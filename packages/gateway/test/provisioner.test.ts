@@ -7,8 +7,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   AgentProvisioner,
+  BOOTSTRAP_FILENAME,
   PERSONA_TEMPLATE_FILES,
   ProvisionError,
+  WORKSPACE_STATE_FILENAME,
   renderTemplate,
   type ProvisionAgentParams,
 } from '../src/provisioner';
@@ -16,17 +18,37 @@ import type { CliExecOptions, OpenClawCliLike, OpenClawCliResult } from '../src/
 
 const REAL_TEMPLATES_DIR = fileURLToPath(new URL('../workspace-templates/', import.meta.url));
 
+async function fileExists(target: string): Promise<boolean> {
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // fakes
 // ---------------------------------------------------------------------------
 
 type CliCall = { args: readonly string[]; options?: CliExecOptions };
 
+/** The generic persona OpenClaw seeds into a fresh workspace on `agents add`. */
+const SEEDED_DEFAULT_SOUL = "# SOUL.md\n\nYou're not a chatbot. You're becoming someone.\n";
+
 class FakeCli implements OpenClawCliLike {
   calls: CliCall[] = [];
   /** agents currently "registered" (returned by agents list). */
   agents: { id: string; model?: string }[] = [];
   failListWith?: Error;
+  /**
+   * When set, `agents add` mimics the real gateway seeding a fresh workspace:
+   * it drops OpenClaw's generic default SOUL.md, a BOOTSTRAP.md, and its OWN
+   * `openclaw-workspace-state.json` (with `bootstrapSeededAt`, no
+   * `setupCompletedAt`) so tests can prove our render/marker wins afterwards.
+   * Maps openclawId -> host workspace dir.
+   */
+  seedWorkspaceDirs?: Map<string, string>;
 
   async exec(args: readonly string[], options?: CliExecOptions): Promise<OpenClawCliResult> {
     this.calls.push({ args, ...(options !== undefined ? { options } : {}) });
@@ -43,9 +65,23 @@ class FakeCli implements OpenClawCliLike {
       const id = args[2]!;
       const model = args[args.indexOf('--model') + 1];
       this.agents.push({ id, ...(model !== undefined ? { model } : {}) });
+      await this.seedWorkspace(id);
       return { agentId: id, name: id } as T;
     }
     throw new Error(`FakeCli: unexpected command ${args.join(' ')}`);
+  }
+
+  private async seedWorkspace(id: string): Promise<void> {
+    const dir = this.seedWorkspaceDirs?.get(id);
+    if (dir === undefined) return;
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'SOUL.md'), SEEDED_DEFAULT_SOUL, 'utf8');
+    await fs.writeFile(path.join(dir, BOOTSTRAP_FILENAME), '# BOOTSTRAP\n\nWho am I?\n', 'utf8');
+    await fs.writeFile(
+      path.join(dir, WORKSPACE_STATE_FILENAME),
+      `${JSON.stringify({ version: 1, bootstrapSeededAt: new Date().toISOString() })}\n`,
+      'utf8',
+    );
   }
 }
 
@@ -126,8 +162,12 @@ describe('AgentProvisioner.provisionAgent', () => {
     const templateNames = (await fs.readdir(REAL_TEMPLATES_DIR)).sort((a, b) =>
       a.localeCompare(b),
     );
-    expect(result.filesWritten).toEqual(templateNames);
+    // filesWritten covers the CONTENT templates; the bootstrap-suppression
+    // marker is reported via bootstrapSuppressed, not filesWritten.
+    const contentTemplates = templateNames.filter((n) => n !== WORKSPACE_STATE_FILENAME);
+    expect(result.filesWritten.sort()).toEqual(contentTemplates);
     expect(result.filesSkipped).toEqual([]);
+    expect(result.bootstrapSuppressed).toBe(true);
     expect(result.hostWorkspaceDir).toBe(path.join(dataDir, 'workspace-banny'));
     expect(result.containerWorkspaceDir).toBe('/home/node/.openclaw/workspace-banny');
 
@@ -142,13 +182,42 @@ describe('AgentProvisioner.provisionAgent', () => {
     const memory = await fs.readFile(path.join(result.hostWorkspaceDir, 'MEMORY.md'), 'utf8');
     expect(memory).toContain('- Banny joined Eden in 2023.');
     const state = JSON.parse(
-      await fs.readFile(path.join(result.hostWorkspaceDir, 'openclaw-workspace-state.json'), 'utf8'),
+      await fs.readFile(path.join(result.hostWorkspaceDir, WORKSPACE_STATE_FILENAME), 'utf8'),
     ) as { version: number; setupCompletedAt: string };
     expect(state).toEqual({ version: 1, setupCompletedAt: '2026-07-03T00:00:00.000Z' });
 
     // memory dirs for the agent's own journals + per-user notes
     const usersDir = await fs.stat(path.join(result.hostWorkspaceDir, 'memory', 'users'));
     expect(usersDir.isDirectory()).toBe(true);
+  });
+
+  it('renders persona AFTER agents add — our SOUL beats the seeded default, ' +
+    'BOOTSTRAP.md is removed, and the state marker suppresses the ritual', async () => {
+    // FakeCli seeds OpenClaw's generic defaults on `agents add` (the real bug
+    // trigger). Provisioning must overwrite them so our persona wins.
+    const cli = new FakeCli();
+    cli.seedWorkspaceDirs = new Map([['banny', path.join(dataDir, 'workspace-banny')]]);
+    const provisioner = makeProvisioner({ cli });
+    const result = await provisioner.provisionAgent(PARAMS);
+
+    // registration happened before the render (add is in the call log)
+    expect(result.registration).toBe('added');
+    expect(result.bootstrapSuppressed).toBe(true);
+
+    // (a) persona file contains OUR persona, not the seeded generic default
+    const soul = await fs.readFile(path.join(result.hostWorkspaceDir, 'SOUL.md'), 'utf8');
+    expect(soul).toContain('exuberant banana');
+    expect(soul).not.toContain("You're not a chatbot");
+
+    // (b) bootstrap-suppression state file exists with the right key
+    const state = JSON.parse(
+      await fs.readFile(path.join(result.hostWorkspaceDir, WORKSPACE_STATE_FILENAME), 'utf8'),
+    ) as { version: number; setupCompletedAt?: string; bootstrapSeededAt?: string };
+    expect(state.setupCompletedAt).toBe('2026-07-03T00:00:00.000Z');
+    expect(state.bootstrapSeededAt).toBeUndefined(); // seed's marker was overwritten
+
+    // BOOTSTRAP.md the seed dropped is gone (belt-and-suspenders suppression)
+    expect(await fileExists(path.join(result.hostWorkspaceDir, BOOTSTRAP_FILENAME))).toBe(false);
   });
 
   it('omitted memorySeed renders as empty (never a literal placeholder)', async () => {
@@ -182,16 +251,27 @@ describe('AgentProvisioner.provisionAgent', () => {
     expect(add!.options?.gatewayToken).toBeUndefined();
   });
 
-  it('skips existing files without force and overwrites with force', async () => {
+  it('skips existing content files without force and overwrites with force, ' +
+    'but ALWAYS re-asserts the bootstrap-suppression marker', async () => {
     const provisioner = makeProvisioner({});
     const first = await provisioner.provisionAgent(PARAMS);
     const soulPath = path.join(first.hostWorkspaceDir, 'SOUL.md');
+    const statePath = path.join(first.hostWorkspaceDir, WORKSPACE_STATE_FILENAME);
     await fs.writeFile(soulPath, 'hand-edited\n');
+    // Simulate a stray BOOTSTRAP.md + a regressed state marker reappearing.
+    await fs.writeFile(path.join(first.hostWorkspaceDir, BOOTSTRAP_FILENAME), 'stale\n');
+    await fs.writeFile(statePath, `${JSON.stringify({ version: 1 })}\n`);
 
     const second = await provisioner.provisionAgent(PARAMS);
+    // content files untouched (idempotent), so filesWritten is empty...
     expect(second.filesWritten).toEqual([]);
     expect(second.filesSkipped.sort()).toEqual(first.filesWritten.sort());
     expect(await fs.readFile(soulPath, 'utf8')).toBe('hand-edited\n');
+    // ...but the marker is re-asserted and BOOTSTRAP.md re-removed every time.
+    expect(second.bootstrapSuppressed).toBe(true);
+    const state = JSON.parse(await fs.readFile(statePath, 'utf8')) as { setupCompletedAt?: string };
+    expect(state.setupCompletedAt).toBe('2026-07-03T00:00:00.000Z');
+    expect(await fileExists(path.join(first.hostWorkspaceDir, BOOTSTRAP_FILENAME))).toBe(false);
 
     const third = await provisioner.provisionAgent(PARAMS, { force: true });
     expect(third.filesWritten.sort()).toEqual(first.filesWritten.sort());

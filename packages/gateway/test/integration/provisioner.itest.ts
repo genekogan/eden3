@@ -7,7 +7,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 
 import { CronSync, scheduleToCron } from '../../src/cron-sync';
 import { OpenClawCli, OpenClawCliError } from '../../src/docker';
-import { AgentProvisioner } from '../../src/provisioner';
+import { AgentProvisioner, BOOTSTRAP_FILENAME, WORKSPACE_STATE_FILENAME } from '../../src/provisioner';
 
 /**
  * Integration test against the LIVE OpenClaw gateway (docker eden3-openclaw,
@@ -74,21 +74,29 @@ describe('provisioner (live gateway)', () => {
     );
 
     expect(['added', 'existing']).toContain(result.registration);
-    expect(result.filesWritten.length).toBeGreaterThanOrEqual(7); // full template set
+    expect(result.filesWritten.length).toBeGreaterThanOrEqual(6); // content template set (state marker reported separately)
     expect(result.filesSkipped).toEqual([]);
+    expect(result.bootstrapSuppressed).toBe(true);
 
-    // host workspace: fully rendered, no placeholder leakage
+    // host workspace: OUR persona rendered over the seed, no placeholder leakage,
+    // no leftover generic default from `agents add`.
     const soul = await fs.readFile(path.join(result.hostWorkspaceDir, 'SOUL.md'), 'utf8');
     expect(soul).toContain('# Itest Scratch');
     expect(soul).not.toMatch(/\{\{[A-Z_]+\}\}/);
+    expect(soul).not.toContain("You're not a chatbot"); // OpenClaw's seeded default persona
+
+    // bootstrap-suppression marker present with the load-bearing setupCompletedAt key
     const state = JSON.parse(
-      await fs.readFile(
-        path.join(result.hostWorkspaceDir, 'openclaw-workspace-state.json'),
-        'utf8',
-      ),
+      await fs.readFile(path.join(result.hostWorkspaceDir, WORKSPACE_STATE_FILENAME), 'utf8'),
     ) as { version: number; setupCompletedAt: string };
     expect(state.version).toBe(1);
+    expect(typeof state.setupCompletedAt).toBe('string');
     expect(new Date(state.setupCompletedAt).getTime()).toBeGreaterThan(0);
+
+    // the seeded first-run ritual file is gone (belt-and-suspenders suppression)
+    await expect(
+      fs.access(path.join(result.hostWorkspaceDir, BOOTSTRAP_FILENAME)),
+    ).rejects.toThrow();
 
     // registered with the CLI (canonical agents.list view)
     const agents = await cli.execJson<{ id: string; model?: string }[]>(['agents', 'list']);
@@ -117,8 +125,13 @@ describe('provisioner (live gateway)', () => {
       model: MODEL,
     });
     expect(result.registration).toBe('existing');
-    expect(result.filesWritten).toEqual([]);
-    expect(result.filesSkipped.length).toBeGreaterThanOrEqual(7);
+    expect(result.filesWritten).toEqual([]); // content untouched (idempotent)
+    expect(result.filesSkipped.length).toBeGreaterThanOrEqual(6);
+    expect(result.bootstrapSuppressed).toBe(true); // marker re-asserted even on skip
+    const state = JSON.parse(
+      await fs.readFile(path.join(result.hostWorkspaceDir, WORKSPACE_STATE_FILENAME), 'utf8'),
+    ) as { setupCompletedAt?: string };
+    expect(typeof state.setupCompletedAt).toBe('string');
   });
 
   it('answers one cheap chat turn (raw fetch, non-stream)', async () => {

@@ -19,9 +19,20 @@ import type { GatewayClientOptions } from './types';
  * CONTAINER path `/home/node/.openclaw/workspace-<openclawId>` (the data dir
  * is bind-mounted at `/home/node/.openclaw`).
  *
- * The full template set is written INCLUDING `openclaw-workspace-state.json`
- * (`{"version":1,"setupCompletedAt":<iso>}`) so the gateway's first-boot
- * BOOTSTRAP ritual is skipped for migrated agents (spike "workspace seeding").
+ * ORDERING (critical — see fix in this file): `openclaw agents add` SEEDS the
+ * workspace with OpenClaw's DEFAULT template files (generic SOUL.md, a
+ * `BOOTSTRAP.md`, and its own `openclaw-workspace-state.json`). So we register
+ * FIRST, then overwrite ALL of our rendered persona files so ours win, then
+ * write the bootstrap-suppression marker LAST.
+ *
+ * BOOTSTRAP SUPPRESSION (verified against the running image, 2026.6.10,
+ * `workspace-*.js` `resolveWorkspaceBootstrapStatus`): the first-boot ritual is
+ * skipped iff `openclaw-workspace-state.json` at the workspace ROOT carries a
+ * non-empty-string `setupCompletedAt` — OR no `BOOTSTRAP.md` exists. We do
+ * BOTH: write `{"version":1,"setupCompletedAt":<iso>}` last, and delete the
+ * `BOOTSTRAP.md` the seeder dropped. These two are correctness invariants
+ * (re-asserted on every provision, even without `force`) rather than
+ * user-editable content, so they live outside the skip-if-exists file loop.
  */
 
 export class ProvisionError extends Error {
@@ -56,6 +67,21 @@ export type TemplateVars = Record<TemplateVarKey, string>;
 
 /** Files re-rendered by {@link AgentProvisioner.updateAgentPersona} (hot). */
 export const PERSONA_TEMPLATE_FILES = ['SOUL.md', 'IDENTITY.md'] as const;
+
+/**
+ * Bootstrap-suppression marker at the workspace ROOT. OpenClaw
+ * (`resolveWorkspaceBootstrapStatus`) treats the first-boot ritual as complete
+ * when this file carries a non-empty `setupCompletedAt`. Written LAST so the
+ * seeding done by `agents add` cannot clobber it.
+ */
+export const WORKSPACE_STATE_FILENAME = 'openclaw-workspace-state.json';
+
+/**
+ * First-run ritual file OpenClaw's seeder drops into a fresh workspace. Its mere
+ * presence flips the workspace back to bootstrap-pending, so we remove it after
+ * registration (belt-and-suspenders alongside {@link WORKSPACE_STATE_FILENAME}).
+ */
+export const BOOTSTRAP_FILENAME = 'BOOTSTRAP.md';
 
 const PLACEHOLDER_RE = /\{\{([A-Z_]+)\}\}/g;
 
@@ -154,14 +180,24 @@ export interface ProvisionAgentResult {
   openclawId: string;
   hostWorkspaceDir: string;
   containerWorkspaceDir: string;
-  /** Template files written this call (relative paths). */
+  /**
+   * Content template files written this call (relative paths). Excludes the
+   * bootstrap-suppression marker ({@link WORKSPACE_STATE_FILENAME}), which is
+   * always re-asserted and reported via {@link bootstrapSuppressed}.
+   */
   filesWritten: string[];
-  /** Template files left untouched (existed and !force). */
+  /** Content template files left untouched (existed and !force). */
   filesSkipped: string[];
   /** "added" via CLI this call, or "existing" (already registered). */
   registration: 'added' | 'existing';
   /** True when an existing registration's model was updated to params.model. */
   modelUpdated: boolean;
+  /**
+   * Always true on success: the `openclaw-workspace-state.json` marker was
+   * (re-)written with `setupCompletedAt` and any seeded `BOOTSTRAP.md` removed,
+   * so the first-boot ritual is suppressed. Re-asserted every call, force or not.
+   */
+  bootstrapSuppressed: boolean;
 }
 
 export interface ProvisionerOptions {
@@ -217,14 +253,25 @@ export class AgentProvisioner {
   }
 
   /**
-   * Provision an agent end-to-end:
-   *  1. render ALL workspace templates into `<dataDir>/workspace-<id>/`
-   *     (existing files are only overwritten with `force: true`),
-   *  2. create the `memory/` (+ `memory/users/`) dirs,
-   *  3. register the agent via `openclaw agents add` (container workspace
+   * Provision an agent end-to-end. Order matters — `agents add` seeds the
+   * workspace with OpenClaw's generic defaults, so our persona has to be
+   * written AFTER registration:
+   *
+   *  1. create the workspace + `memory/` (+ `memory/users/`) dirs,
+   *  2. register the agent via `openclaw agents add` (container workspace
    *     path) unless it is already in agents.list — in which case a model
-   *     drift is corrected in openclaw.json instead,
-   *  4. poll `GET /v1/models` until `openclaw/<id>` is routable.
+   *     drift is corrected in openclaw.json instead. This is what seeds the
+   *     default SOUL.md/BOOTSTRAP.md/state file into a fresh workspace,
+   *  3. render ALL our workspace templates OVER the seeded defaults. On a fresh
+   *     registration we always overwrite (our persona must beat the just-written
+   *     seed); on an already-registered agent existing files are preserved
+   *     unless `force: true` (keeps user hand-edits). The two bootstrap-
+   *     suppression invariants below are re-asserted regardless,
+   *  4. write the `openclaw-workspace-state.json` marker
+   *     (`{"version":1,"setupCompletedAt":<iso>}`) and delete any seeded
+   *     `BOOTSTRAP.md` — both suppress the first-boot ritual for migrated
+   *     agents,
+   *  5. poll `GET /v1/models` until `openclaw/<id>` is routable.
    */
   async provisionAgent(
     params: ProvisionAgentParams,
@@ -241,30 +288,16 @@ export class AgentProvisioner {
       MEMORY_SEED: params.memorySeed ?? '',
       PROVISIONED_AT: this.now().toISOString(),
     };
-
-    // 1. render workspace files
     const workspaceDir = this.hostWorkspaceDir(params.openclawId);
-    const templates = await loadTemplates(this.templatesDir);
-    const filesWritten: string[] = [];
-    const filesSkipped: string[] = [];
-    await fs.mkdir(workspaceDir, { recursive: true });
-    for (const template of templates) {
-      const rendered = renderTemplate(template.raw, vars);
-      assertFullyRendered(template.relPath, rendered);
-      const target = path.join(workspaceDir, template.relPath);
-      if (!force && (await fileExists(target))) {
-        filesSkipped.push(template.relPath);
-        continue;
-      }
-      await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(target, rendered, 'utf8');
-      filesWritten.push(template.relPath);
-    }
 
-    // 2. memory dirs (per-user notes live at memory/users/<username>.md)
+    // 1. workspace + memory dirs (per-user notes live at memory/users/<username>.md)
+    await fs.mkdir(workspaceDir, { recursive: true });
     await fs.mkdir(path.join(workspaceDir, 'memory', 'users'), { recursive: true });
 
-    // 3. register (idempotent)
+    // 2. register FIRST (idempotent). `agents add` seeds the workspace with
+    //    OpenClaw's default template files — including a generic SOUL.md and a
+    //    BOOTSTRAP.md — so it must run BEFORE we render ours (step 3), or our
+    //    persona is clobbered by the seed.
     const existing = await this.findRegisteredAgent(params.openclawId);
     let registration: ProvisionAgentResult['registration'] = 'existing';
     let modelUpdated = false;
@@ -285,7 +318,42 @@ export class AgentProvisioner {
       modelUpdated = true;
     }
 
-    // 4. verify routable
+    // 3. render our workspace files OVER whatever the seed wrote so our persona
+    //    wins. The bootstrap-suppression marker is handled separately in step 4
+    //    (always re-asserted, never skipped), so it is excluded from this loop.
+    //
+    //    Overwrite rule: skip-if-exists preserves USER hand-edits across
+    //    re-provisions — but it must NOT preserve the generic defaults that
+    //    `agents add` just seeded on a fresh registration. So when we added the
+    //    agent THIS call, force the render over the seed; otherwise honour the
+    //    caller's `force` flag (default: keep existing files).
+    const overwrite = force || registration === 'added';
+    const templates = (await loadTemplates(this.templatesDir)).filter(
+      (t) => t.relPath !== WORKSPACE_STATE_FILENAME,
+    );
+    const filesWritten: string[] = [];
+    const filesSkipped: string[] = [];
+    for (const template of templates) {
+      const rendered = renderTemplate(template.raw, vars);
+      assertFullyRendered(template.relPath, rendered);
+      const target = path.join(workspaceDir, template.relPath);
+      if (!overwrite && (await fileExists(target))) {
+        filesSkipped.push(template.relPath);
+        continue;
+      }
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.writeFile(target, rendered, 'utf8');
+      filesWritten.push(template.relPath);
+    }
+
+    // 4. suppress the first-boot BOOTSTRAP ritual for migrated agents. These are
+    //    correctness invariants, not user-editable content: write the state
+    //    marker LAST (so `agents add`'s own state file can't survive) and remove
+    //    the seeded BOOTSTRAP.md. Re-asserted on EVERY provision, force or not.
+    await this.writeBootstrapSuppressionMarker(workspaceDir, vars.PROVISIONED_AT);
+    await fs.rm(path.join(workspaceDir, BOOTSTRAP_FILENAME), { force: true });
+
+    // 5. verify routable
     await this.waitRoutable(params.openclawId);
 
     return {
@@ -296,7 +364,33 @@ export class AgentProvisioner {
       filesSkipped,
       registration,
       modelUpdated,
+      bootstrapSuppressed: true,
     };
+  }
+
+  /**
+   * Write the workspace-state marker that suppresses OpenClaw's first-boot
+   * ritual. Rendered from the `openclaw-workspace-state.json` template so the
+   * shape stays in one place; `setupCompletedAt` is the load-bearing key
+   * (`resolveWorkspaceBootstrapStatus` → "complete" when it is a non-empty
+   * string).
+   */
+  private async writeBootstrapSuppressionMarker(
+    workspaceDir: string,
+    provisionedAt: string,
+  ): Promise<void> {
+    const sourcePath = path.join(this.templatesDir, WORKSPACE_STATE_FILENAME);
+    let raw: string;
+    try {
+      raw = await fs.readFile(sourcePath, 'utf8');
+    } catch (err) {
+      throw new ProvisionError(
+        `cannot read workspace-state template ${sourcePath}: ${(err as Error).message}`,
+      );
+    }
+    const rendered = renderTemplate(raw, { PROVISIONED_AT: provisionedAt });
+    assertFullyRendered(WORKSPACE_STATE_FILENAME, rendered);
+    await fs.writeFile(path.join(workspaceDir, WORKSPACE_STATE_FILENAME), rendered, 'utf8');
   }
 
   /**
