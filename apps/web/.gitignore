@@ -1,0 +1,2 @@
+# Isolated build dirs for secondary dev servers (NEXT_DIST_DIR, see next.config.ts)
+.next-*/

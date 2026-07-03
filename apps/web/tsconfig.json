@@ -1,0 +1,42 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "ES2023"
+    ],
+    "jsx": "preserve",
+    "allowJs": true,
+    "incremental": true,
+    "tsBuildInfoFile": ".next/cache/web.tsbuildinfo",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ]
+  },
+  "include": [
+    ".next-buildcheck/types/**/*.ts",
+    ".next-chatverify/types/**/*.ts",
+    ".next-verify/types/**/*.ts",
+    ".next/types/**/*.ts",
+    "app",
+    "components",
+    "lib",
+    "next-env.d.ts",
+    "next.config.ts",
+    "test",
+    ".next-smoke-build/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    ".next/cache"
+  ]
+}

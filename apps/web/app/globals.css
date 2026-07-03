@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+/*
+ * Eden3 palette — near-black, soft white, one violet. The media is the hero:
+ * chrome stays quiet, violet is rationed (wordmark digit, active-nav bar,
+ * primary actions, the manna glyph).
+ *
+ *   background  page base            #0a0a0b
+ *   surface     sidebar / panels     #101012
+ *   raised      cards, inputs       #17171a
+ *   edge        hairline borders    #232329
+ *   foreground  primary text        #f4f4f5
+ *   muted       secondary text      #9a9aa6
+ *   faint       tertiary/labels     #5d5d69
+ *   accent      violet              #7c5cff
+ *   accent-soft lighter violet      #a18fff
+ */
+@theme {
+  --color-background: #0a0a0b;
+  --color-surface: #101012;
+  --color-raised: #17171a;
+  --color-edge: #232329;
+  --color-foreground: #f4f4f5;
+  --color-muted: #9a9aa6;
+  --color-faint: #5d5d69;
+  --color-accent: #7c5cff;
+  --color-accent-soft: #a18fff;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica,
+    Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+  }
+
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-accent) 40%, transparent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  /* Quiet scrollbars that match the chrome. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-edge) transparent;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
