@@ -25,6 +25,7 @@
   "include": [
     ".next-buildcheck/types/**/*.ts",
     ".next-chatverify/types/**/*.ts",
+    ".next-smoke-build/types/**/*.ts",
     ".next-verify/types/**/*.ts",
     ".next/types/**/*.ts",
     "app",
@@ -33,7 +34,7 @@
     "next-env.d.ts",
     "next.config.ts",
     "test",
-    ".next-smoke-build/types/**/*.ts"
+    ".next-dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules",

@@ -1,0 +1,10 @@
+packages:
+  - apps/*
+  - packages/*
+  - etl
+
+onlyBuiltDependencies:
+  - '@tailwindcss/oxide'
+  - esbuild
+  - sharp
+  - unrs-resolver
