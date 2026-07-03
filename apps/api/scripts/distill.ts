@@ -33,12 +33,15 @@ const force = args.includes('--force');
 const concurrency = args.includes('--concurrency') ? Number(args[args.indexOf('--concurrency') + 1]) : 1;
 
 // Input budget: cap chars sampled per agent so eve (237k msgs) costs like the rest.
-const MAX_CHARS = 90_000; // ~22k tokens of transcript per agent
-const CHUNK_CHARS = 30_000; // → ~3 map chunks max
+const MAX_CHARS = 100_000; // ~25k tokens of transcript per agent
+const CHUNK_CHARS = 50_000; // → ≤2 map chunks (Opus handles long context — fewer, more coherent passes)
 const FLAGSHIPS = new Set(['abraham', 'eve', 'solienne', 'chiba', 'verdelis', 'dungeon-master']);
 
-const MAP_MODEL = 'claude-haiku-4-5';
-const REDUCE_MODEL = 'claude-sonnet-4-6';
+// Accuracy-critical: the map pass extracts facts from raw transcripts, so a weak
+// model here poisons the memory with misattributed collaborators/works. Use Opus
+// for BOTH extraction and synthesis (per operator direction — no Haiku).
+const MAP_MODEL = 'claude-opus-4-6';
+const REDUCE_MODEL = 'claude-opus-4-6';
 
 interface Pilot { openclawId: string; username: string; accountId: string; persona: string | null }
 
