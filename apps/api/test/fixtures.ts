@@ -211,6 +211,7 @@ export function makeFakeProvisioner(opts: { failProvision?: boolean } = {}): Fak
         filesSkipped: [],
         registration: 'added',
         modelUpdated: false,
+        bootstrapSuppressed: true,
       };
     },
     async updateAgentPersona(params): Promise<{ filesWritten: string[] }> {
