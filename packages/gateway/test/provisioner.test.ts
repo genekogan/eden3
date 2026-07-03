@@ -510,4 +510,46 @@ describe('AgentProvisioner.updateAgentPersona', () => {
       }),
     ).rejects.toThrow(/provision "ghost" first/);
   });
+
+  it('re-asserts the bootstrap-suppression marker (self-heals a wiped marker + stray BOOTSTRAP.md)', async () => {
+    const provisioner = makeProvisioner({});
+    const first = await provisioner.provisionAgent(PARAMS);
+
+    // Simulate a workspace that has LOST its durable "onboarded" state after the
+    // initial provision: the marker got emptied AND a BOOTSTRAP.md slipped back
+    // in. Under OpenClaw's per-turn predicate this is the poisoned "pending"
+    // state that would trigger the blank-slate ritual (and clobber the persona).
+    await fs.writeFile(
+      path.join(first.hostWorkspaceDir, WORKSPACE_STATE_FILENAME),
+      `${JSON.stringify({ version: 1, setupCompletedAt: '' })}\n`,
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(first.hostWorkspaceDir, BOOTSTRAP_FILENAME),
+      '# BOOTSTRAP\n\nWho am I?\n',
+      'utf8',
+    );
+    expect(await workspaceBootstrapStatus(first.hostWorkspaceDir)).toBe('pending');
+
+    // Editing the persona in the studio must restore the durable suppression so
+    // the agent keeps its (freshly edited) persona across the next turn/restart.
+    const updated = await provisioner.updateAgentPersona({
+      openclawId: 'banny',
+      name: 'Banny Prime',
+      username: 'banny',
+      description: 'Reformed banana, now a sculptor',
+      persona: 'You are Banny Prime, a solemn sculptor.',
+      greeting: 'Welcome to the studio.',
+    });
+    expect(updated.bootstrapSuppressed).toBe(true);
+
+    // Marker restored with a non-empty setupCompletedAt, stray BOOTSTRAP.md gone.
+    const marker = JSON.parse(
+      await fs.readFile(path.join(first.hostWorkspaceDir, WORKSPACE_STATE_FILENAME), 'utf8'),
+    ) as { setupCompletedAt?: unknown };
+    expect(typeof marker.setupCompletedAt).toBe('string');
+    expect((marker.setupCompletedAt as string).length).toBeGreaterThan(0);
+    expect(await fileExists(path.join(first.hostWorkspaceDir, BOOTSTRAP_FILENAME))).toBe(false);
+    expect(await workspaceBootstrapStatus(first.hostWorkspaceDir)).toBe('complete');
+  });
 });

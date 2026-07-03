@@ -214,9 +214,9 @@ export function makeFakeProvisioner(opts: { failProvision?: boolean } = {}): Fak
         bootstrapSuppressed: true,
       };
     },
-    async updateAgentPersona(params): Promise<{ filesWritten: string[] }> {
+    async updateAgentPersona(params): ReturnType<ProvisionerLike['updateAgentPersona']> {
       personaUpdates.push(params);
-      return { filesWritten: ['SOUL.md', 'IDENTITY.md'] };
+      return { filesWritten: ['SOUL.md', 'IDENTITY.md'], bootstrapSuppressed: true };
     },
   };
 }

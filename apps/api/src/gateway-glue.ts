@@ -10,6 +10,7 @@ import {
   type SyncTriggerParams,
   type SyncTriggerResult,
   type UpdatePersonaParams,
+  type UpdatePersonaResult,
 } from '@eden3/gateway';
 
 import { ApiError } from './errors';
@@ -32,7 +33,7 @@ export interface ProvisionerLike {
     params: ProvisionAgentParams,
     options?: { force?: boolean },
   ): Promise<ProvisionAgentResult>;
-  updateAgentPersona(params: UpdatePersonaParams): Promise<{ filesWritten: string[] }>;
+  updateAgentPersona(params: UpdatePersonaParams): Promise<UpdatePersonaResult>;
 }
 
 /** Structural subset of {@link CronSync} the routes use. */

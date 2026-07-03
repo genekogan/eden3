@@ -176,6 +176,16 @@ export interface UpdatePersonaParams {
   greeting: string;
 }
 
+export interface UpdatePersonaResult {
+  filesWritten: string[];
+  /**
+   * Always true on success: the bootstrap-suppression marker was re-asserted
+   * (see {@link AgentProvisioner.updateAgentPersona}). Mirrors
+   * {@link ProvisionAgentResult.bootstrapSuppressed}.
+   */
+  bootstrapSuppressed: true;
+}
+
 export interface ProvisionAgentResult {
   openclawId: string;
   hostWorkspaceDir: string;
@@ -439,8 +449,18 @@ export class AgentProvisioner {
    * Hot persona update: re-render ONLY SOUL.md + IDENTITY.md (always
    * overwrites — this is the "edit persona in the studio" path). The gateway
    * reads workspace files per turn, so no re-registration is needed.
+   *
+   * Also RE-ASSERTS the bootstrap-suppression marker (writes
+   * `openclaw-workspace-state.json` with a fresh `setupCompletedAt` and removes
+   * any stray `BOOTSTRAP.md`), then verifies via {@link assertBootstrapSuppressed}.
+   * This is defense-in-depth + self-healing: the running gateway never re-seeds
+   * a workspace whose marker is already set, but if a marker is ever lost (manual
+   * edit, a partial `agents add` re-seed, a restored-from-backup workspace),
+   * editing the persona in the studio restores the durable "onboarded" state so
+   * the agent cannot fall back into the blank-slate ritual (which would then
+   * overwrite the very persona we just wrote) on its next turn or a restart.
    */
-  async updateAgentPersona(params: UpdatePersonaParams): Promise<{ filesWritten: string[] }> {
+  async updateAgentPersona(params: UpdatePersonaParams): Promise<UpdatePersonaResult> {
     assertValidOpenclawId(params.openclawId);
     const workspaceDir = this.hostWorkspaceDir(params.openclawId);
     if (!(await fileExists(workspaceDir))) {
@@ -469,7 +489,12 @@ export class AgentProvisioner {
       await fs.writeFile(path.join(workspaceDir, relPath), rendered, 'utf8');
       filesWritten.push(relPath);
     }
-    return { filesWritten };
+    // Re-assert the durable suppression invariant so a persona edit can never
+    // leave the workspace in a bootstrap-pending state on next load.
+    await this.writeBootstrapSuppressionMarker(workspaceDir, this.now().toISOString());
+    await fs.rm(path.join(workspaceDir, BOOTSTRAP_FILENAME), { force: true });
+    await this.assertBootstrapSuppressed(workspaceDir);
+    return { filesWritten, bootstrapSuppressed: true };
   }
 
   /**
