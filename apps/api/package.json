@@ -1,0 +1,32 @@
+{
+  "name": "@eden3/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "test": "vitest run --passWithNoTests",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@eden3/core": "workspace:*",
+    "@eden3/db": "workspace:*",
+    "@eden3/gateway": "workspace:*",
+    "@eden3/shared": "workspace:*",
+    "@fastify/cors": "^11.0.1",
+    "@fastify/static": "^8.2.0",
+    "chokidar": "^4.0.3",
+    "drizzle-orm": "^0.44.2",
+    "eventsource-parser": "^3.0.3",
+    "fastify": "^5.4.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
