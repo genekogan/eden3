@@ -298,7 +298,13 @@ export const mannaTransactions = pgTable(
       .notNull()
       .references(() => mannaAccounts.id),
     amount: numeric('amount', { precision: 20, scale: 4 }).notNull(),
-    type: text('type').notNull(),
+    /**
+     * Transaction type (spend/refund/credit_stripe/…). Nullable on purpose:
+     * ~57% of migrated v1-era ledger rows predate the field and carry no type
+     * in the source — that absence is preserved as NULL, never coerced to a
+     * sentinel. The eden3 spend path always writes an explicit type.
+     */
+    type: text('type'),
     taskExternalId: text('task_external_id'),
     /** Stripe webhook provenance (credit_stripe rows) — audit/reconciliation. */
     stripeEventId: text('stripe_event_id'),

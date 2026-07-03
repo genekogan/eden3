@@ -1,0 +1,1 @@
+ALTER TABLE "manna_transactions" ALTER COLUMN "type" DROP NOT NULL;

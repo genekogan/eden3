@@ -15,6 +15,13 @@
       "when": 1783049963030,
       "tag": "0001_sloppy_marvel_zombies",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1783084839135,
+      "tag": "0002_first_iron_monger",
+      "breakpoints": true
     }
   ]
 }
