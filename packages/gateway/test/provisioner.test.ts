@@ -12,6 +12,7 @@ import {
   ProvisionError,
   WORKSPACE_STATE_FILENAME,
   renderTemplate,
+  workspaceBootstrapStatus,
   type ProvisionAgentParams,
 } from '../src/provisioner';
 import type { CliExecOptions, OpenClawCliLike, OpenClawCliResult } from '../src/docker';
@@ -153,6 +154,53 @@ describe('renderTemplate', () => {
   });
 });
 
+/**
+ * Truth table for the EXACT predicate the running gateway
+ * (`resolveWorkspaceBootstrapStatus`, image 2026.6.10) uses per turn. If this
+ * ever diverges from the bundled source, migrated agents silently regress to the
+ * blank-slate ritual — so it is pinned here as a contract.
+ */
+describe('workspaceBootstrapStatus (mirrors OpenClaw resolveWorkspaceBootstrapStatus)', () => {
+  let ws: string;
+  beforeEach(async () => {
+    ws = await fs.mkdtemp(path.join(os.tmpdir(), 'eden3-bootstrap-status-'));
+  });
+  afterEach(async () => {
+    await fs.rm(ws, { recursive: true, force: true });
+  });
+
+  const writeState = (obj: unknown) =>
+    fs.writeFile(path.join(ws, WORKSPACE_STATE_FILENAME), JSON.stringify(obj), 'utf8');
+  const writeBootstrap = () => fs.writeFile(path.join(ws, BOOTSTRAP_FILENAME), '# BOOTSTRAP\n', 'utf8');
+
+  it('complete: non-empty setupCompletedAt suppresses even when BOOTSTRAP.md is present', async () => {
+    await writeState({ version: 1, setupCompletedAt: '2026-07-03T00:00:00.000Z' });
+    await writeBootstrap();
+    expect(await workspaceBootstrapStatus(ws)).toBe('complete');
+  });
+
+  it('complete: no BOOTSTRAP.md suppresses even without a setupCompletedAt', async () => {
+    await writeState({ version: 1 });
+    expect(await workspaceBootstrapStatus(ws)).toBe('complete');
+  });
+
+  it('complete: no state file at all + no BOOTSTRAP.md', async () => {
+    expect(await workspaceBootstrapStatus(ws)).toBe('complete');
+  });
+
+  it('pending: BOOTSTRAP.md present AND setupCompletedAt missing (the poisoned seed state)', async () => {
+    await writeState({ version: 1, bootstrapSeededAt: '2026-07-03T00:00:00.000Z' });
+    await writeBootstrap();
+    expect(await workspaceBootstrapStatus(ws)).toBe('pending');
+  });
+
+  it('pending: BOOTSTRAP.md present AND setupCompletedAt is an empty/whitespace string', async () => {
+    await writeState({ version: 1, setupCompletedAt: '   ' });
+    await writeBootstrap();
+    expect(await workspaceBootstrapStatus(ws)).toBe('pending');
+  });
+});
+
 describe('AgentProvisioner.provisionAgent', () => {
   it('renders every real template with no unresolved placeholders', async () => {
     const cli = new FakeCli();
@@ -218,6 +266,71 @@ describe('AgentProvisioner.provisionAgent', () => {
 
     // BOOTSTRAP.md the seed dropped is gone (belt-and-suspenders suppression)
     expect(await fileExists(path.join(result.hostWorkspaceDir, BOOTSTRAP_FILENAME))).toBe(false);
+
+    // the durable, restart-surviving contract: the workspace now resolves to
+    // "complete" under the SAME predicate the gateway runs per turn — this is
+    // exactly what a `docker restart` re-evaluates, so proving it here proves
+    // restart-survival without a live gateway.
+    expect(await workspaceBootstrapStatus(result.hostWorkspaceDir)).toBe('complete');
+  });
+
+  it('leaves the workspace bootstrap-complete after provisioning (restart-survival contract)', async () => {
+    const cli = new FakeCli();
+    cli.seedWorkspaceDirs = new Map([['banny', path.join(dataDir, 'workspace-banny')]]);
+    const provisioner = makeProvisioner({ cli });
+    const result = await provisioner.provisionAgent(PARAMS);
+    // The gateway re-reads this predicate on every load, including after a
+    // restart; "complete" here == no blank-slate ritual then.
+    expect(await workspaceBootstrapStatus(result.hostWorkspaceDir)).toBe('complete');
+  });
+
+  it('fails loudly when bootstrap suppression is defeated (BOOTSTRAP.md reappears + empty marker)', async () => {
+    // Simulate the worst-case regression: the state marker renders with an EMPTY
+    // setupCompletedAt (so suppression would rely solely on BOOTSTRAP.md being
+    // gone) AND a stray BOOTSTRAP.md reappears AFTER the provisioner removed it
+    // (a late seed / hook / race). Under the real gateway predicate this flips
+    // the workspace back to "pending" → blank-slate ritual on next load. The
+    // read-back assertion (step 4b) must convert that into a hard failure.
+    //
+    // We inject the reappearance via a FakeCli subclass whose `agents list`
+    // (called during findRegisteredAgent on a SECOND provision) re-drops
+    // BOOTSTRAP.md — but simplest & most direct: override the marker writer to
+    // leave an empty marker, then re-create BOOTSTRAP.md through a subclass hook
+    // that runs after removal.
+    const wsDir = path.join(dataDir, 'workspace-banny');
+    const brokenTemplatesDir = await fs.mkdtemp(path.join(os.tmpdir(), 'eden3-broken-tpl-'));
+    for (const f of await fs.readdir(REAL_TEMPLATES_DIR)) {
+      await fs.copyFile(path.join(REAL_TEMPLATES_DIR, f), path.join(brokenTemplatesDir, f));
+    }
+    await fs.writeFile(
+      path.join(brokenTemplatesDir, WORKSPACE_STATE_FILENAME),
+      JSON.stringify({ version: 1, setupCompletedAt: '' }) + '\n',
+      'utf8',
+    );
+
+    /** Subclass that re-drops BOOTSTRAP.md strictly AFTER the provisioner's rm. */
+    class RaceProvisioner extends AgentProvisioner {
+      protected override async afterBootstrapSuppression(dir: string): Promise<void> {
+        await fs.writeFile(path.join(dir, BOOTSTRAP_FILENAME), '# BOOTSTRAP\n', 'utf8');
+      }
+    }
+    const provisioner = new RaceProvisioner({
+      gateway: { baseUrl: 'http://gw.test', token: 'tok', fetchImpl: modelsFetch({
+        ids: ['openclaw/main', 'openclaw/banny'],
+      }).fetchImpl },
+      cli: new FakeCli(),
+      dataDir,
+      templatesDir: brokenTemplatesDir,
+      routableTimeoutMs: 2_000,
+      routablePollIntervalMs: 10,
+      now: () => new Date('2026-07-03T00:00:00.000Z'),
+    });
+    await expect(provisioner.provisionAgent(PARAMS)).rejects.toThrow(
+      /bootstrap suppression failed.*blank-slate ritual/s,
+    );
+    // and the workspace really is in the pending state the assertion caught
+    expect(await workspaceBootstrapStatus(wsDir)).toBe('pending');
+    await fs.rm(brokenTemplatesDir, { recursive: true, force: true });
   });
 
   it('omitted memorySeed renders as empty (never a literal placeholder)', async () => {

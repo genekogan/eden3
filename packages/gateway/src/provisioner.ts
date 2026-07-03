@@ -353,6 +353,20 @@ export class AgentProvisioner {
     await this.writeBootstrapSuppressionMarker(workspaceDir, vars.PROVISIONED_AT);
     await fs.rm(path.join(workspaceDir, BOOTSTRAP_FILENAME), { force: true });
 
+    // Test seam: lets a subclass simulate a post-removal race (a stray
+    // BOOTSTRAP.md reappearing after we cleaned it) so the read-back assertion
+    // below can be exercised. No-op in production.
+    await this.afterBootstrapSuppression(workspaceDir);
+
+    // 4b. VERIFY suppression actually took — this is the restart-survival
+    //     guarantee. `resolveWorkspaceBootstrapStatus` in the running image reads
+    //     ONLY these two disk facts per turn (nothing in-memory, nothing in the
+    //     state sqlite), so if the marker didn't land or a BOOTSTRAP.md slipped
+    //     back in, the agent WILL run the blank-slate ritual on its next load
+    //     (incl. after a gateway restart). Re-read from disk and fail loudly
+    //     rather than ship a workspace that regresses. See docs/dev/spike.md.
+    await this.assertBootstrapSuppressed(workspaceDir);
+
     // 5. verify routable
     await this.waitRoutable(params.openclawId);
 
@@ -391,6 +405,34 @@ export class AgentProvisioner {
     const rendered = renderTemplate(raw, { PROVISIONED_AT: provisionedAt });
     assertFullyRendered(WORKSPACE_STATE_FILENAME, rendered);
     await fs.writeFile(path.join(workspaceDir, WORKSPACE_STATE_FILENAME), rendered, 'utf8');
+  }
+
+  /**
+   * Test seam invoked after the bootstrap-suppression marker is written and any
+   * seeded BOOTSTRAP.md removed, but before the read-back assertion. Overridden
+   * in tests to simulate a post-removal race; a no-op in production.
+   */
+  protected async afterBootstrapSuppression(_workspaceDir: string): Promise<void> {
+    // intentionally empty
+  }
+
+  /**
+   * Re-read the workspace from disk and assert the first-boot ritual is
+   * suppressed by the SAME predicate the running gateway uses per turn
+   * ({@link workspaceBootstrapStatus}). Throws {@link ProvisionError} otherwise
+   * so a provision that would regress on next load (or after a gateway restart)
+   * fails loudly here instead of silently shipping a blank-slate agent.
+   */
+  private async assertBootstrapSuppressed(workspaceDir: string): Promise<void> {
+    const status = await workspaceBootstrapStatus(workspaceDir);
+    if (status !== 'complete') {
+      throw new ProvisionError(
+        `bootstrap suppression failed for ${workspaceDir}: workspace still resolves ` +
+          `to "${status}" — the agent would run the blank-slate ritual on its next ` +
+          `load. Expected a non-empty setupCompletedAt in ${WORKSPACE_STATE_FILENAME} ` +
+          `and no ${BOOTSTRAP_FILENAME}.`,
+      );
+    }
   }
 
   /**
@@ -500,4 +542,43 @@ async function fileExists(target: string): Promise<boolean> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Reimplementation of OpenClaw's `resolveWorkspaceBootstrapStatus`
+ * (`dist/workspace-*.js` in image 2026.6.10) — the EXACT per-turn predicate that
+ * decides whether an agent gets the blank-slate BOOTSTRAP handoff prompt or its
+ * normal SOUL-based prompt. Kept here as the single durable-marker contract the
+ * provisioner enforces and the tests assert against.
+ *
+ * The gateway checks TWO disk facts at the workspace ROOT and NOTHING else — not
+ * the state sqlite (its `workspace_setup_state` table is DDL-only in 6.10 and is
+ * never read), not any in-memory flag (which is why a restart re-runs this):
+ *
+ *   status = "complete"  when  openclaw-workspace-state.json has a non-empty
+ *                              string `setupCompletedAt`
+ *                        OR    no BOOTSTRAP.md exists at the workspace root
+ *          = "pending"   otherwise  → triggers the "I just came online, who am
+ *                                     I?" ritual (model-generated, not a fixed
+ *                                     string) which then overwrites SOUL.md.
+ *
+ * A durable, restart-surviving "onboarded" marker therefore requires BOTH a
+ * non-empty `setupCompletedAt` AND the absence of BOOTSTRAP.md — the provisioner
+ * asserts exactly this after every provision.
+ */
+export async function workspaceBootstrapStatus(
+  workspaceDir: string,
+): Promise<'complete' | 'pending'> {
+  let setupCompletedAt: unknown;
+  try {
+    const parsed = JSON.parse(
+      await fs.readFile(path.join(workspaceDir, WORKSPACE_STATE_FILENAME), 'utf8'),
+    ) as Record<string, unknown>;
+    setupCompletedAt = parsed?.setupCompletedAt;
+  } catch {
+    setupCompletedAt = undefined;
+  }
+  if (typeof setupCompletedAt === 'string' && setupCompletedAt.trim().length > 0) return 'complete';
+  if (!(await fileExists(path.join(workspaceDir, BOOTSTRAP_FILENAME)))) return 'complete';
+  return 'pending';
 }
