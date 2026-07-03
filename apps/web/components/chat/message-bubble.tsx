@@ -91,7 +91,7 @@ function AgentRow({
   children: ReactNode;
 }) {
   return (
-    <div className="group flex gap-3">
+    <div className="group flex gap-3" data-testid="message" data-role="assistant">
       <div className="w-7 shrink-0 pt-0.5">
         {showAvatar ? (
           sender ? (
@@ -175,7 +175,7 @@ function UserBubble({
   pending?: boolean;
 }) {
   return (
-    <div className="flex justify-end">
+    <div className="flex justify-end" data-testid="message" data-role="user">
       <div
         className={`max-w-[85%] rounded-2xl rounded-br-md border border-accent/20 bg-accent/[0.13] px-4 py-2.5 sm:max-w-[70%] ${
           pending ? "opacity-80" : ""
