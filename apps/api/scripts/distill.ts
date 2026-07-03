@@ -43,11 +43,16 @@ const REDUCE_MODEL = 'claude-sonnet-4-6';
 interface Pilot { openclawId: string; username: string; accountId: string; persona: string | null }
 
 async function claudeP(prompt: string, input: string, model: string): Promise<string> {
-  // headless one-shot; prompt via -p, content on stdin. Generous buffer + timeout.
+  // headless one-shot. NOTE: `claude -p` has a ~3s stdin read timeout and races
+  // execFile's stdin write ("no stdin data received in 3s, proceeding without it"),
+  // silently dropping the content. So embed the content in the prompt arg instead
+  // (map chunks are <=30k chars, reduce notes are small — well under ARG_MAX), and
+  // close stdin explicitly.
+  const full = `${prompt}\n\n---\nINPUT:\n${input}`;
   const { stdout } = await exec(
     'claude',
-    ['-p', prompt, '--model', model],
-    { input, maxBuffer: 64 * 1024 * 1024, timeout: 240_000, encoding: 'utf8' },
+    ['-p', full, '--model', model],
+    { input: '', maxBuffer: 64 * 1024 * 1024, timeout: 300_000, encoding: 'utf8' },
   );
   return stdout.trim();
 }
