@@ -73,7 +73,7 @@ for (const r of rows) {
       { force: FORCE },
     );
     await pg`
-      update agents set provision_status = 'provisioned', provisioned_at = now(),
+      update agents set provision_status = 'ready', provisioned_at = now(),
              openclaw_id = ${openclawId}, workspace_path = ${res.hostWorkspaceDir}
       where account_id = ${r.accountId}
     `;
@@ -81,7 +81,7 @@ for (const r of rows) {
     console.log(`✓ ${r.username} (${openclawId}) — ${res.registration}, ${res.filesWritten.length} files`);
   } catch (err) {
     failed++;
-    await pg`update agents set provision_status = 'error' where account_id = ${r.accountId}`;
+    await pg`update agents set provision_status = 'failed' where account_id = ${r.accountId}`;
     console.error(`✗ ${r.username}: ${(err as Error).message}`);
   }
 }

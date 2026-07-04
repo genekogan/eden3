@@ -139,10 +139,17 @@ export function accountSummaryFromEntity(account: Account): AccountSummary {
 // Agents
 // ---------------------------------------------------------------------------
 
+/** Legacy provisioner vocabulary → canonical DTO status. */
+const PROVISION_ALIASES: Record<string, ProvisionStatus> = {
+  provisioned: 'ready',
+  error: 'failed',
+};
+
 function coerceProvisionStatus(value: string): ProvisionStatus {
-  return (PROVISION_STATUSES as readonly string[]).includes(value)
-    ? (value as ProvisionStatus)
-    : 'pending';
+  if ((PROVISION_STATUSES as readonly string[]).includes(value)) {
+    return value as ProvisionStatus;
+  }
+  return PROVISION_ALIASES[value] ?? 'pending';
 }
 
 /** Raw `accounts JOIN agents` row (snake_case, text timestamps). */
