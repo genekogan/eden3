@@ -348,6 +348,64 @@ export const collectionCreations = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// concepts + concept_images — per-agent reference-image aesthetics (the
+// eden1 "concepts" successor). A concept is an owner-curated named style:
+// name/description/instructions plus up to 8 reference images. Rows are
+// projected into the agent's OpenClaw workspace (concepts/<slug>/) so the
+// runtime can pass the reference files to image tools. Soft-deleted rows
+// release their slug via the partial unique index.
+// ---------------------------------------------------------------------------
+export const concepts = pgTable(
+  'concepts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    agentId: uuid('agent_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    /** Kebab-case, unique per agent among non-deleted rows; doubles as the workspace dir name. */
+    slug: text('slug').notNull(),
+    description: text('description'),
+    /** Optional "how to use these references" note, rendered into CONCEPT.md. */
+    instructions: text('instructions'),
+    deleted: boolean('deleted').notNull().default(false),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('concepts_agent_slug_uq')
+      .on(t.agentId, t.slug)
+      .where(sql`${t.deleted} = false`),
+    index('concepts_agent_created_idx').on(t.agentId, t.createdAt.desc()),
+  ],
+);
+
+export const conceptImages = pgTable(
+  'concept_images',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    conceptId: uuid('concept_id')
+      .notNull()
+      .references(() => concepts.id, { onDelete: 'cascade' }),
+    /** Servable URL (`<MEDIA_BASE_URL>/<sha256><ext>`) from the media store. */
+    url: text('url').notNull(),
+    /** Absolute path of the content-addressed file — workspace projection copies from here. */
+    localPath: text('local_path'),
+    /** Content address (media store sha256). NOT unique: two concepts may share a file. */
+    sha256: text('sha256').notNull(),
+    mime: text('mime').notNull(),
+    width: integer('width'),
+    height: integer('height'),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }),
+    /** Original upload filename (display only). */
+    filename: text('filename'),
+    position: integer('position').notNull().default(0),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [index('concept_images_concept_position_idx').on(t.conceptId, t.position)],
+);
+
+// ---------------------------------------------------------------------------
 // manna — balances + append-only ledger.
 // ---------------------------------------------------------------------------
 export const mannaAccounts = pgTable('manna_accounts', {
@@ -713,6 +771,10 @@ export type NewAgentLike = typeof agentLikes.$inferInsert;
 export type Collection = typeof collections.$inferSelect;
 export type NewCollection = typeof collections.$inferInsert;
 export type CollectionCreation = typeof collectionCreations.$inferSelect;
+export type Concept = typeof concepts.$inferSelect;
+export type NewConcept = typeof concepts.$inferInsert;
+export type ConceptImage = typeof conceptImages.$inferSelect;
+export type NewConceptImage = typeof conceptImages.$inferInsert;
 export type MannaAccount = typeof mannaAccounts.$inferSelect;
 export type NewMannaAccount = typeof mannaAccounts.$inferInsert;
 export type MannaTransaction = typeof mannaTransactions.$inferSelect;

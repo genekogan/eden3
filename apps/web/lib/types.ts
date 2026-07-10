@@ -140,6 +140,53 @@ export interface CollectionDetail {
   creations: CreationDto[];
 }
 
+// ---------------------------------------------------------------------------
+// Concepts — per-agent reference-image aesthetics
+// ---------------------------------------------------------------------------
+
+export interface ConceptImageDto {
+  id: string;
+  /** Servable /media/<sha256><ext> URL. */
+  url: string;
+  mime: string;
+  width: number | null;
+  height: number | null;
+  filename: string | null;
+  position: number;
+  createdAt: string;
+}
+
+/** GET /api/agents/:username/concepts item. */
+export interface ConceptDto {
+  id: string;
+  agentId: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  instructions: string | null;
+  images: ConceptImageDto[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** POST /api/agents/:username/concepts */
+export interface ConceptCreateInput {
+  name: string;
+  description?: string;
+  instructions?: string;
+}
+
+/** PATCH /api/agents/:username/concepts/:slug */
+export type ConceptUpdateInput = Partial<ConceptCreateInput>;
+
+/** POST /api/agents/:username/concepts/:slug/images (base64-JSON upload). */
+export interface ConceptImageUploadInput {
+  filename?: string;
+  /** png / jpeg / webp only; the api validates decoded size (≤ 8MB). */
+  mime: string;
+  dataBase64: string;
+}
+
 /** GET /api/manna */
 export interface MannaSummary {
   balance: number;
