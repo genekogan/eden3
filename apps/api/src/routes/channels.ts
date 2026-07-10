@@ -8,6 +8,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
 import { ApiError, sendError } from '../errors';
+import { defaultOpenclawDataDir } from '../gateway-glue';
 import { FixedWindowRateLimiter } from '../services/http-hardening';
 import { defaultSecretVault, type SecretVaultLike } from '../services/secret-vault';
 
@@ -364,7 +365,10 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     }
 
     const sync: ChannelRuntimeSyncLike = opts.channelSync ?? {
-      ensureDiscordChannel: (o) => ensureDiscordChannel(o),
+      // dataDir must be the repo-anchored path — resolveDataDir()'s cwd
+      // fallback points inside apps/api when the api runs from its package.
+      ensureDiscordChannel: (o) =>
+        ensureDiscordChannel({ ...o, dataDir: defaultOpenclawDataDir() }),
     };
     await sync.ensureDiscordChannel({
       tokenEnvVar: DISCORD_RUNTIME_TOKEN_ENV,
