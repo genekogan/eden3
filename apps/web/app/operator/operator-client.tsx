@@ -74,10 +74,13 @@ function HealthPanel({ health }: { health: OperatorHealth }) {
     : gateway.reachable
       ? "ok"
       : "bad";
+  // "models" here is the /v1/models count (~1 endpoint per registered agent),
+  // not a menu of distinct base models — label it "routable endpoints" and
+  // tag the round-trip time as a probe so neither reads as something it isn't.
   const gatewayLine = !gateway.configured
     ? "not configured"
     : gateway.reachable
-      ? `reachable · ${gateway.routableModels ?? 0} models · ${gateway.registeredAgents ?? 0} agents${gateway.latencyMs != null ? ` · ${gateway.latencyMs}ms` : ""}`
+      ? `reachable · ${gateway.registeredAgents ?? 0} agents · ${gateway.routableModels ?? 0} routable endpoints${gateway.latencyMs != null ? ` · ${gateway.latencyMs}ms probe` : ""}`
       : `unreachable${gateway.error ? ` · ${gateway.error}` : ""}`;
 
   const egress = health.egressProxy;
@@ -85,14 +88,29 @@ function HealthPanel({ health }: { health: OperatorHealth }) {
     egress.reachable === true ? "ok" : egress.reachable === false ? "warn" : "muted";
   const egressLine =
     egress.reachable === true
-      ? `${egress.mode === "open" ? "open exterior / sealed interior" : egress.mode}`
+      ? `${egress.mode === "open" ? "public web allowed · internals sealed" : egress.mode}`
       : egress.reachable === false
         ? "unreachable"
         : "not mapped to host";
 
-  const rows: Array<{ label: string; tone: "ok" | "warn" | "bad" | "muted"; line: string }> = [
-    { label: "Gateway", tone: gatewayTone, line: gatewayLine },
-    { label: "Egress proxy", tone: egressTone, line: egressLine },
+  const rows: Array<{
+    label: string;
+    tone: "ok" | "warn" | "bad" | "muted";
+    line: string;
+    hint?: string;
+  }> = [
+    {
+      label: "Gateway",
+      tone: gatewayTone,
+      line: gatewayLine,
+      hint: "OpenClaw gateway. Routable endpoints = the /v1/models list (roughly one per registered agent, plus a couple of base models); probe = round-trip time of a single reachability fetch.",
+    },
+    {
+      label: "Egress proxy",
+      tone: egressTone,
+      line: egressLine,
+      hint: "Sandboxed agents can reach the public web but are blocked from platform internals (the sealed interior).",
+    },
     {
       label: "Scheduler",
       tone: health.scheduler.running ? "ok" : "warn",
@@ -120,7 +138,10 @@ function HealthPanel({ health }: { health: OperatorHealth }) {
               <HealthDot tone={row.tone} />
               <span className="text-sm text-foreground">{row.label}</span>
             </div>
-            <p className="mt-1 truncate font-mono text-[11px] text-muted" title={row.line}>
+            <p
+              className="mt-1 truncate font-mono text-[11px] text-muted"
+              title={row.hint ? `${row.line}\n\n${row.hint}` : row.line}
+            >
               {row.line}
             </p>
           </div>
@@ -134,15 +155,21 @@ function Metric({
   label,
   value,
   sub,
+  hint,
 }: {
   label: string;
   value: string;
   sub?: string;
+  hint?: string;
 }) {
   return (
-    <div className="min-w-0 rounded-lg border border-edge bg-surface px-4 py-3">
+    <div
+      className="min-w-0 rounded-lg border border-edge bg-surface px-4 py-3"
+      title={hint}
+    >
       <div className="font-mono text-[10px] uppercase tracking-[0.2em] text-faint">
         {label}
+        {hint ? <span aria-hidden className="ml-1 text-faint/70">ⓘ</span> : null}
       </div>
       <div className="mt-2 truncate text-2xl font-light tabular-nums">{value}</div>
       {sub ? <div className="mt-1 truncate text-xs text-muted">{sub}</div> : null}
@@ -236,18 +263,25 @@ function RecentActivity({ rows }: { rows: OperatorRecentUsageEvent[] }) {
       {rows.length === 0 ? (
         <div className="px-4 py-8 text-sm text-muted">No rows</div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[860px] text-left text-sm">
+        // Relaxed min-width + Model/Latency hidden below lg keeps the money
+        // columns (Cost, Manna) on-screen on narrow viewports; the right-edge
+        // fade and caption make the remaining horizontal scroll discoverable
+        // so nothing silently clips.
+        <div className="relative">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[680px] text-left text-sm">
             <thead className="border-b border-edge font-mono text-[10px] uppercase tracking-[0.16em] text-faint">
               <tr>
                 <th className="px-4 py-2.5 font-medium">Time</th>
                 <th className="px-4 py-2.5 font-medium">Event</th>
                 <th className="px-4 py-2.5 font-medium">User</th>
                 <th className="px-4 py-2.5 font-medium">Agent</th>
-                <th className="px-4 py-2.5 font-medium">Model</th>
+                <th className="hidden px-4 py-2.5 font-medium lg:table-cell">Model</th>
                 <th className="px-4 py-2.5 text-right font-medium">Cost</th>
                 <th className="px-4 py-2.5 text-right font-medium">Manna</th>
-                <th className="px-4 py-2.5 text-right font-medium">Latency</th>
+                <th className="hidden px-4 py-2.5 text-right font-medium lg:table-cell">
+                  Latency
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-edge">
@@ -285,7 +319,7 @@ function RecentActivity({ rows }: { rows: OperatorRecentUsageEvent[] }) {
                         {row.agentId ?? "no id"}
                       </div>
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="hidden px-4 py-3 lg:table-cell">
                       <div className="truncate">{row.model ?? "unknown"}</div>
                       <div className="mt-0.5 truncate font-mono text-[11px] text-faint">
                         {row.provider ?? "no provider"}
@@ -297,14 +331,22 @@ function RecentActivity({ rows }: { rows: OperatorRecentUsageEvent[] }) {
                     <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-xs tabular-nums text-muted">
                       {formatMannaExact(row.manna)}
                     </td>
-                    <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-xs tabular-nums text-muted">
+                    <td className="hidden whitespace-nowrap px-4 py-3 text-right font-mono text-xs tabular-nums text-muted lg:table-cell">
                       {row.latencyMs == null ? "n/a" : `${integer.format(row.latencyMs)} ms`}
                     </td>
                   </tr>
                 );
               })}
             </tbody>
-          </table>
+            </table>
+          </div>
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-surface to-transparent lg:hidden"
+          />
+          <p className="border-t border-edge px-4 py-2 text-[11px] text-faint lg:hidden">
+            Scroll sideways for cost &amp; manna →
+          </p>
         </div>
       )}
     </section>
@@ -357,8 +399,16 @@ export function OperatorClient() {
             Operator
           </p>
           <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
-            Usage
+            Platform usage
           </h1>
+          <p className="mt-2 max-w-xl text-sm text-muted">
+            Admin view across all tenants — runtime health, spend, and metered
+            activity. Users see only their own data on{" "}
+            <a href="/usage" className="text-accent-soft hover:underline">
+              Usage
+            </a>
+            .
+          </p>
         </div>
         <div className="flex items-center gap-2">
           {[7, 30, 90].map((value) => (
@@ -418,23 +468,26 @@ export function OperatorClient() {
             className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"
           >
             <Metric
-              label="Cost"
+              label="Provider cost"
               value={usd.format(summary.totals.costUsd)}
-              sub={`${formatMannaExact(summary.totals.manna)} manna`}
+              sub={`${formatMannaExact(summary.totals.manna)} manna billed`}
+              hint="Raw provider cost (before markup) across all tenants in the window. Manna is what users were billed. Admin-only — never shown to users."
             />
             <Metric
-              label="Events"
+              label="Metered calls"
               value={integer.format(summary.totals.events)}
               sub={`${integer.format(summary.totals.errors)} errors`}
+              hint="One event = one metered provider call (a chat turn or a generation). 'Errors' are calls that failed."
             />
             <Metric
-              label="Latency"
+              label="Avg call latency"
               value={
                 summary.totals.avgLatencyMs == null
                   ? "n/a"
                   : `${decimal.format(summary.totals.avgLatencyMs)} ms`
               }
-              sub={`${summary.window.days} day window`}
+              sub={`chat + media · ${summary.window.days}-day window`}
+              hint="Unweighted mean across every call, chat and media alike. Long video/image generations pull this up, so it reads far higher than a typical chat turn."
             />
             <Metric
               label="Rows"
@@ -446,6 +499,10 @@ export function OperatorClient() {
           <section className="rounded-lg border border-edge bg-surface">
             <div className="border-b border-edge px-4 py-3">
               <h2 className="text-sm font-medium">Status</h2>
+              <p className="mt-0.5 text-xs text-faint">
+                Metered calls bucketed by outcome — one row per status
+                (completed, error, …).
+              </p>
             </div>
             {summary.byStatus.length === 0 ? (
               <div className="px-4 py-8 text-sm text-muted">No rows</div>
