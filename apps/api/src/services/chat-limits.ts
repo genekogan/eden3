@@ -1,4 +1,4 @@
-import { getEnv } from '@eden3/core';
+import { getEnv, netSpendSince } from '@eden3/core';
 import { pg } from '@eden3/db';
 
 export class TurnConcurrencyLimiter {
@@ -29,25 +29,15 @@ function startOfUtcDay(now: Date): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
 
+/**
+ * Fast-path read of today's net spend for friendly pre-checks. The
+ * authoritative, race-free enforcement is `debit({dailyCap})` in @eden3/core.
+ */
 export async function dailyMannaSpend(
   accountId: string,
   opts: { now?: Date } = {},
 ): Promise<number> {
-  const since = startOfUtcDay(opts.now ?? new Date()).toISOString();
-  const [row] = await pg<{ spend: string | null }[]>`
-    select coalesce(sum(
-      case
-        when mt.type like 'spend%' and mt.amount < 0 then -mt.amount
-        when mt.type like 'refund%' and mt.amount > 0 then -mt.amount
-        else 0
-      end
-    ), 0)::numeric::text as spend
-    from manna_transactions mt
-    join manna_accounts ma on ma.id = mt.manna_account_id
-    where ma.account_id = ${accountId}
-      and mt.created_at >= ${since}
-  `;
-  return Math.max(0, Number(row?.spend ?? 0));
+  return netSpendSince(accountId, startOfUtcDay(opts.now ?? new Date()));
 }
 
 export type SubscriptionTier = 'basic' | 'pro' | 'believer';

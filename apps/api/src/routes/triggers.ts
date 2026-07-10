@@ -1,4 +1,12 @@
-import { getEnv, InsufficientMannaError, isHex24, isUuid, PRICING, resolveAgentByUsername } from '@eden3/core';
+import {
+  DailyCapExceededError,
+  getEnv,
+  InsufficientMannaError,
+  isHex24,
+  isUuid,
+  PRICING,
+  resolveAgentByUsername,
+} from '@eden3/core';
 import { agents, db, pg, triggers, type Trigger } from '@eden3/db';
 import { CronSyncError, scheduleToCron, type EdenSchedule } from '@eden3/gateway';
 import { and, desc, eq } from 'drizzle-orm';
@@ -295,6 +303,13 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
           402,
           'insufficient_manna',
           `Not enough manna: this run costs ${err.required}, you have ${err.available}`,
+        );
+      }
+      if (err instanceof DailyCapExceededError) {
+        throw new ApiError(
+          429,
+          'daily_manna_cap_exceeded',
+          `Daily manna cap exceeded: ${err.spentToday} spent today, cap is ${err.cap}`,
         );
       }
       throw err;

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  DailyCapExceededError,
   getEnv,
   InsufficientMannaError,
   gatewaySessionKey,
@@ -365,6 +366,15 @@ export const chatRoutes: FastifyPluginAsync = async (app) => {
             402,
             'insufficient_manna',
             `Not enough manna: this turn costs ${err.required}, you have ${err.available}`,
+          );
+        }
+        // The reservation's in-transaction cap check (race-free, unlike the
+        // fast pre-check above) can also reject the turn.
+        if (err instanceof DailyCapExceededError) {
+          throw new ApiError(
+            429,
+            'daily_manna_cap_exceeded',
+            `Daily manna cap exceeded: ${err.spentToday} spent today, cap is ${err.cap}`,
           );
         }
         throw err;

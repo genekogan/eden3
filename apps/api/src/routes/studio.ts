@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import {
+  DailyCapExceededError,
   InsufficientMannaError,
   CostTableError,
   costFromParams,
@@ -502,13 +503,16 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
     const idempotencyKey = `studio:${requestId}:reserve`;
     const gatewaySessionKey = `eden3:studio:${requestId}`;
 
-    // 1. Debit up front — refunded on any downstream failure.
+    // 1. Debit up front — refunded on any downstream failure. Studio spends
+    // count toward the same Q7 daily ceiling as chat turns (checked inside
+    // the debit transaction, race-free) — previously studio bypassed the cap.
     try {
       await debit({
         accountId: account.accountId,
         amount: quote.manna,
         type: `spend:${action}`,
         idempotencyKey,
+        dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
       });
     } catch (err) {
       if (err instanceof InsufficientMannaError) {
@@ -517,6 +521,14 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           402,
           'insufficient_manna',
           `${body.tool} costs ${quote.manna} manna; you have ${err.available}`,
+        );
+      }
+      if (err instanceof DailyCapExceededError) {
+        return sendError(
+          reply,
+          429,
+          'daily_manna_cap_exceeded',
+          `Daily manna cap reached: ${err.spentToday} of ${err.cap} manna spent today. The cap resets at midnight UTC.`,
         );
       }
       throw err;

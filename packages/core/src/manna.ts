@@ -90,6 +90,22 @@ export class InsufficientMannaError extends Error {
   }
 }
 
+/** Thrown by {@link debit} when a `dailyCap` check would be exceeded. */
+export class DailyCapExceededError extends Error {
+  constructor(
+    readonly accountId: string,
+    readonly spentToday: number,
+    readonly requested: number,
+    readonly cap: number,
+  ) {
+    super(
+      `daily manna cap exceeded: account ${accountId} spent ${spentToday} today, ` +
+        `requested ${requested} more, cap is ${cap}`,
+    );
+    this.name = 'DailyCapExceededError';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Balances
 // ---------------------------------------------------------------------------
@@ -186,8 +202,50 @@ export interface DebitParams {
   idempotencyKey: string;
   /** Legacy task hex id, when the spend maps to an eden1-style task. */
   taskExternalId?: string;
+  /**
+   * Optional per-UTC-day spend ceiling (Q7 runaway protection). When set, the
+   * debit takes a per-account advisory lock inside its transaction and
+   * re-checks today's net spend (spends minus refunds) plus this debit
+   * against the cap, throwing {@link DailyCapExceededError} without writing
+   * anything when it would exceed. The lock serializes cap-checked debits for
+   * the same account, so concurrent requests cannot all pass a stale check
+   * (the classic route-level TOCTOU this replaces).
+   */
+  dailyCap?: { limit: number; now?: Date };
   /** Run inside an existing drizzle client/transaction. */
   db?: DbHandle;
+}
+
+/** Start of the UTC day containing `now` — the daily-cap window boundary. */
+function startOfUtcDay(now: Date): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
+/**
+ * Net metered spend (spends minus refunds, floor 0) for one account since
+ * `since`, computed on the ledger. Exposed for the API's fast-path check;
+ * the authoritative, race-free check runs inside {@link debit}.
+ */
+export async function netSpendSince(
+  accountId: string,
+  since: Date,
+  opts: { db?: DbHandle } = {},
+): Promise<number> {
+  const dbc = opts.db ?? db;
+  const rows = (await dbc.execute(sql`
+    select coalesce(sum(
+      case
+        when mt.type like 'spend%' and mt.amount < 0 then -mt.amount
+        when mt.type like 'refund%' and mt.amount > 0 then -mt.amount
+        else 0
+      end
+    ), 0)::numeric::text as spend
+    from manna_transactions mt
+    join manna_accounts ma on ma.id = mt.manna_account_id
+    where ma.account_id = ${accountId}
+      and mt.created_at >= ${since.toISOString()}
+  `)) as unknown as { spend: string | null }[];
+  return Math.max(0, Number(rows[0]?.spend ?? 0));
 }
 
 /** `dbc.transaction` for either the root client or a tx (savepoint). */
@@ -238,6 +296,29 @@ export async function debit(params: DebitParams): Promise<LedgerResult> {
       }
 
       const account = await getOrCreateMannaAccount(params.accountId, { db: tx });
+
+      if (params.dailyCap) {
+        // Serialize cap-checked debits per account for the rest of this tx —
+        // two concurrent debits cannot both read a stale daily sum and both
+        // land. hashtextextended gives a stable bigint lock key per uuid.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${params.accountId}::text, 42))`,
+        );
+        const spentToday = await netSpendSince(
+          params.accountId,
+          startOfUtcDay(params.dailyCap.now ?? new Date()),
+          { db: tx },
+        );
+        if (spentToday + params.amount > params.dailyCap.limit) {
+          throw new DailyCapExceededError(
+            params.accountId,
+            spentToday,
+            params.amount,
+            params.dailyCap.limit,
+          );
+        }
+      }
+
       const amount = numberToNumeric(params.amount);
       const [updated] = await tx
         .update(mannaAccounts)

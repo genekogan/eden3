@@ -1,7 +1,15 @@
 import { randomUUID } from 'node:crypto';
 
 import type { AuthSession, CostProvider } from '@eden3/core';
-import { PRICING, costFromLlmUsage, credit, debit, mannaForEstimate, refund } from '@eden3/core';
+import {
+  PRICING,
+  costFromLlmUsage,
+  credit,
+  debit,
+  getEnv,
+  mannaForEstimate,
+  refund,
+} from '@eden3/core';
 import { DEFAULT_AGENT_MODEL, DEFAULT_AGENT_THINKING_LEVEL } from '@eden3/shared';
 import { accounts, db, messages, sessions, usageEvents, type Session } from '@eden3/db';
 import type { ChatTurnParams, GatewayTurnEvent, GatewayUsage } from '@eden3/gateway';
@@ -383,11 +391,14 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
       : undefined;
 
   // 1. Debit — idempotencyKey is the turn uuid; a 402 must precede streaming.
+  // The dailyCap makes the reservation itself enforce Q7's per-day ceiling
+  // race-free (the route-level pre-check is just a fast friendly 429).
   const debited = await debit({
     accountId: user.accountId,
     amount: PRICING.chatTurn,
     type: 'spend:chat',
     idempotencyKey: turnId,
+    dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
     ...(taskExternalId ? { taskExternalId } : {}),
   });
 
@@ -495,6 +506,8 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
     usageEventRecorded = true;
     try {
       const metering = record.metering ?? meterChatUsage(record.usage, agent.model);
+      // Paired with the usage_events_turn_unique partial index: a retried or
+      // crashed-and-replayed pipeline cannot double-record this turn.
       await db.insert(usageEvents).values({
         eventType: 'chat_turn',
         status: record.status,
@@ -526,7 +539,7 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
           emptyTurn: record.emptyTurn ?? null,
           source: params.source ?? null,
         },
-      });
+      }).onConflictDoNothing();
     } catch (err) {
       onError(err, 'usage event insert');
     }

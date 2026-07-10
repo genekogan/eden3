@@ -248,6 +248,123 @@ describe('debit', () => {
   });
 });
 
+describe('debit dailyCap (Q7 per-day ceiling, race-free)', () => {
+  it('allows spends under the cap and rejects the one that would cross it, writing nothing', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+
+    await debit({
+      accountId,
+      amount: 200,
+      type: 'spend:image',
+      idempotencyKey: `cap-${randomUUID()}`,
+      dailyCap: { limit: 300 },
+    });
+    await expect(
+      debit({
+        accountId,
+        amount: 150,
+        type: 'spend:image',
+        idempotencyKey: `cap-${randomUUID()}`,
+        dailyCap: { limit: 300 },
+      }),
+    ).rejects.toMatchObject({
+      name: 'DailyCapExceededError',
+      spentToday: 200,
+      requested: 150,
+      cap: 300,
+    });
+
+    // The rejected debit left no ledger row and took no manna.
+    expect(await getBalance(accountId)).toEqual({
+      balance: 800,
+      subscriptionBalance: 0,
+      total: 800,
+    });
+    const rows = await ledgerRowsFor(accountId);
+    expect(rows.filter((r) => r.type === 'spend:image')).toHaveLength(1);
+  });
+
+  it('counts refunds back into the day’s headroom', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+    const key = `cap-${randomUUID()}`;
+
+    await debit({
+      accountId,
+      amount: 250,
+      type: 'spend:video',
+      idempotencyKey: key,
+      dailyCap: { limit: 300 },
+    });
+    await refund({ originalIdempotencyKey: key, type: 'refund:video' });
+
+    // 250 spent then refunded -> net 0 today; a fresh 250 fits again.
+    const again = await debit({
+      accountId,
+      amount: 250,
+      type: 'spend:video',
+      idempotencyKey: `cap-${randomUUID()}`,
+      dailyCap: { limit: 300 },
+    });
+    expect(again.alreadyApplied).toBe(false);
+  });
+
+  it('never lets concurrent debits collectively exceed the cap (advisory-lock serialization)', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+
+    const settled = await Promise.allSettled(
+      Array.from({ length: 6 }, () =>
+        debit({
+          accountId,
+          amount: 100,
+          type: 'spend:image',
+          idempotencyKey: `cap-${randomUUID()}`,
+          dailyCap: { limit: 300 },
+        }),
+      ),
+    );
+
+    const ok = settled.filter((s) => s.status === 'fulfilled');
+    const failed = settled.filter((s) => s.status === 'rejected');
+    expect(ok).toHaveLength(3); // 300-cap admits exactly three 100-manna spends
+    for (const f of failed) {
+      expect((f as PromiseRejectedResult).reason).toMatchObject({
+        name: 'DailyCapExceededError',
+      });
+    }
+    expect(await getBalance(accountId)).toEqual({
+      balance: 700,
+      subscriptionBalance: 0,
+      total: 700,
+    });
+  });
+
+  it('replays an applied key untouched even when the cap is exhausted', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+    const key = `cap-${randomUUID()}`;
+
+    await debit({
+      accountId,
+      amount: 300,
+      type: 'spend:image',
+      idempotencyKey: key,
+      dailyCap: { limit: 300 },
+    });
+    // Cap fully consumed — but replaying the SAME key is a read, not a spend.
+    const replay = await debit({
+      accountId,
+      amount: 300,
+      type: 'spend:image',
+      idempotencyKey: key,
+      dailyCap: { limit: 300 },
+    });
+    expect(replay.alreadyApplied).toBe(true);
+  });
+});
+
 describe('refund', () => {
   it('restores the debited amount and links the original transaction', async () => {
     const accountId = await makeAccount();
