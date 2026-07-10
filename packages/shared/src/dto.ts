@@ -243,9 +243,12 @@ export type MannaTransactionDto = z.infer<typeof mannaTransactionDto>;
 
 /**
  * eden1 schedule dict (APScheduler-style), stored as-is in triggers.schedule
- * jsonb — snake_case keys preserved from the source system.
+ * jsonb — snake_case keys preserved from the source system. One-time tasks
+ * store `{at: <ISO-8601 instant>}` instead of the recurring fields.
  */
 export const cronScheduleDto = z.object({
+  /** One-time schedule: fire once at this ISO-8601 instant. */
+  at: z.string().optional(),
   year: z.union([z.number().int(), z.string()]).optional(),
   month: z.union([z.number().int(), z.string()]).optional(),
   day: z.union([z.number().int(), z.string()]).optional(),
@@ -275,6 +278,11 @@ export const triggerDto = z.object({
   status: z.string().nullable(),
   lastRunTime: isoDateTimeSchema.nullable(),
   nextScheduledRun: isoDateTimeSchema.nullable(),
+  /**
+   * Session the most recent run wrote its transcript into (resolved from the
+   * run's usage event; null until a metered run happens).
+   */
+  lastRunSessionId: uuidSchema.nullable(),
   lastError: z.string().nullable(),
   createdAt: isoDateTimeSchema,
   updatedAt: isoDateTimeSchema,

@@ -275,6 +275,36 @@ describe('CronSync.syncTrigger', () => {
     expect(jobs.map((j) => j.id)).toEqual(['a']);
   });
 
+  it('removeTrigger removes by trigger id without needing schedule params', async () => {
+    const cli = new FakeCronCli();
+    cli.jobs = [matchingJob(), { id: 'foreign-1', name: 'ops:nightly' }];
+    const result = await new CronSync({ cli }).removeTrigger('trig-1');
+    expect(result).toEqual({ name: 'eden3:trig-1', action: 'removed' });
+    expect(cli.callsFor('rm').map((c) => c.args[2])).toEqual(['job-1']);
+    expect(cli.callsFor('add')).toHaveLength(0);
+  });
+
+  it('removeAllEden3Jobs removes every eden3:* job and nothing else', async () => {
+    const cli = new FakeCronCli();
+    cli.jobs = [
+      { id: 'a', name: 'eden3:trig-1' },
+      { id: 'b', name: 'ops:nightly' },
+      { id: 'c', name: 'eden3:trig-2' },
+      { id: 'd' }, // unnamed foreign job
+    ];
+    const result = await new CronSync({ cli }).removeAllEden3Jobs();
+    expect(result).toEqual({ removed: 2 });
+    expect(cli.callsFor('rm').map((c) => c.args[2])).toEqual(['a', 'c']);
+    expect(cli.jobs.map((j) => j.id)).toEqual(['b', 'd']);
+  });
+
+  it('removeAllEden3Jobs is a no-op when the gateway holds no eden3 jobs', async () => {
+    const cli = new FakeCronCli();
+    cli.jobs = [{ id: 'b', name: 'ops:nightly' }];
+    expect(await new CronSync({ cli }).removeAllEden3Jobs()).toEqual({ removed: 0 });
+    expect(cli.callsFor('rm')).toHaveLength(0);
+  });
+
   it('retries transient OpenClaw config-read races', async () => {
     const cli = new FakeCronCli();
     cli.jobs = [matchingJob()];
