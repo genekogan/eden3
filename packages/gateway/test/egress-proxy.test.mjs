@@ -68,6 +68,39 @@ describe('egress policy — blocked addresses (the sealed interior)', () => {
       expect(blockedAddress(ip), ip).toBeNull();
     }
   });
+
+  it('blocks IPv4-mapped IPv6 embedding an interior v4 — in ANY spelling (rebinding-class hole)', () => {
+    // The WHATWG URL parser rewrites ::ffff:127.0.0.1 to the hex form
+    // ::ffff:7f00:1; the old dotted-decimal-only match let the hex form
+    // through, defeating the sealed interior. Every spelling must block.
+    for (const ip of [
+      '::ffff:7f00:1', // 127.0.0.1 (hex)
+      '::ffff:127.0.0.1', // 127.0.0.1 (dotted)
+      '[::ffff:7f00:1]', // bracketed literal
+      '::ffff:a9fe:a9fe', // 169.254.169.254 cloud metadata
+      '::ffff:0a00:0001', // 10.0.0.1
+      '::ffff:ac10:0001', // 172.16.0.1
+      '::ffff:c0a8:0101', // 192.168.1.1
+      '::ffff:6440:0001', // 100.64.0.1 cgnat
+      '::7f00:1', // v4-compatible ::127.0.0.1 (deprecated)
+    ]) {
+      expect(blockedAddress(ip), ip).toBeTruthy();
+    }
+    // …but a PUBLIC v4 via the mapped form stays allowed.
+    expect(blockedAddress('::ffff:5db8:d70e')).toBeNull(); // 93.184.215.14
+    expect(blockedAddress('::ffff:0808:0808')).toBeNull(); // 8.8.8.8
+  });
+
+  it('classifies canonical and non-canonical IPv6 special ranges on the expanded form', () => {
+    expect(blockedAddress('::1')).toBe('loopback');
+    expect(blockedAddress('0:0:0:0:0:0:0:1')).toBe('loopback'); // uncompressed ::1
+    expect(blockedAddress('::')).toBe('unspecified');
+    expect(blockedAddress('fe80::1')).toBe('link-local fe80::/10');
+    expect(blockedAddress('febf::1')).toBe('link-local fe80::/10'); // top of the /10
+    expect(blockedAddress('fc00::1')).toBe('unique-local fc00::/7');
+    expect(blockedAddress('fd12:3456::1')).toBe('unique-local fc00::/7');
+    expect(blockedAddress('ff02::1')).toBe('multicast');
+  });
 });
 
 describe('egress policy — blocked hostnames', () => {
