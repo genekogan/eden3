@@ -169,8 +169,10 @@ describe('studio media pipeline (live gateway + watcher + postgres)', () => {
       expect(asset!.sourcePath).toContain('media');
       expect(body.url).toContain(asset!.sha256!);
 
-      // The file is served under the /media/ static route.
-      const mediaPath = new URL(body.url).pathname;
+      // The file is served under the /media/ static route. MEDIA_BASE_URL is
+      // the same-origin relative "/media" in local dev, so body.url may be a
+      // bare path — resolve against a dummy origin.
+      const mediaPath = new URL(body.url, 'http://media.local').pathname;
       expect(mediaPath.startsWith('/media/')).toBe(true);
       const served = await app.inject({ method: 'GET', url: mediaPath });
       expect(served.statusCode).toBe(200);
