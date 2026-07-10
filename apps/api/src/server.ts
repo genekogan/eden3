@@ -31,6 +31,7 @@ import { billingRoutes, type BillingRoutesOptions } from './routes/billing';
 import { chatRoutes } from './routes/chat';
 import { channelsRoutes, type ChannelsRoutesOptions } from './routes/channels';
 import { collectionsRoutes } from './routes/collections';
+import { conceptsRoutes } from './routes/concepts';
 import { creationsRoutes } from './routes/creations';
 import { devRoutes } from './routes/dev';
 import { feedRoutes } from './routes/feed';
@@ -283,6 +284,8 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(authRoutes, { prefix: '/auth' });
   await app.register(sessionsRoutes, { prefix: '/sessions' });
   await app.register(agentsRoutes, { prefix: '/agents' });
+  // Concepts share the /agents path root (/agents/:username/concepts/*).
+  await app.register(conceptsRoutes, { prefix: '/agents' });
   await app.register(skillsRoutes);
   await app.register(creationsRoutes, { prefix: '/creations' });
   await app.register(feedRoutes, { prefix: '/feed' });
