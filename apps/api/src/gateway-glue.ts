@@ -9,7 +9,6 @@ import {
   setAgentToolGroups,
   type ProvisionAgentParams,
   type ProvisionAgentResult,
-  type SyncTriggerParams,
   type SyncTriggerResult,
   type UpdatePersonaParams,
   type UpdatePersonaResult,
@@ -38,9 +37,15 @@ export interface ProvisionerLike {
   updateAgentPersona(params: UpdatePersonaParams): Promise<UpdatePersonaResult>;
 }
 
-/** Structural subset of {@link CronSync} the routes use. */
+/**
+ * Structural subset of {@link CronSync} eden3 uses. Scheduled firing is
+ * eden3-side (services/task-scheduler.ts) — the gateway seam only ever
+ * REMOVES cron jobs now: per-trigger on create/edit/pause/delete, and a
+ * bulk sweep of legacy `eden3:*` jobs on scheduler boot.
+ */
 export interface CronSyncLike {
-  syncTrigger(params: SyncTriggerParams): Promise<SyncTriggerResult>;
+  removeTrigger(triggerId: string): Promise<SyncTriggerResult>;
+  removeAllEden3Jobs(): Promise<{ removed: number }>;
 }
 
 export interface SkillSyncParams {

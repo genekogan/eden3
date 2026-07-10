@@ -5,7 +5,6 @@ import { pg } from '@eden3/db';
 import type {
   ProvisionAgentParams,
   ProvisionAgentResult,
-  SyncTriggerParams,
   SyncTriggerResult,
   UpdatePersonaParams,
 } from '@eden3/gateway';
@@ -273,23 +272,32 @@ export function makeFakeProvisioner(opts: { failProvision?: boolean } = {}): Fak
 }
 
 export interface FakeCronSync extends CronSyncLike {
-  calls: SyncTriggerParams[];
+  /** Trigger ids whose gateway-job removal was requested, in call order. */
+  removals: string[];
+  /** Count of removeAllEden3Jobs boot sweeps. */
+  sweeps: number;
 }
 
+/**
+ * Removal-only cron seam (scheduled firing is eden3-side; the gateway only
+ * ever gets REMOVE calls now — see services/task-scheduler.ts).
+ */
 export function makeFakeCronSync(opts: { fail?: boolean } = {}): FakeCronSync {
-  const calls: SyncTriggerParams[] = [];
-  return {
-    calls,
-    async syncTrigger(params): Promise<SyncTriggerResult> {
-      calls.push(params);
+  const fake: FakeCronSync = {
+    removals: [],
+    sweeps: 0,
+    async removeTrigger(triggerId): Promise<SyncTriggerResult> {
+      fake.removals.push(triggerId);
       if (opts.fail === true) throw new Error('fake cron-sync failure');
-      return {
-        name: `eden3:${params.triggerId}`,
-        action: params.enabled ? 'created' : 'removed',
-        ...(params.enabled ? { jobId: `fake-job-${params.triggerId.slice(0, 8)}` } : {}),
-      };
+      return { name: `eden3:${triggerId}`, action: 'absent' };
+    },
+    async removeAllEden3Jobs(): Promise<{ removed: number }> {
+      fake.sweeps += 1;
+      if (opts.fail === true) throw new Error('fake cron-sync failure');
+      return { removed: 0 };
     },
   };
+  return fake;
 }
 
 export interface FakeSkillSync extends SkillSyncLike {

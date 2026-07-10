@@ -22,6 +22,7 @@ import { ensureDefaultEdenAssistant } from './services/default-assistant';
 import { registerHttpHardening } from './services/http-hardening';
 import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './services/history-sync';
 import { MediaPipeline } from './services/media-pipeline';
+import { makeScheduledTaskRunner, TaskScheduler } from './services/task-scheduler';
 import { TurnRegistry } from './services/turn-registry';
 import type { CompatClientLike } from './services/turns';
 import { createAttachmentSightingHandler, MediaWatcher } from './workers/media-watcher';
@@ -76,6 +77,14 @@ export interface BuildServerOptions {
   };
   billing?: BillingRoutesOptions;
   channels?: ChannelsRoutesOptions;
+  scheduler?: {
+    /**
+     * Start the scheduled-task loop during server boot. Entrypoints should
+     * enable this; tests leave it off and drive `app.taskScheduler.tick()`
+     * (or their own TaskScheduler) directly.
+     */
+    autoStart?: boolean;
+  };
 }
 
 declare module 'fastify' {
@@ -88,6 +97,8 @@ declare module 'fastify' {
     gatewayCompat: CompatClientLike | null;
     /** Per-process in-flight chat turn limiter. */
     turnLimiter: TurnConcurrencyLimiter;
+    /** Eden3-side scheduled-task loop (null when the gateway is not configured). */
+    taskScheduler: TaskScheduler | null;
   }
 }
 
@@ -268,6 +279,34 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Provisioning seam (agent create/persona edit, trigger cron-sync) — lazy
   // real clients by default, fakes injectable via opts.provisioning.
   app.decorate('gatewayGlue', new GatewayGlue(opts.provisioning));
+
+  // Eden3-side scheduled-task firing. Constructed whenever a gateway is
+  // wired (scheduled runs are real metered agent turns), but only STARTED
+  // when the entrypoint opts in — tests drive tick() themselves. Interval 0
+  // (TASK_SCHEDULER_INTERVAL_MS) also disables start().
+  const taskScheduler =
+    gatewayClients && historySync
+      ? new TaskScheduler({
+          runTask: makeScheduledTaskRunner({
+            compat: gatewayClients.compat,
+            bus: app.eventsBus,
+            registry: app.turnRegistry,
+            historySync,
+            turnLimiter: app.turnLimiter,
+            onError: (err, context) => app.log.error({ err, context }, 'scheduled task side-error'),
+          }),
+          intervalMs: env.TASK_SCHEDULER_INTERVAL_MS,
+          // Legacy gateway cron jobs double-fire against this scheduler —
+          // sweep them once per boot.
+          cleanupGatewayJobs: () => app.gatewayGlue.cronSync.removeAllEden3Jobs(),
+          logger: app.log,
+        })
+      : null;
+  app.decorate('taskScheduler', taskScheduler);
+  app.addHook('onClose', async () => {
+    taskScheduler?.stop();
+  });
+  if (opts.scheduler?.autoStart === true) taskScheduler?.start();
   await ensureBuiltinSkills();
   await ensureDefaultEdenAssistant({
     // The real API entrypoint starts the media watcher and talks to the live

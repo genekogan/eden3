@@ -7,8 +7,7 @@ import {
   PRICING,
   resolveAgentByUsername,
 } from '@eden3/core';
-import { agents, db, pg, triggers, type Trigger } from '@eden3/db';
-import { CronSyncError, scheduleToCron, type EdenSchedule } from '@eden3/gateway';
+import { db, pg, triggers, type Trigger } from '@eden3/db';
 import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
@@ -18,24 +17,33 @@ import type { GatewayGlue } from '../gateway-glue';
 import { triggerDtoFromEntity } from '../route-helpers';
 import { concurrentTurnLimit, dailyMannaSpend } from '../services/chat-limits';
 import { runScheduledTask } from '../services/scheduled-tasks';
+import { nextOccurrence, TaskScheduleError } from '../services/task-schedule';
 
 /**
- * Tasks API — user-scheduled prompts ("triggers"), synced to OpenClaw cron
- * jobs. Registered under the /tasks prefix (the web contract):
+ * Tasks API — user-scheduled prompts ("triggers"). Registered under the
+ * /tasks prefix (the web contract):
  *
- *   GET   /tasks     — the signed-in user's triggers, newest first
- *   POST  /tasks     — {agentUsername, name, prompt, schedule{…}} -> row +
- *                      gateway cron-sync (job name eden3:<trigger uuid>)
- *   PATCH /tasks/:id — {status: active|paused} and/or {deleted: true} ->
- *                      update + cron-sync (resume re-adds, pause/delete removes)
+ *   GET   /tasks          — the signed-in user's triggers, newest first
+ *   POST  /tasks          — {agentUsername, name, prompt, schedule{…}} -> row
+ *                           with next_scheduled_run stamped
+ *   POST  /tasks/:id/runs — fire one scheduled prompt now (metered run)
+ *   PATCH /tasks/:id      — {status: active|paused}, name/prompt/schedule
+ *                           edits, and/or {deleted: true}
  *
- * Cron-sync failures (gateway down, CLI device lacking the operator.admin
- * scope) never lose the row: the error lands in triggers.last_error and the
- * next successful sync converges (jobs are reconciled by name).
+ * FIRING IS EDEN3-SIDE: services/task-scheduler.ts polls next_scheduled_run
+ * and executes due tasks through the metered runScheduledTask pipeline. The
+ * old OpenClaw gateway-cron mirror is retired (it bypassed metering) — every
+ * write here only ensures any legacy `eden3:<id>` gateway job is REMOVED.
+ * Removal failures (gateway down, CLI device lacking the operator.admin
+ * scope) never lose the row: the error lands in triggers.last_error.
+ *
+ * Schedules: the eden1 APScheduler dict (recurring) or {at: ISO-8601}
+ * (one-time). next_scheduled_run is computed on create and on any PATCH that
+ * leaves the task active; the scheduler re-stamps it after every fire.
  */
 
 /** eden1-style APScheduler dict (snake_case). hour+minute required. */
-const scheduleSchema = z
+const recurringScheduleSchema = z
   .object({
     minute: z.union([z.number().int(), z.string()]),
     hour: z.union([z.number().int(), z.string()]),
@@ -44,7 +52,19 @@ const scheduleSchema = z
     day_of_week: z.union([z.number().int(), z.string()]).optional(),
     timezone: z.string().min(1).max(100).optional(),
   })
-  .passthrough(); // second/year/start_date/end_date tolerated (ignored)
+  .passthrough() // second/year/start_date/end_date tolerated (ignored)
+  .refine((value) => !('at' in value), {
+    message: 'a schedule is either recurring (hour/minute) or one-time (at), not both',
+  });
+
+/** One-time schedule: fire once at this instant. */
+const oneTimeScheduleSchema = z
+  .object({
+    at: z.string().datetime({ offset: true }),
+  })
+  .strict();
+
+const scheduleSchema = z.union([oneTimeScheduleSchema, recurringScheduleSchema]);
 
 const createBodySchema = z.object({
   agentUsername: z.string().trim().min(1).max(200),
@@ -76,14 +96,28 @@ const patchBodySchema = z
 
 const idParamsSchema = z.object({ id: z.string().trim().min(1).max(200) });
 
-/** scheduleToCron with CronSyncError mapped onto the 400 envelope. */
-function cronFromSchedule(schedule: EdenSchedule): { cron: string; tz?: string } {
+/**
+ * Next fire instant for a schedule, with TaskScheduleError mapped onto the
+ * 400 envelope. A valid-but-exhausted schedule (a one-time `at` in the past,
+ * or nothing within the scan cap) is also a 400: an active task that could
+ * never fire is a user mistake, not a row to keep.
+ */
+function nextRunFromSchedule(schedule: unknown, from: Date): Date {
+  let next: Date | null;
   try {
-    return scheduleToCron(schedule);
+    next = nextOccurrence(schedule, from);
   } catch (err) {
-    if (err instanceof CronSyncError) throw new ApiError(400, 'invalid_schedule', err.message);
+    if (err instanceof TaskScheduleError) throw new ApiError(400, 'invalid_schedule', err.message);
     throw err;
   }
+  if (next === null) {
+    throw new ApiError(
+      400,
+      'invalid_schedule',
+      'schedule has no upcoming occurrence (one-time schedules must be in the future)',
+    );
+  }
+  return next;
 }
 
 async function findTrigger(ref: string): Promise<Trigger | null> {
@@ -103,37 +137,29 @@ async function findTrigger(ref: string): Promise<Trigger | null> {
 }
 
 /**
- * Reconcile one trigger with the gateway and persist the outcome
- * (openclaw_job_id / last_synced_at on success, last_error on failure).
- * Returns the re-read row. Never throws for gateway-side failures.
+ * Ensure no `eden3:<id>` gateway cron job survives for this trigger (the
+ * gateway firing path is retired; a leftover job would double-fire). Persists
+ * the outcome (last_synced_at on success, last_error on failure) and returns
+ * the re-read row. Never throws for gateway-side failures.
  */
-async function syncTriggerRow(
+async function ensureGatewayJobRemoved(
   glue: GatewayGlue,
   log: FastifyBaseLogger,
   row: Trigger,
-  params: { openclawAgentId: string; cron: string; tz?: string; enabled: boolean },
 ): Promise<Trigger> {
   try {
-    const result = await glue.cronSync.syncTrigger({
-      triggerId: row.id,
-      openclawAgentId: params.openclawAgentId,
-      cronExpr: params.cron,
-      ...(params.tz !== undefined ? { tz: params.tz } : {}),
-      prompt: row.prompt ?? '',
-      enabled: params.enabled,
-    });
+    await glue.cronSync.removeTrigger(row.id);
     await db
       .update(triggers)
       .set({
-        openclawJobId: params.enabled ? (result.jobId ?? null) : null,
+        openclawJobId: null,
         lastSyncedAt: new Date(),
-        lastError: null,
         updatedAt: new Date(),
       })
       .where(eq(triggers.id, row.id));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log.error({ err }, `cron-sync failed for trigger ${row.id}`);
+    log.error({ err }, `gateway cron removal failed for trigger ${row.id}`);
     await db
       .update(triggers)
       .set({
@@ -147,15 +173,29 @@ async function syncTriggerRow(
   return fresh ?? row;
 }
 
-/** The gateway agent id for a trigger's agent account (null = not linked). */
-async function openclawAgentIdFor(agentAccountId: string | null): Promise<string | null> {
-  if (agentAccountId === null) return null;
-  const [row] = await db
-    .select({ openclawId: agents.openclawId })
-    .from(agents)
-    .where(eq(agents.accountId, agentAccountId))
-    .limit(1);
-  return row?.openclawId ?? null;
+/**
+ * Latest run session per trigger, resolved from usage_events (each metered
+ * run records metadata.source = {kind:'scheduled_task', triggerId} plus the
+ * session it wrote into). `userId` scopes the scan onto
+ * usage_events_user_created_idx.
+ */
+async function lastRunSessionIds(
+  userId: string,
+  triggerIds: string[],
+): Promise<Map<string, string>> {
+  if (triggerIds.length === 0) return new Map();
+  const rows = await pg<{ trigger_id: string; session_id: string }[]>`
+    select distinct on (metadata->'source'->>'triggerId')
+      metadata->'source'->>'triggerId' as trigger_id,
+      session_id
+    from usage_events
+    where user_id = ${userId}
+      and session_id is not null
+      and metadata->'source'->>'kind' = 'scheduled_task'
+      and metadata->'source'->>'triggerId' = any(${triggerIds})
+    order by metadata->'source'->>'triggerId', created_at desc
+  `;
+  return new Map(rows.map((row) => [row.trigger_id, row.session_id]));
 }
 
 async function scheduledTaskQuotaError(account: { accountId: string; isAdmin: boolean }): Promise<{
@@ -192,15 +232,24 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       .where(and(eq(triggers.userId, viewer.accountId), eq(triggers.deleted, false)))
       .orderBy(desc(triggers.createdAt), desc(triggers.id))
       .limit(200);
-    return { items: rows.map(triggerDtoFromEntity), nextCursor: null };
+    const sessions = await lastRunSessionIds(
+      viewer.accountId,
+      rows.map((row) => row.id),
+    );
+    return {
+      items: rows.map((row) =>
+        triggerDtoFromEntity(row, { lastRunSessionId: sessions.get(row.id) ?? null }),
+      ),
+      nextCursor: null,
+    };
   });
 
-  // ---- POST /tasks — create + cron-sync ------------------------------------
+  // ---- POST /tasks — create (next run stamped; no gateway job) -------------
   app.post('/', { preHandler: app.requireAuth }, async (req, reply) => {
     const viewer = req.account;
     if (!viewer) return null; // unreachable — requireAuth replied 401
     const body = createBodySchema.parse(req.body);
-    const { cron, tz } = cronFromSchedule(body.schedule as EdenSchedule);
+    const nextScheduledRun = nextRunFromSchedule(body.schedule, new Date());
 
     const resolved = await resolveAgentByUsername(body.agentUsername);
     if (!resolved) {
@@ -227,17 +276,12 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         schedule: body.schedule,
         status: 'active',
         sessionTarget: 'new',
+        nextScheduledRun,
       })
       .returning();
     if (!row) throw new Error('triggers insert returned no row');
 
-    const openclawAgentId = agent.openclawId ?? agentAccount.username;
-    const fresh = await syncTriggerRow(app.gatewayGlue, req.log, row, {
-      openclawAgentId,
-      cron,
-      ...(tz !== undefined ? { tz } : {}),
-      enabled: true,
-    });
+    const fresh = await ensureGatewayJobRemoved(app.gatewayGlue, req.log, row);
     return reply.code(201).send({ task: triggerDtoFromEntity(fresh) });
   });
 
@@ -318,7 +362,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  // ---- PATCH /tasks/:id — pause / resume / delete --------------------------
+  // ---- PATCH /tasks/:id — pause / resume / edit / delete -------------------
   app.patch('/:id', { preHandler: app.requireAuth }, async (req, reply) => {
     const viewer = req.account;
     if (!viewer) return null; // unreachable — requireAuth replied 401
@@ -336,14 +380,12 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     const nextDeleted = body.deleted === true;
     const nextStatus = nextDeleted ? (existing.status ?? 'paused') : (body.status ?? existing.status);
     const nextSchedule = body.schedule ?? existing.schedule ?? {};
-    const enabled = !nextDeleted && nextStatus === 'active';
+    // 'running' = active with a run in flight — schedule edits keep it live.
+    const enabled = !nextDeleted && (nextStatus === 'active' || nextStatus === 'running');
 
-    // Re-enabling needs a valid stored schedule; removal needs no cron at all.
-    let cron = '';
-    let tz: string | undefined;
-    if (enabled) {
-      ({ cron, tz } = cronFromSchedule(nextSchedule as EdenSchedule));
-    }
+    // An enabled task must have a real upcoming run; paused/deleted tasks
+    // carry none (resume recomputes, so a stale stamp can't "miss-fire").
+    const nextScheduledRun = enabled ? nextRunFromSchedule(nextSchedule, new Date()) : null;
 
     const [updated] = await db
       .update(triggers)
@@ -356,6 +398,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         ...(body.name !== undefined ? { name: body.name } : {}),
         ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
         ...(body.schedule !== undefined ? { schedule: body.schedule } : {}),
+        nextScheduledRun,
         updatedAt: new Date(),
       })
       .where(eq(triggers.id, existing.id))
@@ -364,13 +407,14 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       return sendError(reply, 404, 'task_not_found', `No task "${id}"`);
     }
 
-    const openclawAgentId = (await openclawAgentIdFor(existing.agentId)) ?? '';
-    const fresh = await syncTriggerRow(app.gatewayGlue, req.log, updated, {
-      openclawAgentId,
-      cron,
-      ...(tz !== undefined ? { tz } : {}),
-      enabled,
-    });
-    return { task: triggerDtoFromEntity(fresh) };
+    const fresh = await ensureGatewayJobRemoved(app.gatewayGlue, req.log, updated);
+    const sessions = existing.userId
+      ? await lastRunSessionIds(existing.userId, [existing.id])
+      : new Map<string, string>();
+    return {
+      task: triggerDtoFromEntity(fresh, {
+        lastRunSessionId: sessions.get(existing.id) ?? null,
+      }),
+    };
   });
 };
