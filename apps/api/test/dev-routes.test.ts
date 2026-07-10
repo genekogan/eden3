@@ -49,6 +49,10 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await app?.close();
+  // The /dev/grant tests leave ledger rows — clear them before the account.
+  await pg`delete from manna_transactions where manna_account_id in
+    (select id from manna_accounts where account_id = ${fixtureId})`;
+  await pg`delete from manna_accounts where account_id = ${fixtureId}`;
   await pg`delete from accounts where username = ${marker}`;
   await pg.end({ timeout: 5 });
 });
@@ -79,6 +83,52 @@ describe('GET /dev/users (live postgres)', () => {
     expect(res.statusCode).toBe(200);
     const { users } = res.json() as { users: DevUser[] };
     expect(users.find((u) => u.id === fixtureId)).toBeUndefined();
+  });
+});
+
+describe('POST /dev/grant (live postgres)', () => {
+  it('credits a fixed amount and reports the new balance', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/dev/grant',
+      payload: { accountId: fixtureId, amount: 150 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ ok: true, granted: 150, balance: 150 });
+  });
+
+  it('ensure tops up to the floor and no-ops when already above it', async () => {
+    const topUp = await app.inject({
+      method: 'POST',
+      url: '/dev/grant',
+      payload: { accountId: fixtureId, ensure: 500 },
+    });
+    expect(topUp.statusCode).toBe(200);
+    expect(topUp.json()).toMatchObject({ ok: true, granted: 350, balance: 500 });
+
+    const noop = await app.inject({
+      method: 'POST',
+      url: '/dev/grant',
+      payload: { accountId: fixtureId, ensure: 400 },
+    });
+    expect(noop.statusCode).toBe(200);
+    expect(noop.json()).toMatchObject({ ok: true, granted: 0, balance: 500 });
+  });
+
+  it('rejects passing both amount and ensure, and unknown accounts', async () => {
+    const both = await app.inject({
+      method: 'POST',
+      url: '/dev/grant',
+      payload: { accountId: fixtureId, amount: 10, ensure: 10 },
+    });
+    expect(both.statusCode).toBe(400);
+
+    const missing = await app.inject({
+      method: 'POST',
+      url: '/dev/grant',
+      payload: { accountId: randomUUID(), amount: 10 },
+    });
+    expect(missing.statusCode).toBe(404);
   });
 });
 

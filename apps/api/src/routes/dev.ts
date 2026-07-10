@@ -1,4 +1,12 @@
-import { buildDevSessionCookie, clearDevSessionCookie, getBalance, resolveAccount } from '@eden3/core';
+import { randomUUID } from 'node:crypto';
+
+import {
+  buildDevSessionCookie,
+  clearDevSessionCookie,
+  credit,
+  getBalance,
+  resolveAccount,
+} from '@eden3/core';
 import { pg } from '@eden3/db';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
@@ -84,6 +92,42 @@ export const devRoutes: FastifyPluginAsync = async (app) => {
   app.post('/logout', async (_req, reply) => {
     reply.header('set-cookie', clearDevSessionCookie());
     return { ok: true };
+  });
+
+  // POST /dev/grant {accountId, amount?, ensure?} — dev-only manna faucet.
+  // With `amount`, credits that much. With `ensure`, tops the balance UP TO
+  // that floor (no-op when already above it) — what test harnesses want.
+  // Never mounted in deployments (see plugin docblock).
+  app.post('/grant', async (req, reply) => {
+    const body = z
+      .object({
+        accountId: z.string().trim().min(1),
+        amount: z.number().int().positive().max(1_000_000).optional(),
+        ensure: z.number().int().positive().max(1_000_000).optional(),
+      })
+      .refine((b) => (b.amount !== undefined) !== (b.ensure !== undefined), {
+        message: 'pass exactly one of amount / ensure',
+      })
+      .parse(req.body);
+
+    const account = await resolveAccount(body.accountId);
+    if (!account) {
+      return sendError(reply, 404, 'account_not_found', `No account matches "${body.accountId}"`);
+    }
+
+    const before = await getBalance(account.id);
+    const amount =
+      body.amount !== undefined ? body.amount : Math.max(0, body.ensure! - before.total);
+    if (amount === 0) {
+      return { ok: true, granted: 0, balance: before.total };
+    }
+    const result = await credit({
+      accountId: account.id,
+      amount,
+      type: 'credit:dev-grant',
+      idempotencyKey: `dev-grant:${randomUUID()}`,
+    });
+    return { ok: true, granted: amount, balance: result.balance.total };
   });
 
   // POST /dev/impersonate {accountId} — become that account (sets dev cookie).
