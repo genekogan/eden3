@@ -37,6 +37,7 @@ import {
   SkeletonText,
 } from "@/components/skeleton";
 import { PilotBadge, ProvisionBadge } from "@/components/agents/badges";
+import { AgentWorkspacePanel } from "@/components/agents/agent-workspace";
 import { agentHref, chatHref } from "@/components/agents/agent-card";
 import {
   dedupeById,
@@ -606,7 +607,9 @@ export function AgentProfile({ username }: { username: string }) {
   const [profile, setProfile] = useState<AgentProfileResponse | null>(null);
   const [state, setState] = useState<ProfileState>({ kind: "loading" });
   const [me, setMe] = useState<DevUser | null>(null);
-  const [tab, setTab] = useState<"creations" | "about" | "skills" | "memory">("creations");
+  const [tab, setTab] = useState<
+    "creations" | "about" | "skills" | "memory" | "files"
+  >("creations");
   const [reloadKey, setReloadKey] = useState(0);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -736,7 +739,7 @@ export function AgentProfile({ username }: { username: string }) {
   const liked = Boolean(agent.viewerHasLiked);
   const likeCount = agent.likeCount ?? 0;
   const tabs = canManage
-    ? (["creations", "about", "skills", "memory"] as const)
+    ? (["creations", "about", "skills", "memory", "files"] as const)
     : (["creations", "about", "skills"] as const);
 
   const exportAgent = async () => {
@@ -924,6 +927,8 @@ export function AgentProfile({ username }: { username: string }) {
           <AboutSection agent={agent} isOwner={isOwner} />
         ) : tab === "memory" ? (
           <AgentMemoryPanel username={agent.username} seed={profile.memory} canManage={canManage} />
+        ) : tab === "files" ? (
+          <AgentWorkspacePanel username={agent.username} canManage={canManage} />
         ) : (
           <AgentSkillsPanel username={agent.username} canManage={canManage} />
         )}
