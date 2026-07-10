@@ -2,8 +2,40 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 import { AuthUserControl } from "@/components/AuthUserControl";
 import { MannaBadge } from "@/components/manna-badge";
+
+/**
+ * Tiny environment chip (ENV-1): shows which database the stack points at so
+ * staging-mirror fixture data is never mistaken for the canonical prod fork.
+ * Renders nothing on the canonical DB or when /health doesn't say.
+ */
+function EnvChip() {
+  const [database, setDatabase] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/health")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body: { database?: string | null } | null) => {
+        if (!cancelled) setDatabase(body?.database ?? null);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  if (!database || database === "eden3") return null;
+  const label = database === "eden3_stg" ? "staging db" : database;
+  return (
+    <span
+      title={`Stack database: ${database}`}
+      className="hidden rounded-full border border-amber-400/25 bg-amber-400/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-amber-300/90 lg:inline-flex"
+    >
+      {label}
+    </span>
+  );
+}
 
 /** Minimal 24px stroke icons (multi-subpath `d` strings, lucide-derived). */
 const ICONS = {
@@ -84,6 +116,9 @@ export function Sidebar() {
             className="mt-1 block size-2.5 rounded-full bg-accent lg:hidden"
           />
         </Link>
+        <span className="hidden lg:ml-2 lg:inline-flex lg:items-center">
+          <EnvChip />
+        </span>
       </div>
 
       <nav className="flex-1 overflow-y-auto px-2 lg:px-3" aria-label="Primary">

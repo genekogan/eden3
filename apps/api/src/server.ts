@@ -192,9 +192,23 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     list: false,
   });
 
+  // Which database this stack points at (ENV-1: the running stack may be the
+  // staging mirror) — the UI labels stg vs the canonical fork so fixture data
+  // is never mistaken for migrated data during evaluation. Name only, never
+  // credentials.
+  const databaseName = (() => {
+    try {
+      const url = new URL(process.env.DATABASE_URL ?? '');
+      return url.pathname.replace(/^\//, '') || null;
+    } catch {
+      return null;
+    }
+  })();
+
   app.get('/health', async () => ({
     ok: true,
     versions: { api: pkg.version, node: process.version, fastify: app.version },
+    database: databaseName,
   }));
 
   // Auth (request.account + app.requireAuth) — root scope, before routes.
