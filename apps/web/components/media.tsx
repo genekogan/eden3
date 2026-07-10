@@ -18,6 +18,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { CreationDto } from "@/lib/types";
 import { decodeBlurhash } from "@/lib/blurhash";
+import { promptOf } from "@/components/feed/creation-fields";
 
 const VIDEO_EXTENSIONS = new Set(["mp4", "webm"]);
 const AUDIO_EXTENSIONS = new Set(["mp3", "wav", "ogg", "oga", "m4a", "aac", "flac", "opus"]);
@@ -76,6 +77,9 @@ function resolveSource(
       (typeof attr("mimeType") === "string" ? (attr("mimeType") as string) : null),
     alt:
       overrides.alt ??
+      // The prompt is the most descriptive alt text for AI-generated art —
+      // trimmed for screen readers; fall back to filename, then a generic.
+      (creation ? promptOf(creation)?.slice(0, 200) ?? null : null) ??
       creation?.filename ??
       (creation?.tool ? `${creation.tool} creation` : "creation"),
     blurhash:
