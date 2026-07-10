@@ -209,6 +209,88 @@ describe('GET /operator/usage/summary', () => {
   });
 });
 
+describe('GET /usage/summary (viewer-scoped, no cost_usd leak)', () => {
+  it('401s anonymous requests', async () => {
+    const res = await app.inject({ method: 'GET', url: '/usage/summary' });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('lets a NON-admin see their OWN balance, spend, and activity', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/usage/summary',
+      headers: { cookie: devCookie(userId) },
+    });
+    // The tenant view is NOT admin-gated: the owner of the data can read it.
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      balance: { manna: number; subscriptionManna: number; total: number; updatedAt: string };
+      spend: {
+        week: { manna: number; events: number };
+        month: { manna: number; events: number };
+      };
+      recent: Array<{
+        eventType: string;
+        status: string;
+        agentUsername: string | null;
+        tool: string | null;
+        manna: number | null;
+      }>;
+    };
+
+    expect(typeof body.balance.total).toBe('number');
+    // Spend is windowed: two in-window events (one completed 2025 manna + one
+    // error); the two 2001-dated reconcile fixtures fall outside the 30-day sum.
+    expect(body.spend.week).toMatchObject({ manna: 2025, events: 2 });
+    expect(body.spend.month).toMatchObject({ manna: 2025, events: 2 });
+    // Recent activity is latest-N (not windowed) — the two fresh rows lead.
+    expect(body.recent.length).toBeGreaterThanOrEqual(2);
+    expect(body.recent[0]).toMatchObject({ status: 'error', eventType: 'chat_turn' });
+    expect(body.recent[1]).toMatchObject({
+      status: 'completed',
+      eventType: 'chat_turn',
+      agentUsername: `${marker}_agent`,
+      manna: 2025,
+    });
+    // Friendly-mapping field is present (null for chat turns).
+    expect(body.recent[1]).toHaveProperty('tool');
+  });
+
+  it('never exposes provider cost_usd', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/usage/summary',
+      headers: { cookie: devCookie(userId) },
+    });
+    expect(res.statusCode).toBe(200);
+    // No provider-cost field in any shape (row, spend, or balance).
+    expect(res.payload).not.toMatch(/cost/i);
+    const body = res.json() as { recent: Array<Record<string, unknown>> };
+    for (const row of body.recent) {
+      expect(row).not.toHaveProperty('costUsd');
+      expect(row).not.toHaveProperty('cost_usd');
+    }
+  });
+
+  it('scopes to the viewer — a user cannot see another user\'s usage', async () => {
+    // viewerId is a different account with no usage_events of its own.
+    const res = await app.inject({
+      method: 'GET',
+      url: '/usage/summary',
+      headers: { cookie: devCookie(viewerId) },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      spend: { week: { manna: number; events: number }; month: { events: number } };
+      recent: unknown[];
+    };
+    // None of userId's spend or activity bleeds into viewerId's view.
+    expect(body.spend.week).toMatchObject({ manna: 0, events: 0 });
+    expect(body.spend.month.events).toBe(0);
+    expect(body.recent).toHaveLength(0);
+  });
+});
+
 describe('POST /operator/usage/reconcile', () => {
   function reconciliationWindow() {
     return {

@@ -58,6 +58,7 @@ import type {
   Paginated,
   OperatorHealth,
   OperatorUsageSummary,
+  UserUsageSummary,
   AgentSkillsResponse,
   SessionDetail,
   SessionDto,
@@ -925,6 +926,16 @@ export const api = {
     /** POST /api/agents/:username/skills — replace final OpenClaw allowlist. */
     setAgent(username: string, slugs: string[]): Promise<AgentSkillsResponse> {
       return post<AgentSkillsResponse>(`/agents/${enc(username)}/skills`, { slugs });
+    },
+  },
+
+  usage: {
+    /**
+     * GET /api/usage/summary — the signed-in viewer's OWN balance, spend, and
+     * recent activity. Never admin-gated and never carries provider cost_usd.
+     */
+    async summary(params: { limit?: number } = {}): Promise<UserUsageSummary> {
+      return get<UserUsageSummary>(`/usage/summary${qs(params)}`);
     },
   },
 

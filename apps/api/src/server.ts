@@ -42,6 +42,7 @@ import { sessionsRoutes } from './routes/sessions';
 import { skillsRoutes } from './routes/skills';
 import { studioRoutes } from './routes/studio';
 import { triggersRoutes } from './routes/triggers';
+import { usageRoutes } from './routes/usage';
 import { workspaceRoutes } from './routes/workspace';
 
 const requireCjs = createRequire(import.meta.url);
@@ -350,6 +351,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(billingRoutes, { prefix: '/billing', ...(opts.billing ?? {}) });
   await app.register(channelsRoutes, { prefix: '/channels', ...(opts.channels ?? {}) });
   await app.register(mannaRoutes, { prefix: '/manna' });
+  // /usage — the tenant view of consumption (own balance/spend/activity).
+  // Distinct from /operator (admin platform view); never exposes cost_usd.
+  await app.register(usageRoutes, { prefix: '/usage' });
   await app.register(operatorRoutes, { prefix: '/operator' });
   // Trigger routes live at /tasks on the wire (web contract).
   await app.register(triggersRoutes, { prefix: '/tasks' });

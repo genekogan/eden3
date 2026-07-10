@@ -103,3 +103,30 @@ export function formatMannaExact(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "—";
   return mannaExactFormat.format(value);
 }
+
+/**
+ * Manna → USD peg. Mirrors `DEFAULT_MANNA_PER_USD` in @eden3/core (1000 manna
+ * = $1, i.e. 1 manna = a tenth of a cent). Kept here because the web package
+ * only depends on @eden3/shared, not @eden3/core. This is the price a user
+ * pays in manna — NOT the provider's raw cost.
+ */
+export const MANNA_PER_USD = 1000;
+
+const usdApproxFormat = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  maximumFractionDigits: 2,
+});
+
+/**
+ * Approximate USD value of a manna amount, at the 1000-manna = $1 peg. For
+ * user-facing spend summaries ("≈ $0.95"). Small non-zero amounts round up to
+ * "< $0.01" rather than "$0.00" so a real charge never reads as free.
+ */
+export function formatUsdApprox(manna: number | null | undefined): string {
+  if (manna == null || !Number.isFinite(manna)) return "—";
+  const usd = manna / MANNA_PER_USD;
+  if (usd > 0 && usd < 0.01) return "< $0.01";
+  if (usd < 0 && usd > -0.01) return "> -$0.01";
+  return usdApproxFormat.format(usd);
+}

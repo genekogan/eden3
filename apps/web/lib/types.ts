@@ -460,6 +460,49 @@ export interface OperatorUsageSummary {
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/usage/summary — the tenant (own-data) usage view.
+// Scoped to the signed-in viewer; never carries provider cost_usd.
+// ---------------------------------------------------------------------------
+
+/** One row of the viewer's recent activity — friendly-labelled on the client. */
+export interface UsageActivityEvent {
+  id: string;
+  /** e.g. "chat_turn" | "studio_generation". */
+  eventType: string;
+  status: string;
+  agentId: string | null;
+  agentUsername: string | null;
+  model: string | null;
+  /** For studio_generation: "image_generate" | "video_generate" | "music_generate" | "tts". */
+  tool: string | null;
+  /** Manna charged for this call (null for failed/refunded calls). */
+  manna: number | null;
+  latencyMs: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+}
+
+export interface UsageSpendWindow {
+  manna: number;
+  events: number;
+}
+
+export interface UserUsageSummary {
+  balance: {
+    manna: number;
+    subscriptionManna: number;
+    total: number;
+    updatedAt: string;
+  };
+  spend: {
+    week: UsageSpendWindow;
+    month: UsageSpendWindow;
+  };
+  recent: UsageActivityEvent[];
+}
+
+// ---------------------------------------------------------------------------
 // Request inputs
 // ---------------------------------------------------------------------------
 
