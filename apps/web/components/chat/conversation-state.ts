@@ -170,6 +170,21 @@ export function echoClientId(streamClientId: string): string {
   return `${streamClientId}:echo`;
 }
 
+/**
+ * Strip gateway media-sentinel lines (`MEDIA:<container path>` and the spike
+ * `Attachment: <path>` shape) from displayed message text. The media pipeline
+ * normally parks these and swaps in a real attachment, but when correlation
+ * lands the attachment on a different row (late history-sync) the raw
+ * container path — meaningless outside the gateway — must never reach users.
+ * Mirrors ATTACHMENT_LINE_RE in apps/api/src/services/history-sync.ts.
+ */
+export function stripMediaSentinelLines(text: string): string {
+  return text
+    .replace(/^\s*(?:MEDIA|Attachment):\s*\/\S[^\r\n]*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function messageOrder(a: MessageDto, b: MessageDto): number {
   const at = Date.parse(a.createdAt);
   const bt = Date.parse(b.createdAt);
@@ -234,6 +249,18 @@ const ECHO_MATCH_WINDOW_MS = 10 * 60_000;
 function reconcile(state: ConversationState): ConversationState {
   if (state.local.length === 0) return state;
   const ids = new Set(state.serverMessages.map((message) => message.id));
+  // Creations already present on ANY fetched row. A live media item must retire
+  // once its creation is persisted even if it landed on a different message id
+  // than the one media.attached first referenced (the pipeline can re-home an
+  // attachment off a transient row, deleting the original) — otherwise the
+  // live item lingers as a phantom second copy of the same image until refresh.
+  const persistedCreationIds = new Set(
+    state.serverMessages.flatMap((message) =>
+      (message.attachments ?? [])
+        .map((a) => a.creationId)
+        .filter((id): id is string => typeof id === "string"),
+    ),
+  );
 
   const local = state.local.filter((item) => {
     if (item.kind === "assistant-stream") {
@@ -263,7 +290,18 @@ function reconcile(state: ConversationState): ConversationState {
       }
       return true;
     }
-    if (item.kind === "media") return !ids.has(item.messageId);
+    if (item.kind === "media") {
+      if (ids.has(item.messageId)) return false;
+      // Retire once the creation shows up on any persisted row.
+      if (
+        item.attachments.some(
+          (a) => a.creationId && persistedCreationIds.has(a.creationId),
+        )
+      ) {
+        return false;
+      }
+      return true;
+    }
     if (item.kind === "user-echo") {
       const echoAt = Date.parse(item.at);
       return !state.serverMessages.some(

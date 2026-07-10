@@ -39,6 +39,7 @@ export const accounts = pgTable(
   {
     id: uuid('id').primaryKey().defaultRandom(),
     externalId: text('external_id'),
+    clerkUserId: text('clerk_user_id'),
     type: text('type').$type<'user' | 'agent'>().notNull(),
     username: citext('username').notNull().unique(),
     userImage: text('user_image'),
@@ -50,6 +51,9 @@ export const accounts = pgTable(
     uniqueIndex('accounts_external_id_uq')
       .on(t.externalId)
       .where(sql`${t.externalId} is not null`),
+    uniqueIndex('accounts_clerk_user_id_uq')
+      .on(t.clerkUserId)
+      .where(sql`${t.clerkUserId} is not null`),
   ],
 );
 
@@ -68,6 +72,14 @@ export const agents = pgTable('agents', {
   isPersonaPublic: boolean('is_persona_public').notNull().default(false),
   greeting: text('greeting'),
   voice: text('voice'),
+  model: text('model').notNull().default('anthropic/claude-haiku-4-5'),
+  thinkingLevel: text('thinking_level').notNull().default('balanced'),
+  toolGroups: jsonb('tool_groups')
+    .$type<string[]>()
+    .notNull()
+    .default(
+      sql`'["group:runtime","group:fs","group:web","group:sessions","group:memory","group:media","group:ui","group:automation","group:agents","group:plugins"]'::jsonb`,
+    ),
   public: boolean('public').notNull().default(false),
   openclawId: text('openclaw_id').unique(),
   workspacePath: text('workspace_path'),
@@ -232,6 +244,69 @@ export const creations = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// content_reports — lightweight public/social moderation queue.
+// target_id is polymorphic (creation/agent/etc.) so it intentionally does not
+// carry a foreign key; reporter/reviewer are normal account references.
+// ---------------------------------------------------------------------------
+export const contentReports = pgTable(
+  'content_reports',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    reporterId: uuid('reporter_id')
+      .notNull()
+      .references(() => accounts.id),
+    targetType: text('target_type').notNull(),
+    targetId: uuid('target_id').notNull(),
+    reason: text('reason'),
+    status: text('status').notNull().default('open'),
+    reviewerId: uuid('reviewer_id').references(() => accounts.id),
+    reviewedAt: timestamptz('reviewed_at'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('content_reports_target_idx').on(t.targetType, t.targetId),
+    index('content_reports_status_created_idx').on(t.status, t.createdAt.desc()),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// likes — per-user v1 social interactions.
+// ---------------------------------------------------------------------------
+export const creationLikes = pgTable(
+  'creation_likes',
+  {
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    creationId: uuid('creation_id')
+      .notNull()
+      .references(() => creations.id, { onDelete: 'cascade' }),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.userId, t.creationId] }),
+    index('creation_likes_creation_idx').on(t.creationId),
+  ],
+);
+
+export const agentLikes = pgTable(
+  'agent_likes',
+  {
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    agentId: uuid('agent_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.userId, t.agentId] }),
+    index('agent_likes_agent_idx').on(t.agentId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // collections + members
 // ---------------------------------------------------------------------------
 export const collections = pgTable(
@@ -333,6 +408,210 @@ export const mannaTransactions = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// billing — Stripe subscription state + Eden voucher inventory.
+// ---------------------------------------------------------------------------
+export const billingSubscriptions = pgTable(
+  'billing_subscriptions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id')
+      .notNull()
+      .references(() => accounts.id),
+    stripeCustomerId: text('stripe_customer_id'),
+    stripeSubscriptionId: text('stripe_subscription_id').notNull().unique(),
+    status: text('status').notNull(),
+    tier: text('tier'),
+    monthlyManna: integer('monthly_manna').notNull().default(0),
+    currentPeriodEnd: timestamptz('current_period_end'),
+    cancelAtPeriodEnd: boolean('cancel_at_period_end').notNull().default(false),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('billing_subscriptions_account_idx').on(t.accountId),
+    index('billing_subscriptions_customer_idx').on(t.stripeCustomerId),
+  ],
+);
+
+export const mannaVouchers = pgTable(
+  'manna_vouchers',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    code: citext('code').notNull().unique(),
+    amount: integer('amount').notNull(),
+    maxRedemptions: integer('max_redemptions').notNull().default(1),
+    redeemedCount: integer('redeemed_count').notNull().default(0),
+    expiresAt: timestamptz('expires_at'),
+    disabled: boolean('disabled').notNull().default(false),
+    metadata: jsonb('metadata'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('manna_vouchers_expires_idx').on(t.expiresAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// channel_connections + secret_access_audit_events — user token custody.
+// ---------------------------------------------------------------------------
+export const channelConnections = pgTable(
+  'channel_connections',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id')
+      .notNull()
+      .references(() => accounts.id),
+    agentId: uuid('agent_id').references(() => accounts.id),
+    channel: text('channel').notNull(),
+    label: text('label'),
+    status: text('status').notNull().default('connected'),
+    tokenCiphertext: text('token_ciphertext').notNull(),
+    tokenIv: text('token_iv').notNull(),
+    tokenAuthTag: text('token_auth_tag').notNull(),
+    tokenSha256: text('token_sha256').notNull(),
+    tokenPreview: text('token_preview'),
+    keyVersion: text('key_version').notNull().default('v1'),
+    metadata: jsonb('metadata'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('channel_connections_account_idx').on(t.accountId),
+    index('channel_connections_agent_idx').on(t.agentId),
+  ],
+);
+
+export const secretAccessAuditEvents = pgTable(
+  'secret_access_audit_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    actorAccountId: uuid('actor_account_id').references(() => accounts.id),
+    ownerAccountId: uuid('owner_account_id').references(() => accounts.id),
+    secretKind: text('secret_kind').notNull(),
+    secretId: uuid('secret_id').notNull(),
+    action: text('action').notNull(),
+    metadata: jsonb('metadata'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('secret_access_audit_owner_idx').on(t.ownerAccountId, t.createdAt.desc()),
+    index('secret_access_audit_secret_idx').on(t.secretKind, t.secretId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// skills — OpenClaw skill definitions and per-agent allowlists.
+// ---------------------------------------------------------------------------
+export const skillDefinitions = pgTable(
+  'skill_definitions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    slug: text('slug').notNull().unique(),
+    name: text('name').notNull(),
+    description: text('description'),
+    body: text('body').notNull(),
+    source: text('source').$type<'curated' | 'user'>().notNull().default('user'),
+    status: text('status').$type<'pending' | 'approved' | 'rejected'>().notNull().default('pending'),
+    ownerId: uuid('owner_id').references(() => accounts.id, { onDelete: 'set null' }),
+    reviewerId: uuid('reviewer_id').references(() => accounts.id, { onDelete: 'set null' }),
+    reviewedAt: timestamptz('reviewed_at'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('skill_definitions_status_idx').on(t.status),
+    index('skill_definitions_owner_idx').on(t.ownerId),
+  ],
+);
+
+export const agentSkills = pgTable(
+  'agent_skills',
+  {
+    agentId: uuid('agent_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    skillId: uuid('skill_id')
+      .notNull()
+      .references(() => skillDefinitions.id, { onDelete: 'cascade' }),
+    enabled: boolean('enabled').notNull().default(true),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.agentId, t.skillId] }),
+    index('agent_skills_skill_idx').on(t.skillId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// distill_state — background MEMORY.md distillation status per OpenClaw agent.
+// ---------------------------------------------------------------------------
+export const distillState = pgTable(
+  'distill_state',
+  {
+    openclawId: text('openclaw_id').primaryKey(),
+    agentAccountId: uuid('agent_account_id').references(() => accounts.id, { onDelete: 'set null' }),
+    username: citext('username').notNull(),
+    status: text('status')
+      .$type<'pending' | 'running' | 'done' | 'skipped' | 'error'>()
+      .notNull()
+      .default('pending'),
+    sessionsSampled: integer('sessions_sampled').notNull().default(0),
+    messagesSampled: integer('messages_sampled').notNull().default(0),
+    mapChunks: integer('map_chunks'),
+    memoryChars: integer('memory_chars'),
+    model: text('model'),
+    error: text('error'),
+    startedAt: timestamptz('started_at'),
+    completedAt: timestamptz('completed_at'),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('distill_state_agent_idx').on(t.agentAccountId),
+    index('distill_state_status_idx').on(t.status, t.updatedAt.desc()),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// usage_events — per-turn/generation metering and observability.
+// ---------------------------------------------------------------------------
+export const usageEvents = pgTable(
+  'usage_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    eventType: text('event_type').notNull(),
+    status: text('status').notNull(),
+    userId: uuid('user_id').references(() => accounts.id, { onDelete: 'set null' }),
+    agentId: uuid('agent_id').references(() => accounts.id, { onDelete: 'set null' }),
+    sessionId: uuid('session_id').references(() => sessions.id, { onDelete: 'set null' }),
+    messageId: uuid('message_id').references(() => messages.id, { onDelete: 'set null' }),
+    turnId: uuid('turn_id'),
+    provider: text('provider'),
+    model: text('model'),
+    tableVersion: text('table_version'),
+    promptTokens: integer('prompt_tokens'),
+    completionTokens: integer('completion_tokens'),
+    cachedTokens: integer('cached_tokens'),
+    totalTokens: integer('total_tokens'),
+    costUsd: numeric('cost_usd', { precision: 20, scale: 8 }),
+    manna: integer('manna'),
+    latencyMs: integer('latency_ms'),
+    errorCode: text('error_code'),
+    errorMessage: text('error_message'),
+    metadata: jsonb('metadata'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('usage_events_user_created_idx').on(t.userId, t.createdAt.desc()),
+    index('usage_events_agent_created_idx').on(t.agentId, t.createdAt.desc()),
+    index('usage_events_session_created_idx').on(t.sessionId, t.createdAt.desc()),
+    index('usage_events_turn_idx').on(t.turnId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // triggers — scheduled prompts, synced to OpenClaw cron jobs.
 // ---------------------------------------------------------------------------
 export const triggers = pgTable(
@@ -415,6 +694,12 @@ export type Message = typeof messages.$inferSelect;
 export type NewMessage = typeof messages.$inferInsert;
 export type Creation = typeof creations.$inferSelect;
 export type NewCreation = typeof creations.$inferInsert;
+export type ContentReport = typeof contentReports.$inferSelect;
+export type NewContentReport = typeof contentReports.$inferInsert;
+export type CreationLike = typeof creationLikes.$inferSelect;
+export type NewCreationLike = typeof creationLikes.$inferInsert;
+export type AgentLike = typeof agentLikes.$inferSelect;
+export type NewAgentLike = typeof agentLikes.$inferInsert;
 export type Collection = typeof collections.$inferSelect;
 export type NewCollection = typeof collections.$inferInsert;
 export type CollectionCreation = typeof collectionCreations.$inferSelect;
@@ -422,6 +707,22 @@ export type MannaAccount = typeof mannaAccounts.$inferSelect;
 export type NewMannaAccount = typeof mannaAccounts.$inferInsert;
 export type MannaTransaction = typeof mannaTransactions.$inferSelect;
 export type NewMannaTransaction = typeof mannaTransactions.$inferInsert;
+export type BillingSubscription = typeof billingSubscriptions.$inferSelect;
+export type NewBillingSubscription = typeof billingSubscriptions.$inferInsert;
+export type MannaVoucher = typeof mannaVouchers.$inferSelect;
+export type NewMannaVoucher = typeof mannaVouchers.$inferInsert;
+export type ChannelConnection = typeof channelConnections.$inferSelect;
+export type NewChannelConnection = typeof channelConnections.$inferInsert;
+export type SecretAccessAuditEvent = typeof secretAccessAuditEvents.$inferSelect;
+export type NewSecretAccessAuditEvent = typeof secretAccessAuditEvents.$inferInsert;
+export type SkillDefinition = typeof skillDefinitions.$inferSelect;
+export type NewSkillDefinition = typeof skillDefinitions.$inferInsert;
+export type AgentSkill = typeof agentSkills.$inferSelect;
+export type NewAgentSkill = typeof agentSkills.$inferInsert;
+export type DistillState = typeof distillState.$inferSelect;
+export type NewDistillState = typeof distillState.$inferInsert;
+export type UsageEvent = typeof usageEvents.$inferSelect;
+export type NewUsageEvent = typeof usageEvents.$inferInsert;
 export type Trigger = typeof triggers.$inferSelect;
 export type NewTrigger = typeof triggers.$inferInsert;
 export type MediaAsset = typeof mediaAssets.$inferSelect;

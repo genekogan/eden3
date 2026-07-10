@@ -17,7 +17,12 @@ import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Skeleton } from "@/components/skeleton";
 import { api, emitMannaUpdate, onMannaUpdate } from "@/lib/api";
-import type { MannaSummary, StudioGeneration, StudioTool } from "@/lib/types";
+import type {
+  MannaSummary,
+  StudioGeneration,
+  StudioGenerationQuote,
+  StudioTool,
+} from "@/lib/types";
 import {
   FALLBACK_TOOLS,
   buildArgs,
@@ -32,6 +37,7 @@ import {
 } from "./catalog";
 import { GenerationProgress } from "./generation-progress";
 import { MannaAmount } from "./manna-amount";
+import { studioPrefillFromSearch } from "./prefill";
 import { RecentStrip, type StripItem } from "./recent-strip";
 import { ResultPanel } from "./result-panel";
 import { ToolPicker } from "./tool-picker";
@@ -46,6 +52,12 @@ type ToolsState =
   | { status: "loading" }
   | { status: "ready"; tools: StudioTool[]; live: boolean };
 
+type QuoteState =
+  | { status: "idle" }
+  | { status: "loading"; key: string }
+  | { status: "ready"; key: string; quote: StudioGenerationQuote }
+  | { status: "error"; key: string };
+
 const IDLE: Phase = { kind: "idle", notice: null };
 
 export function StudioView() {
@@ -57,9 +69,17 @@ export function StudioView() {
   const [manna, setManna] = useState<MannaSummary | null>(null);
   const [sessionItems, setSessionItems] = useState<StripItem[]>([]);
   const [stripRefresh, setStripRefresh] = useState(0);
+  const [quoteState, setQuoteState] = useState<QuoteState>({ status: "idle" });
 
   const alive = useRef(true);
   const abortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const prefill = studioPrefillFromSearch(window.location.search);
+    if (prefill.tool) setSelectedName(prefill.tool);
+    if (prefill.prompt) setPrompt(prefill.prompt);
+    if (prefill.duration) setDuration(prefill.duration);
+  }, []);
 
   // ---- tools -------------------------------------------------------------
   useEffect(() => {
@@ -116,10 +136,12 @@ export function StudioView() {
   const selected =
     tools.find((tool) => tool.name === selectedName) ?? tools[0] ?? null;
   const category = selected ? categorizeTool(selected) : "other";
-  const cost =
+  const catalogCost =
     selected && typeof selected.costManna === "number"
       ? selected.costManna
       : null;
+  const quoteCost = quoteState.status === "ready" ? quoteState.quote.manna : null;
+  const cost = quoteCost ?? catalogCost;
   const spendable = manna ? manna.balance + manna.subscriptionBalance : null;
   const insufficient =
     spendable != null && cost != null && spendable < cost;
@@ -129,6 +151,32 @@ export function StudioView() {
     selected != null &&
     trimmedPrompt !== "" &&
     !insufficient;
+
+  // ---- live quote -------------------------------------------------------
+  useEffect(() => {
+    if (!selected || trimmedPrompt === "") {
+      setQuoteState({ status: "idle" });
+      return;
+    }
+    const args = buildArgs(selected, trimmedPrompt, duration);
+    const key = `${selected.name}:${JSON.stringify(args)}`;
+    let cancelled = false;
+    setQuoteState((prev) => (prev.status === "ready" && prev.key === key ? prev : { status: "loading", key }));
+    const timer = window.setTimeout(() => {
+      void api.studio
+        .quote({ tool: selected.name, args })
+        .then((quote) => {
+          if (!cancelled) setQuoteState({ status: "ready", key, quote });
+        })
+        .catch(() => {
+          if (!cancelled) setQuoteState({ status: "error", key });
+        });
+    }, 200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [selected, trimmedPrompt, duration]);
 
   // ---- actions -----------------------------------------------------------
   const selectTool = useCallback((name: string) => {

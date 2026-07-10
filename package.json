@@ -14,6 +14,13 @@
     "typecheck": "pnpm -r typecheck",
     "etl": "pnpm --filter @eden3/etl etl",
     "etl:verify": "pnpm --filter @eden3/etl etl:verify",
+    "etl:parity": "bash scripts/etl-parity-db.sh",
+    "autonomy:smoke": "node scripts/autonomy-smoke.mjs",
+    "load:gateway": "node scripts/load-gateway.mjs",
+    "load:gateway:test": "node --test scripts/load-gateway.test.mjs",
+    "tunnel:api": "bash scripts/tunnel.sh --api",
+    "tunnel:web": "bash scripts/tunnel.sh --web",
+    "tunnel:stop": "bash scripts/tunnel-stop.sh",
     "db:generate": "pnpm --filter @eden3/db generate",
     "db:migrate": "pnpm --filter @eden3/db migrate"
   },

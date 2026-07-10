@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { encodeSseEvent, encodeSseComment, extractSseData } from "@eden3/shared";
 import type { SessionEvent } from "@eden3/shared";
 import {
@@ -7,7 +7,7 @@ import {
   sessionEventsUrl,
   streamSseBody,
 } from "../lib/sse";
-import { toPaginated } from "../lib/api";
+import { api, toPaginated } from "../lib/api";
 import { formatManna, formatRelativeTime } from "../lib/format";
 import { decodeBlurhash } from "../lib/blurhash";
 
@@ -168,6 +168,147 @@ describe("lib/api toPaginated", () => {
       items: [],
       nextCursor: null,
     });
+  });
+});
+
+describe("lib/api browser transport", () => {
+  const originalPublicApiOrigin = process.env.NEXT_PUBLIC_API_ORIGIN;
+
+  afterEach(() => {
+    if (originalPublicApiOrigin === undefined) {
+      delete process.env.NEXT_PUBLIC_API_ORIGIN;
+    } else {
+      process.env.NEXT_PUBLIC_API_ORIGIN = originalPublicApiOrigin;
+    }
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("sends long-running Studio generation directly to the API origin", async () => {
+    process.env.NEXT_PUBLIC_API_ORIGIN = "http://127.0.0.1:4301/";
+    vi.stubGlobal("window", {});
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          creationId: "creation-1",
+          url: "http://127.0.0.1:4301/media/video.mp4",
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const controller = new AbortController();
+    const result = await api.studio.generate(
+      { tool: "video_generate", args: { prompt: "teal cube", duration: 2 } },
+      { signal: controller.signal },
+    );
+
+    expect(result.creationId).toBe("creation-1");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(init).toBeDefined();
+    const requestInit = init as RequestInit;
+    expect(url).toBe("http://127.0.0.1:4301/studio/generate");
+    expect(requestInit).toMatchObject({
+      method: "POST",
+      cache: "no-store",
+      credentials: "include",
+      signal: controller.signal,
+    });
+    expect(JSON.parse(String(requestInit.body))).toEqual({
+      tool: "video_generate",
+      args: { prompt: "teal cube", duration: 2 },
+    });
+  });
+
+  it("keeps ordinary browser API calls on the same-origin rewrite", async () => {
+    process.env.NEXT_PUBLIC_API_ORIGIN = "http://127.0.0.1:4301";
+    vi.stubGlobal("window", {});
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          quote: { tool: "image_generate", manna: 181 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.studio.quote({ tool: "image_generate", args: { prompt: "cactus" } });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(init).toBeDefined();
+    expect(url).toBe("/api/studio/quote");
+    expect(init).toMatchObject({ method: "POST", credentials: "include" });
+  });
+
+  it("normalizes the auth settings payload", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          user: {
+            id: "acct-1",
+            username: "gene",
+            type: "user",
+            userImage: null,
+            isAdmin: true,
+          },
+          manna: { balance: 12, subscriptionBalance: 3 },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.auth.me()).resolves.toEqual({
+      user: {
+        id: "acct-1",
+        username: "gene",
+        type: "user",
+        userImage: null,
+        isAdmin: true,
+      },
+      manna: { balance: 12, subscriptionBalance: 3 },
+    });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/auth/me");
+    expect(init).toMatchObject({ credentials: "include" });
+  });
+
+  it("normalizes the billing subscription payload without Stripe identifiers", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          subscription: {
+            status: "active",
+            tier: "pro",
+            monthlyManna: 9000,
+            currentPeriodEnd: "2026-08-01T00:00:00.000Z",
+            cancelAtPeriodEnd: false,
+            updatedAt: "2026-07-07T00:00:00.000Z",
+            stripeSubscriptionId: "sub_hidden",
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(api.billing.subscription()).resolves.toEqual({
+      status: "active",
+      tier: "pro",
+      monthlyManna: 9000,
+      currentPeriodEnd: "2026-08-01T00:00:00.000Z",
+      cancelAtPeriodEnd: false,
+      updatedAt: "2026-07-07T00:00:00.000Z",
+    });
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/billing/subscription");
+    expect(init).toMatchObject({ credentials: "include" });
   });
 });
 

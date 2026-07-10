@@ -3,6 +3,7 @@ import {
   conversationReducer,
   echoClientId,
   initialConversationState,
+  stripMediaSentinelLines,
 } from "../components/chat/conversation-state";
 import type {
   AssistantStreamItem,
@@ -55,6 +56,33 @@ function streamItems(state: ConversationState): AssistantStreamItem[] {
     (item): item is AssistantStreamItem => item.kind === "assistant-stream",
   );
 }
+
+describe("stripMediaSentinelLines", () => {
+  it("removes raw gateway media paths from mixed text bodies", () => {
+    // Observed live (staging chiba): text + trailing MEDIA: container path.
+    const body =
+      "Here's gene enjoying a sandwich!\n\nMEDIA:/home/node/.openclaw/media/tool-image-generation/image-1---6dc9a993.jpg";
+    expect(stripMediaSentinelLines(body)).toBe("Here's gene enjoying a sandwich!");
+  });
+
+  it("handles Attachment: spike shape, multiple lines, and media-only bodies", () => {
+    expect(
+      stripMediaSentinelLines(
+        "Attachment: /home/node/.openclaw/media/a.png\nMEDIA:/home/node/.openclaw/media/b.mp4",
+      ),
+    ).toBe("");
+    expect(stripMediaSentinelLines("before\nMEDIA:/x/y.png\nafter")).toBe("before\n\nafter");
+  });
+
+  it("leaves ordinary prose intact (only absolute-path values are stripped)", () => {
+    expect(stripMediaSentinelLines("MEDIA budgets are fun: attachments matter.")).toBe(
+      "MEDIA budgets are fun: attachments matter.",
+    );
+    expect(stripMediaSentinelLines("Attachment: see the doc I sent earlier")).toBe(
+      "Attachment: see the doc I sent earlier",
+    );
+  });
+});
 
 describe("send -> stream lifecycle", () => {
   it("renders echo + streaming bubble, accumulates tokens, finalizes", () => {
@@ -305,6 +333,38 @@ describe("media lifecycle", () => {
     ]);
     expect(withRow.serverMessages[0]?.attachments).toHaveLength(1);
     expect(withRow.local.filter((i) => i.kind === "media")).toHaveLength(0);
+  });
+
+  it("retires a live media item when its creation lands on a DIFFERENT row (re-home)", () => {
+    // media.attached first referenced a transient message id; history then
+    // brings the SAME creation persisted on the real completion row, whose id
+    // differs (the pipeline re-homed the attachment and deleted the original).
+    // The live item must not linger as a phantom second image.
+    const otherRowId = "4c1f5b7e-3d2a-4e8b-9f10-2a3b4c5d6e7f";
+    let state = run([streamEvent("c1", attached)]);
+    expect(state.local.filter((i) => i.kind === "media")).toHaveLength(1);
+
+    state = run(
+      [
+        {
+          type: "history/merge",
+          messages: [
+            message({
+              id: otherRowId,
+              content: "There's your Mars.",
+              attachments: [
+                { url: "/media/ab/cd.png", mime: "image/png", creationId: CREATION_ID },
+              ],
+            }),
+          ],
+          olderCursor: null,
+          position: "init",
+        },
+      ],
+      state,
+    );
+    expect(state.local.filter((i) => i.kind === "media")).toHaveLength(0);
+    expect(state.serverMessages[0]?.attachments).toHaveLength(1);
   });
 });
 

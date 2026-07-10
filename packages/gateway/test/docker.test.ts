@@ -32,15 +32,23 @@ describe('OpenClawCli.exec', () => {
     const result = await cli.exec(['agents', 'list']);
     expect(result.stdout).toBe('ok');
     expect(calls[0]!.file).toBe('docker');
-    expect(calls[0]!.args).toEqual(['exec', 'eden3-openclaw', 'openclaw', 'agents', 'list']);
+    expect(calls[0]!.args).toEqual([
+      'exec',
+      '-u',
+      'node',
+      'eden3-openclaw',
+      'openclaw',
+      'agents',
+      'list',
+    ]);
   });
 
   it('honors container overrides (option beats env beats default)', async () => {
     const { runner, calls } = makeRunner({});
     await new OpenClawCli({ runner, env: { OPENCLAW_CONTAINER: 'from-env' } }).exec(['x']);
-    expect(calls[0]!.args[1]).toBe('from-env');
+    expect(calls[0]!.args[3]).toBe('from-env');
     await new OpenClawCli({ runner, container: 'explicit', env: { OPENCLAW_CONTAINER: 'from-env' } }).exec(['x']);
-    expect(calls[1]!.args[1]).toBe('explicit');
+    expect(calls[1]!.args[3]).toBe('explicit');
   });
 
   it('wraps gateway-token commands in sh -c with in-container env expansion', async () => {
@@ -48,13 +56,13 @@ describe('OpenClawCli.exec', () => {
     const cli = new OpenClawCli({ runner, env: {} });
     await cli.exec(['cron', 'list', '--json'], { gatewayToken: true });
     const args = calls[0]!.args;
-    expect(args.slice(0, 4)).toEqual(['exec', 'eden3-openclaw', 'sh', '-c']);
-    const script = args[4]!;
+    expect(args.slice(0, 6)).toEqual(['exec', '-u', 'node', 'eden3-openclaw', 'sh', '-c']);
+    const script = args[6]!;
     // token comes from the CONTAINER env, never the host argv
     expect(script).toContain('--token "${OPENCLAW_GATEWAY_TOKEN:?');
     expect(script).toContain('exec openclaw "$@"');
     // $0 placeholder then the openclaw args verbatim
-    expect(args.slice(5)).toEqual(['openclaw', 'cron', 'list', '--json']);
+    expect(args.slice(7)).toEqual(['openclaw', 'cron', 'list', '--json']);
   });
 
   it('throws OpenClawCliError with exit code and detail on failure', async () => {

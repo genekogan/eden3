@@ -10,7 +10,14 @@ import type {
   UpdatePersonaParams,
 } from '@eden3/gateway';
 
-import type { CronSyncLike, ProvisionerLike } from '../src/gateway-glue';
+import type {
+  CronSyncLike,
+  ProvisionerLike,
+  SkillSyncLike,
+  SkillSyncParams,
+  ToolSyncLike,
+  ToolSyncParams,
+} from '../src/gateway-glue';
 
 /**
  * Shared fixtures for the route tests: live-Postgres row factories with a
@@ -66,8 +73,10 @@ export interface AgentFixtureOptions {
   greeting?: string | null;
   public?: boolean;
   openclawId?: string | null;
+  workspacePath?: string | null;
   isPilot?: boolean;
   provisionStatus?: string;
+  provisionedAt?: Date | null;
   createdAt?: Date;
   externalId?: string;
 }
@@ -85,12 +94,14 @@ export async function insertAgentAccount(
   await pg`
     insert into agents (account_id, owner_id, name, description, persona,
                         is_persona_public, greeting, public, openclaw_id,
-                        is_pilot, provision_status)
+                        workspace_path, is_pilot, provision_status, provisioned_at)
     values (${accountId}, ${opts.ownerId ?? null}, ${opts.name ?? null},
             ${opts.description ?? null}, ${opts.persona ?? null},
             ${opts.isPersonaPublic ?? false}, ${opts.greeting ?? null},
             ${opts.public ?? true}, ${opts.openclawId ?? null},
-            ${opts.isPilot ?? false}, ${opts.provisionStatus ?? 'pending'})
+            ${opts.workspacePath ?? null}, ${opts.isPilot ?? false},
+            ${opts.provisionStatus ?? 'pending'},
+            ${opts.provisionedAt === undefined ? null : opts.provisionedAt ? ts(opts.provisionedAt) : null})
   `;
   return accountId;
 }
@@ -101,6 +112,7 @@ export interface CreationFixtureOptions {
   tool?: string | null;
   url?: string | null;
   thumbnailUrl?: string | null;
+  attributes?: unknown;
   public?: boolean;
   deleted?: boolean;
   createdAt?: Date;
@@ -108,12 +120,13 @@ export interface CreationFixtureOptions {
 }
 
 export async function insertCreation(opts: CreationFixtureOptions = {}): Promise<string> {
+  const attributes = opts.attributes === undefined ? null : JSON.stringify(opts.attributes);
   const rows = await pg<{ id: string }[]>`
     insert into creations (external_id, user_id, agent_id, tool, url,
-                           thumbnail_url, public, deleted, created_at)
+                           thumbnail_url, attributes, public, deleted, created_at)
     values (${opts.externalId ?? null}, ${opts.userId ?? null}, ${opts.agentId ?? null},
             ${opts.tool ?? 'create'}, ${opts.url ?? null}, ${opts.thumbnailUrl ?? null},
-            ${opts.public ?? true}, ${opts.deleted ?? false},
+            ${attributes}::jsonb, ${opts.public ?? true}, ${opts.deleted ?? false},
             ${ts(opts.createdAt)})
     returning id
   `;
@@ -156,10 +169,33 @@ export async function addCollectionCreation(
 
 export async function deleteFixturesByMarker(marker: string): Promise<void> {
   const pattern = `${marker}%`;
+  await pg`delete from manna_vouchers where code::text like ${pattern}`;
+  await pg`delete from distill_state where username::text like ${pattern} or openclaw_id like ${pattern}`;
   const ids = (
     await pg<{ id: string }[]>`select id from accounts where username like ${pattern}`
   ).map((row) => row.id);
+  await pg`delete from skill_definitions where slug like ${pattern}`;
   if (ids.length === 0) return;
+  await pg`delete from content_reports where reporter_id = any(${ids}::uuid[]) or target_id = any(${ids}::uuid[])`;
+  await pg`delete from agent_skills where agent_id = any(${ids}::uuid[])`;
+  await pg`
+    delete from usage_events
+    where user_id = any(${ids}::uuid[])
+       or agent_id = any(${ids}::uuid[])
+       or session_id in (select id from sessions where owner_id = any(${ids}::uuid[]))
+       or message_id in (select id from messages where sender_id = any(${ids}::uuid[]))
+  `;
+  await pg`
+    delete from secret_access_audit_events
+    where owner_account_id = any(${ids}::uuid[])
+       or actor_account_id = any(${ids}::uuid[])
+  `;
+  await pg`delete from channel_connections where account_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
+  await pg`
+    delete from messages
+    where sender_id = any(${ids}::uuid[])
+       or session_id in (select id from sessions where owner_id = any(${ids}::uuid[]))
+  `;
   await pg`
     delete from collection_creations
     where collection_id in (select id from collections where user_id = any(${ids}::uuid[]))
@@ -167,9 +203,23 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
          select id from creations
          where user_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[]))
   `;
+  await pg`
+    delete from creation_likes
+    where user_id = any(${ids}::uuid[])
+       or creation_id in (
+         select id from creations
+         where user_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[]))
+  `;
+  await pg`
+    delete from agent_likes
+    where user_id = any(${ids}::uuid[])
+       or agent_id = any(${ids}::uuid[])
+  `;
   await pg`delete from collections where user_id = any(${ids}::uuid[])`;
   await pg`delete from creations where user_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
   await pg`delete from triggers where user_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
+  await pg`delete from billing_subscriptions where account_id = any(${ids}::uuid[])`;
+  await pg`delete from distill_state where agent_account_id = any(${ids}::uuid[])`;
   await pg`
     delete from manna_transactions
     where manna_account_id in (select id from manna_accounts where account_id = any(${ids}::uuid[]))
@@ -177,6 +227,7 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
   await pg`delete from manna_accounts where account_id = any(${ids}::uuid[])`;
   await pg`delete from session_agents where agent_account_id = any(${ids}::uuid[])`;
   await pg`delete from session_users where user_account_id = any(${ids}::uuid[])`;
+  await pg`delete from sessions where owner_id = any(${ids}::uuid[])`;
   // Detach agents owned by fixture accounts but created under other usernames
   // (e.g. the integration test's apitest-* agent) so the account delete works
   // even when a crashed run left them behind.
@@ -237,6 +288,36 @@ export function makeFakeCronSync(opts: { fail?: boolean } = {}): FakeCronSync {
         action: params.enabled ? 'created' : 'removed',
         ...(params.enabled ? { jobId: `fake-job-${params.triggerId.slice(0, 8)}` } : {}),
       };
+    },
+  };
+}
+
+export interface FakeSkillSync extends SkillSyncLike {
+  calls: SkillSyncParams[];
+}
+
+export function makeFakeSkillSync(): FakeSkillSync {
+  const calls: SkillSyncParams[] = [];
+  return {
+    calls,
+    async syncAgentSkills(params) {
+      calls.push(params);
+      return { changed: true };
+    },
+  };
+}
+
+export interface FakeToolSync extends ToolSyncLike {
+  calls: ToolSyncParams[];
+}
+
+export function makeFakeToolSync(): FakeToolSync {
+  const calls: ToolSyncParams[] = [];
+  return {
+    calls,
+    async syncAgentToolGroups(params) {
+      calls.push(params);
+      return { changed: true };
     },
   };
 }

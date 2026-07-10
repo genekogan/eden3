@@ -17,9 +17,10 @@
  * (lib/api's dev-user event bus).
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { api, ApiError, isEndpointMissing, onDevUserChange } from "@/lib/api";
+import { isClerkEnabled, loadClerk, type ClerkJs } from "@/lib/clerk";
 import { DevUserSwitcher } from "@/components/DevUserSwitcher";
 
 type GateState =
@@ -30,6 +31,14 @@ type GateState =
   | "unguarded"; // /dev/me not implemented/erroring — let pages self-report
 
 export function DevUserGate({ children }: { children: ReactNode }) {
+  if (process.env.NEXT_PUBLIC_EDEN3_DEV_IMPERSONATION === "1") {
+    return <DevImpersonationGate>{children}</DevImpersonationGate>;
+  }
+  if (isClerkEnabled()) return <ClerkGate>{children}</ClerkGate>;
+  return <DevImpersonationGate>{children}</DevImpersonationGate>;
+}
+
+function DevImpersonationGate({ children }: { children: ReactNode }) {
   const [state, setState] = useState<GateState>("checking");
 
   const check = useCallback(async () => {
@@ -68,6 +77,113 @@ export function DevUserGate({ children }: { children: ReactNode }) {
     return <PickUserPanel offline={state === "offline"} onRetry={check} />;
   }
   return <>{children}</>;
+}
+
+type ClerkGateState = "checking" | "user" | "anonymous" | "offline";
+
+function ClerkGate({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<ClerkGateState>("checking");
+  const [clerk, setClerk] = useState<ClerkJs | null>(null);
+
+  const boot = useCallback(async () => {
+    setState("checking");
+    try {
+      const loaded = await loadClerk();
+      setClerk(loaded);
+      setState(loaded.isSignedIn ? "user" : "anonymous");
+      return loaded;
+    } catch {
+      setState("offline");
+      return null;
+    }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
+    void boot().then((loaded) => {
+      if (!loaded || cancelled) return;
+      unsubscribe = loaded.addListener?.(() => {
+        if (!cancelled) setState(loaded.isSignedIn ? "user" : "anonymous");
+      });
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, [boot]);
+
+  if (state === "anonymous" || state === "offline" || state === "checking") {
+    return (
+      <ClerkPanel
+        clerk={clerk}
+        loading={state === "checking"}
+        offline={state === "offline"}
+        onRetry={() => void boot()}
+      />
+    );
+  }
+
+  return <>{children}</>;
+}
+
+function ClerkPanel({
+  clerk,
+  loading,
+  offline,
+  onRetry,
+}: {
+  clerk: ClerkJs | null;
+  loading: boolean;
+  offline: boolean;
+  onRetry: () => void;
+}) {
+  const signInRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = signInRef.current;
+    if (!el || !clerk || loading || offline) return;
+    clerk.mountSignIn(el);
+    return () => {
+      clerk.unmountSignIn?.(el);
+      el.innerHTML = "";
+    };
+  }, [clerk, loading, offline]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-background px-6 py-12">
+      <div className="w-full max-w-sm">
+        <div className="flex items-center gap-3">
+          <span aria-hidden className="size-2.5 rounded-full bg-accent" />
+          <span className="font-mono text-xs tracking-[0.35em] text-muted">
+            EDEN<span className="text-accent">3</span>
+          </span>
+        </div>
+
+        <h1 className="mt-8 text-2xl font-light tracking-tight text-foreground">
+          Sign in
+        </h1>
+        {offline ? (
+          <>
+            <p className="mt-3 text-sm leading-relaxed text-muted">
+              Clerk is not reachable from this browser session.
+            </p>
+            <button
+              type="button"
+              onClick={onRetry}
+              className="mt-5 rounded-md border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+            >
+              Retry connection
+            </button>
+          </>
+        ) : loading ? (
+          <p className="mt-3 text-sm text-muted">Loading…</p>
+        ) : (
+          <div ref={signInRef} className="mt-6" />
+        )}
+      </div>
+    </div>
+  );
 }
 
 function PickUserPanel({

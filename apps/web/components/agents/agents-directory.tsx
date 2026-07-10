@@ -129,20 +129,25 @@ export function AgentsDirectory() {
             Chat with creative agents — or make your own.
           </p>
         </div>
-        <Link href="/agents/new" className={primaryButtonClass}>
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.5}
-            strokeLinecap="round"
-            aria-hidden
-            className="size-4"
-          >
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          Create agent
-        </Link>
+        <div className="flex flex-wrap gap-2">
+          <Link href="/agents/builder" className={quietButtonClass}>
+            Builder
+          </Link>
+          <Link href="/agents/new" className={primaryButtonClass}>
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={1.5}
+              strokeLinecap="round"
+              aria-hidden
+              className="size-4"
+            >
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            Create agent
+          </Link>
+        </div>
       </div>
 
       <div className="relative mt-8 max-w-sm">

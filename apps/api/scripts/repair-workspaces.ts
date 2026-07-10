@@ -15,7 +15,8 @@ import { fileURLToPath } from 'node:url';
 import { pg } from '@eden3/db';
 import { workspaceBootstrapStatus } from '@eden3/gateway';
 
-const DATA_DIR = process.env.OPENCLAW_DATA_DIR ?? path.resolve('infra/openclaw/data');
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const DATA_DIR = process.env.OPENCLAW_DATA_DIR ?? path.join(REPO_ROOT, 'infra', 'openclaw', 'data');
 const TEMPLATES_DIR = fileURLToPath(new URL('../../../packages/gateway/workspace-templates/', import.meta.url));
 const CONTENT_FILES = ['SOUL.md', 'IDENTITY.md', 'AGENTS.md', 'TOOLS.md', 'USER.md', 'MEMORY.md'];
 
@@ -29,7 +30,7 @@ const rows = await pg<{
 }[]>`
   select ag.openclaw_id as "openclawId", a.username, ag.name, ag.description, ag.persona, ag.greeting
   from agents ag join accounts a on a.id = ag.account_id
-  where ag.provision_status = 'provisioned' and ag.openclaw_id is not null and ag.is_pilot
+  where ag.provision_status in ('ready', 'provisioned') and ag.openclaw_id is not null and ag.is_pilot
   order by a.username asc
 `;
 

@@ -18,6 +18,7 @@ import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type {
   AccountSummary,
   AgentDto,
+  TaskScheduleInput,
   TriggerDto,
   TriggerStatus,
 } from "@/lib/types";
@@ -25,7 +26,13 @@ import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton";
 import { formatRelativeTime } from "@/lib/format";
-import { describeSchedule } from "./schedule";
+import {
+  browserTimezone,
+  describeSchedule,
+  parseClock,
+  timezoneOptions,
+  WEEKDAYS,
+} from "./schedule";
 import { NewTaskModal } from "./new-task-modal";
 
 type AgentRef = Pick<AgentDto, "username" | "userImage"> & {
@@ -129,6 +136,250 @@ function StatusChip({ status }: { status: string | null }) {
   );
 }
 
+function scheduleFormState(schedule: TriggerDto["schedule"]): {
+  cadence: "daily" | "weekly";
+  weekday: string;
+  time: string;
+  timezone: string;
+} {
+  const record =
+    schedule && typeof schedule === "object"
+      ? (schedule as Record<string, unknown>)
+      : {};
+  const hour =
+    typeof record.hour === "number"
+      ? record.hour
+      : typeof record.hour === "string"
+        ? Number.parseInt(record.hour, 10)
+        : 9;
+  const minute =
+    typeof record.minute === "number"
+      ? record.minute
+      : typeof record.minute === "string"
+        ? Number.parseInt(record.minute, 10)
+        : 0;
+  const dayOfWeek = record.day_of_week;
+  return {
+    cadence: dayOfWeek === undefined ? "daily" : "weekly",
+    weekday: typeof dayOfWeek === "string" ? dayOfWeek : "mon",
+    time: `${String(Number.isFinite(hour) ? hour : 9).padStart(2, "0")}:${String(
+      Number.isFinite(minute) ? minute : 0,
+    ).padStart(2, "0")}`,
+    timezone:
+      typeof record.timezone === "string" && record.timezone !== ""
+        ? record.timezone
+        : browserTimezone(),
+  };
+}
+
+function EditTaskModal({
+  task,
+  onClose,
+  onSaved,
+}: {
+  task: TriggerDto;
+  onClose: () => void;
+  onSaved: (task: TriggerDto) => void;
+}) {
+  const initial = scheduleFormState(task.schedule);
+  const [name, setName] = useState(task.name ?? "");
+  const [prompt, setPrompt] = useState(task.prompt ?? "");
+  const [cadence, setCadence] = useState<"daily" | "weekly">(initial.cadence);
+  const [weekday, setWeekday] = useState(initial.weekday);
+  const [time, setTime] = useState(initial.time);
+  const [timezone, setTimezone] = useState(initial.timezone);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const zones = timezoneOptions(timezone);
+  const clock = parseClock(time);
+  const schedule: TaskScheduleInput | null = clock
+    ? {
+        hour: clock.hour,
+        minute: clock.minute,
+        timezone,
+        ...(cadence === "weekly" ? { day_of_week: weekday } : {}),
+      }
+    : null;
+  const canSave = !saving && name.trim() !== "" && prompt.trim() !== "" && schedule !== null;
+
+  const save = async () => {
+    if (!canSave || !schedule) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await api.tasks.update(task.id, {
+        name: name.trim(),
+        prompt: prompt.trim(),
+        schedule,
+      });
+      onSaved(updated);
+      onClose();
+    } catch (saveError) {
+      setError(errorCopy(saveError).hint);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const fieldLabel =
+    "font-mono text-[10px] uppercase tracking-[0.2em] text-faint";
+  const fieldInput =
+    "w-full rounded-lg border border-edge bg-background px-3 py-2 text-sm text-foreground placeholder:text-faint focus:border-accent/60 focus:outline-none";
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 pt-[7vh] backdrop-blur-[2px]"
+      onMouseDown={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="edit-task-title"
+        onMouseDown={(event) => event.stopPropagation()}
+        className="w-full max-w-lg rounded-xl border border-edge bg-surface shadow-2xl shadow-black/60"
+      >
+        <header className="flex items-center justify-between border-b border-edge px-5 py-4">
+          <h2 id="edit-task-title" className="text-sm font-medium">
+            Edit task
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="rounded-md p-1 text-faint transition-colors hover:bg-white/[0.05] hover:text-foreground"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={1.5}
+              strokeLinecap="round"
+              aria-hidden
+              className="size-4"
+            >
+              <path d="M18 6 6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </header>
+
+        <form
+          className="space-y-5 px-5 py-5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void save();
+          }}
+        >
+          <div>
+            <label htmlFor="edit-task-name" className={fieldLabel}>
+              Name
+            </label>
+            <input
+              id="edit-task-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              maxLength={120}
+              className={`${fieldInput} mt-1.5`}
+            />
+          </div>
+          <div>
+            <label htmlFor="edit-task-prompt" className={fieldLabel}>
+              Prompt
+            </label>
+            <textarea
+              id="edit-task-prompt"
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              rows={4}
+              className={`${fieldInput} mt-1.5 resize-y leading-relaxed`}
+            />
+          </div>
+          <fieldset>
+            <legend className={fieldLabel}>Schedule</legend>
+            <div className="mt-1.5 space-y-2.5">
+              <div className="inline-flex rounded-lg border border-edge bg-background p-0.5">
+                {(["daily", "weekly"] as const).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    onClick={() => setCadence(option)}
+                    aria-pressed={cadence === option}
+                    className={`rounded-md px-3 py-1.5 text-xs capitalize transition-colors ${
+                      cadence === option
+                        ? "bg-accent/15 text-accent-soft"
+                        : "text-muted hover:text-foreground"
+                    }`}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+              <div className="flex flex-wrap gap-2.5">
+                {cadence === "weekly" ? (
+                  <select
+                    value={weekday}
+                    onChange={(event) => setWeekday(event.target.value)}
+                    aria-label="Day of week"
+                    className={`${fieldInput} w-auto flex-1`}
+                  >
+                    {WEEKDAYS.map((day) => (
+                      <option key={day.value} value={day.value}>
+                        {day.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : null}
+                <input
+                  type="time"
+                  value={time}
+                  onChange={(event) => setTime(event.target.value)}
+                  aria-label="Time of day"
+                  required
+                  className={`${fieldInput} w-32`}
+                />
+                <select
+                  value={timezone}
+                  onChange={(event) => setTimezone(event.target.value)}
+                  aria-label="Timezone"
+                  className={`${fieldInput} min-w-0 flex-1`}
+                >
+                  {zones.map((zone) => (
+                    <option key={zone} value={zone}>
+                      {zone.replace(/_/g, " ")}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          </fieldset>
+
+          {error ? (
+            <p className="rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-xs text-rose-300">
+              {error}
+            </p>
+          ) : null}
+
+          <div className="flex items-center justify-end gap-2.5 pt-1">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={!canSave}
+              className="rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -141,6 +392,7 @@ export function TasksClient() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [loadError, setLoadError] = useState<unknown>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<TriggerDto | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
@@ -210,7 +462,10 @@ export function TasksClient() {
     return () => window.clearTimeout(timer);
   }, [note]);
 
-  const setStatus = async (task: TriggerDto, status: TriggerStatus) => {
+  const setStatus = async (
+    task: TriggerDto,
+    status: Extract<TriggerStatus, "active" | "paused">,
+  ) => {
     setBusyId(task.id);
     try {
       await api.tasks.update(task.id, { status });
@@ -238,7 +493,7 @@ export function TasksClient() {
     setConfirmingId(null);
     setBusyId(task.id);
     try {
-      await api.tasks.update(task.id, { status: "finished" });
+      await api.tasks.update(task.id, { deleted: true });
       if (!alive.current) return;
       setTasks((prev) => prev.filter((t) => t.id !== task.id));
     } catch (error) {
@@ -376,6 +631,14 @@ export function TasksClient() {
                       <button
                         type="button"
                         disabled={busy}
+                        onClick={() => setEditingTask(task)}
+                        className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
                         onClick={() => void remove(task)}
                         className={`rounded-lg border px-3 py-1.5 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                           confirmingId === task.id
@@ -410,6 +673,16 @@ export function TasksClient() {
           void load(true);
         }}
       />
+      {editingTask ? (
+        <EditTaskModal
+          task={editingTask}
+          onClose={() => setEditingTask(null)}
+          onSaved={(updated) => {
+            setTasks((prev) => prev.map((task) => (task.id === updated.id ? updated : task)));
+            void load(true);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

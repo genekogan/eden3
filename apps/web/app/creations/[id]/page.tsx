@@ -14,6 +14,8 @@ import {
 import { api, ApiError, isApiUnavailable } from "@/lib/api";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import type { AccountSummary, CreationDto } from "@/lib/types";
+import { studioRemixHref } from "@/components/studio/prefill";
+import { CreationLikeButton } from "./creation-like-button";
 
 /**
  * /creations/:id — the permalink. Server-rendered (share links get real
@@ -133,6 +135,7 @@ export default async function CreationPage({ params }: Props) {
   const sessionRef = sessionRefOf(creation);
   const agent = creation.agent ?? null;
   const creator = creation.creator ?? null;
+  const remixHref = studioRemixHref({ prompt, tool: creation.tool });
 
   return (
     <div className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8 md:py-10">
@@ -186,23 +189,7 @@ export default async function CreationPage({ params }: Props) {
             </dl>
           ) : null}
 
-          {creation.likeCount > 0 ? (
-            <p className="flex items-center gap-1.5 text-xs text-muted">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={1.5}
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                aria-hidden
-                className="size-3.5"
-              >
-                <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z" />
-              </svg>
-              {creation.likeCount} {creation.likeCount === 1 ? "like" : "likes"}
-            </p>
-          ) : null}
+          <CreationLikeButton creation={creation} />
 
           {args ? (
             <details className="group rounded-lg border border-edge">
@@ -233,6 +220,16 @@ export default async function CreationPage({ params }: Props) {
               className="flex items-center justify-between gap-3 rounded-lg border border-edge px-3.5 py-2.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground"
             >
               Made in a session — view the conversation
+              <span aria-hidden>→</span>
+            </Link>
+          ) : null}
+
+          {remixHref ? (
+            <Link
+              href={remixHref}
+              className="flex items-center justify-between gap-3 rounded-lg border border-edge px-3.5 py-2.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+            >
+              Remix in Studio
               <span aria-hidden>→</span>
             </Link>
           ) : null}

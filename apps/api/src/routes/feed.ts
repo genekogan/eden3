@@ -7,6 +7,7 @@ import { z } from 'zod';
 import {
   agentDtoFromRow,
   creationDtoFromRow,
+  escapeLike,
   nextCursorFrom,
   parseCursorParam,
   pgToIso,
@@ -31,6 +32,7 @@ import {
  */
 
 const feedCreationsQuerySchema = feedQuerySchema.extend({
+  q: z.string().trim().max(200).optional(),
   /** Filter by agent (username, accounts.id uuid, or legacy 24-hex id). */
   agent: z.string().trim().min(1).max(200).optional(),
   /** Filter by creator user (same reference shapes). */
@@ -40,6 +42,14 @@ const feedCreationsQuerySchema = feedQuerySchema.extend({
 const feedAgentsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).default(12),
 });
+
+const safePublicCreationFilter = () => pg`
+  and (
+    c.attributes->>'nsfw_score' is null
+    or (c.attributes->>'nsfw_score') !~ '^[0-9]+(\\.[0-9]+)?$'
+    or (c.attributes->>'nsfw_score')::double precision < 0.85
+  )
+`;
 
 /** Resolve a filter reference to an accounts.id, or null when unknown. */
 async function resolveAccountRef(ref: string): Promise<string | null> {
@@ -51,8 +61,10 @@ async function resolveAccountRef(ref: string): Promise<string | null> {
 export const feedRoutes: FastifyPluginAsync = async (app) => {
   // ---- GET /feed/creations -------------------------------------------------
   app.get('/creations', async (req) => {
-    const { cursor, limit, agent, user } = feedCreationsQuerySchema.parse(req.query);
+    const { q, cursor, limit, agent, user } = feedCreationsQuerySchema.parse(req.query);
     const after = parseCursorParam(cursor);
+    const pattern = q !== undefined && q !== '' ? `%${escapeLike(q)}%` : null;
+    const viewerId = req.account?.accountId ?? null;
 
     let agentId: string | null = null;
     if (agent !== undefined) {
@@ -68,6 +80,14 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
     const rows = await pg<CreationRow[]>`
       select c.id, c.external_id, c.user_id, c.agent_id, c.tool, c.filename,
              c.url, c.thumbnail_url, c.media_attributes, c.like_count, c.public,
+             ${
+               viewerId !== null
+                 ? pg`exists(
+                     select 1 from creation_likes cl
+                     where cl.creation_id = c.id and cl.user_id = ${viewerId}
+                   )`
+                 : pg`false`
+             } as viewer_has_liked,
              c.created_at, c.updated_at,
              cu.id as creator_id, cu.type as creator_type,
              cu.username as creator_username, cu.user_image as creator_user_image,
@@ -77,8 +97,19 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
       left join accounts cu on cu.id = c.user_id
       left join accounts ag on ag.id = c.agent_id
       where c.public = true and c.deleted = false
+        ${safePublicCreationFilter()}
         ${agentId !== null ? pg`and c.agent_id = ${agentId}` : pg``}
         ${userId !== null ? pg`and c.user_id = ${userId}` : pg``}
+        ${
+          pattern !== null
+            ? pg`and (
+                c.tool ilike ${pattern}
+                or c.filename ilike ${pattern}
+                or cu.username ilike ${pattern}
+                or ag.username ilike ${pattern}
+              )`
+            : pg``
+        }
         ${
           after !== null
             ? pg`and c.created_at <= ${after.createdAt}
@@ -98,6 +129,7 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
   // ---- GET /feed/agents — recently active ---------------------------------
   app.get('/agents', async (req) => {
     const { limit } = feedAgentsQuerySchema.parse(req.query);
+    const viewerId = req.account?.accountId ?? null;
 
     // "Active" = has a public creation among the newest 1000 feed entries —
     // one bounded index scan instead of a per-agent lateral over 741 agents.
@@ -108,6 +140,11 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
           select agent_id, created_at
           from creations
           where public = true and deleted = false and agent_id is not null
+            and (
+              attributes->>'nsfw_score' is null
+              or (attributes->>'nsfw_score') !~ '^[0-9]+(\\.[0-9]+)?$'
+              or (attributes->>'nsfw_score')::double precision < 0.85
+            )
           order by created_at desc nulls last
           limit 1000
         ) sub
@@ -115,8 +152,18 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
       )
       select a.id, a.external_id, a.username, a.user_image, a.created_at, a.updated_at,
              g.name, g.description, g.persona, g.is_persona_public, g.greeting, g.voice,
-             g.public, g.owner_id, g.is_pilot, g.is_synthetic, g.provision_status,
-             recent.last_creation_at
+             g.model, g.thinking_level, g.public, g.owner_id, g.is_pilot, g.is_synthetic,
+             g.provision_status,
+             recent.last_creation_at,
+             (select count(*)::int from agent_likes al where al.agent_id = a.id) as like_count,
+             ${
+               viewerId !== null
+                 ? pg`exists(
+                     select 1 from agent_likes al
+                     where al.agent_id = a.id and al.user_id = ${viewerId}
+                   )`
+                 : pg`false`
+             } as viewer_has_liked
       from recent
       join accounts a on a.id = recent.agent_id and a.deleted = false
       join agents g on g.account_id = a.id and g.public = true

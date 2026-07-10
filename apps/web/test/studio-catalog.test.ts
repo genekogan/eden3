@@ -55,12 +55,12 @@ describe("studio catalog", () => {
     expect(toolLabel(tool({ name: "pixel_art_generate" }))).toBe("Pixel Art");
   });
 
-  it("ships a 4-tool fallback catalog with PLAN.md pricing", () => {
+  it("ships a 4-tool fallback catalog with launch metered pricing", () => {
     expect(FALLBACK_TOOLS.map((t) => [t.name, t.costManna])).toEqual([
-      ["image_generate", 5],
-      ["video_generate", 25],
-      ["music_generate", 10],
-      ["tts", 2],
+      ["image_generate", 181],
+      ["video_generate", 608],
+      ["music_generate", 54],
+      ["tts", 28],
     ]);
   });
 

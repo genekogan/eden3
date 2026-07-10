@@ -47,6 +47,37 @@ export const PROVISION_STATUSES = ['pending', 'provisioning', 'ready', 'failed']
 export const provisionStatusSchema = z.enum(PROVISION_STATUSES);
 export type ProvisionStatus = z.infer<typeof provisionStatusSchema>;
 
+export const AGENT_MODEL_OPTIONS = [
+  'anthropic/claude-haiku-4-5',
+  'anthropic/claude-sonnet-4-5',
+  'anthropic/claude-opus-4-6',
+] as const;
+export const DEFAULT_AGENT_MODEL = AGENT_MODEL_OPTIONS[0];
+export const agentModelSchema = z.enum(AGENT_MODEL_OPTIONS);
+export type AgentModel = z.infer<typeof agentModelSchema>;
+
+export const AGENT_THINKING_LEVELS = ['fast', 'balanced', 'deep'] as const;
+export const DEFAULT_AGENT_THINKING_LEVEL = 'balanced';
+export const agentThinkingLevelSchema = z.enum(AGENT_THINKING_LEVELS);
+export type AgentThinkingLevel = z.infer<typeof agentThinkingLevelSchema>;
+
+export const AGENT_TOOL_GROUP_OPTIONS = [
+  'group:runtime',
+  'group:fs',
+  'group:web',
+  'group:sessions',
+  'group:memory',
+  'group:media',
+  'group:ui',
+  'group:automation',
+  'group:agents',
+  'group:plugins',
+] as const;
+export const DEFAULT_AGENT_TOOL_GROUPS = [...AGENT_TOOL_GROUP_OPTIONS];
+export const agentToolGroupSchema = z.enum(AGENT_TOOL_GROUP_OPTIONS);
+export type AgentToolGroup = z.infer<typeof agentToolGroupSchema>;
+export const agentToolGroupsSchema = z.array(agentToolGroupSchema);
+
 export const agentDto = z.object({
   /** accounts.id of the agent account (agents are 1:1 extensions of accounts). */
   id: uuidSchema,
@@ -57,11 +88,17 @@ export const agentDto = z.object({
   persona: z.string().nullable(),
   greeting: z.string().nullable(),
   voice: z.string().nullable(),
+  model: agentModelSchema,
+  thinkingLevel: agentThinkingLevelSchema,
+  toolGroups: agentToolGroupsSchema,
   userImage: z.string().nullable(),
   public: z.boolean(),
   ownerId: uuidSchema.nullable(),
   isPilot: z.boolean(),
   isSynthetic: z.boolean(),
+  /** Optional social fields when a route includes interaction state. */
+  likeCount: z.number().int().nonnegative().optional(),
+  viewerHasLiked: z.boolean().optional(),
   provisionStatus: provisionStatusSchema,
   createdAt: isoDateTimeSchema,
   updatedAt: isoDateTimeSchema,
@@ -145,6 +182,8 @@ export const creationDto = z.object({
   thumbnailUrl: z.string().nullable(),
   mediaAttributes: z.record(z.string(), z.unknown()).nullable(),
   likeCount: z.number().int().nonnegative(),
+  /** Present when the viewer is authenticated or the route computes it. */
+  viewerHasLiked: z.boolean().optional(),
   public: z.boolean(),
   /** Optional embedded creator summaries (when the API joins them in). */
   creator: accountSummaryDto.optional(),
@@ -234,6 +273,9 @@ export const triggerDto = z.object({
   prompt: z.string().nullable(),
   schedule: cronScheduleDto.nullable(),
   status: z.string().nullable(),
+  lastRunTime: isoDateTimeSchema.nullable(),
+  nextScheduledRun: isoDateTimeSchema.nullable(),
+  lastError: z.string().nullable(),
   createdAt: isoDateTimeSchema,
   updatedAt: isoDateTimeSchema,
 });

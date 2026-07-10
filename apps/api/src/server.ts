@@ -15,18 +15,29 @@ import { ZodError } from 'zod';
 import { registerAuth, type AuthPluginOptions } from './auth-plugin';
 import { ApiError, errorEnvelope } from './errors';
 import { EventsBus, sessionEventsRoutes } from './events-bus';
-import { GatewayGlue, type GatewayGlueOptions } from './gateway-glue';
+import { GatewayGlue, defaultOpenclawDataDir, type GatewayGlueOptions } from './gateway-glue';
+import { TurnConcurrencyLimiter } from './services/chat-limits';
+import { ensureBuiltinSkills } from './services/agent-skills';
+import { ensureDefaultEdenAssistant } from './services/default-assistant';
+import { registerHttpHardening } from './services/http-hardening';
 import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './services/history-sync';
+import { MediaPipeline } from './services/media-pipeline';
 import { TurnRegistry } from './services/turn-registry';
 import type { CompatClientLike } from './services/turns';
+import { createAttachmentSightingHandler, MediaWatcher } from './workers/media-watcher';
 import { agentsRoutes } from './routes/agents';
+import { authRoutes } from './routes/auth';
+import { billingRoutes, type BillingRoutesOptions } from './routes/billing';
 import { chatRoutes } from './routes/chat';
+import { channelsRoutes, type ChannelsRoutesOptions } from './routes/channels';
 import { collectionsRoutes } from './routes/collections';
 import { creationsRoutes } from './routes/creations';
 import { devRoutes } from './routes/dev';
 import { feedRoutes } from './routes/feed';
 import { mannaRoutes } from './routes/manna';
+import { operatorRoutes } from './routes/operator';
 import { sessionsRoutes } from './routes/sessions';
+import { skillsRoutes } from './routes/skills';
 import { studioRoutes } from './routes/studio';
 import { triggersRoutes } from './routes/triggers';
 
@@ -55,6 +66,16 @@ export interface BuildServerOptions {
    * `app.historySync?.setAttachmentCallback`.
    */
   onAttachment?: AttachmentCallback;
+  media?: {
+    /**
+     * Start the shared media watcher during server boot. Entrypoints should
+     * enable this; unit tests usually leave it false and let Studio start the
+     * watcher only when a generation is requested.
+     */
+    autoStartWatcher?: boolean;
+  };
+  billing?: BillingRoutesOptions;
+  channels?: ChannelsRoutesOptions;
 }
 
 declare module 'fastify' {
@@ -65,6 +86,8 @@ declare module 'fastify' {
     historySync: HistorySync | null;
     /** Streaming chat client (null when the gateway is not configured). */
     gatewayCompat: CompatClientLike | null;
+    /** Per-process in-flight chat turn limiter. */
+    turnLimiter: TurnConcurrencyLimiter;
   }
 }
 
@@ -78,15 +101,38 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
 
   const app = Fastify({
     logger: opts.logger ?? false,
-    disableRequestLogging: true, // replaced by the compact one-liner below
+    bodyLimit: env.API_BODY_LIMIT_BYTES,
+    disableRequestLogging: true, // replaced by structured redacted logging below
     forceCloseConnections: true, // don't let open SSE sockets block close()
   });
 
-  // Compact request logging: one line per response.
+  app.addHook('onRequest', async (req, reply) => {
+    reply.header('x-request-id', req.id);
+  });
+
+  // Structured request logging. Deliberately no headers/body/cookies/auth.
   if (opts.logger) {
     app.addHook('onResponse', async (req, reply) => {
+      const requestSessionId = Array.isArray(req.headers['x-session-id'])
+        ? req.headers['x-session-id'][0]
+        : req.headers['x-session-id'];
+      const responseSessionId = reply.getHeader('x-session-id');
+      const sessionId =
+        typeof responseSessionId === 'string'
+          ? responseSessionId
+          : typeof requestSessionId === 'string'
+            ? requestSessionId
+            : undefined;
       req.log.info(
-        `${req.method} ${req.url} -> ${reply.statusCode} ${reply.elapsedTime.toFixed(1)}ms`,
+        {
+          requestId: req.id,
+          method: req.method,
+          url: req.url,
+          statusCode: reply.statusCode,
+          elapsedMs: Number(reply.elapsedTime.toFixed(1)),
+          ...(sessionId ? { sessionId } : {}),
+        },
+        'request completed',
       );
     });
   }
@@ -104,6 +150,13 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       message = err.issues
         .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
         .join('; ');
+    } else if (
+      err.code === 'FST_ERR_CTP_BODY_TOO_LARGE' ||
+      (typeof err.statusCode === 'number' && err.statusCode === 413)
+    ) {
+      statusCode = 413;
+      code = 'payload_too_large';
+      message = `Request body exceeds ${env.API_BODY_LIMIT_BYTES} bytes`;
     } else {
       statusCode =
         typeof err.statusCode === 'number' && err.statusCode >= 400 ? err.statusCode : 500;
@@ -118,6 +171,10 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     void reply
       .code(404)
       .send(errorEnvelope(404, 'not_found', `Route ${req.method} ${req.url} not found`));
+  });
+
+  registerHttpHardening(app, {
+    rateLimit: { windowMs: env.API_RATE_LIMIT_WINDOW_MS, max: env.API_RATE_LIMIT_MAX },
   });
 
   await app.register(fastifyCors, {
@@ -172,29 +229,81 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       })
     : null;
   app.decorate('turnRegistry', new TurnRegistry());
+  app.decorate('turnLimiter', new TurnConcurrencyLimiter());
   app.decorate('historySync', historySync);
   app.decorate('gatewayCompat', gatewayClients?.compat ?? null);
   app.addHook('onClose', async () => {
     historySync?.stop();
   });
 
+  // One process-wide media pipeline/watcher shared by chat and Studio.
+  //
+  // Chat media needs the watcher wired to `turnRegistry` and history-sync
+  // attachment sightings; Studio needs the same watcher for claimNext(). A
+  // route-local Studio watcher would see files, but would not know which chat
+  // session was recently active, so async in-chat images would park.
+  const mediaPipeline = new MediaPipeline({ bus: app.eventsBus, logger: app.log });
+  const mediaWatcher = new MediaWatcher({
+    pipeline: mediaPipeline,
+    logger: app.log,
+    turnRegistry: app.turnRegistry,
+  });
+  if (historySync) {
+    historySync.setAttachmentCallback(
+      opts.onAttachment ??
+        createAttachmentSightingHandler({
+          pipeline: mediaPipeline,
+          watcher: mediaWatcher,
+          logger: app.log,
+        }),
+    );
+  }
+  app.addHook('onClose', async () => {
+    await mediaWatcher.stop();
+  });
+  if (opts.media?.autoStartWatcher === true) {
+    await mediaWatcher.start();
+  }
+
   // Provisioning seam (agent create/persona edit, trigger cron-sync) — lazy
   // real clients by default, fakes injectable via opts.provisioning.
   app.decorate('gatewayGlue', new GatewayGlue(opts.provisioning));
+  await ensureBuiltinSkills();
+  await ensureDefaultEdenAssistant({
+    // The real API entrypoint starts the media watcher and talks to the live
+    // gateway. In that mode @eden must also sync OpenClaw's default workspace;
+    // route tests can still bootstrap the DB row without touching live gateway
+    // state.
+    syncWorkspace: opts.media?.autoStartWatcher === true && gatewayClients !== null,
+    dataDir: defaultOpenclawDataDir(),
+  });
 
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
   await app.register(chatRoutes, { prefix: '/sessions' }); // POST /sessions/:idOrNew/messages
+  await app.register(authRoutes, { prefix: '/auth' });
   await app.register(sessionsRoutes, { prefix: '/sessions' });
   await app.register(agentsRoutes, { prefix: '/agents' });
+  await app.register(skillsRoutes);
   await app.register(creationsRoutes, { prefix: '/creations' });
   await app.register(feedRoutes, { prefix: '/feed' });
   // No prefix: collections spans /collections/* AND /users/:username/collections.
   await app.register(collectionsRoutes);
+  await app.register(billingRoutes, { prefix: '/billing', ...(opts.billing ?? {}) });
+  await app.register(channelsRoutes, { prefix: '/channels', ...(opts.channels ?? {}) });
   await app.register(mannaRoutes, { prefix: '/manna' });
+  await app.register(operatorRoutes, { prefix: '/operator' });
   // Trigger routes live at /tasks on the wire (web contract).
   await app.register(triggersRoutes, { prefix: '/tasks' });
-  await app.register(studioRoutes, { prefix: '/studio' });
-  await app.register(devRoutes, { prefix: '/dev' });
+  await app.register(studioRoutes, {
+    prefix: '/studio',
+    deps: { pipeline: mediaPipeline, watcher: mediaWatcher },
+  });
+  // Impersonation routes mount only for dev auth or an explicit env opt-in —
+  // a deployed API (clerk/hybrid without EDEN3_DEV_ROUTES) 404s the whole
+  // /dev prefix (see routes/dev.ts).
+  if (env.AUTH_PROVIDER === 'dev' || env.EDEN3_DEV_ROUTES) {
+    await app.register(devRoutes, { prefix: '/dev' });
+  }
 
   return app;
 }

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { DEV_USER_COOKIE } from '@eden3/core';
+import { DEV_USER_COOKIE, resetEnvCache } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -8,6 +8,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildServer } from '../src/server';
 
 loadRootEnv();
+// These tests exercise the env-gated /dev routes — opt in explicitly (the
+// ambient .env may run AUTH_PROVIDER=hybrid, which gates them off).
+process.env.EDEN3_DEV_ROUTES = '1';
+resetEnvCache();
 
 /**
  * Integration tests against live Postgres (localhost:5433). The accounts

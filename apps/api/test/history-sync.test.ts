@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   HistorySync,
   PRIMER_HEADER,
+  SAME_TURN_DEDUPE_WINDOW_MS,
   extractAttachmentPaths,
   gatewayExternalId,
   historyMessageDate,
@@ -167,6 +168,59 @@ describe('planHistorySync', () => {
     ]);
     expect(plan.backfills).toEqual([{ messageId: 'row-1', externalId: 'gw:id1' }]);
     expect(plan.inserts.map((i) => i.externalId)).toEqual(['gw:id2']);
+  });
+
+  it('does not re-insert a message the gateway re-surfaced under a second id (two-ids guard)', () => {
+    // Observed 2026-07-07 (eden3_stg, agent stg-martian): the gateway emitted
+    // the SAME assistant narration under TWO __openclaw ids on separate
+    // trailing-sync passes — a full uuid and an 8-hex, created_at 41ms apart.
+    // The first id already owns the row; the second is a fresh id-miss with no
+    // backfillable row left, so the old code INSERTED a duplicate.
+    const base = 1_783_083_522_595;
+    const content = 'Creating a vivid landscape of Mars, its rust-red deserts…';
+    const rows: ExistingMessageLike[] = [
+      {
+        id: 'row-narration',
+        externalId: 'gw:ccba9900-8f75-4ec9-a56f-0c0f8ed07e7f', // first id, backfilled on a prior pass
+        role: 'assistant',
+        content,
+        createdAt: new Date(base),
+      },
+    ];
+    const plan = planHistorySync(rows, [
+      // First id — already stored → skipped as a known external id.
+      gwMessage('assistant', content, 'ccba9900-8f75-4ec9-a56f-0c0f8ed07e7f'),
+      // Second id for the SAME logical message, 41ms later → the duplicate.
+      gwMessage('assistant', content, '3c174e57', { timestamp: base + 41 }),
+    ]);
+    expect(plan.backfills).toEqual([]);
+    expect(plan.inserts).toEqual([]); // NO duplicate row
+    expect(plan.skipped).toBe(2); // known first id + deduped second id
+  });
+
+  it('still inserts identical content emitted in a LATER turn (time-window guard)', () => {
+    // The time guard must NOT swallow a genuine repeat: same words, different
+    // turn. Without it, an agent that legitimately says the same thing again
+    // would silently lose the later message.
+    const base = 1_783_083_522_595;
+    const content = 'Creating a vivid landscape of Mars, its rust-red deserts…';
+    const rows: ExistingMessageLike[] = [
+      {
+        id: 'row-earlier-turn',
+        externalId: 'gw:earlier01',
+        role: 'assistant',
+        content,
+        createdAt: new Date(base),
+      },
+    ];
+    const plan = planHistorySync(rows, [
+      // Same content, comfortably beyond the same-turn window → a real repeat.
+      gwMessage('assistant', content, 'later0001', {
+        timestamp: base + SAME_TURN_DEDUPE_WINDOW_MS + 60_000,
+      }),
+    ]);
+    expect(plan.backfills).toEqual([]);
+    expect(plan.inserts.map((i) => i.externalId)).toEqual(['gw:later0001']);
   });
 
   it('backfills two identical-content rows oldest-first (id ordering, W2 #6)', () => {

@@ -14,6 +14,7 @@ import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "@/lib/api";
+import type { AgentExportBundle } from "@/lib/types";
 import {
   apiErrorDetail,
   availabilityFromProbe,
@@ -31,6 +32,14 @@ import {
   TextAreaField,
   TextField,
 } from "@/components/agents/form-fields";
+import {
+  MODEL_TIER_OPTIONS,
+  THINKING_LEVEL_OPTIONS,
+  TOOL_GROUP_OPTIONS,
+  normalizeAgentModel,
+  normalizeThinkingLevel,
+  normalizeToolGroups,
+} from "@/components/agents/runtime-config";
 
 interface UsernameState {
   availability: UsernameAvailability;
@@ -41,6 +50,39 @@ interface UsernameState {
 }
 
 const IDLE: UsernameState = { availability: "idle", error: null, checked: "" };
+
+export const AGENT_TEMPLATES = [
+  {
+    id: "studio-companion",
+    label: "Studio companion",
+    username: "studio-companion",
+    name: "Studio Companion",
+    description: "A practical creative partner for image, video, and sound work.",
+    greeting: "What are we making today?",
+    persona:
+      "You are Studio Companion, a concise creative collaborator. Ask only the clarifying questions that improve the result, then help the user make images, videos, audio, and remix plans with clear taste and practical constraints.",
+  },
+  {
+    id: "research-scout",
+    label: "Research scout",
+    username: "research-scout",
+    name: "Research Scout",
+    description: "A careful researcher that turns messy questions into sourced briefs.",
+    greeting: "Send me the question and the bar for evidence.",
+    persona:
+      "You are Research Scout, a rigorous research assistant. Separate facts from inference, cite primary sources when possible, keep uncertainty visible, and produce short briefs that can be acted on.",
+  },
+  {
+    id: "daily-practice",
+    label: "Daily practice",
+    username: "daily-practice",
+    name: "Daily Practice",
+    description: "A scheduled creative ritual agent for recurring prompts and posts.",
+    greeting: "Let's define the practice.",
+    persona:
+      "You are Daily Practice, a steady creative partner. Help the user design repeatable daily prompts, keep outputs varied, and turn small constraints into a durable body of work.",
+  },
+] as const;
 
 function UsernameNote({ state }: { state: UsernameState }) {
   if (state.error) return <p className="text-red-400">{state.error}</p>;
@@ -68,7 +110,13 @@ export function AgentCreateForm() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [greeting, setGreeting] = useState("");
+  const [voice, setVoice] = useState("");
   const [persona, setPersona] = useState("");
+  const [model, setModel] = useState(normalizeAgentModel(null));
+  const [thinkingLevel, setThinkingLevel] = useState(normalizeThinkingLevel(null));
+  const [toolGroups, setToolGroups] = useState<string[]>(normalizeToolGroups(null));
+  const [importBundle, setImportBundle] = useState<AgentExportBundle | null>(null);
+  const [importName, setImportName] = useState<string | null>(null);
   const [usernameState, setUsernameState] = useState<UsernameState>(IDLE);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -101,6 +149,70 @@ export function AgentCreateForm() {
     });
   };
 
+  const applyTemplate = (template: (typeof AGENT_TEMPLATES)[number]) => {
+    setImportBundle(null);
+    setImportName(null);
+    if (!username.trim()) setUsername(template.username);
+    if (!name.trim()) setName(template.name);
+    if (!description.trim()) setDescription(template.description);
+    if (!greeting.trim()) setGreeting(template.greeting);
+    if (!voice.trim()) setVoice("");
+    if (!persona.trim()) setPersona(template.persona);
+    setModel(normalizeAgentModel(null));
+    setThinkingLevel(normalizeThinkingLevel(null));
+    setToolGroups(normalizeToolGroups(null));
+    setUsernameState(IDLE);
+  };
+
+  const loadBundle = async (file: File | null) => {
+    if (!file) return;
+    setFormError(null);
+    try {
+      const parsed = JSON.parse(await file.text()) as unknown;
+      const candidate =
+        parsed && typeof parsed === "object" && "bundle" in parsed
+          ? (parsed as { bundle: unknown }).bundle
+          : parsed;
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        (candidate as { kind?: unknown }).kind !== "eden3.agent.bundle" ||
+        (candidate as { version?: unknown }).version !== 1 ||
+        !((candidate as { agent?: unknown }).agent instanceof Object)
+      ) {
+        throw new Error("Invalid Eden3 agent bundle.");
+      }
+      const bundle = candidate as AgentExportBundle;
+      const sourceUsername =
+        typeof bundle.agent.username === "string" ? bundle.agent.username : "";
+      const base =
+        normalizeUsername(sourceUsername || bundle.agent.name || "agent")
+          .slice(0, 24)
+          .replace(/[-_]+$/, "") || "agent";
+      setImportBundle(bundle);
+      setImportName(file.name);
+      setUsername(`${base}-copy`.slice(0, 32));
+      setName(bundle.agent.name ?? "");
+      setDescription(bundle.agent.description ?? "");
+      setGreeting(bundle.agent.greeting ?? "");
+      setVoice(bundle.agent.voice ?? "");
+      setPersona(bundle.agent.persona ?? "");
+      setModel(normalizeAgentModel(bundle.agent.model));
+      setThinkingLevel(normalizeThinkingLevel(bundle.agent.thinkingLevel));
+      setToolGroups(normalizeToolGroups(bundle.agent.toolGroups));
+      setUsernameState(IDLE);
+    } catch (error) {
+      setImportBundle(null);
+      setImportName(null);
+      setFormError(error instanceof Error ? error.message : "Invalid bundle.");
+    }
+  };
+
+  const clearBundle = () => {
+    setImportBundle(null);
+    setImportName(null);
+  };
+
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
     if (submitting) return;
@@ -125,13 +237,39 @@ export function AgentCreateForm() {
 
     setSubmitting(true);
     try {
-      const agent = await api.agents.create({
-        username: candidate,
-        name: name.trim(),
-        description: description.trim(),
-        persona: persona.trim(),
-        greeting: greeting.trim(),
-      });
+      const agent = importBundle
+        ? (
+            await api.agents.importBundle({
+              username: candidate,
+              name: name.trim(),
+              bundle: {
+                ...importBundle,
+                agent: {
+                  ...importBundle.agent,
+                  username: candidate,
+                  name: name.trim(),
+                  description: description.trim(),
+                  persona: persona.trim(),
+                  greeting: greeting.trim(),
+                  voice: voice.trim(),
+                  model,
+                  thinkingLevel,
+                  toolGroups,
+                },
+              },
+            })
+          ).agent
+        : await api.agents.create({
+            username: candidate,
+            name: name.trim(),
+            description: description.trim(),
+            persona: persona.trim(),
+            greeting: greeting.trim(),
+            voice: voice.trim(),
+            model,
+            thinkingLevel,
+            toolGroups,
+          });
       router.push(agentHref(agent.username ?? candidate));
     } catch (error) {
       setFormError(apiErrorDetail(error));
@@ -144,6 +282,15 @@ export function AgentCreateForm() {
     (usernameState.availability === "taken" &&
       usernameState.checked === normalizeUsername(username)) ||
     Boolean(usernameState.error && usernameState.checked === normalizeUsername(username));
+
+  const setToolGroup = (value: string, enabled: boolean) => {
+    setToolGroups((prev) => {
+      const next = new Set(prev);
+      if (enabled) next.add(value);
+      else next.delete(value);
+      return TOOL_GROUP_OPTIONS.map((option) => option.value).filter((v) => next.has(v));
+    });
+  };
 
   return (
     <div className="mx-auto w-full max-w-2xl px-6 py-10 md:px-10">
@@ -161,6 +308,59 @@ export function AgentCreateForm() {
         provisioned. Persona edits later are hot — they apply to the next
         message.
       </p>
+
+      <div className="mt-8 grid gap-3 sm:grid-cols-3">
+        {AGENT_TEMPLATES.map((template) => (
+          <button
+            key={template.id}
+            type="button"
+            onClick={() => applyTemplate(template)}
+            className="rounded-xl border border-edge bg-surface p-4 text-left transition-colors hover:border-accent/50 hover:bg-accent/[0.04]"
+          >
+            <span className="block text-sm font-medium text-foreground">
+              {template.label}
+            </span>
+            <span className="mt-1.5 line-clamp-2 block text-xs leading-relaxed text-muted">
+              {template.description}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-5 rounded-xl border border-edge bg-surface p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">
+              Import bundle
+            </p>
+            {importBundle ? (
+              <p className="mt-1 text-sm text-muted">
+                {importName ?? "Loaded bundle"} · {importBundle.skills.length} skills ·{" "}
+                {importBundle.memory.items.length} memory items
+              </p>
+            ) : null}
+          </div>
+          {importBundle ? (
+            <button
+              type="button"
+              onClick={clearBundle}
+              className={quietButtonClass}
+            >
+              Clear
+            </button>
+          ) : (
+            <label className={quietButtonClass}>
+              Load JSON
+              <input
+                type="file"
+                accept="application/json,.json"
+                className="sr-only"
+                onChange={(event) => void loadBundle(event.target.files?.[0] ?? null)}
+              />
+            </label>
+          )}
+        </div>
+      </div>
 
       <form
         onSubmit={(e) => void onSubmit(e)}
@@ -234,6 +434,18 @@ export function AgentCreateForm() {
           disabled={submitting}
         />
 
+        <TextField
+          id="agent-voice"
+          label="Voice"
+          value={voice}
+          onChange={setVoice}
+          optional
+          placeholder="warm, spare, image-minded"
+          hint="Tone note or external voice id."
+          disabled={submitting}
+          maxLength={200}
+        />
+
         <TextAreaField
           id="agent-persona"
           label="Persona"
@@ -248,6 +460,92 @@ export function AgentCreateForm() {
           hint="The system prompt. Private by default; you can refine it any time."
           disabled={submitting}
         />
+
+        <details className="rounded-lg border border-edge bg-raised/40 p-4">
+          <summary className="cursor-pointer text-sm text-foreground">
+            Advanced runtime
+          </summary>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            <FieldShell
+              id="agent-model"
+              label="Model tier"
+              hint="Controls the OpenClaw model registered for this agent."
+            >
+              <select
+                id="agent-model"
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                disabled={submitting}
+                className={inputClass}
+              >
+                {MODEL_TIER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label} · {option.detail}
+                  </option>
+                ))}
+              </select>
+            </FieldShell>
+
+            <FieldShell
+              id="agent-thinking"
+              label="Thinking level"
+              hint="Stored with the agent and usage records."
+            >
+              <select
+                id="agent-thinking"
+                value={thinkingLevel}
+                onChange={(event) => setThinkingLevel(event.target.value)}
+                disabled={submitting}
+                className={inputClass}
+              >
+                {THINKING_LEVEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </FieldShell>
+
+            <FieldShell
+              id="agent-skills"
+              label="Skills"
+              hint="Default skills attach on create; curated and approved user skills attach from the profile skills tab."
+            >
+              <Link href="/skills" className={quietButtonClass}>
+                Browse skills
+              </Link>
+            </FieldShell>
+          </div>
+
+          <FieldShell
+            id="agent-tool-groups"
+            label="Tool groups"
+            hint="Per-agent OpenClaw allowlist. Sandbox and elevated controls stay enforced globally."
+          >
+            <div className="grid gap-2 sm:grid-cols-2">
+              {TOOL_GROUP_OPTIONS.map((option) => (
+                <label
+                  key={option.value}
+                  className="flex min-h-12 items-start gap-3 rounded-md border border-edge bg-surface/50 px-3 py-2"
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-1 h-4 w-4 accent-accent"
+                    checked={toolGroups.includes(option.value)}
+                    disabled={submitting}
+                    onChange={(event) => setToolGroup(option.value, event.target.checked)}
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm text-foreground">{option.label}</span>
+                    <span className="block break-words font-mono text-[11px] text-faint">
+                      {option.value} · {option.detail}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </FieldShell>
+        </details>
 
         {formError ? (
           <p className="rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">

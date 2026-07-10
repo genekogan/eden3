@@ -5,7 +5,7 @@
  * so everything here is defensive: category, label, latency hints and the
  * optional duration field are derived from whatever fields exist on the
  * StudioTool, and FALLBACK_TOOLS keeps the surface navigable when the
- * registry 501s (canonical OpenClaw tool names + PLAN.md pricing).
+ * registry 501s (canonical OpenClaw tool names + launch metered pricing).
  *
  * Relative imports (not "@/…") so vitest can load this without alias config.
  */
@@ -82,7 +82,7 @@ export function toolLabel(tool: StudioTool): string {
 }
 
 // ---------------------------------------------------------------------------
-// Fallback catalog (registry down/501) — canonical names, PLAN.md pricing
+// Fallback catalog (registry down/501) — canonical names, launch metered pricing
 // ---------------------------------------------------------------------------
 
 export const FALLBACK_TOOLS: StudioTool[] = [
@@ -90,28 +90,32 @@ export const FALLBACK_TOOLS: StudioTool[] = [
     name: "image_generate",
     description: "Generate an image from a text prompt.",
     outputType: "image",
-    costManna: 5,
+    costManna: 181,
     parameters: null,
   },
   {
     name: "video_generate",
     description: "Generate a short video clip.",
     outputType: "video",
-    costManna: 25,
-    parameters: null,
+    costManna: 608,
+    parameters: {
+      properties: { duration: { type: "number", minimum: 2, maximum: 10, default: 5 } },
+    },
   },
   {
     name: "music_generate",
     description: "Compose a piece of music from a description.",
     outputType: "audio",
-    costManna: 10,
-    parameters: null,
+    costManna: 54,
+    parameters: {
+      properties: { duration: { type: "number", minimum: 5, maximum: 120, default: 30 } },
+    },
   },
   {
     name: "tts",
     description: "Speak text aloud in an expressive voice.",
     outputType: "audio",
-    costManna: 2,
+    costManna: 28,
     parameters: null,
   },
 ];

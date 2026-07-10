@@ -7,7 +7,9 @@ import { sendError } from '../errors';
 
 /**
  * Dev-only routes (real, not stubs): account picker + impersonation for the
- * DevAuthProvider cookie flow. Never mount in a real deployment.
+ * DevAuthProvider cookie flow. Never mount in a real deployment — server.ts
+ * registers this plugin only when AUTH_PROVIDER=dev or EDEN3_DEV_ROUTES=1
+ * (the local dev stack sets the flag; deployments must not).
  */
 
 const usersQuerySchema = z.object({

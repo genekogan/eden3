@@ -1,16 +1,24 @@
 import {
+  getEnv,
   resolveAccountByUsername,
   resolveAgentByUsername,
   type AuthSession,
 } from '@eden3/core';
 import { accounts, agents, db, pg, type Account, type Agent } from '@eden3/db';
-import { feedQuerySchema } from '@eden3/shared';
+import {
+  DEFAULT_AGENT_MODEL,
+  DEFAULT_AGENT_THINKING_LEVEL,
+  DEFAULT_AGENT_TOOL_GROUPS,
+  agentModelSchema,
+  agentThinkingLevelSchema,
+  agentToolGroupsSchema,
+  feedQuerySchema,
+} from '@eden3/shared';
 import { eq } from 'drizzle-orm';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
 import { ApiError, sendError } from '../errors';
-import { DEFAULT_AGENT_MODEL } from '../gateway-glue';
 import {
   agentDtoFromEntities,
   agentDtoFromRow,
@@ -22,6 +30,18 @@ import {
   type AgentRow,
   type CreationRow,
 } from '../route-helpers';
+import {
+  DEFAULT_AGENT_SKILL_SLUGS,
+  exportedSkillBundlesForAgent,
+  installDefaultAgentSkills,
+  replaceAgentSkills,
+} from '../services/agent-skills';
+import {
+  agentMemorySnapshot,
+  agentMemoryStatus,
+  enqueueLazyMemoryDistillation,
+  saveAgentMemory,
+} from '../services/memory-distillation';
 
 /**
  * Agents API.
@@ -56,7 +76,9 @@ const agentUsernameSchema = z
     /^[a-z0-9][a-z0-9_-]{2,31}$/,
     'username must be 3-32 chars: lowercase letters, digits, "-", "_" (must start alphanumeric)',
   )
-  .refine((u) => u !== 'main', { message: 'username "main" is reserved' });
+  .refine((u) => !['main', 'new', 'builder', 'edit', 'api', 'media'].includes(u), {
+    message: 'username is reserved',
+  });
 
 const createBodySchema = z.object({
   username: agentUsernameSchema,
@@ -64,6 +86,10 @@ const createBodySchema = z.object({
   description: z.string().max(2_000).default(''),
   persona: z.string().max(20_000).default(''),
   greeting: z.string().max(1_000).default(''),
+  voice: z.string().max(200).default(''),
+  model: agentModelSchema.default(DEFAULT_AGENT_MODEL),
+  thinkingLevel: agentThinkingLevelSchema.default(DEFAULT_AGENT_THINKING_LEVEL),
+  toolGroups: agentToolGroupsSchema.default(DEFAULT_AGENT_TOOL_GROUPS),
 });
 
 const patchBodySchema = z
@@ -72,20 +98,77 @@ const patchBodySchema = z
     description: z.string().max(2_000).optional(),
     persona: z.string().max(20_000).optional(),
     greeting: z.string().max(1_000).optional(),
+    voice: z.string().max(200).optional(),
+    model: agentModelSchema.optional(),
+    thinkingLevel: agentThinkingLevelSchema.optional(),
+    toolGroups: agentToolGroupsSchema.optional(),
   })
   .strict()
   .refine((body) => Object.keys(body).length > 0, { message: 'no fields to update' });
+
+const memoryBodySchema = z.object({
+  memory: z.string().trim().min(1).max(100_000),
+});
+
+const skillBundleSchema = z
+  .object({
+    id: z.string().trim().min(1).max(200).optional(),
+    slug: z.string().trim().min(1).max(200).optional(),
+    enabled: z.boolean().default(true),
+  })
+  .passthrough()
+  .refine((skill) => skill.id !== undefined || skill.slug !== undefined, {
+    message: 'skill bundle entries need id or slug',
+  });
+
+const agentExportBundleSchema = z
+  .object({
+    kind: z.literal('eden3.agent.bundle'),
+    version: z.literal(1),
+    agent: z.object({
+      username: z.string().trim().min(1).max(200).optional(),
+      name: z.string().trim().min(1).max(120),
+      description: z.string().max(2_000).nullable().optional(),
+      persona: z.string().max(20_000).nullable().optional(),
+      greeting: z.string().max(1_000).nullable().optional(),
+      voice: z.string().max(200).nullable().optional(),
+      public: z.boolean().optional(),
+      model: agentModelSchema.optional(),
+      thinkingLevel: agentThinkingLevelSchema.optional(),
+      toolGroups: agentToolGroupsSchema.optional(),
+    }),
+    memory: z
+      .object({
+        summary: z.string().max(20_000).nullable().optional(),
+        items: z.array(z.unknown()).default([]),
+      })
+      .default({ items: [] }),
+    skills: z.array(skillBundleSchema).default([]),
+  })
+  .passthrough();
+
+const importBodySchema = z.object({
+  username: agentUsernameSchema.optional(),
+  name: z.string().trim().min(1).max(120).optional(),
+  bundle: agentExportBundleSchema,
+});
 
 /** Fresh fragment per query (postgres.js fragments are single-use-safe). */
 const agentRowColumns = () => pg`
   a.id, a.external_id, a.username, a.user_image, a.created_at, a.updated_at,
   g.name, g.description, g.persona, g.is_persona_public, g.greeting, g.voice,
-  g.public, g.owner_id, g.is_pilot, g.is_synthetic, g.provision_status
+  g.model, g.thinking_level, g.tool_groups, g.public, g.owner_id, g.is_pilot,
+  g.is_synthetic, g.provision_status
 `;
 
 interface DirectoryRow extends AgentRow {
   creation_count: number;
   session_count: number;
+}
+
+interface AgentInteractionRow {
+  like_count: number;
+  viewer_has_liked: boolean;
 }
 
 function canManage(viewer: AuthSession | null, account: Account, agent: Agent): boolean {
@@ -94,12 +177,121 @@ function canManage(viewer: AuthSession | null, account: Account, agent: Agent): 
   return viewer.accountId === agent.ownerId || viewer.accountId === account.id;
 }
 
+async function agentInteraction(
+  agentId: string,
+  viewer: AuthSession | null,
+): Promise<AgentInteractionRow> {
+  const [row] = await pg<AgentInteractionRow[]>`
+    select
+      (select count(*)::int from agent_likes where agent_id = ${agentId}) as like_count,
+      ${
+        viewer !== null
+          ? pg`exists(
+              select 1 from agent_likes
+              where agent_id = ${agentId} and user_id = ${viewer.accountId}
+            )`
+          : pg`false`
+      } as viewer_has_liked
+  `;
+  return row ?? { like_count: 0, viewer_has_liked: false };
+}
+
+function bundleFilename(username: string): string {
+  return `${username}-eden3-agent.json`.replace(/[^a-zA-Z0-9._-]/g, '-');
+}
+
+async function agentExportBundle(account: Account, agent: Agent) {
+  return {
+    kind: 'eden3.agent.bundle',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    source: {
+      platform: 'eden3',
+      accountId: account.id,
+      externalId: account.externalId,
+      username: account.username,
+    },
+    agent: {
+      username: account.username,
+      name: agent.name ?? account.username,
+      description: agent.description ?? '',
+      persona: agent.persona ?? '',
+      greeting: agent.greeting ?? '',
+      voice: agent.voice,
+      public: agent.public,
+      model: agent.model ?? DEFAULT_AGENT_MODEL,
+      thinkingLevel: agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
+      toolGroups: agentToolGroupsSchema.parse(agent.toolGroups ?? DEFAULT_AGENT_TOOL_GROUPS),
+    },
+    memory: {
+      summary: null,
+      items: [],
+    },
+    skills: await exportedSkillBundlesForAgent(account.id),
+    workspaceFiles: {
+      SOUL: agent.persona ?? '',
+      IDENTITY: {
+        name: agent.name ?? account.username,
+        username: account.username,
+        description: agent.description ?? '',
+        greeting: agent.greeting ?? '',
+      },
+    },
+  };
+}
+
+function importSkillSlugs(bundle: z.infer<typeof agentExportBundleSchema>): string[] {
+  const slugs = bundle.skills
+    .filter((skill) => skill.enabled)
+    .map((skill) => skill.slug ?? skill.id)
+    .filter((slug): slug is string => typeof slug === 'string' && slug.trim() !== '');
+  return [...new Set([...DEFAULT_AGENT_SKILL_SLUGS, ...slugs])];
+}
+
+function suggestedImportUsername(raw: string | undefined): string {
+  const base = (raw ?? 'agent')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^[^a-z0-9]+/, '')
+    .replace(/[^a-z0-9]+$/, '')
+    .slice(0, 21);
+  const safe = base.length >= 3 ? base : 'agent';
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return agentUsernameSchema.parse(`${safe}-${suffix}`.slice(0, 32));
+}
+
+async function nativeAgentQuotaError(viewer: AuthSession): Promise<{
+  statusCode: 429;
+  code: 'agent_quota_exceeded';
+  message: string;
+} | null> {
+  const nativeAgentLimit = getEnv().MAX_NATIVE_AGENTS_PER_USER;
+  if (viewer.isAdmin) return null;
+  const [quota] = await pg<{ count: number }[]>`
+    select count(*)::int as count
+    from agents g
+    join accounts a on a.id = g.account_id
+    where g.owner_id = ${viewer.accountId}
+      and a.external_id is null
+      and a.deleted = false`;
+  if ((quota?.count ?? 0) >= nativeAgentLimit) {
+    return {
+      statusCode: 429,
+      code: 'agent_quota_exceeded',
+      message: `Agent creation limit reached (${nativeAgentLimit} native agents)`,
+    };
+  }
+  return null;
+}
+
 export const agentsRoutes: FastifyPluginAsync = async (app) => {
   // ---- GET /agents — public directory ------------------------------------
   app.get('/', async (req) => {
     const { q, cursor, limit } = directoryQuerySchema.parse(req.query);
     const after = parseCursorParam(cursor);
     const pattern = q !== undefined && q !== '' ? `%${escapeLike(q)}%` : null;
+    const viewerId = req.account?.accountId ?? null;
 
     // `nulls last` matches the index direction (created_at is NOT NULL, so
     // semantics are unchanged — but the planner needs the exact sort order).
@@ -108,7 +300,17 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
              (select count(*)::int from creations c
                where c.agent_id = a.id and c.public = true and c.deleted = false) as creation_count,
              (select count(*)::int from session_agents sa
-               where sa.agent_account_id = a.id) as session_count
+               where sa.agent_account_id = a.id) as session_count,
+             (select count(*)::int from agent_likes al
+               where al.agent_id = a.id) as like_count,
+             ${
+               viewerId !== null
+                 ? pg`exists(
+                     select 1 from agent_likes al
+                     where al.agent_id = a.id and al.user_id = ${viewerId}
+                   )`
+                 : pg`false`
+             } as viewer_has_liked
       from accounts a
       join agents g on g.account_id = a.id
       where a.deleted = false
@@ -144,6 +346,28 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
     if (!agent.public && !manager) {
       return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
     }
+    const interaction = await agentInteraction(account.id, req.account);
+    const memory = manager ? await agentMemoryStatus(agent.openclawId, agent.workspacePath) : null;
+    if (
+      manager &&
+      agent.openclawId !== null &&
+      agent.workspacePath !== null &&
+      agent.provisionStatus === 'ready' &&
+      memory?.status !== 'done' &&
+      memory?.status !== 'running'
+    ) {
+      enqueueLazyMemoryDistillation(
+        {
+          agentAccountId: account.id,
+          openclawId: agent.openclawId,
+          username: account.username,
+          name: agent.name,
+          persona: agent.persona,
+          workspacePath: agent.workspacePath,
+        },
+        (err) => req.log.warn({ err }, `memory distillation failed for "${account.username}"`),
+      );
+    }
 
     const creationRows = await pg<CreationRow[]>`
       select c.id, c.external_id, c.user_id, c.agent_id, c.tool, c.filename,
@@ -151,6 +375,15 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
              c.created_at, c.updated_at
       from creations c
       where c.agent_id = ${account.id} and c.public = true and c.deleted = false
+        ${
+          manager
+            ? pg``
+            : pg`and (
+                c.attributes->>'nsfw_score' is null
+                or (c.attributes->>'nsfw_score') !~ '^[0-9]+(\\.[0-9]+)?$'
+                or (c.attributes->>'nsfw_score')::double precision < 0.85
+              )`
+        }
       order by c.created_at desc nulls last, c.id desc
       limit 12
     `;
@@ -158,9 +391,166 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
     return {
       agent: agentDtoFromEntities(account, agent, {
         includePersona: agent.isPersonaPublic || manager,
+        likeCount: interaction.like_count,
+        viewerHasLiked: interaction.viewer_has_liked,
       }),
+      memory,
       recentCreations: creationRows.map(creationDtoFromRow),
     };
+  });
+
+  // ---- POST/DELETE /agents/:username/like — v1 social interaction --------
+  // ---- GET/PUT/POST /agents/:username/memory — owner steering ------------
+  app.get('/:username/memory', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can inspect this agent memory');
+    }
+    if (!agent.openclawId || !agent.workspacePath) {
+      return sendError(reply, 409, 'memory_unavailable', 'Agent memory is available after provisioning');
+    }
+    return { memory: await agentMemorySnapshot(agent.openclawId, agent.workspacePath) };
+  });
+
+  app.put('/:username/memory', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const body = memoryBodySchema.parse(req.body);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can steer this agent memory');
+    }
+    if (!agent.openclawId || !agent.workspacePath) {
+      return sendError(reply, 409, 'memory_unavailable', 'Agent memory is available after provisioning');
+    }
+    return {
+      memory: await saveAgentMemory({
+        agentAccountId: account.id,
+        openclawId: agent.openclawId,
+        username: account.username,
+        workspacePath: agent.workspacePath,
+        memory: body.memory,
+      }),
+    };
+  });
+
+  app.post('/:username/memory/rebuild', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can rebuild this agent memory');
+    }
+    if (!agent.openclawId || !agent.workspacePath || agent.provisionStatus !== 'ready') {
+      return sendError(reply, 409, 'memory_unavailable', 'Agent memory is available after provisioning');
+    }
+    const queued = enqueueLazyMemoryDistillation(
+      {
+        agentAccountId: account.id,
+        openclawId: agent.openclawId,
+        username: account.username,
+        name: agent.name,
+        persona: agent.persona,
+        workspacePath: agent.workspacePath,
+        force: true,
+      },
+      (err) => req.log.warn({ err }, `memory rebuild failed for "${account.username}"`),
+    );
+    const memory = await agentMemoryStatus(agent.openclawId, agent.workspacePath);
+    return reply.code(202).send({ queued, memory });
+  });
+
+  // ---- POST/DELETE /agents/:username/like — v1 social interaction --------
+  app.post('/:username/like', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    const manager = canManage(req.account, account, agent);
+    if (!agent.public && !manager) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+
+    await pg`
+      insert into agent_likes (user_id, agent_id)
+      values (${req.account!.accountId}, ${account.id})
+      on conflict do nothing
+    `;
+    const interaction = await agentInteraction(account.id, req.account);
+    return {
+      agent: agentDtoFromEntities(account, agent, {
+        includePersona: agent.isPersonaPublic || manager,
+        likeCount: interaction.like_count,
+        viewerHasLiked: interaction.viewer_has_liked,
+      }),
+    };
+  });
+
+  app.delete('/:username/like', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    const manager = canManage(req.account, account, agent);
+    if (!agent.public && !manager) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+
+    await pg`
+      delete from agent_likes
+      where user_id = ${req.account!.accountId} and agent_id = ${account.id}
+    `;
+    const interaction = await agentInteraction(account.id, req.account);
+    return {
+      agent: agentDtoFromEntities(account, agent, {
+        includePersona: agent.isPersonaPublic || manager,
+        likeCount: interaction.like_count,
+        viewerHasLiked: interaction.viewer_has_liked,
+      }),
+    };
+  });
+
+  // ---- GET /agents/:username/export — portable owner bundle ---------------
+  app.get('/:username/export', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can export this agent');
+    }
+
+    reply.header('content-disposition', `attachment; filename="${bundleFilename(account.username)}"`);
+    return { bundle: await agentExportBundle(account, agent) };
   });
 
   // ---- POST /agents — create + provision ----------------------------------
@@ -171,6 +561,10 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
 
     // Fail fast (503) when the gateway is unconfigured — before any rows land.
     const provisioner = app.gatewayGlue.provisioner;
+    const quotaError = await nativeAgentQuotaError(viewer);
+    if (quotaError) {
+      return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
+    }
 
     // Friendly pre-check; the citext unique constraint is the real guard.
     const taken = await resolveAccountByUsername(body.username, { includeDeleted: true });
@@ -195,6 +589,10 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
             description: body.description === '' ? null : body.description,
             persona: body.persona === '' ? null : body.persona,
             greeting: body.greeting === '' ? null : body.greeting,
+            voice: body.voice === '' ? null : body.voice,
+            model: body.model,
+            thinkingLevel: body.thinkingLevel,
+            toolGroups: body.toolGroups,
             public: true,
             openclawId: body.username,
             provisionStatus: 'provisioning',
@@ -220,9 +618,21 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
         description: body.description,
         persona: body.persona,
         greeting: body.greeting,
-        model: DEFAULT_AGENT_MODEL,
+        voice: body.voice,
+        thinkingLevel: body.thinkingLevel,
+        model: body.model,
       });
       workspacePath = result.hostWorkspaceDir;
+      await installDefaultAgentSkills({
+        agentId: created.account.id,
+        openclawId: body.username,
+        workspacePath,
+        skillSync: app.gatewayGlue.skillSync,
+      });
+      await app.gatewayGlue.toolSync.syncAgentToolGroups({
+        openclawId: body.username,
+        toolGroups: body.toolGroups,
+      });
     } catch (err) {
       provisionStatus = 'failed';
       req.log.error({ err }, `provisioning failed for agent "${body.username}"`);
@@ -243,6 +653,121 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
       agent: agentDtoFromEntities(created.account, updatedAgent ?? created.agent, {
         includePersona: true,
       }),
+    });
+  });
+
+  // ---- POST /agents/import — create from portable bundle ------------------
+  app.post('/import', { preHandler: app.requireAuth }, async (req, reply) => {
+    const viewer = req.account;
+    if (!viewer) return sendError(reply, 401, 'unauthorized', 'Authentication required');
+    const body = importBodySchema.parse(req.body);
+    const bundleAgent = body.bundle.agent;
+    const username = body.username ?? suggestedImportUsername(bundleAgent.username);
+    const name = body.name ?? bundleAgent.name;
+    const description = bundleAgent.description ?? '';
+    const persona = bundleAgent.persona ?? '';
+    const greeting = bundleAgent.greeting ?? '';
+    const isPublic = bundleAgent.public ?? true;
+    const model = bundleAgent.model ?? DEFAULT_AGENT_MODEL;
+    const thinkingLevel = bundleAgent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL;
+    const toolGroups = agentToolGroupsSchema.parse(bundleAgent.toolGroups ?? DEFAULT_AGENT_TOOL_GROUPS);
+
+    const quotaError = await nativeAgentQuotaError(viewer);
+    if (quotaError) {
+      return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
+    }
+
+    const taken = await resolveAccountByUsername(username, { includeDeleted: true });
+    if (taken) {
+      return sendError(reply, 409, 'username_taken', `Username "${username}" is taken`);
+    }
+
+    let created: { account: Account; agent: Agent };
+    try {
+      created = await db.transaction(async (tx) => {
+        const [account] = await tx
+          .insert(accounts)
+          .values({ type: 'agent', username })
+          .returning();
+        if (!account) throw new Error('accounts insert returned no row');
+        const [agent] = await tx
+          .insert(agents)
+          .values({
+            accountId: account.id,
+            ownerId: viewer.accountId,
+            name,
+            description: description === '' ? null : description,
+            persona: persona === '' ? null : persona,
+            greeting: greeting === '' ? null : greeting,
+            voice: bundleAgent.voice ?? null,
+            model,
+            thinkingLevel,
+            toolGroups,
+            public: isPublic,
+            openclawId: username,
+            provisionStatus: 'provisioning',
+          })
+          .returning();
+        if (!agent) throw new Error('agents insert returned no row');
+        return { account, agent };
+      });
+    } catch (err) {
+      if (isUniqueViolation(err)) {
+        return sendError(reply, 409, 'username_taken', `Username "${username}" is taken`);
+      }
+      throw err;
+    }
+
+    let provisionStatus: 'ready' | 'failed' = 'ready';
+    let workspacePath: string | null = null;
+    try {
+      const result = await app.gatewayGlue.provisioner.provisionAgent({
+        openclawId: username,
+        name,
+        username,
+        description,
+        persona,
+        greeting,
+        voice: bundleAgent.voice ?? '',
+        thinkingLevel,
+        model,
+      });
+      workspacePath = result.hostWorkspaceDir;
+      const requestedImportSkills = importSkillSlugs(body.bundle);
+      await replaceAgentSkills({
+        agentId: created.account.id,
+        openclawId: username,
+        workspacePath,
+        slugs: requestedImportSkills,
+        skillSync: app.gatewayGlue.skillSync,
+      });
+      await app.gatewayGlue.toolSync.syncAgentToolGroups({ openclawId: username, toolGroups });
+    } catch (err) {
+      provisionStatus = 'failed';
+      req.log.error({ err }, `import provisioning failed for agent "${username}"`);
+    }
+
+    const [updatedAgent] = await db
+      .update(agents)
+      .set({
+        provisionStatus,
+        ...(provisionStatus === 'ready'
+          ? { provisionedAt: new Date(), workspacePath }
+          : {}),
+      })
+      .where(eq(agents.accountId, created.account.id))
+      .returning();
+
+    return reply.code(201).send({
+      agent: agentDtoFromEntities(created.account, updatedAgent ?? created.agent, {
+        includePersona: true,
+      }),
+      imported: {
+        bundleVersion: body.bundle.version,
+        sourceUsername: body.bundle.agent.username ?? null,
+        skills: body.bundle.skills.length,
+        memoryItems: body.bundle.memory.items.length,
+      },
     });
   });
 
@@ -279,6 +804,10 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
           ...(body.greeting !== undefined
             ? { greeting: body.greeting === '' ? null : body.greeting }
             : {}),
+          ...(body.voice !== undefined ? { voice: body.voice === '' ? null : body.voice } : {}),
+          ...(body.model !== undefined ? { model: body.model } : {}),
+          ...(body.thinkingLevel !== undefined ? { thinkingLevel: body.thinkingLevel } : {}),
+          ...(body.toolGroups !== undefined ? { toolGroups: body.toolGroups } : {}),
         })
         .where(eq(agents.accountId, account.id))
         .returning();
@@ -291,18 +820,60 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
       return { agent: row, account: freshAccount ?? account };
     });
 
-    // Hot persona re-render (SOUL.md + IDENTITY.md). Best-effort: agents that
-    // were never provisioned (no workspace yet) keep their DB update.
+    const personaChanged =
+      body.name !== undefined ||
+      body.description !== undefined ||
+      body.persona !== undefined ||
+      body.greeting !== undefined ||
+      body.voice !== undefined;
+    const modelChanged = body.model !== undefined && body.model !== agent.model;
+    const toolGroupsChanged = body.toolGroups !== undefined;
+
+    // Hot runtime updates are best-effort: agents that were never provisioned
+    // (no workspace yet) keep their DB update and get fixed on lazy provision.
     if (agent.openclawId !== null) {
+      if (modelChanged) {
+        try {
+          await app.gatewayGlue.provisioner.provisionAgent({
+            openclawId: agent.openclawId,
+            name: updatedAgent.agent.name ?? account.username,
+            username: account.username,
+            description: updatedAgent.agent.description ?? '',
+            persona: updatedAgent.agent.persona ?? '',
+            greeting: updatedAgent.agent.greeting ?? '',
+            voice: updatedAgent.agent.voice ?? '',
+            thinkingLevel: updatedAgent.agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
+            model: updatedAgent.agent.model ?? DEFAULT_AGENT_MODEL,
+          });
+        } catch (err) {
+          req.log.warn({ err }, `model update skipped for "${account.username}"`);
+        }
+      }
+
       try {
-        await app.gatewayGlue.provisioner.updateAgentPersona({
-          openclawId: agent.openclawId,
-          name: updatedAgent.agent.name ?? account.username,
-          username: account.username,
-          description: updatedAgent.agent.description ?? '',
-          persona: updatedAgent.agent.persona ?? '',
-          greeting: updatedAgent.agent.greeting ?? '',
-        });
+        if (toolGroupsChanged) {
+          await app.gatewayGlue.toolSync.syncAgentToolGroups({
+            openclawId: agent.openclawId,
+            toolGroups: body.toolGroups ?? DEFAULT_AGENT_TOOL_GROUPS,
+          });
+        }
+      } catch (err) {
+        req.log.warn({ err }, `tool allowlist update skipped for "${account.username}"`);
+      }
+
+      try {
+        if (personaChanged) {
+          await app.gatewayGlue.provisioner.updateAgentPersona({
+            openclawId: agent.openclawId,
+            name: updatedAgent.agent.name ?? account.username,
+            username: account.username,
+            description: updatedAgent.agent.description ?? '',
+            persona: updatedAgent.agent.persona ?? '',
+            greeting: updatedAgent.agent.greeting ?? '',
+            voice: updatedAgent.agent.voice ?? '',
+            thinkingLevel: updatedAgent.agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
+          });
+        }
       } catch (err) {
         req.log.warn({ err }, `persona re-render skipped for "${account.username}"`);
       }

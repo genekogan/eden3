@@ -5,6 +5,8 @@ import { getEnv } from '@eden3/core';
 import {
   AgentProvisioner,
   CronSync,
+  setAgentSkills,
+  setAgentToolGroups,
   type ProvisionAgentParams,
   type ProvisionAgentResult,
   type SyncTriggerParams,
@@ -25,7 +27,7 @@ import { ApiError } from './errors';
  */
 
 /** Default gateway model for newly created agents (cheap; pilots re-model later). */
-export const DEFAULT_AGENT_MODEL = 'anthropic/claude-haiku-4-5';
+export { DEFAULT_AGENT_MODEL } from '@eden3/shared';
 
 /** Structural subset of {@link AgentProvisioner} the routes use. */
 export interface ProvisionerLike {
@@ -41,22 +43,48 @@ export interface CronSyncLike {
   syncTrigger(params: SyncTriggerParams): Promise<SyncTriggerResult>;
 }
 
+export interface SkillSyncParams {
+  openclawId: string;
+  skills: string[];
+}
+
+export interface SkillSyncLike {
+  syncAgentSkills(params: SkillSyncParams): Promise<{ changed: boolean }>;
+}
+
+export interface ToolSyncParams {
+  openclawId: string;
+  toolGroups: string[];
+}
+
+export interface ToolSyncLike {
+  syncAgentToolGroups(params: ToolSyncParams): Promise<{ changed: boolean }>;
+}
+
 export interface GatewayGlueOptions {
   /** Override the provisioner (tests). Default: real AgentProvisioner, lazy. */
   provisioner?: ProvisionerLike;
   /** Override cron sync (tests). Default: real CronSync (docker exec CLI), lazy. */
   cronSync?: CronSyncLike;
+  /** Override skill sync (tests). Default: openclaw.json allowlist writer. */
+  skillSync?: SkillSyncLike;
+  /** Override tool-group sync (tests). Default: openclaw.json allowlist writer. */
+  toolSync?: ToolSyncLike;
 }
 
 export class GatewayGlue {
   private readonly provisionerOverride: ProvisionerLike | undefined;
   private readonly cronSyncOverride: CronSyncLike | undefined;
+  private readonly skillSyncOverride: SkillSyncLike | undefined;
+  private readonly toolSyncOverride: ToolSyncLike | undefined;
   private lazyProvisioner: ProvisionerLike | undefined;
   private lazyCronSync: CronSyncLike | undefined;
 
   constructor(options: GatewayGlueOptions = {}) {
     this.provisionerOverride = options.provisioner;
     this.cronSyncOverride = options.cronSync;
+    this.skillSyncOverride = options.skillSync;
+    this.toolSyncOverride = options.toolSync;
   }
 
   /** Throws ApiError 503 when the gateway token is not configured. */
@@ -72,6 +100,24 @@ export class GatewayGlue {
     // (docker.ts), so no host-side token is needed here.
     this.lazyCronSync ??= new CronSync();
     return this.lazyCronSync;
+  }
+
+  get skillSync(): SkillSyncLike {
+    return (
+      this.skillSyncOverride ?? {
+        syncAgentSkills: async ({ openclawId, skills }) =>
+          setAgentSkills(openclawId, skills, { dataDir: defaultOpenclawDataDir() }),
+      }
+    );
+  }
+
+  get toolSync(): ToolSyncLike {
+    return (
+      this.toolSyncOverride ?? {
+        syncAgentToolGroups: async ({ openclawId, toolGroups }) =>
+          setAgentToolGroups(openclawId, toolGroups, { dataDir: defaultOpenclawDataDir() }),
+      }
+    );
   }
 }
 

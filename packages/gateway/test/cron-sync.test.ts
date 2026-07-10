@@ -104,6 +104,7 @@ class FakeCronCli implements OpenClawCliLike {
   calls: CliCall[] = [];
   jobs: Record<string, unknown>[] = [];
   addResult: unknown = { id: 'job-new' };
+  listFailures: Error[] = [];
 
   async exec(args: readonly string[], options?: CliExecOptions): Promise<OpenClawCliResult> {
     this.calls.push({ args, ...(options !== undefined ? { options } : {}) });
@@ -117,7 +118,11 @@ class FakeCronCli implements OpenClawCliLike {
 
   async execJson<T = unknown>(args: readonly string[], options?: CliExecOptions): Promise<T> {
     this.calls.push({ args, ...(options !== undefined ? { options } : {}) });
-    if (args[0] === 'cron' && args[1] === 'list') return { jobs: this.jobs } as T;
+    if (args[0] === 'cron' && args[1] === 'list') {
+      const failure = this.listFailures.shift();
+      if (failure) throw failure;
+      return { jobs: this.jobs } as T;
+    }
     if (args[0] === 'cron' && args[1] === 'add') return this.addResult as T;
     throw new Error(`FakeCronCli: unexpected ${args.join(' ')}`);
   }
@@ -268,5 +273,34 @@ describe('CronSync.syncTrigger', () => {
     ];
     const jobs = await new CronSync({ cli }).listEdenJobs();
     expect(jobs.map((j) => j.id)).toEqual(['a']);
+  });
+
+  it('retries transient OpenClaw config-read races', async () => {
+    const cli = new FakeCronCli();
+    cli.jobs = [matchingJob()];
+    cli.listFailures = [
+      new Error(
+        'openclaw cron list failed (exit 1): Failed to read config at /home/node/.openclaw/openclaw.json SyntaxError: JSON5: invalid end of input',
+      ),
+    ];
+    const sync = new CronSync({
+      cli,
+      configReadRetryAttempts: 2,
+      configReadRetryDelayMs: 0,
+    });
+    expect(await sync.listJobs()).toHaveLength(1);
+    expect(cli.callsFor('list')).toHaveLength(2);
+  });
+
+  it('does not retry ordinary cron CLI failures', async () => {
+    const cli = new FakeCronCli();
+    cli.listFailures = [new Error('openclaw cron list failed (exit 1): permission denied')];
+    const sync = new CronSync({
+      cli,
+      configReadRetryAttempts: 3,
+      configReadRetryDelayMs: 0,
+    });
+    await expect(sync.listJobs()).rejects.toThrow(/permission denied/);
+    expect(cli.callsFor('list')).toHaveLength(1);
   });
 });

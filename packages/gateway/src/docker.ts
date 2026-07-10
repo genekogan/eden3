@@ -1,13 +1,13 @@
 import { execFile } from 'node:child_process';
 
 /**
- * Tiny wrapper around `docker exec <container> openclaw <args...>` with lenient
+ * Tiny wrapper around `docker exec -u node <container> openclaw <args...>` with lenient
  * `--json` output parsing.
  *
  * Two invocation modes (probed live 2026-07-03, openclaw 2026.6.10):
  *
  *   - Config-file commands (`agents add|list|delete`, `config …`) run as plain
- *     `docker exec <container> openclaw <args>` — they do not take `--token`.
+ *     `docker exec -u node <container> openclaw <args>` — they do not take `--token`.
  *   - Gateway-WS commands (`cron …`, `devices …`) authenticate per call. We
  *     pass the gateway bearer token via the CONTAINER's own environment
  *     (`OPENCLAW_GATEWAY_TOKEN` is set on eden3-openclaw), wrapped in
@@ -130,8 +130,8 @@ export class OpenClawCli implements OpenClawCliLike {
   /** The argv passed to `docker` (exposed for unit tests). */
   dockerArgs(args: readonly string[], gatewayToken: boolean): string[] {
     return gatewayToken
-      ? ['exec', this.container, 'sh', '-c', TOKEN_WRAPPER_SCRIPT, 'openclaw', ...args]
-      : ['exec', this.container, 'openclaw', ...args];
+      ? ['exec', '-u', 'node', this.container, 'sh', '-c', TOKEN_WRAPPER_SCRIPT, 'openclaw', ...args]
+      : ['exec', '-u', 'node', this.container, 'openclaw', ...args];
   }
 
   /** Run `openclaw <args>`; throws {@link OpenClawCliError} on non-zero exit. */

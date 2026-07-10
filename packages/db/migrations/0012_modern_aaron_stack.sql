@@ -1,0 +1,1 @@
+ALTER TABLE "agents" ADD COLUMN "tool_groups" jsonb DEFAULT '["group:runtime","group:fs","group:web","group:sessions","group:memory","group:media","group:ui","group:automation","group:agents","group:plugins"]'::jsonb NOT NULL;

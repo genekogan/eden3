@@ -1,5 +1,5 @@
-import { resolveCreation } from '@eden3/core';
-import { pg } from '@eden3/db';
+import { resolveCreation, type AuthSession } from '@eden3/core';
+import { pg, type Creation } from '@eden3/db';
 import type { AccountSummary } from '@eden3/shared';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
@@ -20,6 +20,36 @@ import {
  */
 
 const paramsSchema = z.object({ idOrExternal: z.string().trim().min(1).max(200) });
+const reportBodySchema = z.object({
+  reason: z.string().trim().max(1_000).optional(),
+});
+
+const PUBLIC_NSFW_THRESHOLD = 0.85;
+
+function nsfwScore(attributes: unknown): number | null {
+  if (typeof attributes !== 'object' || attributes === null) return null;
+  const value = (attributes as Record<string, unknown>).nsfw_score;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function passesPublicModeration(creation: Creation): boolean {
+  const score = nsfwScore(creation.attributes);
+  return score === null || score < PUBLIC_NSFW_THRESHOLD;
+}
+
+function canViewCreation(creation: Creation, viewer: AuthSession | null): boolean {
+  if (viewer !== null && (viewer.isAdmin || viewer.accountId === creation.userId)) return true;
+  return (
+    creation.public &&
+    !creation.deleted &&
+    passesPublicModeration(creation)
+  );
+}
 
 /** Batch-fetch account summaries for the embed fields. */
 async function accountSummaries(
@@ -35,6 +65,34 @@ async function accountSummaries(
   return new Map(rows.map((row) => [row.id, toAccountSummary(row)]));
 }
 
+async function viewerHasLikedCreation(
+  creationId: string,
+  viewer: AuthSession | null,
+): Promise<boolean> {
+  if (viewer === null) return false;
+  const [row] = await pg<{ liked: boolean }[]>`
+    select exists(
+      select 1 from creation_likes
+      where creation_id = ${creationId} and user_id = ${viewer.accountId}
+    ) as liked
+  `;
+  return row?.liked ?? false;
+}
+
+async function creationPayload(creation: Creation, viewer: AuthSession | null) {
+  const summaries = await accountSummaries([creation.userId, creation.agentId]);
+  const creator = creation.userId !== null ? summaries.get(creation.userId) : undefined;
+  const agent = creation.agentId !== null ? summaries.get(creation.agentId) : undefined;
+  const viewerHasLiked = await viewerHasLikedCreation(creation.id, viewer);
+  return {
+    creation: creationDtoFromEntity(creation, {
+      ...(creator !== undefined ? { creator } : {}),
+      ...(agent !== undefined ? { agent } : {}),
+      viewerHasLiked,
+    }),
+  };
+}
+
 export const creationsRoutes: FastifyPluginAsync = async (app) => {
   app.get('/:idOrExternal', async (req, reply) => {
     const { idOrExternal } = paramsSchema.parse(req.params);
@@ -43,21 +101,102 @@ export const creationsRoutes: FastifyPluginAsync = async (app) => {
       return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
     }
     const viewer = req.account;
-    const canView =
-      creation.public ||
-      (viewer !== null && (viewer.isAdmin || viewer.accountId === creation.userId));
-    if (!canView) {
+    if (!canViewCreation(creation, viewer)) {
       return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
     }
 
-    const summaries = await accountSummaries([creation.userId, creation.agentId]);
-    const creator = creation.userId !== null ? summaries.get(creation.userId) : undefined;
-    const agent = creation.agentId !== null ? summaries.get(creation.agentId) : undefined;
-    return {
-      creation: creationDtoFromEntity(creation, {
-        ...(creator !== undefined ? { creator } : {}),
-        ...(agent !== undefined ? { agent } : {}),
-      }),
-    };
+    return creationPayload(creation, viewer);
+  });
+
+  app.post('/:idOrExternal/report', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { idOrExternal } = paramsSchema.parse(req.params);
+    const body = reportBodySchema.parse(req.body ?? {});
+    const creation = await resolveCreation(idOrExternal);
+    if (!creation || !canViewCreation(creation, req.account)) {
+      return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
+    }
+
+    const [report] = await pg<
+      { id: string; targetId: string; status: string; reason: string | null; createdAt: string }[]
+    >`
+      insert into content_reports (reporter_id, target_type, target_id, reason)
+      values (${req.account!.accountId}, 'creation', ${creation.id}, ${body.reason ?? null})
+      returning id, target_id as "targetId", status, reason, created_at as "createdAt"
+    `;
+    reply.code(201);
+    return { report };
+  });
+
+  app.delete('/:idOrExternal', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { idOrExternal } = paramsSchema.parse(req.params);
+    const creation = await resolveCreation(idOrExternal, { includeDeleted: true });
+    if (!creation) {
+      return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
+    }
+    const canTakeDown = req.account!.isAdmin || req.account!.accountId === creation.userId;
+    if (!canTakeDown) {
+      return sendError(reply, 403, 'forbidden', 'Only the creator or an admin can take down this creation');
+    }
+    await pg`
+      update creations
+      set deleted = true, updated_at = now()
+      where id = ${creation.id}
+    `;
+    return { ok: true, creationId: creation.id, deleted: true };
+  });
+
+  app.post('/:idOrExternal/like', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { idOrExternal } = paramsSchema.parse(req.params);
+    const creation = await resolveCreation(idOrExternal);
+    if (!creation || !canViewCreation(creation, req.account)) {
+      return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
+    }
+
+    await pg.begin(async (sql) => {
+      const inserted = await sql<{ inserted: number }[]>`
+        insert into creation_likes (user_id, creation_id)
+        values (${req.account!.accountId}, ${creation.id})
+        on conflict do nothing
+        returning 1 as inserted
+      `;
+      if (inserted.length > 0) {
+        await sql`
+          update creations
+          set like_count = like_count + 1, updated_at = now()
+          where id = ${creation.id}
+        `;
+      }
+    });
+
+    const fresh = await resolveCreation(creation.id);
+    if (!fresh) return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
+    return creationPayload(fresh, req.account);
+  });
+
+  app.delete('/:idOrExternal/like', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { idOrExternal } = paramsSchema.parse(req.params);
+    const creation = await resolveCreation(idOrExternal);
+    if (!creation || !canViewCreation(creation, req.account)) {
+      return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
+    }
+
+    await pg.begin(async (sql) => {
+      const deleted = await sql<{ deleted: number }[]>`
+        delete from creation_likes
+        where user_id = ${req.account!.accountId} and creation_id = ${creation.id}
+        returning 1 as deleted
+      `;
+      if (deleted.length > 0) {
+        await sql`
+          update creations
+          set like_count = greatest(like_count - 1, 0), updated_at = now()
+          where id = ${creation.id}
+        `;
+      }
+    });
+
+    const fresh = await resolveCreation(creation.id);
+    if (!fresh) return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
+    return creationPayload(fresh, req.account);
   });
 };

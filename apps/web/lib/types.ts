@@ -16,6 +16,7 @@ import type {
   CreationDto,
   MessageDto,
   SessionDto,
+  TriggerStatus,
 } from "@eden3/shared";
 
 /**
@@ -36,7 +37,93 @@ export interface Paginated<T> {
 /** GET /api/agents/:username */
 export interface AgentProfile {
   agent: AgentDto;
+  memory: AgentMemoryStatus | null;
   recentCreations: CreationDto[];
+}
+
+export interface AgentMemoryStatus {
+    status: "pending" | "running" | "done" | "skipped" | "error";
+    sessionsSampled: number;
+    messagesSampled: number;
+    memoryChars: number | null;
+    model: string | null;
+    error: string | null;
+    updatedAt: string | null;
+    completedAt: string | null;
+    summary: string | null;
+}
+
+export interface AgentMemorySnapshot extends AgentMemoryStatus {
+  collective: {
+    filename: "MEMORY.md";
+    chars: number;
+    content: string | null;
+  };
+  userFiles: Array<{
+    filename: string;
+    username: string;
+    chars: number;
+    summary: string | null;
+  }>;
+}
+
+export interface AgentMemoryResponse {
+  memory: AgentMemorySnapshot;
+}
+
+export interface AgentMemoryRebuildResponse {
+  queued: boolean;
+  memory: AgentMemoryStatus | null;
+}
+
+export interface AgentExportBundle {
+  kind: "eden3.agent.bundle";
+  version: 1;
+  exportedAt?: string;
+  source?: {
+    platform?: string;
+    accountId?: string;
+    externalId?: string | null;
+    username?: string;
+  };
+  agent: {
+    username?: string;
+    name: string;
+    description?: string | null;
+    persona?: string | null;
+    greeting?: string | null;
+    voice?: string | null;
+    public?: boolean;
+    model?: string;
+    thinkingLevel?: string;
+    toolGroups?: string[];
+  };
+  memory: {
+    summary?: string | null;
+    items: unknown[];
+  };
+  skills: unknown[];
+  workspaceFiles?: unknown;
+}
+
+export interface AgentExportResponse {
+  bundle: AgentExportBundle;
+}
+
+export interface AgentImportInput {
+  username?: string;
+  name?: string;
+  bundle: AgentExportBundle;
+}
+
+export interface AgentImportResult {
+  agent: AgentDto;
+  imported: {
+    bundleVersion: number;
+    sourceUsername: string | null;
+    skills: number;
+    memoryItems: number;
+  };
 }
 
 /** GET /api/sessions/:id — messages ascending; permalinks accept 24-hex ids. */
@@ -61,6 +148,175 @@ export interface MannaSummary {
   updatedAt?: string;
 }
 
+export interface AuthMeResponse {
+  user: DevUser | null;
+  manna: MannaSummary | null;
+}
+
+export interface BillingCheckoutSession {
+  id: string;
+  url: string | null;
+}
+
+export interface BillingSubscriptionSummary {
+  status: string;
+  tier: string | null;
+  monthlyManna: number;
+  currentPeriodEnd: string | null;
+  cancelAtPeriodEnd: boolean;
+  updatedAt: string;
+}
+
+export interface BillingSubscriptionResponse {
+  subscription: BillingSubscriptionSummary | null;
+}
+
+export interface VoucherRedeemResult {
+  alreadyApplied: boolean;
+  amount: number;
+  balance: {
+    balance: number;
+    subscriptionBalance: number;
+    total: number;
+  };
+}
+
+export type ChannelKind =
+  | "discord"
+  | "telegram"
+  | "whatsapp"
+  | "slack"
+  | "voice";
+
+export interface ChannelConnectionDto {
+  id: string;
+  accountId: string;
+  agentId: string | null;
+  channel: ChannelKind;
+  label: string | null;
+  status: string;
+  tokenPreview: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChannelConnectionCreateInput {
+  channel: ChannelKind;
+  token: string;
+  label?: string;
+  agentUsername?: string;
+}
+
+export interface ChannelMockMessageResult {
+  ok: true;
+  channel: ChannelKind;
+  routed: true;
+  messageLength: number;
+}
+
+export type SkillSource = "curated" | "user";
+export type SkillStatus = "pending" | "approved" | "rejected";
+
+export interface SkillDefinitionDto {
+  id: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  body: string;
+  source: SkillSource;
+  status: SkillStatus;
+  ownerId: string | null;
+  reviewerId: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AgentSkillDto extends SkillDefinitionDto {
+  enabled: boolean;
+}
+
+export interface AgentSkillsResponse {
+  agent: {
+    id: string;
+    username: string;
+    ownerId: string | null;
+    public?: boolean;
+    openclawId?: string | null;
+  };
+  attached: AgentSkillDto[];
+  skills?: AgentSkillDto[];
+  available?: SkillDefinitionDto[];
+}
+
+export interface SkillCreateInput {
+  slug: string;
+  name: string;
+  description?: string;
+  body: string;
+}
+
+export interface SkillReviewInput {
+  status: "approved" | "rejected";
+}
+
+/** GET /api/operator/usage/summary */
+export interface OperatorUsageBreakdown {
+  userId?: string | null;
+  agentId?: string | null;
+  username: string | null;
+  events: number;
+  costUsd: number;
+  manna: number;
+}
+
+export interface OperatorStatusBreakdown {
+  status: string;
+  events: number;
+  costUsd: number;
+  manna: number;
+}
+
+export interface OperatorRecentUsageEvent {
+  id: string;
+  eventType: string;
+  status: string;
+  userId: string | null;
+  userUsername: string | null;
+  agentId: string | null;
+  agentUsername: string | null;
+  sessionId: string | null;
+  messageId: string | null;
+  turnId: string | null;
+  provider: string | null;
+  model: string | null;
+  costUsd: number;
+  manna: number;
+  latencyMs: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+}
+
+export interface OperatorUsageSummary {
+  window: {
+    days: number;
+    userId: string | null;
+    agentId: string | null;
+  };
+  totals: {
+    events: number;
+    costUsd: number;
+    manna: number;
+    avgLatencyMs: number | null;
+    errors: number;
+  };
+  byUser: OperatorUsageBreakdown[];
+  byAgent: OperatorUsageBreakdown[];
+  byStatus: OperatorStatusBreakdown[];
+  recent: OperatorRecentUsageEvent[];
+}
+
 // ---------------------------------------------------------------------------
 // Request inputs
 // ---------------------------------------------------------------------------
@@ -72,10 +328,20 @@ export interface AgentCreateInput {
   description: string;
   persona: string;
   greeting: string;
+  voice?: string;
+  model?: string;
+  thinkingLevel?: string;
+  toolGroups?: string[];
 }
 
 /** PATCH /api/agents/:username */
 export type AgentUpdateInput = Partial<AgentCreateInput>;
+
+export interface CollectionCreateInput {
+  name: string;
+  description?: string;
+  public?: boolean;
+}
 
 /** Schedule accepted by POST /api/tasks (eden1 cron dict, snake_case). */
 export interface TaskScheduleInput {
@@ -93,6 +359,15 @@ export interface TaskCreateInput {
   schedule: TaskScheduleInput;
 }
 
+/** PATCH /api/tasks/:id */
+export interface TaskUpdateInput {
+  status?: Extract<TriggerStatus, "active" | "paused">;
+  name?: string;
+  prompt?: string;
+  schedule?: TaskScheduleInput;
+  deleted?: true;
+}
+
 // ---------------------------------------------------------------------------
 // Studio
 // ---------------------------------------------------------------------------
@@ -107,9 +382,41 @@ export interface StudioTool {
   /** e.g. "image" | "video" | "audio" — drives latency hints in the UI. */
   outputType?: string | null;
   costManna?: number | null;
+  /** Default quote metadata for the canonical/default args, when available. */
+  metering?: StudioGenerationQuote | null;
   /** JSON-schema-ish parameter spec; shape not part of the contract. */
   parameters?: Record<string, unknown> | null;
   [key: string]: unknown;
+}
+
+export interface StudioGenerationQuote {
+  tool: string;
+  action: string;
+  provider: string;
+  model: string;
+  tableVersion: string;
+  units: Record<string, number>;
+  costUsd: number;
+  manna: number;
+  estimated: boolean;
+  lineItems: Array<{
+    unit: string;
+    quantity: number;
+    usdPerUnit: number;
+    costUsd: number;
+    estimated?: true;
+  }>;
+}
+
+export interface StudioGenerationSettlement {
+  status: "settled" | "failed";
+  reservedManna: number;
+  meteredManna: number;
+  adjustmentManna: number;
+  chargedManna: number;
+  transactionId: string | null;
+  alreadyApplied: boolean;
+  error?: string;
 }
 
 /**
@@ -120,6 +427,9 @@ export interface StudioTool {
 export interface StudioGeneration {
   creationId: string;
   url: string;
+  mime?: string;
+  metering?: StudioGenerationQuote;
+  settlement?: StudioGenerationSettlement;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,4 +448,5 @@ export interface DevUser {
   type?: AccountType;
   name?: string | null;
   userImage?: string | null;
+  isAdmin?: boolean;
 }

@@ -15,7 +15,7 @@ export const USERNAME_MAX = 32;
 const USERNAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
 
 /** Route segments that can never be agent usernames. */
-export const RESERVED_USERNAMES = new Set(["new", "edit", "api", "media"]);
+export const RESERVED_USERNAMES = new Set(["new", "builder", "edit", "api", "media"]);
 
 export function normalizeUsername(raw: string): string {
   return raw.trim().toLowerCase();
@@ -112,13 +112,27 @@ export function isProvisionPending(status: string | null | undefined): boolean {
   return status === "pending" || status === "provisioning";
 }
 
+/**
+ * "pending" = dormant, nothing running. Migrated agents sit here until their
+ * FIRST chat message triggers lazy provisioning server-side — so chat must
+ * stay available; it is the wake-up trigger, not something to wait behind.
+ */
+export function isProvisionQueued(status: string | null | undefined): boolean {
+  return status === "pending";
+}
+
+/** "provisioning" = a first turn is actively warming the runtime right now. */
+export function isProvisionWarming(status: string | null | undefined): boolean {
+  return status === "provisioning";
+}
+
 export function isProvisionFailed(status: string | null | undefined): boolean {
   return status === "failed";
 }
 
-/** Badge copy for in-flight/failed provisioning; null when nothing to show. */
+/** Badge copy for dormant/in-flight/failed provisioning; null when nothing to show. */
 export function provisionLabel(status: string | null | undefined): string | null {
-  if (status === "pending") return "Provision queued";
+  if (status === "pending") return "Wakes on first chat";
   if (status === "provisioning") return "Provisioning…";
   if (status === "failed") return "Provision failed";
   return null; // ready / provisioned / unknown -> no badge

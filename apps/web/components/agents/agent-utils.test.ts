@@ -100,8 +100,10 @@ describe("provisioning", () => {
     expect(isProvisionFailed("failed")).toBe(true);
   });
 
-  it("labels only in-flight/failed states", () => {
-    expect(provisionLabel("pending")).toMatch(/queued/i);
+  it("labels only dormant/in-flight/failed states", () => {
+    // "pending" is dormant (wake-on-chat), not an active queue — see
+    // test/agent-provisioning-ux.test.ts for the full contract.
+    expect(provisionLabel("pending")).toMatch(/first chat/i);
     expect(provisionLabel("provisioning")).toMatch(/provisioning/i);
     expect(provisionLabel("failed")).toMatch(/failed/i);
     expect(provisionLabel("ready")).toBeNull();

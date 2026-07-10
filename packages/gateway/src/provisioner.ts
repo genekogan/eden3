@@ -60,6 +60,8 @@ export type TemplateVarKey =
   | 'DESCRIPTION'
   | 'PERSONA'
   | 'GREETING'
+  | 'VOICE'
+  | 'THINKING_LEVEL'
   | 'MEMORY_SEED'
   | 'PROVISIONED_AT';
 
@@ -161,6 +163,10 @@ export interface ProvisionAgentParams {
   persona: string;
   /** First-time-visitor greeting ({{GREETING}}). */
   greeting: string;
+  /** Voice/tone or external voice identifier rendered into IDENTITY.md. */
+  voice?: string;
+  /** Runtime reasoning posture rendered into SOUL.md; default "balanced". */
+  thinkingLevel?: string;
   /** Gateway model ref, e.g. "anthropic/claude-haiku-4-5". */
   model: string;
   /** Distilled history seeded into MEMORY.md ({{MEMORY_SEED}}); default "". */
@@ -174,6 +180,8 @@ export interface UpdatePersonaParams {
   description: string;
   persona: string;
   greeting: string;
+  voice?: string;
+  thinkingLevel?: string;
 }
 
 export interface UpdatePersonaResult {
@@ -295,6 +303,8 @@ export class AgentProvisioner {
       DESCRIPTION: params.description,
       PERSONA: params.persona,
       GREETING: params.greeting,
+      VOICE: params.voice ?? 'unspecified',
+      THINKING_LEVEL: params.thinkingLevel ?? 'balanced',
       MEMORY_SEED: params.memorySeed ?? '',
       PROVISIONED_AT: this.now().toISOString(),
     };
@@ -474,6 +484,8 @@ export class AgentProvisioner {
       DESCRIPTION: params.description,
       PERSONA: params.persona,
       GREETING: params.greeting,
+      VOICE: params.voice ?? 'unspecified',
+      THINKING_LEVEL: params.thinkingLevel ?? 'balanced',
     };
     const filesWritten: string[] = [];
     for (const relPath of PERSONA_TEMPLATE_FILES) {

@@ -38,6 +38,9 @@ describe('resource DTOs', () => {
       persona: 'You are Abraham…',
       greeting: 'Hello.',
       voice: null,
+      model: 'anthropic/claude-haiku-4-5',
+      thinkingLevel: 'balanced',
+      toolGroups: ['group:runtime', 'group:fs'],
       userImage: 'https://cdn.example.com/abraham.png',
       public: true,
       ownerId: uuid('2'),
@@ -51,6 +54,7 @@ describe('resource DTOs', () => {
     expect(
       agentDto.safeParse({ ...agent, provisionStatus: 'exploded' }).success,
     ).toBe(false);
+    expect(agentDto.safeParse({ ...agent, toolGroups: ['group:openclaw'] }).success).toBe(false);
     expect(agentDto.safeParse({ ...agent, id: 'not-a-uuid' }).success).toBe(false);
     expect(agentDto.safeParse({ ...agent, createdAt: 'yesterday' }).success).toBe(false);
   });
@@ -165,6 +169,9 @@ describe('resource DTOs', () => {
       prompt: 'paint a rose',
       schedule,
       status: 'active',
+      lastRunTime: now,
+      nextScheduledRun: null,
+      lastError: null,
       createdAt: now,
       updatedAt: now,
     };

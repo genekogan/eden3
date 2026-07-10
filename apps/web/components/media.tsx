@@ -6,7 +6,8 @@
  *   <MediaThumb creation={c} />   grid/list tile: thumbnail-first, lazy,
  *                                 blurhash placeholder, hover-plays videos.
  *   <MediaFull creation={c} />    permalink/lightbox: full asset, <video>
- *                                 with controls for mp4/webm, <img> otherwise.
+ *                                 or <audio> with controls when applicable,
+ *                                 <img> otherwise.
  *
  * URLs render verbatim: legacy creations point at CloudFront/S3 absolute
  * URLs, new ones at local /media/... paths (proxied to the api). Element
@@ -14,11 +15,12 @@
  * override when the caller has one (e.g. media.attached events).
  */
 
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { CreationDto } from "@/lib/types";
 import { decodeBlurhash } from "@/lib/blurhash";
 
 const VIDEO_EXTENSIONS = new Set(["mp4", "webm"]);
+const AUDIO_EXTENSIONS = new Set(["mp3", "wav", "ogg", "oga", "m4a", "aac", "flac", "opus"]);
 
 /** True when the URL (or explicit mime) should render as <video>. */
 export function isVideoMedia(
@@ -31,6 +33,19 @@ export function isVideoMedia(
   const dot = path.lastIndexOf(".");
   if (dot === -1) return false;
   return VIDEO_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+}
+
+/** True when the URL (or explicit mime) should render as <audio>. */
+export function isAudioMedia(
+  url: string | null | undefined,
+  mime?: string | null,
+): boolean {
+  if (mime) return mime.startsWith("audio/");
+  if (!url) return false;
+  const path = url.split(/[?#]/, 1)[0] ?? "";
+  const dot = path.lastIndexOf(".");
+  if (dot === -1) return false;
+  return AUDIO_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }
 
 interface MediaSource {
@@ -228,7 +243,9 @@ export function MediaFull({
     ...(blurhash !== undefined ? { blurhash } : {}),
   });
   const display = source.url ?? source.thumbnailUrl;
-  const video = isVideoMedia(display, display === source.url ? source.mime : null);
+  const directMime = display === source.url ? source.mime : null;
+  const video = isVideoMedia(display, directMime);
+  const audio = isAudioMedia(display, directMime);
   const [loaded, setLoaded] = useState(false);
 
   // Same cached-media race as MediaThumb: mark complete elements at ref time.
@@ -256,13 +273,21 @@ export function MediaFull({
 
   return (
     <div
-      className={`relative overflow-hidden rounded-xl bg-raised ${className ?? ""}`}
-      style={ratio}
+      className={`relative overflow-hidden rounded-xl bg-raised ${audio ? "p-3" : ""} ${className ?? ""}`}
+      style={audio ? undefined : ratio}
     >
-      {source.blurhash && !loaded ? (
+      {!audio && source.blurhash && !loaded ? (
         <BlurhashCanvas hash={source.blurhash} />
       ) : null}
-      {video ? (
+      {audio ? (
+        <audio
+          src={display}
+          controls
+          preload="metadata"
+          aria-label={source.alt}
+          className="w-full"
+        />
+      ) : video ? (
         <video
           ref={markVideoReady}
           src={display}

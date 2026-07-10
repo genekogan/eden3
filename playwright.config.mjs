@@ -1,4 +1,22 @@
 import { defineConfig } from '@playwright/test';
+import { mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+process.env.PLAYWRIGHT_BROWSERS_PATH ??= path.join(ROOT, 'var/playwright-browsers');
+const browserName = process.env.PLAYWRIGHT_BROWSER ?? 'firefox';
+const channel = process.env.PLAYWRIGHT_CHANNEL;
+const browserHome = path.join(ROOT, 'var/chrome-home');
+mkdirSync(browserHome, { recursive: true });
+const chromiumLaunchOptions = {
+  env: { ...process.env, HOME: browserHome },
+  args: [
+    '--disable-crash-reporter',
+    '--disable-crashpad',
+    `--crash-dumps-dir=${path.join(ROOT, 'var/chrome-crashes')}`,
+  ],
+};
 
 // Runs e2e/acceptance.spec.mjs against the already-running dev stack
 // (web :4300, api :4301, gateway :18789). Boot the stack first with
@@ -15,6 +33,10 @@ export default defineConfig({
   outputDir: 'var/acceptance/artifacts',
   use: {
     baseURL: process.env.WEB_URL ?? 'http://localhost:4300',
+    browserName,
+    ...(browserName === 'chromium' && channel ? { channel } : {}),
+    headless: process.env.PLAYWRIGHT_HEADLESS !== '0',
+    ...(browserName === 'chromium' ? { launchOptions: chromiumLaunchOptions } : {}),
     screenshot: 'on',
     video: 'retain-on-failure',
     trace: 'retain-on-failure',

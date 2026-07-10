@@ -6,6 +6,7 @@ export * from './db-handle';
 export * from './refs';
 export * from './auth';
 export * from './manna';
+export * from './metering';
 export * from './media-store';
 export * from './permalinks';
 export * from './session-key';

@@ -3,14 +3,18 @@
 // process.env through @eden3/core getEnv().
 import { getEnv } from '@eden3/core';
 import { loadRootEnv } from '@eden3/db';
+import { ensureBaseline } from '@eden3/gateway';
 
+import { defaultOpenclawDataDir } from './gateway-glue';
 import { buildServer } from './server';
 
 loadRootEnv();
 const env = getEnv();
+await ensureBaseline({ dataDir: defaultOpenclawDataDir() });
 
 const app = await buildServer({
   logger: { level: 'info', base: undefined }, // compact: no pid/hostname
+  media: { autoStartWatcher: true },
 });
 
 await app.listen({ port: env.API_PORT, host: '127.0.0.1' });

@@ -147,7 +147,7 @@ describe('provisioner (live gateway)', () => {
         model: `openclaw/${AGENT_ID}`,
         user: sessionKey,
         stream: false,
-        messages: [{ role: 'user', content: 'Reply with exactly one word: pong' }],
+        messages: [{ role: 'user', content: 'Reply with exactly one word: pomegranate' }],
       }),
     });
     expect(res.status).toBe(200);
@@ -157,7 +157,7 @@ describe('provisioner (live gateway)', () => {
     const content = body.choices?.[0]?.message?.content;
     expect(typeof content).toBe('string');
     expect(content!.length).toBeGreaterThan(0);
-    expect(content).toMatch(/pong/i);
+    expect(content).toMatch(/pomegranate/i);
   }, 120_000);
 });
 

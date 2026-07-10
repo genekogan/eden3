@@ -299,6 +299,11 @@ export interface CreditParams {
   /** Optional idempotency key (recommended for anything webhook-driven). */
   idempotencyKey?: string;
   taskExternalId?: string;
+  stripeEventId?: string;
+  stripeEventType?: string;
+  stripeEventData?: unknown;
+  voucherExternalId?: string;
+  code?: string;
   /** Credit the monthly subscription pot instead of the durable balance. */
   toSubscriptionBalance?: boolean;
   db?: DbHandle;
@@ -351,6 +356,11 @@ export async function credit(params: CreditParams): Promise<LedgerResult> {
           type: params.type,
           idempotencyKey: params.idempotencyKey ?? null,
           taskExternalId: params.taskExternalId ?? null,
+          stripeEventId: params.stripeEventId ?? null,
+          stripeEventType: params.stripeEventType ?? null,
+          stripeEventData: params.stripeEventData ?? null,
+          voucherExternalId: params.voucherExternalId ?? null,
+          code: params.code ?? null,
         })
         .returning();
       if (!ledger) throw new Error('manna: ledger insert returned no row');

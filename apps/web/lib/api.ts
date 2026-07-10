@@ -23,12 +23,26 @@
 
 import { streamSseBody, subscribeSessionEvents } from "./sse";
 import type { SessionEventStreamOptions, StreamSseOptions } from "./sse";
+import { getClerkToken } from "./clerk";
 import type {
   AgentCreateInput,
   AgentDto,
+  AgentExportResponse,
+  AgentImportInput,
+  AgentImportResult,
+  AgentMemoryRebuildResponse,
+  AgentMemoryResponse,
   AgentProfile,
   AgentUpdateInput,
+  AuthMeResponse,
+  BillingCheckoutSession,
+  BillingSubscriptionResponse,
+  BillingSubscriptionSummary,
+  ChannelConnectionCreateInput,
+  ChannelConnectionDto,
+  ChannelMockMessageResult,
   CollectionDetail,
+  CollectionCreateInput,
   CollectionDto,
   CreationDto,
   DevUser,
@@ -36,25 +50,39 @@ import type {
   MannaTransactionDto,
   MessageDto,
   Paginated,
+  OperatorUsageSummary,
+  AgentSkillsResponse,
   SessionDetail,
   SessionDto,
   SessionEvent,
+  SkillCreateInput,
+  SkillDefinitionDto,
+  SkillReviewInput,
   StudioGeneration,
+  StudioGenerationQuote,
   StudioTool,
   TaskCreateInput,
+  TaskUpdateInput,
   TriggerDto,
-  TriggerStatus,
+  VoucherRedeemResult,
 } from "./types";
 
 // ---------------------------------------------------------------------------
 // Base fetch
 // ---------------------------------------------------------------------------
 
-function apiBase(): string {
-  if (typeof window !== "undefined") return "/api";
+function publicApiOrigin(): string | null {
+  const origin = process.env.NEXT_PUBLIC_API_ORIGIN?.trim();
+  return origin ? origin.replace(/\/+$/, "") : null;
+}
+
+function apiBase(opts: { direct?: boolean } = {}): string {
+  if (typeof window !== "undefined") {
+    return opts.direct ? (publicApiOrigin() ?? "/api") : "/api";
+  }
   return (
     process.env.API_INTERNAL_URL ??
-    `http://localhost:${process.env.API_PORT ?? "4301"}`
+    `http://127.0.0.1:${process.env.API_PORT ?? "4301"}`
   );
 }
 
@@ -97,13 +125,21 @@ async function toApiError(res: Response, path: string): Promise<ApiError> {
   return new ApiError(res.status, `${res.status} ${path}: ${detail}`, body);
 }
 
-async function apiFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${apiBase()}${path}`, {
+async function apiFetch<T>(
+  path: string,
+  init: RequestInit = {},
+  opts: { direct?: boolean } = {},
+): Promise<T> {
+  const clerkToken = await getClerkToken();
+  const res = await fetch(`${apiBase(opts)}${path}`, {
     cache: "no-store",
+    credentials:
+      init.credentials ?? (typeof window !== "undefined" ? "include" : undefined),
     ...init,
     headers: {
       accept: "application/json",
       ...(init.body != null ? { "content-type": "application/json" } : {}),
+      ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
       ...init.headers,
     },
   });
@@ -116,12 +152,21 @@ function get<T>(path: string): Promise<T> {
   return apiFetch<T>(path);
 }
 
-function post<T>(path: string, body?: unknown, init: RequestInit = {}): Promise<T> {
-  return apiFetch<T>(path, {
-    method: "POST",
-    body: body === undefined ? undefined : JSON.stringify(body),
-    ...init,
-  });
+function post<T>(
+  path: string,
+  body?: unknown,
+  init: RequestInit = {},
+  opts: { direct?: boolean } = {},
+): Promise<T> {
+  return apiFetch<T>(
+    path,
+    {
+      method: "POST",
+      body: body === undefined ? undefined : JSON.stringify(body),
+      ...init,
+    },
+    opts,
+  );
 }
 
 function patch<T>(path: string, body: unknown): Promise<T> {
@@ -261,6 +306,7 @@ export async function* sseStream(
   body: unknown,
   options: SseStreamOptions = {},
 ): AsyncGenerator<SessionEvent, void, undefined> {
+  const clerkToken = await getClerkToken();
   const res = await fetch(`${apiBase()}${path}`, {
     method: "POST",
     cache: "no-store",
@@ -268,6 +314,7 @@ export async function* sseStream(
     headers: {
       accept: "text/event-stream",
       "content-type": "application/json",
+      ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
     },
     body: JSON.stringify(body ?? {}),
   });
@@ -305,6 +352,10 @@ function toAgentProfile(data: unknown): AgentProfile {
   const obj = asRecord(data);
   return {
     agent: (obj.agent ?? data) as AgentDto,
+    memory:
+      obj.memory && typeof obj.memory === "object"
+        ? (obj.memory as AgentProfile["memory"])
+        : null,
     recentCreations: Array.isArray(obj.recentCreations)
       ? (obj.recentCreations as CreationDto[])
       : [],
@@ -341,11 +392,53 @@ function toMannaSummary(data: unknown): MannaSummary {
   };
 }
 
+function toAuthMe(data: unknown): AuthMeResponse {
+  const obj = asRecord(data);
+  const rawUser = obj.user;
+  const rawManna = obj.manna;
+  return {
+    user:
+      rawUser && typeof rawUser === "object"
+        ? (rawUser as DevUser)
+        : null,
+    manna:
+      rawManna && typeof rawManna === "object"
+        ? toMannaSummary(rawManna)
+        : null,
+  };
+}
+
+function toBillingSubscription(data: unknown): BillingSubscriptionResponse {
+  const obj = asRecord(data);
+  const raw = obj.subscription;
+  if (!raw || typeof raw !== "object") return { subscription: null };
+  const sub = raw as Record<string, unknown>;
+  return {
+    subscription: {
+      status: typeof sub.status === "string" ? sub.status : "unknown",
+      tier: typeof sub.tier === "string" ? sub.tier : null,
+      monthlyManna:
+        typeof sub.monthlyManna === "number" ? sub.monthlyManna : 0,
+      currentPeriodEnd:
+        typeof sub.currentPeriodEnd === "string" ? sub.currentPeriodEnd : null,
+      cancelAtPeriodEnd: sub.cancelAtPeriodEnd === true,
+      updatedAt: typeof sub.updatedAt === "string" ? sub.updatedAt : "",
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The client
 // ---------------------------------------------------------------------------
 
 export const api = {
+  auth: {
+    /** GET /api/auth/me — current signed-in or impersonated account plus manna. */
+    async me(): Promise<AuthMeResponse> {
+      return toAuthMe(await get<unknown>("/auth/me"));
+    },
+  },
+
   sessions: {
     /** GET /api/sessions?cursor */
     async list(params: { cursor?: string } = {}): Promise<Paginated<SessionDto>> {
@@ -411,10 +504,51 @@ export const api = {
       return unwrap<AgentDto>(await post<unknown>("/agents", input), "agent");
     },
 
+    /** GET /api/agents/:username/export -> portable JSON bundle. */
+    exportBundle(username: string): Promise<AgentExportResponse> {
+      return get<AgentExportResponse>(`/agents/${enc(username)}/export`);
+    },
+
+    /** GET /api/agents/:username/memory -> owner/admin runtime memory files. */
+    memory(username: string): Promise<AgentMemoryResponse> {
+      return get<AgentMemoryResponse>(`/agents/${enc(username)}/memory`);
+    },
+
+    /** PUT /api/agents/:username/memory -> replace collective MEMORY.md. */
+    saveMemory(username: string, memory: string): Promise<AgentMemoryResponse> {
+      return apiFetch<AgentMemoryResponse>(`/agents/${enc(username)}/memory`, {
+        method: "PUT",
+        body: JSON.stringify({ memory }),
+      });
+    },
+
+    /** POST /api/agents/:username/memory/rebuild -> force transcript distillation. */
+    rebuildMemory(username: string): Promise<AgentMemoryRebuildResponse> {
+      return post<AgentMemoryRebuildResponse>(`/agents/${enc(username)}/memory/rebuild`);
+    },
+
+    /** POST /api/agents/import -> create/provision from portable bundle. */
+    importBundle(input: AgentImportInput): Promise<AgentImportResult> {
+      return post<AgentImportResult>("/agents/import", input);
+    },
+
     /** PATCH /api/agents/:username */
     async update(username: string, patchBody: AgentUpdateInput): Promise<AgentDto> {
       return unwrap<AgentDto>(
         await patch<unknown>(`/agents/${enc(username)}`, patchBody),
+        "agent",
+      );
+    },
+
+    /** POST /api/agents/:username/like */
+    async like(username: string): Promise<AgentDto> {
+      return unwrap<AgentDto>(await post<unknown>(`/agents/${enc(username)}/like`), "agent");
+    },
+
+    /** DELETE /api/agents/:username/like */
+    async unlike(username: string): Promise<AgentDto> {
+      return unwrap<AgentDto>(
+        await apiFetch<unknown>(`/agents/${enc(username)}/like`, { method: "DELETE" }),
         "agent",
       );
     },
@@ -423,7 +557,7 @@ export const api = {
   feed: {
     /** GET /api/feed/creations?cursor&agent&user -> {creations[], nextCursor} */
     async creations(
-      params: { cursor?: string; agent?: string; user?: string } = {},
+      params: { q?: string; cursor?: string; agent?: string; user?: string } = {},
     ): Promise<Paginated<CreationDto>> {
       return toPaginated<CreationDto>(
         await get<unknown>(`/feed/creations${qs(params)}`),
@@ -440,12 +574,48 @@ export const api = {
         "creation",
       );
     },
+
+    /** POST /api/creations/:id/like */
+    async like(id: string): Promise<CreationDto> {
+      return unwrap<CreationDto>(await post<unknown>(`/creations/${enc(id)}/like`), "creation");
+    },
+
+    /** DELETE /api/creations/:id/like */
+    async unlike(id: string): Promise<CreationDto> {
+      return unwrap<CreationDto>(
+        await apiFetch<unknown>(`/creations/${enc(id)}/like`, { method: "DELETE" }),
+        "creation",
+      );
+    },
   },
 
   collections: {
     /** GET /api/collections/:id */
     async get(id: string): Promise<CollectionDetail> {
       return toCollectionDetail(await get<unknown>(`/collections/${enc(id)}`));
+    },
+
+    /** POST /api/collections */
+    async create(input: CollectionCreateInput): Promise<CollectionDto> {
+      return unwrap<CollectionDto>(await post<unknown>("/collections", input), "collection");
+    },
+
+    /** POST /api/collections/:id/creations */
+    addCreation(
+      id: string,
+      body: { creationId: string; position?: number },
+    ): Promise<{ ok: true; collectionId: string; creationId: string; position: number }> {
+      return post<{ ok: true; collectionId: string; creationId: string; position: number }>(
+        `/collections/${enc(id)}/creations`,
+        body,
+      );
+    },
+
+    /** DELETE /api/collections/:id/creations/:creationId */
+    removeCreation(id: string, creationId: string): Promise<{ ok: true }> {
+      return apiFetch<{ ok: true }>(`/collections/${enc(id)}/creations/${enc(creationId)}`, {
+        method: "DELETE",
+      });
     },
   },
 
@@ -474,6 +644,110 @@ export const api = {
     },
   },
 
+  billing: {
+    /** GET /api/billing/subscription -> safe current subscription summary. */
+    async subscription(): Promise<BillingSubscriptionSummary | null> {
+      return toBillingSubscription(
+        await get<unknown>("/billing/subscription"),
+      ).subscription;
+    },
+
+    /** POST /api/billing/checkout -> Stripe Checkout session. */
+    async checkout(
+      body:
+        | { kind: "manna_topup" }
+        | { kind: "subscription"; tier: "basic" | "pro" | "believer" },
+    ): Promise<BillingCheckoutSession> {
+      return unwrap<BillingCheckoutSession>(
+        await post<unknown>("/billing/checkout", body),
+        "session",
+      );
+    },
+
+    /** POST /api/billing/vouchers/redeem {code}. */
+    redeemVoucher(code: string): Promise<VoucherRedeemResult> {
+      return post<VoucherRedeemResult>("/billing/vouchers/redeem", { code });
+    },
+  },
+
+  channels: {
+    /** GET /api/channels/connections — safe metadata only, never plaintext tokens. */
+    async list(): Promise<Paginated<ChannelConnectionDto>> {
+      return toPaginated<ChannelConnectionDto>(
+        await get<unknown>("/channels/connections"),
+        "connections",
+      );
+    },
+
+    /** POST /api/channels/connections — stores an encrypted channel token. */
+    async create(input: ChannelConnectionCreateInput): Promise<ChannelConnectionDto> {
+      return unwrap<ChannelConnectionDto>(
+        await post<unknown>("/channels/connections", input),
+        "connection",
+      );
+    },
+
+    /** POST /api/channels/connections/:id/mock-message — sandbox route test. */
+    mockMessage(id: string, message: string): Promise<ChannelMockMessageResult> {
+      return post<ChannelMockMessageResult>(
+        `/channels/connections/${enc(id)}/mock-message`,
+        { message },
+      );
+    },
+
+    /** DELETE /api/channels/connections/:id. */
+    delete(id: string): Promise<{ ok: true }> {
+      return apiFetch<{ ok: true }>(`/channels/connections/${enc(id)}`, {
+        method: "DELETE",
+      });
+    },
+  },
+
+  skills: {
+    /** GET /api/skills — approved skills plus viewer-owned pending/rejected rows. */
+    async list(): Promise<Paginated<SkillDefinitionDto>> {
+      return toPaginated<SkillDefinitionDto>(
+        await get<unknown>("/skills"),
+        "skills",
+      );
+    },
+
+    /** POST /api/skills/user — submit a pending user-created skill. */
+    async createUser(input: SkillCreateInput): Promise<SkillDefinitionDto> {
+      return unwrap<SkillDefinitionDto>(
+        await post<unknown>("/skills/user", input),
+        "skill",
+      );
+    },
+
+    /** POST /api/skills/:slug/review — admin moderation. */
+    async review(slug: string, input: SkillReviewInput): Promise<SkillDefinitionDto> {
+      return unwrap<SkillDefinitionDto>(
+        await post<unknown>(`/skills/${enc(slug)}/review`, input),
+        "skill",
+      );
+    },
+
+    /** GET /api/agents/:username/skills. */
+    agent(username: string): Promise<AgentSkillsResponse> {
+      return get<AgentSkillsResponse>(`/agents/${enc(username)}/skills`);
+    },
+
+    /** POST /api/agents/:username/skills — replace final OpenClaw allowlist. */
+    setAgent(username: string, slugs: string[]): Promise<AgentSkillsResponse> {
+      return post<AgentSkillsResponse>(`/agents/${enc(username)}/skills`, { slugs });
+    },
+  },
+
+  operator: {
+    /** GET /api/operator/usage/summary — admin-only usage/spend aggregate. */
+    async usageSummary(
+      params: { days?: number; limit?: number; userId?: string; agentId?: string } = {},
+    ): Promise<OperatorUsageSummary> {
+      return get<OperatorUsageSummary>(`/operator/usage/summary${qs(params)}`);
+    },
+  },
+
   tasks: {
     /** GET /api/tasks — scheduled prompts (triggers) for the current user. */
     async list(): Promise<Paginated<TriggerDto>> {
@@ -489,11 +763,8 @@ export const api = {
       return unwrap<TriggerDto>(await post<unknown>("/tasks", input), "task");
     },
 
-    /** PATCH /api/tasks/:id {status} — pause/resume. */
-    async update(
-      id: string,
-      body: { status: TriggerStatus },
-    ): Promise<TriggerDto> {
+    /** PATCH /api/tasks/:id — pause/resume/edit/delete. */
+    async update(id: string, body: TaskUpdateInput): Promise<TriggerDto> {
       return unwrap<TriggerDto>(
         await patch<unknown>(`/tasks/${enc(id)}`, body),
         "task",
@@ -510,6 +781,17 @@ export const api = {
       ).items;
     },
 
+    /** POST /api/studio/quote {tool,args} -> {quote}. */
+    async quote(body: {
+      tool: string;
+      args: Record<string, unknown>;
+    }): Promise<StudioGenerationQuote> {
+      return unwrap<StudioGenerationQuote>(
+        await post<unknown>("/studio/quote", body),
+        "quote",
+      );
+    },
+
     /**
      * POST /api/studio/generate {tool, args} -> {creationId, url}.
      * Long-running (image ~2min, video up to 10min) — keep a progress state
@@ -520,26 +802,22 @@ export const api = {
       options: { signal?: AbortSignal } = {},
     ): Promise<StudioGeneration> {
       return unwrap<StudioGeneration>(
-        await post<unknown>("/studio/generate", body, {
-          signal: options.signal,
-        }),
+        await post<unknown>(
+          "/studio/generate",
+          body,
+          { signal: options.signal },
+          { direct: true },
+        ),
         "generation",
       );
     },
   },
 
-  /** Dev impersonation auth (Clerk later) — see DevUserSwitcher. */
+  /** Current auth session + dev impersonation helpers. */
   dev: {
-    /** GET /api/dev/me — current impersonated user, or null. Tolerate 501. */
+    /** GET /api/auth/me — current signed-in or impersonated user, or null. */
     async me(): Promise<DevUser | null> {
-      const data = await get<unknown>("/dev/me");
-      if (!data || typeof data !== "object") return null;
-      const obj = data as Record<string, unknown>;
-      if ("user" in obj) return (obj.user as DevUser | null) ?? null;
-      if (typeof obj.id === "string" && typeof obj.username === "string") {
-        return obj as unknown as DevUser;
-      }
-      return null;
+      return (await api.auth.me()).user;
     },
 
     /** GET /api/dev/users?q= — search accounts to impersonate. */

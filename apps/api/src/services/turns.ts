@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
-import type { AuthSession } from '@eden3/core';
-import { PRICING, debit, refund } from '@eden3/core';
-import { accounts, db, messages, sessions, type Session } from '@eden3/db';
+import type { AuthSession, CostProvider } from '@eden3/core';
+import { PRICING, costFromLlmUsage, credit, debit, mannaForEstimate, refund } from '@eden3/core';
+import { DEFAULT_AGENT_MODEL, DEFAULT_AGENT_THINKING_LEVEL } from '@eden3/shared';
+import { accounts, db, messages, sessions, usageEvents, type Session } from '@eden3/db';
 import type { ChatTurnParams, GatewayTurnEvent, GatewayUsage } from '@eden3/gateway';
 import type { SessionEvent, Usage } from '@eden3/shared';
 import { desc, eq, sql } from 'drizzle-orm';
@@ -62,6 +63,10 @@ export interface TurnAgent {
   username: string;
   /** OpenClaw agent id the gateway routes by. */
   openclawId: string;
+  /** Provider/model ref when known, e.g. "anthropic/claude-haiku-4-5". */
+  model?: string;
+  /** User-facing reasoning control persisted on the agent. */
+  thinkingLevel?: string;
 }
 
 export interface RunTurnParams {
@@ -71,6 +76,12 @@ export interface RunTurnParams {
   user: AuthSession;
   /** The user's message exactly as typed (persisted verbatim). */
   content: string;
+  /** Optional product surface that initiated this turn. */
+  source?: {
+    kind: 'scheduled_task';
+    triggerId: string;
+    triggerExternalId?: string | null;
+  };
   /**
    * Called once the turn is funded and persisted — the route hijacks the
    * reply and returns the SSE sink. Everything failing before this point
@@ -156,6 +167,159 @@ export async function loadPrimerMessages(sessionId: string): Promise<PrimerMessa
 // Pipeline
 // ---------------------------------------------------------------------------
 
+export const DEFAULT_CHAT_METERING_MODEL = 'anthropic/claude-haiku-4-5';
+
+type ChatCostProvider = Extract<CostProvider, 'anthropic' | 'google' | 'openrouter'>;
+type ChatModelSource = 'agent' | 'default';
+
+export type ChatTurnMetering =
+  | {
+      status: 'metered';
+      provider: ChatCostProvider;
+      model: string;
+      modelSource: ChatModelSource;
+      tableVersion: string;
+      costUsd: number;
+      manna: number;
+      estimated: boolean;
+      lineItems: Array<{
+        unit: string;
+        quantity: number;
+        usdPerUnit: number;
+        costUsd: number;
+        estimated?: boolean;
+      }>;
+    }
+  | {
+      status: 'missing_usage';
+      provider: ChatCostProvider;
+      model: string;
+      modelSource: ChatModelSource;
+      costUsd: null;
+      manna: null;
+    }
+  | {
+      status: 'unmetered';
+      provider: string;
+      model: string;
+      modelSource: ChatModelSource;
+      error: string;
+      costUsd: null;
+      manna: null;
+    };
+
+export type ChatChargeSettlement =
+  | {
+      status: 'settled';
+      reservedManna: number;
+      meteredManna: number;
+      adjustmentManna: number;
+      chargedManna: number;
+      balance: number;
+      transactionId: string | null;
+      alreadyApplied: boolean;
+    }
+  | {
+      status: 'unmetered';
+      reservedManna: number;
+      chargedManna: number;
+      reason: string;
+    }
+  | {
+      status: 'failed';
+      reservedManna: number;
+      meteredManna: number;
+      adjustmentManna: number;
+      chargedManna: number;
+      error: string;
+    };
+
+function resolveChatMeteringModel(model: string | undefined): {
+  provider: string;
+  model: string;
+  source: ChatModelSource;
+} {
+  const raw = (model && model.trim() !== '' ? model : DEFAULT_CHAT_METERING_MODEL).trim();
+  const source: ChatModelSource = model && model.trim() !== '' ? 'agent' : 'default';
+  const slash = raw.indexOf('/');
+  if (slash === -1) return { provider: 'anthropic', model: raw, source };
+  return { provider: raw.slice(0, slash), model: raw.slice(slash + 1), source };
+}
+
+function asChatCostProvider(provider: string): ChatCostProvider {
+  if (provider === 'anthropic' || provider === 'google' || provider === 'openrouter') {
+    return provider;
+  }
+  throw new Error(`unsupported chat cost provider "${provider}"`);
+}
+
+function costUsdToNumeric(costUsd: number | null): string | null {
+  if (costUsd === null) return null;
+  if (!Number.isFinite(costUsd) || costUsd < 0) {
+    throw new RangeError(`costUsd must be finite and nonnegative, got ${String(costUsd)}`);
+  }
+  return costUsd.toFixed(8);
+}
+
+/** Meter gateway token usage for the metadata stored on assistant messages. */
+export function meterChatUsage(
+  usage: GatewayUsage | undefined,
+  model?: string,
+): ChatTurnMetering {
+  const resolved = resolveChatMeteringModel(model);
+  try {
+    const provider = asChatCostProvider(resolved.provider);
+    if (!usage) {
+      return {
+        status: 'missing_usage',
+        provider,
+        model: resolved.model,
+        modelSource: resolved.source,
+        costUsd: null,
+        manna: null,
+      };
+    }
+
+    const completionTokens = usage.completionTokens ?? 0;
+    const promptTokens =
+      usage.promptTokens ?? (usage.totalTokens !== undefined ? Math.max(0, usage.totalTokens - completionTokens) : 0);
+    const estimate = costFromLlmUsage({
+      provider,
+      model: resolved.model,
+      promptTokens,
+      completionTokens,
+      cachedTokens: usage.cachedTokens ?? 0,
+    });
+    return {
+      status: 'metered',
+      provider,
+      model: estimate.model,
+      modelSource: resolved.source,
+      tableVersion: estimate.tableVersion,
+      costUsd: estimate.totalCostUsd,
+      manna: mannaForEstimate(estimate),
+      estimated: estimate.estimated,
+      lineItems: estimate.lineItems.map((line) => ({
+        unit: line.unit,
+        quantity: line.quantity,
+        usdPerUnit: line.usdPerUnit,
+        costUsd: line.costUsd,
+        ...(line.estimated === true ? { estimated: true } : {}),
+      })),
+    };
+  } catch (err) {
+    return {
+      status: 'unmetered',
+      provider: resolved.provider,
+      model: resolved.model,
+      modelSource: resolved.source,
+      error: err instanceof Error ? err.message : String(err),
+      costUsd: null,
+      manna: null,
+    };
+  }
+}
+
 /** Shared Usage view of a gateway usage block (cachedTokens stays internal). */
 function toSharedUsage(usage: GatewayUsage | undefined): Usage | undefined {
   if (!usage) return undefined;
@@ -212,6 +376,11 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
   if (!sessionKey) throw new Error(`session ${session.id} has no gateway session key`);
 
   const turnId = randomUUID();
+  const turnStartedAtMs = Date.now();
+  const taskExternalId =
+    params.source?.kind === 'scheduled_task' && params.source.triggerExternalId
+      ? params.source.triggerExternalId
+      : undefined;
 
   // 1. Debit — idempotencyKey is the turn uuid; a 402 must precede streaming.
   const debited = await debit({
@@ -219,6 +388,7 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
     amount: PRICING.chatTurn,
     type: 'spend:chat',
     idempotencyKey: turnId,
+    ...(taskExternalId ? { taskExternalId } : {}),
   });
 
   // A bare refund for the PRE-STREAM window (no SSE sink exists yet, so we
@@ -309,12 +479,66 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
     }
   };
 
+  let usageEventRecorded = false;
+  const recordUsageEvent = async (record: {
+    status: 'completed' | 'missing_usage' | 'unmetered' | 'error';
+    usage?: GatewayUsage;
+    metering?: ChatTurnMetering;
+    settlement?: ChatChargeSettlement;
+    messageId?: string | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+    finishReason?: string | null;
+    emptyTurn?: boolean;
+  }): Promise<void> => {
+    if (usageEventRecorded) return;
+    usageEventRecorded = true;
+    try {
+      const metering = record.metering ?? meterChatUsage(record.usage, agent.model);
+      await db.insert(usageEvents).values({
+        eventType: 'chat_turn',
+        status: record.status,
+        userId: user.accountId,
+        agentId: agent.accountId,
+        sessionId: session.id,
+        messageId: record.messageId ?? null,
+        turnId,
+        provider: metering.provider,
+        model: metering.model,
+        tableVersion: metering.status === 'metered' ? metering.tableVersion : null,
+        promptTokens: record.usage?.promptTokens ?? null,
+        completionTokens: record.usage?.completionTokens ?? null,
+        cachedTokens: record.usage?.cachedTokens ?? null,
+        totalTokens: record.usage?.totalTokens ?? null,
+        costUsd: costUsdToNumeric(metering.costUsd),
+        manna: metering.manna,
+        latencyMs: Date.now() - turnStartedAtMs,
+        errorCode: record.errorCode ?? null,
+        errorMessage: record.errorMessage ?? null,
+        metadata: {
+          metering,
+          agentConfig: {
+            model: agent.model ?? DEFAULT_AGENT_MODEL,
+            thinkingLevel: agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
+          },
+          settlement: record.settlement ?? null,
+          finishReason: record.finishReason ?? null,
+          emptyTurn: record.emptyTurn ?? null,
+          source: params.source ?? null,
+        },
+      });
+    } catch (err) {
+      onError(err, 'usage event insert');
+    }
+  };
+
   try {
     publish({ type: 'turn.started', sessionId: session.id, turnId });
     publish({ type: 'manna.updated', accountId: user.accountId, balance: debited.balance.total });
 
     let primedMarked = !prime;
     let completed = false;
+    let terminalEvent: 'completed' | 'error' | null = null;
 
     for await (const event of deps.compat.chatTurn({
       agentId: agent.openclawId,
@@ -339,26 +563,165 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
           break;
         }
         case 'token': {
+          if (terminalEvent !== null) {
+            onError(
+              new Error(`gateway emitted token after terminal ${terminalEvent} event for turn ${turnId}`),
+              'post-terminal gateway token',
+            );
+            break;
+          }
           publish({ type: 'token', turnId, delta: event.delta });
           break;
         }
         case 'turn.completed': {
+          if (terminalEvent !== null) {
+            onError(
+              new Error(`gateway emitted turn.completed after terminal ${terminalEvent} event for turn ${turnId}`),
+              terminalEvent === 'completed'
+                ? 'duplicate gateway completion'
+                : 'post-error gateway completion',
+            );
+            break;
+          }
+          terminalEvent = 'completed';
           completed = true;
+          const metering = meterChatUsage(event.usage, agent.model);
+          const settleChatCharge = async (): Promise<ChatChargeSettlement> => {
+            if (metering.status !== 'metered') {
+              return {
+                status: 'unmetered',
+                reservedManna: PRICING.chatTurn,
+                chargedManna: PRICING.chatTurn,
+                reason: metering.status,
+              };
+            }
+
+            const meteredManna = metering.manna;
+            const adjustmentManna = meteredManna - PRICING.chatTurn;
+            if (adjustmentManna === 0) {
+              return {
+                status: 'settled',
+                reservedManna: PRICING.chatTurn,
+                meteredManna,
+                adjustmentManna,
+                chargedManna: meteredManna,
+                balance: debited.balance.total,
+                transactionId: null,
+                alreadyApplied: false,
+              };
+            }
+
+            try {
+              if (adjustmentManna > 0) {
+                const adjusted = await debit({
+                  accountId: user.accountId,
+                  amount: adjustmentManna,
+                  type: 'spend:chat:settle',
+                  idempotencyKey: `${turnId}:settle`,
+                  ...(taskExternalId ? { taskExternalId } : {}),
+                });
+                publish({
+                  type: 'manna.updated',
+                  accountId: user.accountId,
+                  balance: adjusted.balance.total,
+                });
+                return {
+                  status: 'settled',
+                  reservedManna: PRICING.chatTurn,
+                  meteredManna,
+                  adjustmentManna,
+                  chargedManna: meteredManna,
+                  balance: adjusted.balance.total,
+                  transactionId: adjusted.transaction.id,
+                  alreadyApplied: adjusted.alreadyApplied,
+                };
+              }
+
+              const adjusted = await credit({
+                accountId: user.accountId,
+                amount: Math.abs(adjustmentManna),
+                type: 'refund:chat:settle',
+                idempotencyKey: `${turnId}:settle:refund`,
+                ...(taskExternalId ? { taskExternalId } : {}),
+              });
+              publish({
+                type: 'manna.updated',
+                accountId: user.accountId,
+                balance: adjusted.balance.total,
+              });
+              return {
+                status: 'settled',
+                reservedManna: PRICING.chatTurn,
+                meteredManna,
+                adjustmentManna,
+                chargedManna: meteredManna,
+                balance: adjusted.balance.total,
+                transactionId: adjusted.transaction.id,
+                alreadyApplied: adjusted.alreadyApplied,
+              };
+            } catch (err) {
+              onError(err, 'chat charge settlement');
+              return {
+                status: 'failed',
+                reservedManna: PRICING.chatTurn,
+                meteredManna,
+                adjustmentManna,
+                chargedManna: PRICING.chatTurn,
+                error: err instanceof Error ? err.message : String(err),
+              };
+            }
+          };
+          const meteringWithAccounts = {
+            ...metering,
+            userAccountId: user.accountId,
+            agentAccountId: agent.accountId,
+          };
+          const messageData = {
+            kind: 'chat_turn',
+            turnId,
+            usage: event.usage ?? null,
+            metering: meteringWithAccounts,
+            agentConfig: {
+              model: agent.model ?? DEFAULT_AGENT_MODEL,
+              thinkingLevel: agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
+            },
+            settlement: null as ChatChargeSettlement | null,
+            emptyTurn: event.emptyTurn,
+            finishReason: event.finishReason ?? null,
+            source: params.source ?? null,
+          };
           const assistant = await persistMessage({
             sessionId: session.id,
             senderId: agent.accountId,
             role: 'assistant',
             content: event.text,
             name: agent.username,
-            edenMessageData: {
-              kind: 'chat_turn',
-              turnId,
-              usage: event.usage ?? null,
-              emptyTurn: event.emptyTurn,
-              finishReason: event.finishReason ?? null,
-            },
+            edenMessageData: messageData,
           });
           outcome.assistantMessageId = assistant.id;
+          const settlement = await settleChatCharge();
+          try {
+            await db
+              .update(messages)
+              .set({ edenMessageData: { ...messageData, settlement } })
+              .where(eq(messages.id, assistant.id));
+          } catch (err) {
+            onError(err, 'chat settlement metadata update');
+          }
+          await recordUsageEvent({
+            status:
+              metering.status === 'metered'
+                ? 'completed'
+                : metering.status === 'missing_usage'
+                  ? 'missing_usage'
+                  : 'unmetered',
+            usage: event.usage,
+            metering,
+            settlement,
+            messageId: assistant.id,
+            finishReason: event.finishReason ?? null,
+            emptyTurn: event.emptyTurn,
+          });
           if (event.emptyTurn) {
             // Agent said nothing — typically an async media tool is running
             // (spike: compat filler suppressed upstream). Signal the UI.
@@ -374,8 +737,21 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
           break;
         }
         case 'error': {
+          if (terminalEvent !== null) {
+            onError(
+              new Error(`gateway emitted error after terminal ${terminalEvent} event for turn ${turnId}`),
+              'post-terminal gateway error',
+            );
+            break;
+          }
+          terminalEvent = 'error';
           outcome.errorCode = event.code;
           await refundTurn();
+          await recordUsageEvent({
+            status: 'error',
+            errorCode: event.code,
+            errorMessage: event.message,
+          });
           publish({ type: 'error', turnId, code: event.code, message: event.message });
           break;
         }
@@ -386,6 +762,11 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
       // Stream ended without a terminal event (should not happen) — refund.
       outcome.errorCode = 'gateway_stream_error';
       await refundTurn();
+      await recordUsageEvent({
+        status: 'error',
+        errorCode: 'gateway_stream_error',
+        errorMessage: 'gateway stream ended without completing the turn',
+      });
       publish({
         type: 'error',
         turnId,
@@ -397,6 +778,11 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
     outcome.errorCode = 'internal_error';
     onError(err, 'turn pipeline');
     await refundTurn();
+    await recordUsageEvent({
+      status: 'error',
+      errorCode: 'internal_error',
+      errorMessage: err instanceof Error ? err.message : 'turn pipeline failed',
+    });
     publish({
       type: 'error',
       turnId,

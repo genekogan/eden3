@@ -4,6 +4,7 @@
 
 import {
   isProvisionFailed,
+  isProvisionWarming,
   provisionLabel,
 } from "@/components/agents/agent-utils";
 
@@ -32,6 +33,9 @@ export function ProvisionBadge({
   const label = provisionLabel(status);
   if (!label) return null;
   const failed = isProvisionFailed(status);
+  // The pulse implies live activity — only show it while a warm-up is
+  // actually running, not for dormant wake-on-chat agents.
+  const pulsing = isProvisionWarming(status);
   return (
     <span
       className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.15em] ${
@@ -43,7 +47,7 @@ export function ProvisionBadge({
       {failed ? null : (
         <span
           aria-hidden
-          className="size-1.5 animate-pulse rounded-full bg-accent"
+          className={`size-1.5 rounded-full bg-accent ${pulsing ? "animate-pulse" : ""}`}
         />
       )}
       {label}

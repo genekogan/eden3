@@ -10,7 +10,14 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, isEndpointMissing, onMannaUpdate } from "@/lib/api";
+import type { FormEvent } from "react";
+import {
+  api,
+  ApiError,
+  emitMannaUpdate,
+  isEndpointMissing,
+  onMannaUpdate,
+} from "@/lib/api";
 import type { MannaSummary, MannaTransactionDto } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
 import { Skeleton, SkeletonRows } from "@/components/skeleton";
@@ -116,6 +123,16 @@ function TransactionRow({ tx }: { tx: MannaTransactionDto }) {
 // ---------------------------------------------------------------------------
 
 type Phase = "loading" | "ready" | "error";
+type CheckoutTarget = "manna" | "basic" | "pro" | "believer";
+
+const SUBSCRIPTION_TIERS: Array<{
+  tier: "basic" | "pro" | "believer";
+  label: string;
+}> = [
+  { tier: "basic", label: "Basic" },
+  { tier: "pro", label: "Pro" },
+  { tier: "believer", label: "Believer" },
+];
 
 export function MannaClient() {
   const [summary, setSummary] = useState<MannaSummary | null>(null);
@@ -127,6 +144,11 @@ export function MannaClient() {
   const [txError, setTxError] = useState<unknown>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [checkoutBusy, setCheckoutBusy] = useState<CheckoutTarget | null>(null);
+  const [voucherCode, setVoucherCode] = useState("");
+  const [voucherBusy, setVoucherBusy] = useState(false);
+  const [billingNote, setBillingNote] = useState<string | null>(null);
+  const [billingError, setBillingError] = useState<string | null>(null);
   const alive = useRef(true);
 
   const loadSummary = useCallback(async () => {
@@ -189,6 +211,51 @@ export function MannaClient() {
       // Leave the button in place — retrying is the recovery path.
     } finally {
       if (alive.current) setLoadingMore(false);
+    }
+  };
+
+  const startCheckout = async (target: CheckoutTarget) => {
+    setCheckoutBusy(target);
+    setBillingError(null);
+    setBillingNote(null);
+    try {
+      const session =
+        target === "manna"
+          ? await api.billing.checkout({ kind: "manna_topup" })
+          : await api.billing.checkout({ kind: "subscription", tier: target });
+      if (!session.url) {
+        setBillingError("Stripe did not return a checkout URL.");
+        return;
+      }
+      window.location.assign(session.url);
+    } catch (error) {
+      setBillingError(error instanceof Error ? error.message : "Checkout failed.");
+    } finally {
+      if (alive.current) setCheckoutBusy(null);
+    }
+  };
+
+  const redeemVoucher = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const code = voucherCode.trim();
+    if (!code || voucherBusy) return;
+    setVoucherBusy(true);
+    setBillingError(null);
+    setBillingNote(null);
+    try {
+      const result = await api.billing.redeemVoucher(code);
+      setVoucherCode("");
+      setBillingNote(
+        result.alreadyApplied
+          ? "Voucher already applied."
+          : `Voucher applied: +${formatMannaExact(result.amount)} manna.`,
+      );
+      emitMannaUpdate();
+      await Promise.all([loadSummary(), loadTransactions()]);
+    } catch (error) {
+      setBillingError(error instanceof Error ? error.message : "Voucher failed.");
+    } finally {
+      if (alive.current) setVoucherBusy(false);
     }
   };
 
@@ -274,6 +341,54 @@ export function MannaClient() {
                 </div>
               ) : null}
             </dl>
+            <div className="mt-6 border-t border-edge pt-5">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={checkoutBusy !== null}
+                  onClick={() => void startCheckout("manna")}
+                  className="rounded-lg border border-accent/45 bg-accent/10 px-3 py-2 text-sm text-accent-soft transition-colors hover:border-accent disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {checkoutBusy === "manna" ? "Opening…" : "Buy manna"}
+                </button>
+                {SUBSCRIPTION_TIERS.map(({ tier, label }) => (
+                  <button
+                    key={tier}
+                    type="button"
+                    disabled={checkoutBusy !== null}
+                    onClick={() => void startCheckout(tier)}
+                    className="rounded-lg border border-edge px-3 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {checkoutBusy === tier ? "Opening…" : label}
+                  </button>
+                ))}
+              </div>
+              <form
+                onSubmit={(event) => void redeemVoucher(event)}
+                className="mt-3 flex flex-col gap-2 sm:flex-row"
+              >
+                <input
+                  value={voucherCode}
+                  onChange={(event) => setVoucherCode(event.target.value)}
+                  placeholder="Voucher code"
+                  autoComplete="off"
+                  className="min-w-0 flex-1 rounded-lg border border-edge bg-background px-3 py-2 text-sm placeholder:text-faint focus:border-accent/60 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={voucherBusy || voucherCode.trim().length === 0}
+                  className="rounded-lg border border-edge px-3 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {voucherBusy ? "Redeeming…" : "Redeem"}
+                </button>
+              </form>
+              {billingNote ? (
+                <p className="mt-2 text-xs text-emerald-300">{billingNote}</p>
+              ) : null}
+              {billingError ? (
+                <p className="mt-2 text-xs text-rose-300">{billingError}</p>
+              ) : null}
+            </div>
           </div>
         ) : null}
       </section>

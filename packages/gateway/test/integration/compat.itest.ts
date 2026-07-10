@@ -165,6 +165,7 @@ describe('OpenClawCompatClient.chatTurn (live)', () => {
     );
     const completed = expectCompleted(second);
     expect(completed.text.toLowerCase()).toContain(codeword.toLowerCase());
+    expect(completed.usage?.cachedTokens ?? 0).toBeGreaterThan(0);
 
     // Cross-check via the tools client: the transcript is addressable through
     // sessions_history with the probed args shape (scoped key + top-level

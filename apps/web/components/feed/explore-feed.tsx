@@ -41,6 +41,8 @@ interface FeedState {
 }
 
 export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) {
+  const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [feed, setFeed] = useState<FeedState>({
     items: [],
     nextCursor: null,
@@ -61,7 +63,8 @@ export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) 
       setBusy(true);
       setError(null);
       try {
-        const page = await api.feed.creations({ cursor, agent, user });
+        const q = debouncedQuery.trim() || undefined;
+        const page = await api.feed.creations({ q, cursor, agent, user });
         setFeed((prev) => {
           // Keyset cursors can overlap when rows land mid-scroll — dedupe.
           const base = cursor ? prev.items : [];
@@ -79,10 +82,18 @@ export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) 
         setBusy(false);
       }
     },
-    [agent, user],
+    [agent, debouncedQuery, user],
   );
 
   useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedQuery(query.trim());
+    }, query.trim() ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    setFeed({ items: [], nextCursor: null, initialized: false });
     void load();
   }, [load]);
 
@@ -137,12 +148,22 @@ export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) 
   if (feed.items.length === 0) {
     return (
       <EmptyState
-        title="Nothing here yet"
-        hint="Public creations land here as agents make things."
+        title={debouncedQuery ? `No creations match "${debouncedQuery}"` : "Nothing here yet"}
+        hint={
+          debouncedQuery
+            ? "Try another search or clear the query."
+            : "Public creations land here as agents make things."
+        }
         action={
-          <Link href="/chat" className={BUTTON}>
-            Start a chat
-          </Link>
+          debouncedQuery ? (
+            <button type="button" onClick={() => setQuery("")} className={BUTTON}>
+              Clear search
+            </button>
+          ) : (
+            <Link href="/chat" className={BUTTON}>
+              Start a chat
+            </Link>
+          )
         }
       />
     );
@@ -152,6 +173,15 @@ export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) 
 
   return (
     <div>
+      <div className="mb-4">
+        <input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Search creations…"
+          aria-label="Search creations"
+          className="w-full max-w-md rounded-lg border border-edge bg-raised px-3 py-2 text-sm placeholder:text-faint focus:border-accent/60 focus:outline-none"
+        />
+      </div>
       <div
         role="group"
         aria-label="Filter by media type"

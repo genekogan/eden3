@@ -1,6 +1,7 @@
-import { DevAuthProvider, type AuthProvider, type AuthSession } from '@eden3/core';
+import { DevAuthProvider, getEnv, type AuthProvider, type AuthSession } from '@eden3/core';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
+import { ClerkAuthProvider, FallbackAuthProvider } from './clerk-auth-provider';
 import { sendError } from './errors';
 
 /**
@@ -34,15 +35,29 @@ export interface AuthPluginOptions {
   provider?: AuthProvider;
 }
 
+function defaultAuthProvider(): AuthProvider {
+  const env = getEnv();
+  const dev = new DevAuthProvider({ adminUsernames: env.ADMIN_USERNAMES });
+  if (env.AUTH_PROVIDER === 'dev') return dev;
+
+  const clerk = new ClerkAuthProvider({
+    adminUsernames: env.ADMIN_USERNAMES,
+    authorizedParties: env.CLERK_AUTHORIZED_PARTIES,
+    jwtKey: env.CLERK_JWT_KEY,
+    seedManna: env.CLERK_NEW_USER_SEED_MANNA,
+  });
+  return env.AUTH_PROVIDER === 'hybrid' ? new FallbackAuthProvider([clerk, dev]) : clerk;
+}
+
 /** preHandler: reject anonymous requests with a 401 envelope. */
 export async function requireAuth(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   if (!req.account) {
-    await sendError(reply, 401, 'unauthorized', 'Authentication required (dev: POST /dev/impersonate)');
+    await sendError(reply, 401, 'unauthorized', 'Authentication required');
   }
 }
 
 export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {}): void {
-  const provider = opts.provider ?? new DevAuthProvider();
+  const provider = opts.provider ?? defaultAuthProvider();
 
   app.decorateRequest('account', null);
   app.decorate('authProvider', provider);

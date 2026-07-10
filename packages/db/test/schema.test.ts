@@ -11,17 +11,28 @@ const expectedTables = {
   session_users: schema.sessionUsers,
   messages: schema.messages,
   creations: schema.creations,
+  content_reports: schema.contentReports,
+  creation_likes: schema.creationLikes,
+  agent_likes: schema.agentLikes,
   collections: schema.collections,
   collection_creations: schema.collectionCreations,
   manna_accounts: schema.mannaAccounts,
   manna_transactions: schema.mannaTransactions,
+  usage_events: schema.usageEvents,
   triggers: schema.triggers,
   media_assets: schema.mediaAssets,
+  billing_subscriptions: schema.billingSubscriptions,
+  manna_vouchers: schema.mannaVouchers,
+  channel_connections: schema.channelConnections,
+  secret_access_audit_events: schema.secretAccessAuditEvents,
+  skill_definitions: schema.skillDefinitions,
+  agent_skills: schema.agentSkills,
+  distill_state: schema.distillState,
   etl_state: schema.etlState,
 } as const;
 
 describe('@eden3/db schema', () => {
-  it('defines all 14 tables under their SQL names', () => {
+  it('defines all expected tables under their SQL names', () => {
     for (const [sqlName, table] of Object.entries(expectedTables)) {
       expect(getTableName(table)).toBe(sqlName);
     }
@@ -29,6 +40,17 @@ describe('@eden3/db schema', () => {
 
   it('uses citext for accounts.username', () => {
     expect(schema.accounts.username.getSQLType()).toBe('citext');
+  });
+
+  it('stores Clerk subject separately from legacy external id', () => {
+    expect(schema.accounts.externalId.getSQLType()).toBe('text');
+    expect(schema.accounts.clerkUserId.getSQLType()).toBe('text');
+  });
+
+  it('stores agent runtime configuration', () => {
+    expect(schema.agents.model.getSQLType()).toBe('text');
+    expect(schema.agents.thinkingLevel.getSQLType()).toBe('text');
+    expect(schema.agents.toolGroups.getSQLType()).toBe('jsonb');
   });
 
   it('uses timestamptz for timestamps', () => {

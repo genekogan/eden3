@@ -35,6 +35,7 @@ const DATA_DIR = defaultOpenclawDataDir();
 
 const marker = makeMarker('apigw');
 const agentUsername = `apitest-${randomUUID().slice(0, 6)}`;
+const importedAgentUsername = `apiimport-${randomUUID().slice(0, 6)}`;
 const SCOPE_BLOCK_RE = /scope upgrade|pairing required|operator\.admin/i;
 
 let app: FastifyInstance;
@@ -61,8 +62,12 @@ afterAll(async () => {
     await cronSync.removeTrigger(taskId).catch(() => {});
   }
   await cli.execJson(['agents', 'delete', agentUsername, '--force']).catch(() => {});
+  await cli.execJson(['agents', 'delete', importedAgentUsername, '--force']).catch(() => {});
   await fs
     .rm(path.join(DATA_DIR, `workspace-${agentUsername}`), { recursive: true, force: true })
+    .catch(() => {});
+  await fs
+    .rm(path.join(DATA_DIR, `workspace-${importedAgentUsername}`), { recursive: true, force: true })
     .catch(() => {});
   await pg`delete from triggers where user_id = ${userId}`.catch(() => {});
   await app?.close();
@@ -71,6 +76,10 @@ afterAll(async () => {
     delete from agents where account_id in (select id from accounts where username = ${agentUsername})
   `;
   await pg`delete from accounts where username = ${agentUsername}`;
+  await pg`
+    delete from agents where account_id in (select id from accounts where username = ${importedAgentUsername})
+  `;
+  await pg`delete from accounts where username = ${importedAgentUsername}`;
   await deleteFixturesByMarker(marker);
   await pg.end({ timeout: 5 });
 });
@@ -138,6 +147,52 @@ describe('POST /agents (live gateway provisioning)', () => {
     );
     expect(soul).toContain('REVISED EDITION');
   }, 60_000);
+
+  it('exports and imports a real provisioned agent bundle', async () => {
+    const exported = await app.inject({
+      method: 'GET',
+      url: `/agents/${agentUsername}/export`,
+      headers: { cookie: devCookie(userId) },
+    });
+    expect(exported.statusCode).toBe(200);
+    const bundle = (
+      exported.json() as {
+        bundle: {
+          kind: 'eden3.agent.bundle';
+          version: 1;
+          agent: { persona: string; name: string; username: string };
+        };
+      }
+    ).bundle;
+    expect(bundle.kind).toBe('eden3.agent.bundle');
+    expect(bundle.agent.persona).toContain('REVISED EDITION');
+
+    const imported = await app.inject({
+      method: 'POST',
+      url: '/agents/import',
+      headers: { cookie: devCookie(userId) },
+      payload: { username: importedAgentUsername, bundle },
+    });
+    expect(imported.statusCode).toBe(201);
+    const { agent } = imported.json() as { agent: AgentDto };
+    expect(agent.username).toBe(importedAgentUsername);
+    expect(agent.provisionStatus).toBe('ready');
+    expect(agent.persona).toContain('REVISED EDITION');
+
+    const soul = await fs.readFile(
+      path.join(DATA_DIR, `workspace-${importedAgentUsername}`, 'SOUL.md'),
+      'utf8',
+    );
+    expect(soul).toContain('Api Itest Agent');
+    expect(soul).toContain('REVISED EDITION');
+
+    const models = await fetch(`${BASE_URL}/v1/models`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    expect(models.status).toBe(200);
+    const body = (await models.json()) as { data: { id: string }[] };
+    expect(body.data.map((m) => m.id)).toContain(`openclaw/${importedAgentUsername}`);
+  }, 120_000);
 });
 
 describe('POST/PATCH /tasks (live gateway cron)', () => {

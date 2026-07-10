@@ -11,6 +11,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type { CollectionDetail, DevUser } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
@@ -75,7 +76,12 @@ export function CollectionClient({ id }: { id: string }) {
   const [phase, setPhase] = useState<Phase>("loading");
   const [detail, setDetail] = useState<CollectionDetail | null>(null);
   const [owner, setOwner] = useState<OwnerRef | null>(null);
+  const [canEdit, setCanEdit] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
+  const [creationRef, setCreationRef] = useState("");
+  const [mutationBusy, setMutationBusy] = useState(false);
+  const [mutationError, setMutationError] = useState<string | null>(null);
+  const [mutationNote, setMutationNote] = useState<string | null>(null);
   const alive = useRef(true);
 
   const load = useCallback(async () => {
@@ -88,6 +94,7 @@ export function CollectionClient({ id }: { id: string }) {
       if (!alive.current) return;
       setDetail(result);
       setOwner(resolveOwner(result, me));
+      setCanEdit(Boolean(me && (me.isAdmin || me.id === result.collection.userId)));
       setPhase("ready");
     } catch (error) {
       if (!alive.current) return;
@@ -103,6 +110,41 @@ export function CollectionClient({ id }: { id: string }) {
       alive.current = false;
     };
   }, [load]);
+
+  const addCreation = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const ref = creationRef.trim();
+    if (!ref || mutationBusy) return;
+    setMutationBusy(true);
+    setMutationError(null);
+    setMutationNote(null);
+    try {
+      await api.collections.addCreation(id, { creationId: ref });
+      setCreationRef("");
+      setMutationNote("Creation added.");
+      await load();
+    } catch (error) {
+      setMutationError(error instanceof Error ? error.message : "Couldn't add creation.");
+    } finally {
+      if (alive.current) setMutationBusy(false);
+    }
+  };
+
+  const removeCreation = async (creationId: string) => {
+    if (mutationBusy) return;
+    setMutationBusy(true);
+    setMutationError(null);
+    setMutationNote(null);
+    try {
+      await api.collections.removeCreation(id, creationId);
+      setMutationNote("Creation removed.");
+      await load();
+    } catch (error) {
+      setMutationError(error instanceof Error ? error.message : "Couldn't remove creation.");
+    } finally {
+      if (alive.current) setMutationBusy(false);
+    }
+  };
 
   const collection = detail?.collection;
   const creations = detail?.creations ?? [];
@@ -174,6 +216,29 @@ export function CollectionClient({ id }: { id: string }) {
               <span aria-hidden>·</span>
               <span>updated {formatDate(collection.updatedAt)}</span>
             </div>
+            {canEdit ? (
+              <form
+                onSubmit={(event) => void addCreation(event)}
+                className="mt-5 flex flex-col gap-2 rounded-xl border border-edge bg-surface p-3 sm:flex-row sm:items-center"
+              >
+                <input
+                  value={creationRef}
+                  onChange={(event) => setCreationRef(event.target.value)}
+                  placeholder="Creation id or legacy id"
+                  aria-label="Creation id"
+                  className="min-w-0 flex-1 rounded-lg border border-edge bg-background px-3 py-2 text-sm placeholder:text-faint focus:border-accent/60 focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  disabled={mutationBusy || creationRef.trim().length === 0}
+                  className="rounded-lg border border-edge px-3 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {mutationBusy ? "Saving…" : "Add"}
+                </button>
+              </form>
+            ) : null}
+            {mutationNote ? <p className="mt-2 text-xs text-emerald-300">{mutationNote}</p> : null}
+            {mutationError ? <p className="mt-2 text-xs text-rose-300">{mutationError}</p> : null}
           </header>
 
           <div className="mt-10">
@@ -185,16 +250,27 @@ export function CollectionClient({ id }: { id: string }) {
             ) : (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
                 {creations.map((creation) => (
-                  <Link
-                    key={creation.id}
-                    href={`/creations/${encodeURIComponent(creation.id)}`}
-                    className="group relative"
-                  >
-                    <MediaThumb
-                      creation={creation}
-                      className="aspect-square transition-opacity group-hover:opacity-90"
-                    />
-                  </Link>
+                  <div key={creation.id} className="group relative">
+                    <Link
+                      href={`/creations/${encodeURIComponent(creation.id)}`}
+                      className="block"
+                    >
+                      <MediaThumb
+                        creation={creation}
+                        className="aspect-square transition-opacity group-hover:opacity-90"
+                      />
+                    </Link>
+                    {canEdit ? (
+                      <button
+                        type="button"
+                        disabled={mutationBusy}
+                        onClick={() => void removeCreation(creation.id)}
+                        className="absolute right-2 top-2 rounded-md border border-edge bg-background/90 px-2 py-1 text-[11px] text-muted opacity-0 shadow-lg shadow-black/30 transition-opacity hover:border-rose-300/50 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-40 group-hover:opacity-100"
+                      >
+                        Remove
+                      </button>
+                    ) : null}
+                  </div>
                 ))}
               </div>
             )}

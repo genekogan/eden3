@@ -1,9 +1,13 @@
+import { credit, resetEnvCache } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
+import type { GatewayTurnEvent } from '@eden3/gateway';
 import type { TriggerDto } from '@eden3/shared';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildServer } from '../src/server';
+import type { ToolsClientLike } from '../src/services/history-sync';
+import type { CompatClientLike } from '../src/services/turns';
 import {
   deleteFixturesByMarker,
   devCookie,
@@ -29,6 +33,7 @@ let otherUserId = '';
 
 let app: FastifyInstance;
 let fakeCron: FakeCronSync;
+let compatCalls: Array<{ agentId: string; sessionKey: string; userMessage: string }> = [];
 
 interface TaskBody {
   task: TriggerDto;
@@ -37,8 +42,64 @@ interface TaskList {
   items: TriggerDto[];
   nextCursor: string | null;
 }
+interface TaskRunBody {
+  run: {
+    triggerId: string;
+    sessionId: string;
+    outcome: { turnId: string; userMessageId: string; assistantMessageId: string | null; errorCode: string | null };
+    lastRunTime: string;
+  };
+}
 
 const schedule = { hour: 9, minute: 30, timezone: 'UTC' };
+const emptyTools: ToolsClientLike = {
+  sessionsHistory: async () => ({
+    sessionKey: '',
+    messages: [],
+    truncated: false,
+    contentTruncated: false,
+  }),
+};
+const fakeCompat: CompatClientLike = {
+  async *chatTurn(params): AsyncGenerator<GatewayTurnEvent, void, void> {
+    compatCalls.push(params);
+    yield { type: 'turn.started' };
+    yield { type: 'token', delta: 'scheduled ' };
+    yield {
+      type: 'turn.completed',
+      text: 'scheduled done',
+      emptyTurn: false,
+      finishReason: 'stop',
+      usage: {
+        promptTokens: 10,
+        completionTokens: 2,
+        totalTokens: 12,
+      },
+    };
+  },
+};
+
+async function spendCount(accountId: string): Promise<number> {
+  const [row] = await pg<{ count: string }[]>`
+    select count(*)::text as count
+    from manna_transactions mt
+    join manna_accounts ma on ma.id = mt.manna_account_id
+    where ma.account_id = ${accountId}
+      and mt.type like 'spend%'
+  `;
+  return Number(row?.count ?? 0);
+}
+
+function withEnv(name: string, value: string): () => void {
+  const original = process.env[name];
+  process.env[name] = value;
+  resetEnvCache();
+  return () => {
+    if (original === undefined) delete process.env[name];
+    else process.env[name] = original;
+    resetEnvCache();
+  };
+}
 
 beforeAll(async () => {
   userId = await insertUserAccount(`${marker}_user`);
@@ -48,10 +109,18 @@ beforeAll(async () => {
     name: 'Task Bot',
     public: true,
     openclawId: `${marker}bot`.replace(/_/g, '-'),
+    provisionStatus: 'ready',
+  });
+  await credit({
+    accountId: userId,
+    amount: 100,
+    type: 'credit:test',
+    idempotencyKey: `${marker}:credit`,
   });
 
   fakeCron = makeFakeCronSync();
   app = await buildServer({
+    gateway: { compat: fakeCompat, tools: emptyTools },
     provisioning: { provisioner: makeFakeProvisioner(), cronSync: fakeCron },
   });
   await app.ready();
@@ -71,6 +140,36 @@ describe('POST /tasks', () => {
       payload: { agentUsername, name: 'x', prompt: 'y', schedule },
     });
     expect(res.statusCode).toBe(401);
+  });
+
+  it('429s before insert/cron-sync when the scheduled-task quota is exhausted', async () => {
+    const restore = withEnv('MAX_SCHEDULED_TASKS_PER_USER', '0');
+    const beforeCalls = fakeCron.calls.length;
+    const [beforeRows] = await pg<{ count: string }[]>`
+      select count(*)::text as count from triggers where name = ${`${marker} quota blocked`}
+    `;
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/tasks',
+        headers: { cookie: devCookie(userId) },
+        payload: {
+          agentUsername,
+          name: `${marker} quota blocked`,
+          prompt: 'should not insert',
+          schedule,
+        },
+      });
+      expect(res.statusCode).toBe(429);
+      expect((res.json() as { error: { code: string } }).error.code).toBe('task_quota_exceeded');
+      expect(fakeCron.calls).toHaveLength(beforeCalls);
+      const [afterRows] = await pg<{ count: string }[]>`
+        select count(*)::text as count from triggers where name = ${`${marker} quota blocked`}
+      `;
+      expect(Number(afterRows!.count)).toBe(Number(beforeRows!.count));
+    } finally {
+      restore();
+    }
   });
 
   it('creates the trigger row and syncs a gateway cron job', async () => {
@@ -177,6 +276,87 @@ describe('POST /tasks', () => {
       await app2.close();
     }
   });
+
+  it('does not spend while idle; firing a task records a session output and metered spend', async () => {
+    const beforeCreateSpend = await spendCount(userId);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Fire me',
+        prompt: 'Run the scheduled practice.',
+        schedule,
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const { task } = created.json() as TaskBody;
+    expect(await spendCount(userId)).toBe(beforeCreateSpend);
+
+    const beforeRunCalls = compatCalls.length;
+    const fired = await app.inject({
+      method: 'POST',
+      url: `/tasks/${task.id}/runs`,
+      headers: { cookie: devCookie(userId) },
+    });
+    expect(fired.statusCode).toBe(201);
+    const { run } = fired.json() as TaskRunBody;
+    expect(run.triggerId).toBe(task.id);
+    expect(run.outcome.errorCode).toBeNull();
+    expect(run.outcome.assistantMessageId).toEqual(expect.any(String));
+    expect(Date.parse(run.lastRunTime)).not.toBeNaN();
+
+    const call = compatCalls.at(-1)!;
+    expect(compatCalls).toHaveLength(beforeRunCalls + 1);
+    expect(call).toMatchObject({
+      agentId: `${marker}bot`.replace(/_/g, '-'),
+      userMessage: 'Run the scheduled practice.',
+    });
+    expect(call.sessionKey).toContain(run.sessionId);
+
+    const transcript = await pg<{ role: string; content: string | null; name: string | null }[]>`
+      select role, content, name
+      from messages
+      where session_id = ${run.sessionId}
+      order by created_at asc
+    `;
+    expect(transcript.map((row) => [row.role, row.content])).toEqual([
+      ['user', 'Run the scheduled practice.'],
+      ['assistant', 'scheduled done'],
+    ]);
+
+    const [triggerRow] = await pg<
+      { last_run_time: string | null; last_error: string | null; status: string | null }[]
+    >`
+      select last_run_time, last_error, status from triggers where id = ${task.id}
+    `;
+    expect(triggerRow).toMatchObject({
+      last_error: null,
+      status: 'active',
+    });
+    expect(triggerRow!.last_run_time).not.toBeNull();
+
+    const [usage] = await pg<{ status: string; metadata: { source?: { triggerId?: string } } | null }[]>`
+      select status, metadata
+      from usage_events
+      where turn_id = ${run.outcome.turnId}
+    `;
+    expect(usage).toMatchObject({ status: 'completed' });
+    expect(usage!.metadata?.source).toMatchObject({
+      kind: 'scheduled_task',
+      triggerId: task.id,
+    });
+    expect(await spendCount(userId)).toBeGreaterThan(beforeCreateSpend);
+
+    const listed = (
+      await app.inject({ method: 'GET', url: '/tasks', headers: { cookie: devCookie(userId) } })
+    ).json() as TaskList;
+    const listedTask = listed.items.find((item) => item.id === task.id);
+    expect(typeof listedTask?.lastRunTime).toBe('string');
+    expect(Date.parse(listedTask!.lastRunTime!)).not.toBeNaN();
+    expect(listedTask?.lastError).toBeNull();
+  });
 });
 
 describe('GET /tasks', () => {
@@ -234,6 +414,41 @@ describe('PATCH /tasks/:id', () => {
     expect((resumed.json() as TaskBody).task.status).toBe('active');
     const resumeCall = fakeCron.calls.filter((c) => c.triggerId === task.id).at(-1)!;
     expect(resumeCall).toMatchObject({ enabled: true, cronExpr: '30 9 * * *' });
+  });
+
+  it('edits name, prompt, and schedule, then resyncs the active cron job', async () => {
+    const task = await createTask();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/tasks/${task.id}`,
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        name: 'Edited task',
+        prompt: 'edited prompt',
+        schedule: { hour: 14, minute: 5, day_of_week: 'fri', timezone: 'America/New_York' },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const edited = (res.json() as TaskBody).task;
+    expect(edited).toMatchObject({
+      id: task.id,
+      name: 'Edited task',
+      prompt: 'edited prompt',
+      status: 'active',
+    });
+    expect(edited.schedule).toMatchObject({
+      hour: 14,
+      minute: 5,
+      day_of_week: 'fri',
+      timezone: 'America/New_York',
+    });
+    const editCall = fakeCron.calls.filter((c) => c.triggerId === task.id).at(-1)!;
+    expect(editCall).toMatchObject({
+      enabled: true,
+      cronExpr: '5 14 * * fri',
+      tz: 'America/New_York',
+      prompt: 'edited prompt',
+    });
   });
 
   it('soft-deletes (cron removed, gone from the list)', async () => {

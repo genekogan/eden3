@@ -106,6 +106,8 @@ const PARAMS: ProvisionAgentParams = {
   description: 'Resident banana artist',
   persona: 'You are Banny, an exuberant banana who paints.',
   greeting: 'Peel free to ask me anything!',
+  voice: 'bright banana baritone',
+  thinkingLevel: 'deep',
   model: 'anthropic/claude-haiku-4-5',
   memorySeed: '- Banny joined Eden in 2023.',
 };
@@ -227,6 +229,9 @@ describe('AgentProvisioner.provisionAgent', () => {
     expect(soul).toContain('# Banny');
     expect(soul).toContain('exuberant banana');
     expect(soul).toContain('Peel free to ask me anything!');
+    expect(soul).toContain('Thinking level: deep.');
+    const identity = await fs.readFile(path.join(result.hostWorkspaceDir, 'IDENTITY.md'), 'utf8');
+    expect(identity).toContain('Voice: bright banana baritone');
     const memory = await fs.readFile(path.join(result.hostWorkspaceDir, 'MEMORY.md'), 'utf8');
     expect(memory).toContain('- Banny joined Eden in 2023.');
     const state = JSON.parse(
@@ -484,15 +489,19 @@ describe('AgentProvisioner.updateAgentPersona', () => {
       description: 'Reformed banana, now a sculptor',
       persona: 'You are Banny Prime, a solemn sculptor.',
       greeting: 'Welcome to the studio.',
+      voice: 'quiet stone rasp',
+      thinkingLevel: 'fast',
     });
     expect(updated.filesWritten).toEqual([...PERSONA_TEMPLATE_FILES]);
 
     const soul = await fs.readFile(path.join(first.hostWorkspaceDir, 'SOUL.md'), 'utf8');
     expect(soul).toContain('# Banny Prime');
     expect(soul).toContain('solemn sculptor');
+    expect(soul).toContain('Thinking level: fast.');
     const identity = await fs.readFile(path.join(first.hostWorkspaceDir, 'IDENTITY.md'), 'utf8');
     expect(identity).toContain('Banny Prime');
     expect(identity).toContain('Reformed banana');
+    expect(identity).toContain('Voice: quiet stone rasp');
     // untouched files stay untouched
     expect(await fs.readFile(path.join(first.hostWorkspaceDir, 'MEMORY.md'), 'utf8')).toBe(memoryBefore);
   });

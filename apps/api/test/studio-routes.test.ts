@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { DEV_USER_COOKIE, DevAuthProvider, LocalMediaStore, credit, getBalance } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
-import { GatewayToolError } from '@eden3/gateway';
+import { GatewayHttpError, GatewayToolError } from '@eden3/gateway';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { ZodError } from 'zod';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -13,7 +13,15 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { registerAuth } from '../src/auth-plugin';
 import { ApiError, errorEnvelope } from '../src/errors';
 import { MediaPipeline } from '../src/services/media-pipeline';
-import { studioRoutes, GENERATION_TIMEOUTS_MS, STUDIO_TOOLS } from '../src/routes/studio';
+import { feedRoutes } from '../src/routes/feed';
+import {
+  studioRoutes,
+  GENERATION_TIMEOUTS_MS,
+  STUDIO_TOOLS,
+  quoteStudioGeneration,
+  type StudioToolName,
+  type TtsFallbackGenerator,
+} from '../src/routes/studio';
 import {
   MediaClaimTimeoutError,
   type MediaClaim,
@@ -36,6 +44,7 @@ const srcDir = mkdtempSync(path.join(tmpdir(), 'eden3-studio-src-'));
 let app: FastifyInstance;
 let richUserId = '';
 let brokeUserId = '';
+const imageQuote = quoteStudioGeneration('image_generate', { prompt: 'x' });
 
 // -- fakes -------------------------------------------------------------------
 
@@ -66,12 +75,25 @@ const fakeWatcher = {
   },
 };
 
-let invokeCalls: Array<{ tool: string; agentId: string }> = [];
+let invokeCalls: Array<{ tool: string; agentId: string; sessionKey?: string }> = [];
 let invokeError: Error | null = null;
+let invokeHang = false;
+let nextTtsFallback: TtsFallbackGenerator | null = null;
 const fakeToolsClient = {
-  async invokeTool(params: { tool: string; agentId: string; args: Record<string, unknown> }) {
-    invokeCalls.push({ tool: params.tool, agentId: params.agentId });
+  async invokeTool(params: {
+    tool: string;
+    agentId: string;
+    args: Record<string, unknown>;
+    sessionKey?: string;
+    signal?: AbortSignal;
+  }) {
+    invokeCalls.push({ tool: params.tool, agentId: params.agentId, sessionKey: params.sessionKey });
     if (invokeError) throw invokeError;
+    if (invokeHang) {
+      await new Promise<never>((_resolve, reject) => {
+        params.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    }
     return { async: true, taskId: 'task-1', details: {} };
   },
 };
@@ -90,6 +112,16 @@ function fakePngFile(name: string): MediaFileEvent {
   return { path: filePath, basename: name, mime: 'image/png', kind: 'image' };
 }
 
+function fakeMediaFile(
+  name: string,
+  mime: string,
+  kind: MediaFileEvent['kind'],
+): MediaFileEvent {
+  const filePath = path.join(srcDir, name);
+  writeFileSync(filePath, Buffer.from(`${name}:${randomUUID()}`));
+  return { path: filePath, basename: name, mime, kind };
+}
+
 // -- setup --------------------------------------------------------------------
 
 beforeAll(async () => {
@@ -101,7 +133,7 @@ beforeAll(async () => {
   `;
   richUserId = rows[0]!.id;
   brokeUserId = rows[1]!.id;
-  await credit({ accountId: richUserId, amount: 10, type: 'credit:test' });
+  await credit({ accountId: richUserId, amount: 5_000, type: 'credit:test' });
 
   app = Fastify({ logger: false });
   // Mirror the server's error envelope (ZodError -> 400) — buildServer isn't
@@ -134,13 +166,20 @@ beforeAll(async () => {
       watcher: fakeWatcher,
       getToolsClient: () => fakeToolsClient,
       agentId: 'main',
+      timeoutsMs: { image_generate: 50 },
+      ttsFallback: (params) => {
+        if (nextTtsFallback === null) throw new Error('unexpected tts fallback');
+        return nextTtsFallback(params);
+      },
     },
   });
+  await app.register(feedRoutes, { prefix: '/feed' });
   await app.ready();
 });
 
 afterAll(async () => {
   await app?.close();
+  await pg`delete from usage_events where user_id in (${richUserId}, ${brokeUserId})`;
   await pg`delete from media_assets where creation_id in
            (select id from creations where user_id in (${richUserId}, ${brokeUserId}))`;
   await pg`delete from creations where user_id in (${richUserId}, ${brokeUserId})`;
@@ -158,11 +197,11 @@ function asUser(id: string): { cookie: string } {
 // -- tests ---------------------------------------------------------------------
 
 describe('GET /studio/tools', () => {
-  it('lists the four tools with PLAN.md pricing', async () => {
+  it('lists the four tools with metered launch pricing', async () => {
     const res = await app.inject({ method: 'GET', url: '/studio/tools' });
     expect(res.statusCode).toBe(200);
     const body = res.json() as {
-      tools: Array<{ name: string; costManna: number }>;
+      tools: Array<{ name: string; costManna: number; metering?: { provider: string; model: string } }>;
       pricing: Record<string, number>;
     };
     expect(body.tools.map((t) => t.name)).toEqual([
@@ -172,10 +211,35 @@ describe('GET /studio/tools', () => {
       'tts',
     ]);
     const byName = Object.fromEntries(body.tools.map((t) => [t.name, t.costManna]));
-    expect(byName).toEqual({ image_generate: 5, video_generate: 25, music_generate: 10, tts: 2 });
-    expect(body.pricing.chatTurn).toBe(1);
+    expect(byName).toEqual({
+      image_generate: quoteStudioGeneration('image_generate', { prompt: 'x' }).manna,
+      video_generate: quoteStudioGeneration('video_generate', { prompt: 'x' }).manna,
+      music_generate: quoteStudioGeneration('music_generate', { prompt: 'x' }).manna,
+      tts: STUDIO_TOOLS.find((tool) => tool.name === 'tts')!.costManna,
+    });
+    expect(body.pricing.image_generate).toBe(imageQuote.manna);
+    expect(body.tools[0]!.metering).toMatchObject({
+      provider: 'google',
+      model: 'gemini-3-pro-image',
+    });
     expect(STUDIO_TOOLS).toHaveLength(4);
     expect(GENERATION_TIMEOUTS_MS.video_generate).toBe(600_000);
+  });
+
+  it('quotes submitted args before generation', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/studio/quote',
+      payload: { tool: 'tts', args: { text: 'hello world' } },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { quote: { provider: string; model: string; manna: number; units: Record<string, number> } };
+    expect(body.quote).toMatchObject({
+      provider: 'elevenlabs',
+      model: 'tts',
+      units: { audio_character: 11 },
+    });
+    expect(body.quote.manna).toBe(3);
   });
 });
 
@@ -237,17 +301,37 @@ describe('POST /studio/generate', () => {
       payload: { tool: 'image_generate', args: { prompt: 'a plain teal square' } },
     });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { creationId: string; url: string; mime: string };
+    const body = res.json() as {
+      creationId: string;
+      url: string;
+      mime: string;
+      metering: { provider: string; model: string; manna: number; costUsd: number };
+      settlement: { status: string; reservedManna: number; meteredManna: number; chargedManna: number };
+    };
     expect(body.creationId).toMatch(/^[0-9a-f-]{36}$/);
     expect(body.url).toMatch(/^http:\/\/media\.test\/media\/[0-9a-f]{64}\.png$/);
     expect(body.mime).toBe('image/png');
+    expect(body.metering).toMatchObject({
+      provider: 'google',
+      model: 'gemini-3-pro-image',
+      manna: imageQuote.manna,
+      costUsd: imageQuote.costUsd,
+    });
+    expect(body.settlement).toMatchObject({
+      status: 'settled',
+      reservedManna: imageQuote.manna,
+      meteredManna: imageQuote.manna,
+      chargedManna: imageQuote.manna,
+    });
 
-    expect(invokeCalls).toEqual([{ tool: 'image_generate', agentId: 'main' }]);
+    expect(invokeCalls).toHaveLength(1);
+    expect(invokeCalls[0]).toMatchObject({ tool: 'image_generate', agentId: 'main' });
+    expect(invokeCalls[0]!.sessionKey).toMatch(/^eden3:studio:[0-9a-f-]{36}$/);
 
     const [creation] = await pg<
-      { userId: string; agentId: string | null; tool: string; url: string; args: unknown }[]
+      { userId: string; agentId: string | null; tool: string; url: string; args: unknown; public: boolean }[]
     >`
-      select user_id as "userId", agent_id as "agentId", tool, url, args
+      select user_id as "userId", agent_id as "agentId", tool, url, args, public
       from creations where id = ${body.creationId}`;
     expect(creation).toMatchObject({
       userId: richUserId,
@@ -255,15 +339,199 @@ describe('POST /studio/generate', () => {
       tool: 'image_generate',
       url: body.url,
       args: { prompt: 'a plain teal square' },
+      public: true,
     });
+    const feed = await app.inject({
+      method: 'GET',
+      url: `/feed/creations?user=${richUserId}&limit=5`,
+    });
+    expect(feed.statusCode).toBe(200);
+    expect(
+      (feed.json() as { items: Array<{ id: string; url: string | null }> }).items,
+    ).toContainEqual(expect.objectContaining({ id: body.creationId, url: body.url }));
 
     const after = await getBalance(richUserId);
-    expect(after.total).toBe(before.total - 5);
+    expect(after.total).toBe(before.total - imageQuote.manna);
     const [tx] = await pg<{ type: string; amount: string }[]>`
       select type, amount from manna_transactions
       where manna_account_id in (select id from manna_accounts where account_id = ${richUserId})
         and type = 'spend:image' order by created_at desc limit 1`;
-    expect(tx).toMatchObject({ type: 'spend:image', amount: '-5.0000' });
+    expect(tx).toMatchObject({ type: 'spend:image', amount: (-imageQuote.manna).toFixed(4) });
+
+    const [usage] = await pg<
+      Array<{
+        eventType: string;
+        status: string;
+        userId: string | null;
+        agentId: string | null;
+        provider: string;
+        model: string;
+        costUsd: string;
+        manna: number;
+        latencyMs: number | null;
+        errorCode: string | null;
+        errorMessage: string | null;
+        metadata: { tool?: string; creationId?: string | null } | null;
+      }>
+    >`
+      select event_type as "eventType", status, user_id as "userId", agent_id as "agentId",
+             provider, model, cost_usd as "costUsd", manna, latency_ms as "latencyMs",
+             error_code as "errorCode", error_message as "errorMessage", metadata
+      from usage_events
+      where user_id = ${richUserId} and event_type = 'studio_generation'
+      order by created_at desc limit 1`;
+    expect(usage).toMatchObject({
+      eventType: 'studio_generation',
+      status: 'completed',
+      userId: richUserId,
+      agentId: null,
+      provider: 'google',
+      model: 'gemini-3-pro-image',
+      costUsd: imageQuote.costUsd.toFixed(8),
+      manna: imageQuote.manna,
+      errorCode: null,
+      errorMessage: null,
+    });
+    expect(usage!.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(usage!.metadata).toMatchObject({
+      tool: 'image_generate',
+      creationId: body.creationId,
+    });
+  });
+
+  it.each([
+    {
+      tool: 'video_generate' as const,
+      args: { prompt: 'a neon wave rolling through a gallery', duration: 2 },
+      file: () => fakeMediaFile('studio-video.mp4', 'video/mp4', 'video'),
+      expectedMime: 'video/mp4',
+    },
+    {
+      tool: 'music_generate' as const,
+      args: { prompt: 'slow glass bells over a deep bass pulse' },
+      file: () => fakeMediaFile('studio-music.mp3', 'audio/mpeg', 'audio'),
+      expectedMime: 'audio/mpeg',
+    },
+    {
+      tool: 'tts' as const,
+      args: { text: 'Welcome to Eden.' },
+      file: () => fakeMediaFile('studio-voice.mp3', 'audio/mpeg', 'audio'),
+      expectedMime: 'audio/mpeg',
+    },
+  ] satisfies Array<{
+    tool: StudioToolName;
+    args: Record<string, unknown>;
+    file: () => MediaFileEvent;
+    expectedMime: string;
+  }>)('generates and settles $tool outputs', async ({ tool, args, file, expectedMime }) => {
+    invokeCalls = [];
+    invokeError = null;
+    nextClaim = claimResolving(file());
+    const quote = quoteStudioGeneration(tool, args);
+    const before = await getBalance(richUserId);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/studio/generate',
+      headers: asUser(richUserId),
+      payload: { tool, args },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      creationId: string;
+      url: string;
+      mime: string;
+      metering: { provider: string; model: string; manna: number; costUsd: number };
+      settlement: { status: string; reservedManna: number; meteredManna: number; chargedManna: number };
+    };
+    expect(body.mime).toBe(expectedMime);
+    expect(body.metering.manna).toBe(quote.manna);
+    expect(body.settlement).toMatchObject({
+      status: 'settled',
+      reservedManna: quote.manna,
+      meteredManna: quote.manna,
+      chargedManna: quote.manna,
+    });
+    expect(invokeCalls).toHaveLength(1);
+    expect(invokeCalls[0]).toMatchObject({ tool, agentId: 'main' });
+
+    const [creation] = await pg<
+      { userId: string; tool: string; url: string; args: unknown; public: boolean }[]
+    >`
+      select user_id as "userId", tool, url, args, public
+      from creations where id = ${body.creationId}`;
+    expect(creation).toMatchObject({
+      userId: richUserId,
+      tool,
+      url: body.url,
+      args,
+      public: true,
+    });
+    expect((await getBalance(richUserId)).total).toBe(before.total - quote.manna);
+  });
+
+  it('falls back to direct ElevenLabs TTS when OpenClaw lacks a direct tts invoke tool', async () => {
+    invokeCalls = [];
+    invokeError = new GatewayHttpError(404, 'gateway responded 404 to /tools/invoke (tts)');
+    nextClaim = claimUnused;
+    nextTtsFallback = async ({ args }) => {
+      expect(args).toEqual({ text: 'Fallback speech.' });
+      return fakeMediaFile('studio-fallback-voice.mp3', 'audio/mpeg', 'audio');
+    };
+    const quote = quoteStudioGeneration('tts', { text: 'Fallback speech.' });
+    const before = await getBalance(richUserId);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/studio/generate',
+      headers: asUser(richUserId),
+      payload: { tool: 'tts', args: { text: 'Fallback speech.' } },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      creationId: string;
+      url: string;
+      mime: string;
+      metering: { provider: string; model: string; manna: number };
+    };
+    expect(body.mime).toBe('audio/mpeg');
+    expect(body.metering).toMatchObject({ provider: 'elevenlabs', model: 'tts', manna: quote.manna });
+    expect(invokeCalls).toHaveLength(1);
+    expect(invokeCalls[0]).toMatchObject({ tool: 'tts', agentId: 'main' });
+
+    const [creation] = await pg<
+      { userId: string; tool: string; url: string; args: unknown; public: boolean }[]
+    >`
+      select user_id as "userId", tool, url, args, public
+      from creations where id = ${body.creationId}`;
+    expect(creation).toMatchObject({
+      userId: richUserId,
+      tool: 'tts',
+      url: body.url,
+      args: { text: 'Fallback speech.' },
+      public: true,
+    });
+    expect((await getBalance(richUserId)).total).toBe(before.total - quote.manna);
+
+    const [usage] = await pg<
+      Array<{ status: string; provider: string; model: string; manna: number; errorCode: string | null }>
+    >`
+      select status, provider, model, manna, error_code as "errorCode"
+      from usage_events
+      where user_id = ${richUserId}
+        and event_type = 'studio_generation'
+        and metadata->>'creationId' = ${body.creationId}
+      order by created_at desc limit 1`;
+    expect(usage).toMatchObject({
+      status: 'completed',
+      provider: 'elevenlabs',
+      model: 'tts',
+      manna: quote.manna,
+      errorCode: null,
+    });
+
+    invokeError = null;
+    nextTtsFallback = null;
   });
 
   it('502s and refunds when the gateway invoke fails', async () => {
@@ -285,7 +553,58 @@ describe('POST /studio/generate', () => {
       where manna_account_id in (select id from manna_accounts where account_id = ${richUserId})
         and type = 'refund:image'`;
     expect(Number(countRow!.count)).toBe(1);
+    const [usage] = await pg<
+      Array<{
+        eventType: string;
+        status: string;
+        userId: string | null;
+        provider: string;
+        model: string;
+        costUsd: string;
+        manna: number;
+        latencyMs: number | null;
+        errorCode: string | null;
+        errorMessage: string | null;
+      }>
+    >`
+      select event_type as "eventType", status, user_id as "userId", provider, model,
+             cost_usd as "costUsd", manna, latency_ms as "latencyMs",
+             error_code as "errorCode", error_message as "errorMessage"
+      from usage_events
+      where user_id = ${richUserId}
+        and event_type = 'studio_generation'
+        and error_code = 'gateway_error'
+      order by created_at desc limit 1`;
+    expect(usage).toMatchObject({
+      eventType: 'studio_generation',
+      status: 'error',
+      userId: richUserId,
+      provider: 'google',
+      model: 'gemini-3-pro-image',
+      costUsd: '0.00000000',
+      manna: 0,
+      errorCode: 'gateway_error',
+      errorMessage: expect.stringContaining('fal exploded'),
+    });
+    expect(usage!.latencyMs).toBeGreaterThanOrEqual(0);
     invokeError = null;
+  });
+
+  it('504s and refunds when the gateway invocation hangs past the generation timeout', async () => {
+    invokeHang = true;
+    nextClaim = claimResolving(fakePngFile('claimed-before-hang.png'));
+    const before = await getBalance(richUserId);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/studio/generate',
+      headers: asUser(richUserId),
+      payload: { tool: 'image_generate', args: { prompt: 'x' } },
+    });
+    expect(res.statusCode).toBe(504);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('generation_timeout');
+    expect((await getBalance(richUserId)).total).toBe(before.total); // refunded
+    invokeHang = false;
   });
 
   it('504s and refunds when no file lands before the timeout', async () => {

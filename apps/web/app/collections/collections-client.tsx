@@ -10,6 +10,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type { CollectionDto, DevUser } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
@@ -58,10 +59,19 @@ export function CollectionsClient() {
   const [phase, setPhase] = useState<Phase>("loading");
   const [collections, setCollections] = useState<CollectionDto[]>([]);
   const [loadError, setLoadError] = useState<unknown>(null);
+  const [name, setName] = useState("");
+  const [isPublic, setIsPublic] = useState(false);
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const alive = useRef(true);
+  // Bumped on every load() and on create, so a slow in-flight list response
+  // can't clobber state that changed after it was requested (e.g. a
+  // just-created collection prepended while the initial load was still open).
+  const loadSeq = useRef(0);
 
-  const load = useCallback(async () => {
-    setPhase("loading");
+  const load = useCallback(async ({ background = false } = {}) => {
+    const seq = ++loadSeq.current;
+    if (!background) setPhase("loading");
     try {
       let me: DevUser | null = null;
       try {
@@ -69,17 +79,18 @@ export function CollectionsClient() {
       } catch {
         // /dev/me may 501 or the api may be down — fall through to no-user.
       }
-      if (!alive.current) return;
+      if (!alive.current || seq !== loadSeq.current) return;
       if (!me) {
         setPhase("no-user");
         return;
       }
       const { items } = await api.users.collections(me.username);
-      if (!alive.current) return;
+      if (!alive.current || seq !== loadSeq.current) return;
       setCollections(items);
       setPhase("ready");
     } catch (error) {
-      if (!alive.current) return;
+      if (!alive.current || seq !== loadSeq.current) return;
+      if (background) return;
       setLoadError(error);
       setPhase("error");
     }
@@ -92,6 +103,30 @@ export function CollectionsClient() {
       alive.current = false;
     };
   }, [load]);
+
+  const createCollection = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed || createBusy) return;
+    setCreateBusy(true);
+    setCreateError(null);
+    try {
+      const collection = await api.collections.create({
+        name: trimmed,
+        public: isPublic,
+      });
+      loadSeq.current += 1; // invalidate any list fetch that predates the create
+      setCollections((prev) => [collection, ...prev]);
+      setName("");
+      setIsPublic(false);
+      setPhase("ready");
+      void load({ background: true }); // pull the server list that includes it
+    } catch (error) {
+      setCreateError(error instanceof Error ? error.message : "Couldn't create collection");
+    } finally {
+      if (alive.current) setCreateBusy(false);
+    }
+  };
 
   return (
     <div className="mx-auto w-full max-w-6xl px-6 py-14 md:px-10">
@@ -106,6 +141,36 @@ export function CollectionsClient() {
           Creations you&apos;ve grouped together.
         </p>
       </header>
+
+      <form
+        onSubmit={(event) => void createCollection(event)}
+        className="mt-8 flex flex-col gap-3 rounded-xl border border-edge bg-surface p-4 sm:flex-row sm:items-center"
+      >
+        <input
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+          placeholder="New collection"
+          aria-label="Collection name"
+          className="min-w-0 flex-1 rounded-lg border border-edge bg-background px-3 py-2 text-sm placeholder:text-faint focus:border-accent/60 focus:outline-none"
+        />
+        <label className="inline-flex items-center gap-2 text-sm text-muted">
+          <input
+            type="checkbox"
+            checked={isPublic}
+            onChange={(event) => setIsPublic(event.target.checked)}
+            className="size-4"
+          />
+          Public
+        </label>
+        <button
+          type="submit"
+          disabled={createBusy || name.trim().length === 0}
+          className="rounded-lg border border-accent/45 bg-accent/10 px-3 py-2 text-sm text-accent-soft transition-colors hover:border-accent disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {createBusy ? "Creating…" : "Create"}
+        </button>
+        {createError ? <p className="text-xs text-rose-300">{createError}</p> : null}
+      </form>
 
       <div className="mt-10">
         {phase === "loading" ? (

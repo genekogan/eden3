@@ -1,5 +1,5 @@
-import { isHex24, isUuid, resolveAgentByUsername } from '@eden3/core';
-import { agents, db, triggers, type Trigger } from '@eden3/db';
+import { getEnv, InsufficientMannaError, isHex24, isUuid, PRICING, resolveAgentByUsername } from '@eden3/core';
+import { agents, db, pg, triggers, type Trigger } from '@eden3/db';
 import { CronSyncError, scheduleToCron, type EdenSchedule } from '@eden3/gateway';
 import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
@@ -8,6 +8,8 @@ import { z } from 'zod';
 import { ApiError, sendError } from '../errors';
 import type { GatewayGlue } from '../gateway-glue';
 import { triggerDtoFromEntity } from '../route-helpers';
+import { concurrentTurnLimit, dailyMannaSpend } from '../services/chat-limits';
+import { runScheduledTask } from '../services/scheduled-tasks';
 
 /**
  * Tasks API — user-scheduled prompts ("triggers"), synced to OpenClaw cron
@@ -46,12 +48,23 @@ const createBodySchema = z.object({
 const patchBodySchema = z
   .object({
     status: z.enum(['active', 'paused']).optional(),
+    name: z.string().trim().min(1).max(200).optional(),
+    prompt: z.string().trim().min(1).max(10_000).optional(),
+    schedule: scheduleSchema.optional(),
     deleted: z.literal(true).optional(),
   })
   .strict()
-  .refine((body) => body.status !== undefined || body.deleted !== undefined, {
+  .refine(
+    (body) =>
+      body.status !== undefined ||
+      body.name !== undefined ||
+      body.prompt !== undefined ||
+      body.schedule !== undefined ||
+      body.deleted !== undefined,
+    {
     message: 'provide status and/or deleted',
-  });
+    },
+  );
 
 const idParamsSchema = z.object({ id: z.string().trim().min(1).max(200) });
 
@@ -137,6 +150,29 @@ async function openclawAgentIdFor(agentAccountId: string | null): Promise<string
   return row?.openclawId ?? null;
 }
 
+async function scheduledTaskQuotaError(account: { accountId: string; isAdmin: boolean }): Promise<{
+  statusCode: 429;
+  code: 'task_quota_exceeded';
+  message: string;
+} | null> {
+  if (account.isAdmin) return null;
+  const limit = getEnv().MAX_SCHEDULED_TASKS_PER_USER;
+  const [quota] = await pg<{ count: number }[]>`
+    select count(*)::int as count
+    from triggers
+    where user_id = ${account.accountId}
+      and deleted = false
+  `;
+  if ((quota?.count ?? 0) >= limit) {
+    return {
+      statusCode: 429,
+      code: 'task_quota_exceeded',
+      message: `Scheduled task limit reached (${limit} tasks)`,
+    };
+  }
+  return null;
+}
+
 export const triggersRoutes: FastifyPluginAsync = async (app) => {
   // ---- GET /tasks — the signed-in user's triggers --------------------------
   app.get('/', { preHandler: app.requireAuth }, async (req) => {
@@ -168,6 +204,11 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
     }
 
+    const quotaError = await scheduledTaskQuotaError(viewer);
+    if (quotaError) {
+      return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
+    }
+
     const [row] = await db
       .insert(triggers)
       .values({
@@ -192,6 +233,76 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     return reply.code(201).send({ task: triggerDtoFromEntity(fresh) });
   });
 
+  // ---- POST /tasks/:id/runs — fire one scheduled prompt now -----------------
+  app.post('/:id/runs', { preHandler: app.requireAuth }, async (req, reply) => {
+    const viewer = req.account;
+    if (!viewer) return null; // unreachable — requireAuth replied 401
+    const { id } = idParamsSchema.parse(req.params);
+
+    const existing = await findTrigger(id);
+    if (!existing || existing.deleted) {
+      return sendError(reply, 404, 'task_not_found', `No task "${id}"`);
+    }
+    if (!viewer.isAdmin && existing.userId !== viewer.accountId) {
+      return sendError(reply, 403, 'forbidden', 'Only the task owner can run it');
+    }
+    if (!app.gatewayCompat || !app.historySync) {
+      throw new ApiError(
+        503,
+        'gateway_not_configured',
+        'OPENCLAW_GATEWAY_TOKEN is not configured — scheduled task runs are unavailable',
+      );
+    }
+    if (!existing.userId) {
+      throw new ApiError(409, 'task_missing_owner', `Task ${existing.id} has no owner`);
+    }
+
+    const env = getEnv();
+    const spentToday = await dailyMannaSpend(existing.userId);
+    if (spentToday + PRICING.chatTurn > env.DAILY_MANNA_SPEND_CAP_PER_USER) {
+      throw new ApiError(
+        429,
+        'daily_manna_cap_exceeded',
+        `Daily manna cap exceeded: ${spentToday} spent today, cap is ${env.DAILY_MANNA_SPEND_CAP_PER_USER}`,
+      );
+    }
+
+    const turnLimit = await concurrentTurnLimit(existing.userId);
+    const releaseTurn = app.turnLimiter.acquire(existing.userId, turnLimit.limit);
+    if (!releaseTurn) {
+      throw new ApiError(
+        429,
+        'turn_concurrency_exceeded',
+        `Too many active scheduled turns: limit is ${turnLimit.limit}${turnLimit.tier ? ` for ${turnLimit.tier}` : ''}`,
+      );
+    }
+
+    try {
+      const run = await runScheduledTask(
+        {
+          compat: app.gatewayCompat,
+          bus: app.eventsBus,
+          registry: app.turnRegistry,
+          historySync: app.historySync,
+          onError: (err, context) => req.log.error({ err, context }, 'scheduled task side-error'),
+        },
+        existing,
+      );
+      return reply.code(201).send({ run });
+    } catch (err) {
+      if (err instanceof InsufficientMannaError) {
+        throw new ApiError(
+          402,
+          'insufficient_manna',
+          `Not enough manna: this run costs ${err.required}, you have ${err.available}`,
+        );
+      }
+      throw err;
+    } finally {
+      releaseTurn();
+    }
+  });
+
   // ---- PATCH /tasks/:id — pause / resume / delete --------------------------
   app.patch('/:id', { preHandler: app.requireAuth }, async (req, reply) => {
     const viewer = req.account;
@@ -209,20 +320,27 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
 
     const nextDeleted = body.deleted === true;
     const nextStatus = nextDeleted ? (existing.status ?? 'paused') : (body.status ?? existing.status);
+    const nextSchedule = body.schedule ?? existing.schedule ?? {};
     const enabled = !nextDeleted && nextStatus === 'active';
 
     // Re-enabling needs a valid stored schedule; removal needs no cron at all.
     let cron = '';
     let tz: string | undefined;
     if (enabled) {
-      ({ cron, tz } = cronFromSchedule((existing.schedule ?? {}) as EdenSchedule));
+      ({ cron, tz } = cronFromSchedule(nextSchedule as EdenSchedule));
     }
 
     const [updated] = await db
       .update(triggers)
       .set({
-        ...(body.status !== undefined ? { status: body.status } : {}),
-        ...(nextDeleted ? { deleted: true } : {}),
+        ...(nextDeleted
+          ? { deleted: true, status: 'finished' }
+          : body.status !== undefined
+            ? { status: body.status }
+            : {}),
+        ...(body.name !== undefined ? { name: body.name } : {}),
+        ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
+        ...(body.schedule !== undefined ? { schedule: body.schedule } : {}),
         updatedAt: new Date(),
       })
       .where(eq(triggers.id, existing.id))

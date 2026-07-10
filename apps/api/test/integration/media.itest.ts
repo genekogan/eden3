@@ -6,6 +6,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildServer } from '../../src/server';
+import { quoteStudioGeneration } from '../../src/routes/studio';
 
 loadRootEnv();
 
@@ -27,6 +28,7 @@ loadRootEnv();
 
 const AGENT_ID = 'main';
 const marker = `mediaitest_${randomUUID().slice(0, 8)}`;
+const imageQuote = quoteStudioGeneration('image_generate', { prompt: 'x' });
 
 let app: FastifyInstance;
 let userId = '';
@@ -58,7 +60,7 @@ beforeAll(async () => {
   const rows = await pg<{ id: string }[]>`
     insert into accounts (type, username) values ('user', ${marker}) returning id`;
   userId = rows[0]!.id;
-  await credit({ accountId: userId, amount: 50, type: 'credit:test' });
+  await credit({ accountId: userId, amount: 500, type: 'credit:test' });
 
   app = await buildServer();
   await app.ready();
@@ -69,6 +71,7 @@ afterAll(async () => {
   if (cleanupCreationIds.length > 0) {
     await pg`delete from media_assets where creation_id in ${pg(cleanupCreationIds)}`;
   }
+  await pg`delete from usage_events where user_id = ${userId}`;
   await pg`delete from creations where user_id = ${userId}`;
   await pg`delete from manna_transactions where manna_account_id in
            (select id from manna_accounts where account_id = ${userId})`;
@@ -81,16 +84,16 @@ describe('studio media pipeline (live gateway + watcher + postgres)', () => {
   it('GET /studio/tools serves the catalog without auth', async () => {
     const res = await app.inject({ method: 'GET', url: '/studio/tools' });
     expect(res.statusCode).toBe(200);
-    const body = res.json() as { tools: Array<{ name: string }>; pricing: { image: number } };
+    const body = res.json() as { tools: Array<{ name: string }>; pricing: { image_generate: number } };
     expect(body.tools).toHaveLength(4);
-    expect(body.pricing.image).toBe(5);
+    expect(body.pricing.image_generate).toBe(imageQuote.manna);
   });
 
   it(
     'POST /studio/generate produces a REAL image: creation row + served file + manna debit',
     async () => {
       const before = await getBalance(userId);
-      expect(before.total).toBe(50);
+      expect(before.total).toBe(500);
 
       const generate = () =>
         app.inject({
@@ -110,14 +113,26 @@ describe('studio media pipeline (live gateway + watcher + postgres)', () => {
       if (res.statusCode === 504) {
         // eslint-disable-next-line no-console
         console.info('[itest] first generation timed out (504) — verifying refund, retrying once');
-        expect((await getBalance(userId)).total).toBe(50); // fully refunded
+        expect((await getBalance(userId)).total).toBe(500); // fully refunded
         res = await generate();
       }
 
       expect(res.statusCode).toBe(200);
-      const body = res.json() as { creationId: string; url: string; mime: string };
+      const body = res.json() as {
+        creationId: string;
+        url: string;
+        mime: string;
+        metering: { manna: number; provider: string; model: string };
+        settlement: { chargedManna: number };
+      };
       expect(body.creationId).toMatch(/^[0-9a-f-]{36}$/);
       expect(body.mime).toMatch(/^image\//);
+      expect(body.metering).toMatchObject({
+        manna: imageQuote.manna,
+        provider: imageQuote.provider,
+        model: imageQuote.model,
+      });
+      expect(body.settlement.chargedManna).toBe(imageQuote.manna);
       cleanupCreationIds.push(body.creationId);
 
       // creations row: owned by the caller, no session/agent, tool + args kept.
@@ -162,10 +177,10 @@ describe('studio media pipeline (live gateway + watcher + postgres)', () => {
       expect(served.headers['content-type']).toMatch(/^image\//);
       expect(served.rawPayload.length).toBe(sizeBytes);
 
-      // Manna: net exactly ONE unrefunded 5-manna debit (a timed-out attempt,
+      // Manna: net exactly ONE unrefunded metered debit (a timed-out attempt,
       // if any, was fully refunded above).
       const after = await getBalance(userId);
-      expect(after.total).toBe(45);
+      expect(after.total).toBe(500 - imageQuote.manna);
       const txs = await pg<{ type: string; amount: string }[]>`
         select type, amount from manna_transactions
         where manna_account_id in (select id from manna_accounts where account_id = ${userId})
@@ -173,7 +188,18 @@ describe('studio media pipeline (live gateway + watcher + postgres)', () => {
       const spends = txs.filter((t) => t.type === 'spend:image');
       const refunds = txs.filter((t) => t.type === 'refund:image');
       expect(spends.length - refunds.length).toBe(1);
-      expect(spends.at(-1)!.amount).toBe('-5.0000');
+      expect(spends.at(-1)!.amount).toBe((-imageQuote.manna).toFixed(4));
+
+      const [usage] = await pg<{ eventType: string; status: string; manna: number }[]>`
+        select event_type as "eventType", status, manna
+        from usage_events
+        where user_id = ${userId} and event_type = 'studio_generation'
+        order by created_at desc limit 1`;
+      expect(usage).toMatchObject({
+        eventType: 'studio_generation',
+        status: 'completed',
+        manna: imageQuote.manna,
+      });
     },
     280_000, // room for one 120s timeout + one retried generation
   );

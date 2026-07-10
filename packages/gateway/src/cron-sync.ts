@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
-import { OpenClawCli, type OpenClawCliLike } from './docker';
+import {
+  OpenClawCli,
+  type CliExecOptions,
+  type OpenClawCliLike,
+  type OpenClawCliResult,
+} from './docker';
 
 /**
  * Sync eden3 triggers onto OpenClaw cron jobs.
@@ -175,14 +180,26 @@ export interface SyncTriggerResult {
 
 export class CronSync {
   private readonly cli: OpenClawCliLike;
+  private readonly configReadRetryAttempts: number;
+  private readonly configReadRetryDelayMs: number;
 
-  constructor(options: { cli?: OpenClawCliLike } = {}) {
+  constructor(
+    options: {
+      cli?: OpenClawCliLike;
+      configReadRetryAttempts?: number;
+      configReadRetryDelayMs?: number;
+    } = {},
+  ) {
     this.cli = options.cli ?? new OpenClawCli();
+    this.configReadRetryAttempts = options.configReadRetryAttempts ?? 4;
+    this.configReadRetryDelayMs = options.configReadRetryDelayMs ?? 250;
   }
 
   /** All gateway cron jobs (any owner). */
   async listJobs(): Promise<CronJob[]> {
-    const raw = await this.cli.execJson<unknown>(['cron', 'list'], { gatewayToken: true });
+    const raw = await this.execJsonWithConfigRetry<unknown>(['cron', 'list'], {
+      gatewayToken: true,
+    });
     const parsed = cronListSchema.safeParse(raw);
     if (!parsed.success) throw new CronSyncError('cron list --json returned an unexpected shape');
     return parsed.data.jobs ?? [];
@@ -254,13 +271,43 @@ export class CronSync {
       '--no-deliver',
     ];
     if (params.tz !== undefined && params.tz !== '') args.push('--tz', params.tz);
-    const raw = await this.cli.execJson<unknown>(args, { gatewayToken: true });
+    const raw = await this.execJsonWithConfigRetry<unknown>(args, { gatewayToken: true });
     return extractJobId(raw);
   }
 
   private async removeJob(jobId: string): Promise<void> {
     // exec (not execJson): rm output is informational; success = exit 0.
-    await this.cli.exec(['cron', 'rm', jobId, '--json'], { gatewayToken: true });
+    await this.execWithConfigRetry(['cron', 'rm', jobId, '--json'], { gatewayToken: true });
+  }
+
+  private async execJsonWithConfigRetry<T>(
+    args: readonly string[],
+    options: CliExecOptions,
+  ): Promise<T> {
+    return this.withConfigReadRetry(() => this.cli.execJson<T>(args, options));
+  }
+
+  private async execWithConfigRetry(
+    args: readonly string[],
+    options: CliExecOptions,
+  ): Promise<OpenClawCliResult> {
+    return this.withConfigReadRetry(() => this.cli.exec(args, options));
+  }
+
+  private async withConfigReadRetry<T>(fn: () => Promise<T>): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= this.configReadRetryAttempts; attempt += 1) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastError = err;
+        if (!isTransientConfigReadError(err) || attempt >= this.configReadRetryAttempts) {
+          throw err;
+        }
+        await sleep(this.configReadRetryDelayMs);
+      }
+    }
+    throw lastError;
   }
 
   /**
@@ -304,6 +351,19 @@ function firstString(...values: unknown[]): string | undefined {
     if (typeof value === 'string') return value;
   }
   return undefined;
+}
+
+function isTransientConfigReadError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    /Failed to read config/i.test(message) &&
+    (/openclaw\.json/i.test(message) || /JSON5: invalid end of input/i.test(message))
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function extractJobId(raw: unknown): string | undefined {

@@ -24,6 +24,7 @@ import { MediaFull } from "@/components/media";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import type { AccountSummary, MessageAttachment, MessageDto } from "@/lib/types";
 import { Markdown } from "./markdown";
+import { stripMediaSentinelLines } from "./conversation-state";
 import type {
   AssistantStreamItem,
   ErrorItem,
@@ -281,14 +282,17 @@ export function MessageRow({
   }
 
   // assistant (and any unknown migrated role) — agent-side rendering.
-  const hasText = (message.content ?? "").trim().length > 0;
+  // Sentinel lines are parked by the media pipeline; if one survives into a
+  // persisted body (late attachment correlation) never show the raw path.
+  const assistantText = stripMediaSentinelLines(message.content ?? "");
+  const hasText = assistantText.length > 0;
   return (
     <AgentRow
       sender={sender}
       meta={formatRelativeTime(message.createdAt)}
       showAvatar={showAvatar}
     >
-      {hasText ? <Markdown text={message.content ?? ""} /> : null}
+      {hasText ? <Markdown text={assistantText} /> : null}
       {message.toolCalls && message.toolCalls.length > 0 ? (
         <ToolCallDisclosure
           label={`tool · ${message.toolCalls.length} call${message.toolCalls.length > 1 ? "s" : ""}`}

@@ -16,6 +16,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { pg } from '@eden3/db';
 import { loadEnv } from '@eden3/core';
@@ -23,8 +24,9 @@ import { loadEnv } from '@eden3/core';
 import { MAP_PROMPT, REDUCE_PROMPT, USERS_PROMPT } from './distill-prompts.js';
 
 const exec = promisify(execFile);
-const env = loadEnv();
-const DATA_DIR = process.env.OPENCLAW_DATA_DIR ?? path.resolve('infra/openclaw/data');
+loadEnv();
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
+const DATA_DIR = process.env.OPENCLAW_DATA_DIR ?? path.join(REPO_ROOT, 'infra', 'openclaw', 'data');
 
 const args = process.argv.slice(2);
 const only = args.includes('--username') ? args[args.indexOf('--username') + 1]! : null;
@@ -161,13 +163,13 @@ async function distill(p: Pilot): Promise<void> {
 const pilots = await pg<Pilot[]>`
   select ag.openclaw_id as "openclawId", a.username, ag.account_id as "accountId", ag.persona
   from agents ag join accounts a on a.id = ag.account_id
-  where ag.provision_status = 'provisioned'
+  where ag.provision_status in ('ready', 'provisioned')
     and ag.openclaw_id is not null
     ${only ? pg`and a.username = ${only}` : all ? pg`and ag.is_pilot = true` : pg`and false`}
   order by a.username asc
 `;
 if (pilots.length === 0) {
-  console.error('no provisioned pilots match (provision first, or pass --username/--all)');
+  console.error('no ready/provisioned pilots match (provision first, or pass --username/--all)');
   process.exit(1);
 }
 console.log(`distilling ${pilots.length} agent(s), concurrency ${concurrency}\n`);

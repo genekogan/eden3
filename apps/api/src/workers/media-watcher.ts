@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import chokidar, { type FSWatcher } from 'chokidar';
@@ -112,37 +112,66 @@ function isContainedIn(child: string, root: string): boolean {
   );
 }
 
+/** File extensions the ingest path will accept (media only, lower-case). */
+const INGESTIBLE_MEDIA_EXTENSIONS = new Set([
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  '.gif',
+  '.svg',
+  '.mp4',
+  '.webm',
+  '.mov',
+  '.mp3',
+  '.wav',
+  '.ogg',
+  '.m4a',
+  '.flac',
+  '.aac',
+]);
+
 /**
  * Map a container path from a gateway transcript (`MEDIA:/home/node/...`)
  * onto the host filesystem. Host paths already under the mapped dirs pass
  * through unchanged; anything else returns null.
  *
  * SECURITY: the transcript is attacker-controlled (an agent's completion text
- * — personas are agent-authored). A `..` sequence like
- * `/home/node/.openclaw/../../../../etc/passwd` must NOT escape the mapped
- * root, or ingestFile would content-address an arbitrary host file into
- * MEDIA_DIR and serve it publicly. Every branch therefore path.resolve()s the
- * mapped result and asserts containment in the target root, returning null on
- * any escape.
+ * — personas are agent-authored, and a prompt-injected agent can emit an
+ * arbitrary `MEDIA:` line). ingestFile content-addresses whatever this maps to
+ * into the PUBLIC media store, so the mapped target must be nothing but tool
+ * media output. Two layers:
+ *   1. Containment is restricted to the actual media-output roots — the
+ *      `media/` subdir of the data mount and the tmp-output mount — NOT the
+ *      whole `/home/node/.openclaw` data root. Without this, legitimate
+ *      (traversal-free) paths like `/home/node/.openclaw/openclaw.json` (the
+ *      gateway config + device token) or another agent's per-user memory file
+ *      under its `workspace-<slug>` dir map through and get published.
+ *   2. A media-extension allowlist rejects non-media files even inside those
+ *      roots (defense in depth against a future non-media artifact landing in
+ *      the media dir).
+ * `..` traversal is still caught by the containment resolve() in every branch.
  */
 export function containerPathToHost(
   containerPath: string,
   dirs: OpenclawDirs = resolveOpenclawDirs(),
 ): string | null {
   const p = containerPath.trim();
+  if (!INGESTIBLE_MEDIA_EXTENSIONS.has(path.extname(p).toLowerCase())) return null;
+  const mediaRoot = path.join(dirs.dataDir, 'media');
+  const containMediaOutput = (host: string): string | null =>
+    isContainedIn(host, mediaRoot) || isContainedIn(host, dirs.tmpDir) ? host : null;
+
   if (p.startsWith(`${CONTAINER_DATA_ROOT}/`)) {
     const mapped = path.resolve(dirs.dataDir, p.slice(CONTAINER_DATA_ROOT.length + 1));
-    return isContainedIn(mapped, dirs.dataDir) ? mapped : null;
+    return containMediaOutput(mapped);
   }
   if (p.startsWith(`${CONTAINER_TMP_ROOT}/`)) {
     const mapped = path.resolve(dirs.tmpDir, p.slice(CONTAINER_TMP_ROOT.length + 1));
     return isContainedIn(mapped, dirs.tmpDir) ? mapped : null;
   }
   const resolved = path.resolve(p);
-  if (isContainedIn(resolved, dirs.dataDir) || isContainedIn(resolved, dirs.tmpDir)) {
-    return resolved; // already a host path
-  }
-  return null;
+  return containMediaOutput(resolved); // already a host path
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +319,7 @@ export class MediaWatcher {
   private watcher: FSWatcher | null = null;
   private tickTimer: NodeJS.Timeout | null = null;
   private starting: Promise<void> | null = null;
+  private ticking = false;
   /** path → stability tracking state. */
   private readonly pending = new Map<string, { size: number; stable: number }>();
   /** Paths already handed off (claim/ingest/sighting) this process lifetime. */
@@ -321,7 +351,9 @@ export class MediaWatcher {
       watcher.on('add', (p) => this.enqueue(p));
       watcher.on('change', (p) => this.enqueue(p));
       watcher.on('error', (err) => this.log.error(`media-watcher: watch error: ${String(err)}`));
-      watcher.once('ready', () => resolve());
+      watcher.once('ready', () => {
+        void this.markExistingFilesProcessed().then(resolve, reject);
+      });
       watcher.once('error', (err) => reject(err instanceof Error ? err : new Error(String(err))));
     });
     this.tickTimer = setInterval(() => void this.tick(), this.pollIntervalMs);
@@ -393,40 +425,75 @@ export class MediaWatcher {
     if (!this.pending.has(abs)) this.pending.set(abs, { size: -1, stable: 0 });
   }
 
+  private async walkFiles(dir: string, visit: (filePath: string) => void): Promise<void> {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = await readdir(dir, { withFileTypes: true, encoding: 'utf8' });
+    } catch {
+      return;
+    }
+    await Promise.all(
+      entries.map(async (entry) => {
+        const fullPath = path.join(dir, entry.name);
+        if (isIgnoredPath(fullPath)) return;
+        if (entry.isDirectory()) {
+          await this.walkFiles(fullPath, visit);
+        } else if (entry.isFile()) {
+          visit(path.resolve(fullPath));
+        }
+      }),
+    );
+  }
+
+  private async markExistingFilesProcessed(): Promise<void> {
+    await Promise.all(this.dirs.map((dir) => this.walkFiles(dir, (file) => this.processed.add(file))));
+  }
+
+  private async scanDirs(): Promise<void> {
+    await Promise.all(this.dirs.map((dir) => this.walkFiles(dir, (file) => this.enqueue(file))));
+  }
+
   /** Stability loop: a file is ready once its size held for N polls. */
   private async tick(): Promise<void> {
-    for (const [filePath, state] of [...this.pending]) {
-      if (this.processed.has(filePath)) {
-        this.pending.delete(filePath); // claimed by a sighting mid-wait
-        continue;
-      }
-      let size: number;
-      try {
-        const stats = await stat(filePath);
-        if (!stats.isFile()) {
-          this.pending.delete(filePath);
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      await this.scanDirs();
+      for (const [filePath, state] of [...this.pending]) {
+        if (this.processed.has(filePath)) {
+          this.pending.delete(filePath); // claimed by a sighting mid-wait
           continue;
         }
-        size = stats.size;
-      } catch {
-        this.pending.delete(filePath); // vanished mid-write
-        continue;
-      }
-      if (size > 0 && size === state.size) {
-        state.stable += 1;
-      } else {
-        state.size = size;
-        state.stable = 0;
-      }
-      if (state.stable >= this.stablePolls) {
-        this.pending.delete(filePath);
-        this.processed.add(filePath);
+        let size: number;
         try {
-          await this.handleStableFile(filePath);
-        } catch (err) {
-          this.log.error(`media-watcher: failed to handle ${filePath}: ${String(err)}`);
+          const stats = await stat(filePath);
+          if (!stats.isFile()) {
+            this.pending.delete(filePath);
+            continue;
+          }
+          size = stats.size;
+        } catch {
+          this.pending.delete(filePath); // vanished mid-write
+          continue;
+        }
+        if (size > 0 && size === state.size) {
+          state.stable += 1;
+        } else {
+          state.size = size;
+          state.stable = 0;
+        }
+        if (state.stable >= this.stablePolls) {
+          this.pending.delete(filePath);
+          this.processed.add(filePath);
+          try {
+            await this.handleStableFile(filePath);
+          } catch (err) {
+            this.log.error(`media-watcher: failed to handle ${filePath}: ${String(err)}`);
+          }
         }
       }
+    } finally {
+      this.ticking = false;
     }
   }
 

@@ -25,29 +25,59 @@ import {
 } from "@/components/agents/agent-utils";
 import {
   ButtonSpinner,
+  FieldShell,
+  inputClass,
   primaryButtonClass,
   quietButtonClass,
   TextAreaField,
   TextField,
 } from "@/components/agents/form-fields";
+import {
+  MODEL_TIER_OPTIONS,
+  THINKING_LEVEL_OPTIONS,
+  TOOL_GROUP_OPTIONS,
+  normalizeAgentModel,
+  normalizeThinkingLevel,
+  normalizeToolGroups,
+} from "@/components/agents/runtime-config";
 import { Toast } from "@/components/agents/toast";
 
-type EditableKey = "name" | "description" | "greeting" | "persona";
-type Fields = Record<EditableKey, string>;
+type Fields = {
+  name: string;
+  description: string;
+  greeting: string;
+  voice: string;
+  persona: string;
+  model: string;
+  thinkingLevel: string;
+  toolGroups: string[];
+};
+type EditableKey = keyof Fields;
 
 function fieldsOf(agent: AgentDto): Fields {
   return {
     name: agent.name ?? "",
     description: agent.description ?? "",
     greeting: agent.greeting ?? "",
+    voice: agent.voice ?? "",
     persona: agent.persona ?? "",
+    model: normalizeAgentModel(agent.model),
+    thinkingLevel: normalizeThinkingLevel(agent.thinkingLevel),
+    toolGroups: normalizeToolGroups(agent.toolGroups),
   };
 }
 
 function diff(baseline: Fields, current: Fields): AgentUpdateInput {
   const patch: AgentUpdateInput = {};
-  for (const key of Object.keys(current) as EditableKey[]) {
-    if (current[key] !== baseline[key]) patch[key] = current[key];
+  if (current.name !== baseline.name) patch.name = current.name;
+  if (current.description !== baseline.description) patch.description = current.description;
+  if (current.greeting !== baseline.greeting) patch.greeting = current.greeting;
+  if (current.voice !== baseline.voice) patch.voice = current.voice;
+  if (current.persona !== baseline.persona) patch.persona = current.persona;
+  if (current.model !== baseline.model) patch.model = current.model;
+  if (current.thinkingLevel !== baseline.thinkingLevel) patch.thinkingLevel = current.thinkingLevel;
+  if (JSON.stringify(current.toolGroups) !== JSON.stringify(baseline.toolGroups)) {
+    patch.toolGroups = current.toolGroups;
   }
   return patch;
 }
@@ -79,7 +109,11 @@ export function AgentEditForm({ username }: { username: string }) {
     name: "",
     description: "",
     greeting: "",
+    voice: "",
     persona: "",
+    model: normalizeAgentModel(null),
+    thinkingLevel: normalizeThinkingLevel(null),
+    toolGroups: normalizeToolGroups(null),
   });
   const baseline = useRef<Fields>(fields);
   const [saving, setSaving] = useState(false);
@@ -132,8 +166,17 @@ export function AgentEditForm({ username }: { username: string }) {
     })();
   }, [username, reloadKey]);
 
-  const setField = (key: EditableKey) => (value: string) => {
+  const setField = (key: Exclude<EditableKey, "toolGroups">) => (value: string) => {
     setFields((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const setToolGroup = (value: string, enabled: boolean) => {
+    setFields((prev) => {
+      const next = new Set(prev.toolGroups);
+      if (enabled) next.add(value);
+      else next.delete(value);
+      return { ...prev, toolGroups: TOOL_GROUP_OPTIONS.map((option) => option.value).filter((v) => next.has(v)) };
+    });
   };
 
   const onSubmit = async (event: FormEvent) => {
@@ -154,7 +197,7 @@ export function AgentEditForm({ username }: { username: string }) {
       baseline.current = fieldsOf(merged);
       setFields(baseline.current);
       setGate({ kind: "ready", agent: merged });
-      setToast("Live — persona updates apply to the next message");
+      setToast("Live — updates apply to the next message");
     } catch (error) {
       setSaveError(apiErrorDetail(error));
     } finally {
@@ -303,6 +346,16 @@ export function AgentEditForm({ username }: { username: string }) {
           hint="The agent's opening line in a fresh chat."
         />
 
+        <TextField
+          id="edit-voice"
+          label="Voice"
+          value={fields.voice}
+          onChange={setField("voice")}
+          disabled={saving}
+          maxLength={200}
+          hint="Tone note or external voice id."
+        />
+
         <TextAreaField
           id="edit-persona"
           label="Persona"
@@ -313,6 +366,92 @@ export function AgentEditForm({ username }: { username: string }) {
           disabled={saving}
           hint="The system prompt — voice, temperament, obsessions, boundaries."
         />
+
+        <details className="rounded-lg border border-edge bg-raised/40 p-4">
+          <summary className="cursor-pointer text-sm text-foreground">
+            Advanced runtime
+          </summary>
+          <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            <FieldShell
+              id="edit-model"
+              label="Model tier"
+              hint="Changing this updates the OpenClaw model registration."
+            >
+              <select
+                id="edit-model"
+                value={fields.model}
+                onChange={(event) => setField("model")(event.target.value)}
+                disabled={saving}
+                className={inputClass}
+              >
+                {MODEL_TIER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label} · {option.detail}
+                  </option>
+                ))}
+              </select>
+            </FieldShell>
+
+            <FieldShell
+              id="edit-thinking"
+              label="Thinking level"
+              hint="Stored with the next chat usage record."
+            >
+              <select
+                id="edit-thinking"
+                value={fields.thinkingLevel}
+                onChange={(event) => setField("thinkingLevel")(event.target.value)}
+                disabled={saving}
+                className={inputClass}
+              >
+                {THINKING_LEVEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </FieldShell>
+
+            <FieldShell
+              id="edit-skills"
+              label="Skills"
+              hint="Curated and approved user-authored skills attach from the profile skills tab."
+            >
+              <Link href={agentHref(agent.username)} className={quietButtonClass}>
+                Manage skills
+              </Link>
+            </FieldShell>
+          </div>
+
+          <FieldShell
+            id="edit-tool-groups"
+            label="Tool groups"
+            hint="Per-agent OpenClaw allowlist. Sandbox and elevated controls stay enforced globally."
+          >
+            <div className="grid gap-2 sm:grid-cols-2">
+              {TOOL_GROUP_OPTIONS.map((option) => (
+                <label
+                  key={option.value}
+                  className="flex min-h-12 items-start gap-3 rounded-md border border-edge bg-surface/50 px-3 py-2"
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-1 h-4 w-4 accent-accent"
+                    checked={fields.toolGroups.includes(option.value)}
+                    disabled={saving}
+                    onChange={(event) => setToolGroup(option.value, event.target.checked)}
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm text-foreground">{option.label}</span>
+                    <span className="block break-words font-mono text-[11px] text-faint">
+                      {option.value} · {option.detail}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </FieldShell>
+        </details>
 
         {saveError ? (
           <p className="rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">

@@ -6,7 +6,7 @@ import { defineConfig } from 'vitest/config';
 // `*.itest.ts` (`*` matches dots).
 export default defineConfig({
   test: {
-    include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'test/**/*.test.ts', 'test/**/*.test.mjs'],
     exclude: ['**/node_modules/**', '**/*.itest.ts'],
   },
 });

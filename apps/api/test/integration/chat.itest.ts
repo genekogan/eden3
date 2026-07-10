@@ -53,6 +53,33 @@ const codename = `zanzibar_${run}`;
 let migratedSessionId = '';
 const migratedExternalId = randomUUID().replaceAll('-', '').slice(0, 24);
 
+async function scrubStaleChatFixtures(): Promise<void> {
+  const accounts = await pg<{ id: string }[]>`
+    select id from accounts
+    where username like 'apitest_chat_%' and external_id is null`;
+  const accountIds = accounts.map((row) => row.id);
+  if (accountIds.length === 0) return;
+
+  const sessionRows = await pg<{ id: string }[]>`
+    select id from sessions where owner_id = any(${accountIds}::uuid[])`;
+  const sessionIds = sessionRows.map((row) => row.id);
+  if (sessionIds.length > 0) {
+    await pg`delete from usage_events where session_id = any(${sessionIds}::uuid[])`;
+    await pg`delete from messages where session_id = any(${sessionIds}::uuid[])`;
+    await pg`delete from session_agents where session_id = any(${sessionIds}::uuid[])`;
+    await pg`delete from session_users where session_id = any(${sessionIds}::uuid[])`;
+    await pg`delete from sessions where id = any(${sessionIds}::uuid[])`;
+  }
+
+  await pg`delete from usage_events where user_id = any(${accountIds}::uuid[]) or agent_id = any(${accountIds}::uuid[])`;
+  await pg`
+    delete from manna_transactions where manna_account_id in
+      (select id from manna_accounts where account_id = any(${accountIds}::uuid[]))`;
+  await pg`delete from manna_accounts where account_id = any(${accountIds}::uuid[])`;
+  await pg`delete from agents where account_id = any(${accountIds}::uuid[])`;
+  await pg`delete from accounts where id = any(${accountIds}::uuid[])`;
+}
+
 function cookieFor(accountId: string): string {
   return `${DEV_USER_COOKIE}=${accountId}`;
 }
@@ -139,6 +166,7 @@ async function eventually<T>(
 beforeAll(async () => {
   loadRootEnv();
   resetEnvCache();
+  await scrubStaleChatFixtures();
   const env = getEnv();
   if (!env.OPENCLAW_GATEWAY_TOKEN) {
     throw new Error('OPENCLAW_GATEWAY_TOKEN is not set (env or repo-root .env)');
@@ -213,6 +241,7 @@ afterAll(async () => {
     select id from sessions where owner_id in (${ownerId}, ${brokeId})`;
   const sessionIds = sessionRows.map((row) => row.id);
   if (sessionIds.length > 0) {
+    await pg`delete from usage_events where session_id = any(${sessionIds}::uuid[])`;
     await pg`delete from messages where session_id = any(${sessionIds}::uuid[])`;
     await pg`delete from session_agents where session_id = any(${sessionIds}::uuid[])`;
     await pg`delete from session_users where session_id = any(${sessionIds}::uuid[])`;
@@ -407,19 +436,32 @@ describe('POST /sessions/new/messages (live gateway + postgres)', () => {
     expect(meta.turnId).toBe(turnIds[0]);
     expect(meta.usage?.promptTokens).toBeGreaterThan(0);
 
-    // Manna: two -1 debits keyed by the turn uuids; total 100 -> 98.
+    const usage = await pg<{ turnId: string; status: string; manna: number | null }[]>`
+      select turn_id as "turnId", status, manna
+      from usage_events
+      where turn_id = any(${turnIds}::uuid[])
+      order by created_at asc`;
+    expect(usage).toHaveLength(2);
+    expect(usage.map((row) => row.turnId)).toEqual(turnIds);
+    expect(usage.every((row) => row.status === 'completed' && row.manna !== null)).toBe(true);
+    const meteredManna = usage.reduce((sum, row) => sum + (row.manna ?? 0), 0);
+
+    // Manna: each turn reserves 1 upfront, then settles to usage_events.manna.
     const ledger = await pg<{ amount: string; type: string; idempotencyKey: string }[]>`
       select mt.amount, mt.type, mt.idempotency_key as "idempotencyKey"
       from manna_transactions mt
       join manna_accounts ma on ma.id = mt.manna_account_id
       where ma.account_id = ${ownerId} order by mt.created_at asc`;
-    expect(ledger.length).toBe(2);
-    expect(ledger.every((tx) => Number(tx.amount) === -1 && tx.type === 'spend:chat')).toBe(true);
-    expect(ledger.map((tx) => tx.idempotencyKey)).toEqual(turnIds);
+    const reserves = ledger.filter((tx) => tx.type === 'spend:chat');
+    expect(reserves.map((tx) => [Number(tx.amount), tx.idempotencyKey])).toEqual(
+      turnIds.map((id) => [-1, id]),
+    );
+    const netMannaCharged = -ledger.reduce((sum, tx) => sum + Number(tx.amount), 0);
+    expect(netMannaCharged).toBe(meteredManna);
     const [balance] = await pg<{ balance: string; subscriptionBalance: string }[]>`
       select balance, subscription_balance as "subscriptionBalance"
       from manna_accounts where account_id = ${ownerId}`;
-    expect(Number(balance!.balance) + Number(balance!.subscriptionBalance)).toBe(98);
+    expect(Number(balance!.balance) + Number(balance!.subscriptionBalance)).toBe(100 - meteredManna);
   });
 
   it('trailing history-sync backfills gateway message ids onto streamed rows', async () => {

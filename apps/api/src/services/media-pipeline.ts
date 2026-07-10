@@ -23,6 +23,8 @@ import {
 import type { SessionEvent } from '@eden3/shared';
 import { eq, sql } from 'drizzle-orm';
 
+import { stripAttachmentLines } from './history-sync';
+
 /**
  * Media ingest pipeline — the single write path for generated files.
  *
@@ -287,6 +289,51 @@ export class MediaPipeline {
       const sameSession = (existing.sessionId ?? null) === sessionId;
       const alreadyComplete = sameSession && (existing.creationId !== null || !correlated);
       if (alreadyComplete) {
+        // Late history-sync sighting: the watcher already ingested this file
+        // and parked it on a standalone media message BEFORE the streamed
+        // completion row was stamped. Now that we have the real completion row
+        // (attachTo) and the asset lives on a DIFFERENT (orphan) message,
+        // re-home the attachment onto the completion row and strip its
+        // sentinel line — no new creation, no re-charge (idempotent).
+        if (attachTo && existing.messageId && existing.messageId !== attachTo.id) {
+          const rehomed = await this.rehomeAttachment({
+            sessionId: sessionId as string,
+            asset: existing,
+            orphanMessageId: existing.messageId,
+            completion: attachTo,
+            kind,
+          });
+          if (this.bus && rehomed.creation) {
+            try {
+              this.bus.publish(sessionId as string, {
+                type: 'media.attached',
+                sessionId: sessionId as string,
+                messageId: attachTo.id,
+                url: put.url,
+                mime: put.mime,
+                creationId: rehomed.creation.id,
+              });
+            } catch (err) {
+              this.log.error(
+                `media-pipeline: rehome event publish failed for ${put.sha256}: ${String(err)}`,
+              );
+            }
+          }
+          return {
+            asset: existing,
+            creation: rehomed.creation,
+            message: rehomed.completion,
+            url: put.url,
+            mime: put.mime,
+            kind,
+            sha256: put.sha256,
+            billedAccountId: null,
+            debit: null,
+            debitError: null,
+            deduped: true,
+          };
+        }
+
         // Same content, same correlation context, nothing left to write.
         let creation: Creation | null = null;
         if (existing.creationId) {
@@ -391,7 +438,9 @@ export class MediaPipeline {
               ...(put.width !== undefined ? { width: put.width } : {}),
               ...(put.height !== undefined ? { height: put.height } : {}),
             },
-            public: false,
+            // Eden semantics: generated media lands in the internal Explore
+            // feed immediately. There is no separate publish step.
+            public: true,
           })
           .returning();
         if (!inserted) throw new Error('media-pipeline: creations insert returned no row');
@@ -402,11 +451,15 @@ export class MediaPipeline {
       if (sessionId) {
         const fullAttachment = { ...attachment, creationId: creationRow?.id ?? null };
         if (attachTo) {
-          // Append to the existing (history-synced) completion message; the
-          // row was already counted when it was inserted.
+          // Append to the existing (history-synced) completion message and
+          // strip its `MEDIA:`/`Attachment:` sentinel line (the raw container
+          // path is a gateway artifact, not user text). The row was already
+          // counted when it was inserted.
+          const cleaned = stripAttachmentLines(attachTo.content ?? '') || null;
           const [updated] = await tx
             .update(messages)
             .set({
+              content: cleaned,
               attachments: sql`coalesce(${messages.attachments}, '[]'::jsonb) || ${JSON.stringify([fullAttachment])}::jsonb`,
             })
             .where(eq(messages.id, attachTo.id))
@@ -525,5 +578,96 @@ export class MediaPipeline {
       // creation/message — report it as deduped, like a plain re-ingest.
       deduped: txResult.raced,
     };
+  }
+
+  /**
+   * Move an already-ingested attachment from the standalone media message the
+   * watcher created onto the real (history-synced) completion row, strip the
+   * sentinel line from the completion's content, and delete the now-empty
+   * orphan. One transaction; no creation/ledger changes — the asset was
+   * already fully ingested and charged.
+   */
+  private async rehomeAttachment(params: {
+    sessionId: string;
+    asset: MediaAsset;
+    orphanMessageId: string;
+    completion: Message;
+    kind: AttachmentKind;
+  }): Promise<{ completion: Message; creation: Creation | null }> {
+    const { sessionId, asset, orphanMessageId, completion, kind } = params;
+    const fullAttachment = {
+      url: asset.url,
+      mime: asset.mime,
+      kind,
+      ...(asset.width != null ? { width: asset.width } : {}),
+      ...(asset.height != null ? { height: asset.height } : {}),
+      creationId: asset.creationId ?? null,
+    };
+    const cleanedContent = stripAttachmentLines(completion.content ?? '') || null;
+
+    return this.db.transaction(async (tx) => {
+      const [orphan] = await tx
+        .select()
+        .from(messages)
+        .where(eq(messages.id, orphanMessageId))
+        .limit(1);
+
+      // Append onto the completion row and drop its sentinel line. Guard the
+      // append against a re-run: skip if this url is already attached there.
+      const alreadyThere = ((completion.attachments as Array<{ url?: string }> | null) ?? []).some(
+        (a) => a?.url === asset.url,
+      );
+      const [updated] = await tx
+        .update(messages)
+        .set({
+          content: cleanedContent,
+          ...(alreadyThere
+            ? {}
+            : {
+                attachments: sql`coalesce(${messages.attachments}, '[]'::jsonb) || ${JSON.stringify([fullAttachment])}::jsonb`,
+              }),
+        })
+        .where(eq(messages.id, completion.id))
+        .returning();
+
+      // Detach from the orphan; delete it (and decrement the session count) if
+      // it was the bare media message we created — never touch a message that
+      // carries other content or attachments.
+      if (orphan) {
+        const orphanAttachments = (orphan.attachments as Array<Record<string, unknown>> | null) ?? [];
+        const remaining = orphanAttachments.filter(
+          (a) => (a as { url?: string })?.url !== asset.url,
+        );
+        const orphanEmptyText = !(orphan.content ?? '').trim();
+        if (remaining.length === 0 && orphanEmptyText) {
+          await tx.delete(messages).where(eq(messages.id, orphan.id));
+          await tx
+            .update(sessions)
+            .set({ messageCount: sql`greatest(${sessions.messageCount} - 1, 0)` })
+            .where(eq(sessions.id, sessionId));
+        } else if (remaining.length !== orphanAttachments.length) {
+          await tx
+            .update(messages)
+            .set({ attachments: remaining.length > 0 ? remaining : null })
+            .where(eq(messages.id, orphan.id));
+        }
+      }
+
+      await tx
+        .update(mediaAssets)
+        .set({ messageId: completion.id })
+        .where(eq(mediaAssets.id, asset.id));
+
+      let creation: Creation | null = null;
+      if (asset.creationId) {
+        const [row] = await tx
+          .select()
+          .from(creations)
+          .where(eq(creations.id, asset.creationId))
+          .limit(1);
+        creation = row ?? null;
+      }
+      return { completion: updated ?? completion, creation };
+    });
   }
 }

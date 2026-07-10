@@ -52,6 +52,17 @@ import { desc, eq, sql } from 'drizzle-orm';
  * the turn (user POST body, streamed assistant text) have no gateway id yet —
  * those are matched by (role, exact content) against recent rows and the
  * gateway id is BACKFILLED onto them, so subsequent syncs dedupe by id alone.
+ *
+ * Two-ids-one-message guard: the gateway can surface ONE logical message under
+ * TWO different `__openclaw.id` values across passes (observed 2026-07-07 on
+ * eden3_stg: identical assistant narration persisted twice, ids
+ * `gw:ccba9900-…` full-uuid and `gw:3c174e57` 8-hex, `created_at` 41ms apart —
+ * both gateway turn timestamps). The first id backfills/inserts a row; on a
+ * LATER pass the second id is a fresh id-miss with no backfillable row left, so
+ * it would INSERT a duplicate. Before inserting we therefore also skip when a
+ * non-consumed existing row (any external id) carries the same role + content
+ * AND was created within a tight same-turn window of this message — see
+ * {@link SAME_TURN_DEDUPE_WINDOW_MS}.
  */
 
 export const GATEWAY_EXTERNAL_ID_PREFIX = 'gw:';
@@ -148,6 +159,18 @@ export function extractAttachmentPaths(text: string): string[] {
 }
 
 /**
+ * Remove `MEDIA:`/`Attachment:` sentinel lines from a persisted message body.
+ * Used when an attachment is (re)homed onto a completion row: the raw
+ * container path is a gateway artifact, not user-facing text.
+ */
+export function stripAttachmentLines(text: string): string {
+  return text
+    .replace(ATTACHMENT_LINE_RE, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
  * Whitespace-insensitive comparison key for dedupe (W2 finding #5).
  *
  * The gateway streams a multi-block assistant reply as OpenAI content deltas
@@ -168,7 +191,26 @@ export interface ExistingMessageLike {
   externalId: string | null;
   role: string | null;
   content: string | null;
+  /**
+   * `messages.created_at`. Used by the two-ids-one-message insert guard to
+   * confirm a same-content existing row belongs to the SAME turn before
+   * treating a second gateway id as a duplicate. Absent (null/undefined) on
+   * legacy callers/fixtures — the guard then declines to dedupe (fail safe:
+   * keep the message rather than risk dropping a legitimate one).
+   */
+  createdAt?: Date | null;
 }
+
+/**
+ * Same-turn window for the two-ids-one-message insert guard. A second gateway
+ * id for content already on a non-consumed row is treated as a duplicate only
+ * when that row's `created_at` is within this window of the incoming message's
+ * time. The observed duplicate is 41ms apart; the window is generous enough to
+ * absorb streaming latency and server↔gateway clock skew, yet far tighter than
+ * the spacing between turns — so an agent legitimately repeating identical
+ * content in a LATER turn is still inserted, not swallowed.
+ */
+export const SAME_TURN_DEDUPE_WINDOW_MS = 10_000;
 
 export interface PlannedInsert {
   externalId: string;
@@ -250,11 +292,36 @@ export function planHistorySync(
       continue;
     }
 
+    const createdAt = historyMessageDate(message, now);
+
+    // Two-ids-one-message guard (see module docblock). The gateway can surface
+    // one logical message under a second `__openclaw.id` on a later pass; by
+    // then the first id already owns a row, no backfillable row is left, and
+    // this second id would INSERT a duplicate. Skip when a NON-consumed
+    // existing row (any external id — the twin already carries the first id)
+    // has the same role + content AND sits within the same-turn window. The
+    // time guard is essential: it keeps a genuine identical reply in a LATER
+    // turn (well outside the window) from being wrongly deduped. The matched
+    // row is left non-consumed so a third id for the same message also skips.
+    const sameTurnTwin = existing.some(
+      (row) =>
+        !consumed.has(row.id) &&
+        row.role === message.role &&
+        row.content != null &&
+        dedupeKey(row.content) === contentKey &&
+        row.createdAt != null &&
+        Math.abs(row.createdAt.getTime() - createdAt.getTime()) <= SAME_TURN_DEDUPE_WINDOW_MS,
+    );
+    if (sameTurnTwin) {
+      plan.skipped += 1;
+      continue;
+    }
+
     plan.inserts.push({
       externalId,
       role: message.role,
       content,
-      createdAt: historyMessageDate(message, now),
+      createdAt,
       attachmentPaths: extractAttachmentPaths(content),
     });
   }
@@ -364,6 +431,7 @@ export class HistorySync {
         externalId: messages.externalId,
         role: messages.role,
         content: messages.content,
+        createdAt: messages.createdAt,
       })
       .from(messages)
       .where(eq(messages.sessionId, session.id))

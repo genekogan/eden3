@@ -11,6 +11,21 @@ import { z } from 'zod';
  */
 
 const portSchema = z.coerce.number().int().min(1).max(65535);
+const positiveIntSchema = z.coerce.number().int().min(1);
+const nonnegativeIntSchema = z.coerce.number().int().min(0);
+const csvSchema = z.preprocess(
+  (value) =>
+    typeof value === 'string'
+      ? value
+          .split(',')
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0)
+      : value,
+  z.array(z.string().min(1)).default([]),
+);
+const authProviderSchema = z
+  .enum(['dev', 'clerk', 'hybrid'])
+  .default('dev');
 
 export const envSchema = z.object({
   /** Postgres (docker, localhost:5433). */
@@ -26,10 +41,79 @@ export const envSchema = z.object({
     .string()
     .min(1)
     .default(() => path.resolve('var', 'media')),
-  /** Public base URL media files are served from. */
-  MEDIA_BASE_URL: z.string().min(1).default('http://localhost:4301/media'),
+  /**
+   * Base URL locally-generated media is served from, stored verbatim on each
+   * creation/attachment. Defaults to the SAME-ORIGIN relative `/media` so the
+   * browser fetches it against the page origin and the web layer proxies it
+   * (next.config rewrites `/media/*` → the API, or a CDN in prod). An absolute
+   * API-origin URL here bakes a cross-origin link into every row that only
+   * works when the API port is directly browser-reachable — which it is not in
+   * production. Set this to the CDN origin when serving media off a CDN.
+   */
+  MEDIA_BASE_URL: z.string().min(1).default('/media'),
   API_PORT: portSchema.default(4301),
   WEB_PORT: portSchema.default(4300),
+  /** Comma-separated dev/operator admin usernames. */
+  ADMIN_USERNAMES: csvSchema,
+  /** Auth mode: dev impersonation, Clerk, or Clerk with dev fallback for localhost. */
+  AUTH_PROVIDER: authProviderSchema,
+  /**
+   * Opt-in gate for the API's /dev routes (account search + impersonation
+   * cookie). They mount when AUTH_PROVIDER=dev or this is `1`/`true` — hybrid
+   * local stacks need the flag for the dev-cookie flow. Never set it in a
+   * real deployment.
+   */
+  EDEN3_DEV_ROUTES: z
+    .enum(['0', '1', 'true', 'false'])
+    .default('0')
+    .transform((v) => v === '1' || v === 'true'),
+  /** Clerk token verification and local auth continuity. */
+  CLERK_SECRET_KEY: z.string().min(1).optional(),
+  CLERK_JWT_KEY: z.string().min(1).optional(),
+  CLERK_AUTHORIZED_PARTIES: csvSchema,
+  /** Seed manna credited once when a brand-new Clerk subject first signs in. */
+  CLERK_NEW_USER_SEED_MANNA: nonnegativeIntSchema.default(1_000),
+  /** Base64/hex 32-byte AES-GCM key for user channel token custody. */
+  CHANNEL_TOKEN_ENCRYPTION_KEY: z.string().min(1).optional(),
+  /** Eden3-native agents a non-admin user may create; migrated agents are grandfathered. */
+  MAX_NATIVE_AGENTS_PER_USER: nonnegativeIntSchema.default(25),
+  /** Scheduled tasks a non-admin user may keep active/non-deleted. */
+  MAX_SCHEDULED_TASKS_PER_USER: nonnegativeIntSchema.default(100),
+  /** External channel connections a non-admin user may keep connected. */
+  MAX_CHANNEL_CONNECTIONS_PER_USER: nonnegativeIntSchema.default(20),
+  /** Chat turns a user may have in flight at once for the current local tier. */
+  MAX_CONCURRENT_TURNS_PER_USER: nonnegativeIntSchema.default(2),
+  /** Tier-specific chat turn concurrency ceilings. Fall back to the local default when unset. */
+  MAX_CONCURRENT_TURNS_BASIC: nonnegativeIntSchema.optional(),
+  MAX_CONCURRENT_TURNS_PRO: nonnegativeIntSchema.optional(),
+  MAX_CONCURRENT_TURNS_BELIEVER: nonnegativeIntSchema.optional(),
+  /** Maximum net manna a user may spend on chat turns per UTC day. */
+  DAILY_MANNA_SPEND_CAP_PER_USER: nonnegativeIntSchema.default(10_000),
+  /** Fastify JSON/body parser ceiling. */
+  API_BODY_LIMIT_BYTES: positiveIntSchema.default(1_000_000),
+  /** Fixed-window per-client API rate-limit interval. */
+  API_RATE_LIMIT_WINDOW_MS: positiveIntSchema.default(60_000),
+  /** Requests per client per fixed window. */
+  API_RATE_LIMIT_MAX: nonnegativeIntSchema.default(600),
+  /** Stripe secret key; optional until billing routes are exercised. */
+  STRIPE_SECRET_KEY: z.string().min(1).optional(),
+  /** Stripe webhook signing secret for /billing/webhook. */
+  STRIPE_WEBHOOK_SECRET: z.string().min(1).optional(),
+  /** Stripe Checkout Price id for one-time manna top-ups. */
+  STRIPE_MANNA_TOPUP_PRICE_ID: z.string().min(1).optional(),
+  /** Manna credited by the configured one-time top-up price. */
+  STRIPE_MANNA_TOPUP_AMOUNT: positiveIntSchema.default(10_000),
+  /** Stripe Checkout subscription Price ids for Eden tiers. */
+  STRIPE_SUBSCRIPTION_BASIC_PRICE_ID: z.string().min(1).optional(),
+  STRIPE_SUBSCRIPTION_PRO_PRICE_ID: z.string().min(1).optional(),
+  STRIPE_SUBSCRIPTION_BELIEVER_PRICE_ID: z.string().min(1).optional(),
+  /** Monthly subscription manna grants by Eden tier. */
+  STRIPE_SUBSCRIPTION_BASIC_MONTHLY_MANNA: nonnegativeIntSchema.default(10_000),
+  STRIPE_SUBSCRIPTION_PRO_MONTHLY_MANNA: nonnegativeIntSchema.default(35_000),
+  STRIPE_SUBSCRIPTION_BELIEVER_MONTHLY_MANNA: nonnegativeIntSchema.default(100_000),
+  /** Checkout redirects. Defaults are local web pages that can be implemented later. */
+  BILLING_SUCCESS_URL: z.string().min(1).optional(),
+  BILLING_CANCEL_URL: z.string().min(1).optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

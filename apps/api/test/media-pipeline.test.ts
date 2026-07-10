@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { LocalMediaStore, credit, getBalance } from '@eden3/core';
+import { LocalMediaStore, PRICING, credit, getBalance } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import type { SessionEvent } from '@eden3/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -62,6 +62,16 @@ function fakePngFile(name: string, width = 3, height = 2): string {
   return filePath;
 }
 
+function fakeBinaryFile(name: string): string {
+  const buf = Buffer.concat([
+    Buffer.from(`eden3 synthetic media ${name}\n`),
+    Buffer.from(randomUUID()),
+  ]);
+  const filePath = path.join(srcDir, name);
+  writeFileSync(filePath, buf);
+  return filePath;
+}
+
 beforeAll(async () => {
   const accounts = await pg<{ id: string }[]>`
     insert into accounts (type, username) values
@@ -97,7 +107,7 @@ afterAll(async () => {
   await pg`delete from manna_accounts where account_id in (${userId}, ${agentId}, ${brokeUserId})`;
   await pg`delete from accounts where username like ${`${marker}%`}`;
   await pg.end({ timeout: 5 });
-});
+}, 30_000);
 
 describe('pure helpers', () => {
   it('maps extensions to mimes and mimes to kinds', () => {
@@ -182,6 +192,95 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     expect(types).toContain('media.attached');
     expect(types).toContain('manna.updated');
   });
+
+  for (const mediaCase of [
+    {
+      label: 'video',
+      fileName: 'chat-video.mp4',
+      tool: 'video_generate',
+      mime: 'video/mp4',
+      kind: 'video',
+      action: 'video',
+    },
+    {
+      label: 'music',
+      fileName: 'chat-music.mp3',
+      tool: 'music_generate',
+      mime: 'audio/mpeg',
+      kind: 'audio',
+      action: 'music',
+    },
+    {
+      label: 'speech',
+      fileName: 'chat-speech.mp3',
+      tool: 'tts',
+      mime: 'audio/mpeg',
+      kind: 'audio',
+      action: 'tts',
+    },
+  ] as const) {
+    it(`in-chat ${mediaCase.label} ingest attaches inline metadata and charges ${mediaCase.action}`, async () => {
+      events.length = 0;
+      await credit({
+        accountId: userId,
+        amount: PRICING[mediaCase.action] + 1,
+        type: 'credit:test',
+      });
+      const file = fakeBinaryFile(mediaCase.fileName);
+      const before = await getBalance(userId);
+
+      const result = await pipeline.ingestFile(file, {
+        sessionId,
+        agentAccountId: agentId,
+        tool: mediaCase.tool,
+      });
+
+      expect(result.deduped).toBe(false);
+      expect(result.mime).toBe(mediaCase.mime);
+      expect(result.kind).toBe(mediaCase.kind);
+      expect(result.url).toContain(`/media/${result.sha256}`);
+
+      expect(result.creation).not.toBeNull();
+      expect(result.creation!.userId).toBe(userId);
+      expect(result.creation!.agentId).toBe(agentId);
+      expect(result.creation!.tool).toBe(mediaCase.tool);
+      expect(result.creation!.mediaAttributes).toMatchObject({
+        mime: mediaCase.mime,
+        sha256: result.sha256,
+      });
+
+      expect(result.message).not.toBeNull();
+      expect(result.message!.senderId).toBe(agentId);
+      const attachments = result.message!.attachments as Array<Record<string, unknown>>;
+      expect(attachments).toHaveLength(1);
+      expect(attachments[0]).toMatchObject({
+        url: result.url,
+        mime: mediaCase.mime,
+        kind: mediaCase.kind,
+        creationId: result.creation!.id,
+      });
+
+      expect(result.billedAccountId).toBe(userId);
+      expect(result.debitError).toBeNull();
+      expect(result.debit?.balance.total).toBe(before.total - PRICING[mediaCase.action]);
+      const [tx] = await pg<{ amount: string; type: string }[]>`
+        select amount, type from manna_transactions
+        where idempotency_key = ${mediaDebitIdempotencyKey(result.sha256, sessionId)}`;
+      expect(Number(tx!.amount)).toBe(-PRICING[mediaCase.action]);
+      expect(tx!.type).toBe(`spend:${mediaCase.action}`);
+
+      const event = events.find((e) => e.event.type === 'media.attached')?.event;
+      expect(event).toMatchObject({
+        type: 'media.attached',
+        sessionId,
+        messageId: result.message!.id,
+        url: result.url,
+        mime: mediaCase.mime,
+        creationId: result.creation!.id,
+      });
+      expect(events.some((e) => e.event.type === 'manna.updated')).toBe(true);
+    });
+  }
 
   it('re-ingesting the same file into the same session is a no-op', async () => {
     const file = fakePngFile('dedupe.png');
@@ -276,6 +375,141 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     const [countRow] = await pg<{ count: string }[]>`
       select count(*) from messages where session_id = ${sessionId} and id = ${messageId}`;
     expect(Number(countRow!.count)).toBe(1);
+  });
+
+  it('late history-sync attachment completes a parked file on the existing completion row', async () => {
+    events.length = 0;
+    await credit({ accountId: userId, amount: 5, type: 'credit:test' });
+    const file = fakePngFile('parked-attach.png');
+    const parked = await pipeline.ingestFile(file, { tool: 'image_generate' });
+    expect(parked.creation).toBeNull();
+    expect(parked.message).toBeNull();
+    expect(parked.asset.sessionId).toBeNull();
+
+    const [row] = await pg<{ id: string }[]>`
+      insert into messages (session_id, sender_id, role, content)
+      values (${sessionId}, ${agentId}, 'assistant', 'Done!\n\nMEDIA:/home/node/.openclaw/media/tool-image-generation/parked-attach.png')
+      returning id
+    `;
+    const messageId = row!.id;
+
+    const before = await getBalance(userId);
+    const attached = await pipeline.ingestFile(file, {
+      sessionId,
+      messageId,
+      tool: 'image_generate',
+    });
+
+    expect(attached.deduped).toBe(false);
+    expect(attached.asset.id).toBe(parked.asset.id);
+    expect(attached.asset.sessionId).toBe(sessionId);
+    expect(attached.asset.messageId).toBe(messageId);
+    expect(attached.asset.creationId).toBe(attached.creation!.id);
+    expect(attached.message!.id).toBe(messageId);
+    // The raw gateway sentinel line is stripped; the real reply text remains.
+    expect(attached.message!.content).not.toContain('MEDIA:');
+    expect(attached.message!.content).toContain('Done!');
+    expect(attached.creation!.agentId).toBe(agentId);
+
+    const attachments = attached.message!.attachments as Array<Record<string, unknown>>;
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0]).toMatchObject({
+      url: attached.url,
+      mime: 'image/png',
+      kind: 'image',
+      creationId: attached.creation!.id,
+    });
+
+    const [messageCount] = await pg<{ count: string }[]>`
+      select count(*) from messages
+      where session_id = ${sessionId}
+        and attachments @> ${JSON.stringify([{ creationId: attached.creation!.id }])}::jsonb`;
+    expect(Number(messageCount!.count)).toBe(1);
+
+    expect(attached.debit?.balance.total).toBe(before.total - 5);
+    const event = events.find((e) => e.event.type === 'media.attached')?.event;
+    expect(event).toMatchObject({
+      type: 'media.attached',
+      sessionId,
+      messageId,
+      url: attached.url,
+      mime: 'image/png',
+      creationId: attached.creation!.id,
+    });
+  });
+
+  it('re-homes an orphaned in-session attachment onto the late completion row', async () => {
+    // The chiba-on-eden3_stg case: the watcher ingests DURING the turn (session
+    // known, completion row not yet stamped) → creates a creation + a standalone
+    // empty media message (the orphan). history-sync THEN stamps the real
+    // completion row and reports the MEDIA: sighting on it. The re-ingest must
+    // move the attachment onto the completion row, strip its sentinel, delete
+    // the orphan, and never double-charge.
+    events.length = 0;
+    await credit({ accountId: userId, amount: 5, type: 'credit:test' });
+    const file = fakePngFile('orphan-rehome.png');
+
+    // 1. in-session ingest with NO messageId → creation + orphan empty message.
+    const balBefore = await getBalance(userId);
+    const orphaned = await pipeline.ingestFile(file, { sessionId, tool: 'image_generate' });
+    expect(orphaned.creation).not.toBeNull();
+    expect(orphaned.message).not.toBeNull();
+    expect(orphaned.message!.content).toBeNull();
+    const orphanId = orphaned.message!.id;
+    const afterCharge = await getBalance(userId);
+    expect(afterCharge.total).toBe(balBefore.total - PRICING.image);
+
+    // 2. the real streamed completion row lands later, carrying the sentinel.
+    const [row] = await pg<{ id: string }[]>`
+      insert into messages (session_id, sender_id, role, content)
+      values (${sessionId}, ${agentId}, 'assistant',
+        'Here you go!\n\nMEDIA:/home/node/.openclaw/media/tool-image-generation/orphan-rehome.png')
+      returning id`;
+    const completionId = row!.id;
+
+    // 3. history-sync sighting re-ingests the SAME file against the completion.
+    const rehomed = await pipeline.ingestFile(file, {
+      sessionId,
+      messageId: completionId,
+      tool: 'image_generate',
+    });
+
+    // attachment now lives on the completion row, sentinel stripped.
+    expect(rehomed.deduped).toBe(true);
+    expect(rehomed.message!.id).toBe(completionId);
+    expect(rehomed.message!.content).not.toContain('MEDIA:');
+    expect(rehomed.message!.content).toContain('Here you go!');
+    const att = rehomed.message!.attachments as Array<Record<string, unknown>>;
+    expect(att).toHaveLength(1);
+    expect(att[0]).toMatchObject({ url: rehomed.url, kind: 'image', creationId: rehomed.creation!.id });
+
+    // the orphan message is gone.
+    const [orphanGone] = await pg<{ count: string }[]>`
+      select count(*) from messages where id = ${orphanId}`;
+    expect(Number(orphanGone!.count)).toBe(0);
+
+    // exactly one message in the session carries this creation's attachment.
+    const [attCount] = await pg<{ count: string }[]>`
+      select count(*) from messages
+      where session_id = ${sessionId}
+        and attachments @> ${JSON.stringify([{ creationId: rehomed.creation!.id }])}::jsonb`;
+    expect(Number(attCount!.count)).toBe(1);
+
+    // the asset points at the completion row now.
+    const [assetRow] = await pg<{ message_id: string }[]>`
+      select message_id from media_assets where id = ${rehomed.asset.id}`;
+    expect(assetRow!.message_id).toBe(completionId);
+
+    // NO second charge — the file was already billed on the orphan ingest.
+    const balAfter = await getBalance(userId);
+    expect(balAfter.total).toBe(afterCharge.total);
+    expect(rehomed.debit).toBeNull();
+
+    // the UI is told the media moved onto the completion row.
+    const event = events.find(
+      (e) => e.event.type === 'media.attached' && e.event.messageId === completionId,
+    )?.event;
+    expect(event).toMatchObject({ type: 'media.attached', sessionId, messageId: completionId });
   });
 
   it('parks an uncorrelated file, then completes it on late correlation', async () => {

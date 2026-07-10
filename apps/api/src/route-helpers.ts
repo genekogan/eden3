@@ -2,6 +2,12 @@ import { numericToNumber } from '@eden3/core';
 import type { Account, Agent, Creation, Trigger } from '@eden3/db';
 import {
   PROVISION_STATUSES,
+  DEFAULT_AGENT_MODEL,
+  DEFAULT_AGENT_THINKING_LEVEL,
+  DEFAULT_AGENT_TOOL_GROUPS,
+  agentToolGroupsSchema,
+  agentModelSchema,
+  agentThinkingLevelSchema,
   encodeFeedCursor,
   tryDecodeFeedCursor,
   type AccountSummary,
@@ -166,16 +172,38 @@ export interface AgentRow {
   is_persona_public: boolean;
   greeting: string | null;
   voice: string | null;
+  model: string | null;
+  thinking_level: string | null;
+  tool_groups: unknown | null;
   public: boolean;
   owner_id: string | null;
   is_pilot: boolean;
   is_synthetic: boolean;
   provision_status: string;
+  like_count?: number;
+  viewer_has_liked?: boolean;
 }
 
 export interface AgentDtoOptions {
   /** Persona text is owner-gated (agents.is_persona_public); false -> null. */
   includePersona: boolean;
+  likeCount?: number;
+  viewerHasLiked?: boolean;
+}
+
+function coerceAgentModel(value: string | null | undefined): AgentDto['model'] {
+  const parsed = agentModelSchema.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_AGENT_MODEL;
+}
+
+function coerceThinkingLevel(value: string | null | undefined): AgentDto['thinkingLevel'] {
+  const parsed = agentThinkingLevelSchema.safeParse(value);
+  return parsed.success ? parsed.data : DEFAULT_AGENT_THINKING_LEVEL;
+}
+
+function coerceToolGroups(value: unknown): AgentDto['toolGroups'] {
+  const parsed = agentToolGroupsSchema.safeParse(value ?? DEFAULT_AGENT_TOOL_GROUPS);
+  return parsed.success ? parsed.data : [...DEFAULT_AGENT_TOOL_GROUPS];
 }
 
 export function agentDtoFromRow(row: AgentRow, opts: AgentDtoOptions): AgentDto {
@@ -188,11 +216,16 @@ export function agentDtoFromRow(row: AgentRow, opts: AgentDtoOptions): AgentDto 
     persona: opts.includePersona ? row.persona : null,
     greeting: row.greeting,
     voice: row.voice,
+    model: coerceAgentModel(row.model),
+    thinkingLevel: coerceThinkingLevel(row.thinking_level),
+    toolGroups: coerceToolGroups(row.tool_groups),
     userImage: row.user_image,
     public: row.public,
     ownerId: row.owner_id,
     isPilot: row.is_pilot,
     isSynthetic: row.is_synthetic,
+    ...(row.like_count !== undefined ? { likeCount: row.like_count } : {}),
+    ...(row.viewer_has_liked !== undefined ? { viewerHasLiked: row.viewer_has_liked } : {}),
     provisionStatus: coerceProvisionStatus(row.provision_status),
     createdAt: pgToIso(row.created_at),
     updatedAt: pgToIso(row.updated_at),
@@ -213,11 +246,16 @@ export function agentDtoFromEntities(
     persona: opts.includePersona ? agent.persona : null,
     greeting: agent.greeting,
     voice: agent.voice,
+    model: coerceAgentModel(agent.model),
+    thinkingLevel: coerceThinkingLevel(agent.thinkingLevel),
+    toolGroups: coerceToolGroups(agent.toolGroups),
     userImage: account.userImage,
     public: agent.public,
     ownerId: agent.ownerId,
     isPilot: agent.isPilot,
     isSynthetic: agent.isSynthetic,
+    ...(opts.likeCount !== undefined ? { likeCount: opts.likeCount } : {}),
+    ...(opts.viewerHasLiked !== undefined ? { viewerHasLiked: opts.viewerHasLiked } : {}),
     provisionStatus: coerceProvisionStatus(agent.provisionStatus),
     createdAt: account.createdAt.toISOString(),
     updatedAt: account.updatedAt.toISOString(),
@@ -243,6 +281,7 @@ export interface CreationRow {
   thumbnail_url: string | null;
   media_attributes: unknown;
   like_count: number;
+  viewer_has_liked?: boolean;
   public: boolean;
   created_at: string;
   updated_at: string;
@@ -287,6 +326,7 @@ export function creationDtoFromRow(row: CreationRow): CreationDto {
     thumbnailUrl: row.thumbnail_url,
     mediaAttributes: (row.media_attributes as Record<string, unknown> | null) ?? null,
     likeCount: row.like_count,
+    ...(row.viewer_has_liked !== undefined ? { viewerHasLiked: row.viewer_has_liked } : {}),
     public: row.public,
     ...(creator !== undefined ? { creator } : {}),
     ...(agent !== undefined ? { agent } : {}),
@@ -297,7 +337,7 @@ export function creationDtoFromRow(row: CreationRow): CreationDto {
 
 export function creationDtoFromEntity(
   creation: Creation,
-  embeds: { creator?: AccountSummary; agent?: AccountSummary } = {},
+  embeds: { creator?: AccountSummary; agent?: AccountSummary; viewerHasLiked?: boolean } = {},
 ): CreationDto {
   return {
     id: creation.id,
@@ -310,6 +350,7 @@ export function creationDtoFromEntity(
     thumbnailUrl: creation.thumbnailUrl,
     mediaAttributes: (creation.mediaAttributes as Record<string, unknown> | null) ?? null,
     likeCount: creation.likeCount,
+    ...(embeds.viewerHasLiked !== undefined ? { viewerHasLiked: embeds.viewerHasLiked } : {}),
     public: creation.public,
     ...(embeds.creator !== undefined ? { creator: embeds.creator } : {}),
     ...(embeds.agent !== undefined ? { agent: embeds.agent } : {}),
@@ -394,6 +435,9 @@ export function triggerDtoFromEntity(trigger: Trigger): TriggerDto {
     prompt: trigger.prompt,
     schedule: (trigger.schedule as CronSchedule | null) ?? null,
     status: trigger.status,
+    lastRunTime: trigger.lastRunTime ? trigger.lastRunTime.toISOString() : null,
+    nextScheduledRun: trigger.nextScheduledRun ? trigger.nextScheduledRun.toISOString() : null,
+    lastError: trigger.lastError,
     createdAt: trigger.createdAt.toISOString(),
     updatedAt: trigger.updatedAt.toISOString(),
   };
