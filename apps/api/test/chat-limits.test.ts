@@ -157,9 +157,11 @@ describe('chat rate limits', () => {
         persona: 'You are Lazy Agent.',
         thinkingLevel: 'balanced',
       });
+      // eden-safe-base retired to the platform layer — lazy provision attaches
+      // no default skills.
       expect(skillSync.calls).toContainEqual({
         openclawId: username,
-        skills: ['eden-safe-base'],
+        skills: [],
       });
       expect(toolSync.calls).toContainEqual({
         openclawId: username,

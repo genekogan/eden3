@@ -233,4 +233,29 @@ describe('skills routes', () => {
     });
     expect(res.statusCode).toBe(403);
   });
+
+  it('retires eden-safe-base: not in the catalog, not a default, not attachable', async () => {
+    // Privacy/safety moved to the platform layer (AGENTS.md conduct + the egress
+    // sealed-interior + capability floor). ensureBuiltinSkills (run at boot)
+    // deletes the row, so it must be absent from every skill surface.
+    const [defCount] = await pg<{ count: number }[]>`
+      select count(*)::int as count from skill_definitions where slug = 'eden-safe-base'
+    `;
+    expect(defCount!.count).toBe(0);
+
+    const catalog = await app.inject({ method: 'GET', url: '/skills' });
+    expect(catalog.statusCode).toBe(200);
+    const slugs = (catalog.json() as { items: SkillDto[] }).items.map((item) => item.slug);
+    expect(slugs).not.toContain('eden-safe-base');
+
+    // It is no longer an installable skill.
+    const attach = await app.inject({
+      method: 'POST',
+      url: `/agents/${marker}_agent/skills`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { slugs: ['eden-safe-base'] },
+    });
+    expect(attach.statusCode).toBe(404);
+    expect(attach.json()).toMatchObject({ error: { code: 'skill_not_found' } });
+  });
 });

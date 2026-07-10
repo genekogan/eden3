@@ -38,17 +38,6 @@ export class SkillInstallError extends Error {
 
 export const BUILTIN_SKILLS = [
   {
-    slug: 'eden-safe-base',
-    name: 'Eden Safe Base',
-    description: 'Baseline operating rules for privacy, consent, and careful execution.',
-    body:
-      '# Eden Safe Base\n\n' +
-      '- Protect private user data, secrets, credentials, payment details, and unreleased work.\n' +
-      '- Ask before taking irreversible or externally visible actions.\n' +
-      '- State uncertainty plainly when evidence is incomplete.\n' +
-      '- Prefer the smallest effective tool call and avoid unnecessary spend.\n',
-  },
-  {
     slug: 'creative-brief',
     name: 'Creative Brief',
     description: 'Turns vague creative direction into concrete prompts, constraints, and review criteria.',
@@ -70,7 +59,25 @@ export const BUILTIN_SKILLS = [
   },
 ] as const;
 
-export const DEFAULT_AGENT_SKILL_SLUGS = ['eden-safe-base'] as const;
+/**
+ * Skills attached to every newly provisioned agent. Now empty: the old
+ * `eden-safe-base` baseline moved OUT of the skill system and into the
+ * always-loaded platform layer (packages/gateway/workspace-templates/AGENTS.md
+ * "Conduct" section) so privacy/consent/careful-execution rules are standing
+ * conduct no toggle can remove — not a user-facing, deletable "skill". The
+ * secrets portion is additionally enforced by the runtime egress sealed-interior
+ * + capability floor, so the AGENTS.md line is a restatement, not the control.
+ */
+export const DEFAULT_AGENT_SKILL_SLUGS: readonly string[] = [];
+
+/**
+ * Skills that were once curated/default but are now handled by the platform
+ * layer. On every provision/skill-sync they are deleted from `skill_definitions`
+ * (cascading their `agent_skills` links), stripped from the TOOLS.md manifest,
+ * and their `skills/<slug>/` directory removed — so existing workspaces shed
+ * them idempotently without a one-off migration. Adding a slug here retires it.
+ */
+export const RETIRED_SKILL_SLUGS = ['eden-safe-base'] as const;
 
 export function skillColumns() {
   return pg`
@@ -96,6 +103,12 @@ export async function ensureBuiltinSkills(): Promise<void> {
           status = 'approved',
           updated_at = now()
     `;
+  }
+  // Retire skills that are now platform-enforced. Deleting the definition row
+  // cascades to `agent_skills` (FK onDelete: cascade), so it vanishes from the
+  // global catalog (GET /skills) and every agent's panel. Idempotent.
+  if (RETIRED_SKILL_SLUGS.length > 0) {
+    await pg`delete from skill_definitions where slug = any(${[...RETIRED_SKILL_SLUGS]}::text[])`;
   }
 }
 
@@ -191,6 +204,12 @@ export async function writeSkillFiles(
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(path.join(dir, 'SKILL.md'), skillFileBody(skill), { mode: 0o600 });
   }
+  // Drop any retired skill directories a prior provision left behind (the
+  // manifest rewrite below already omits them). Fixed constant slugs, so the
+  // path is trusted.
+  for (const slug of RETIRED_SKILL_SLUGS) {
+    await fs.rm(path.resolve(root, slug), { recursive: true, force: true });
+  }
   await writeSkillManifest(workspacePath, skills);
 }
 
@@ -276,9 +295,15 @@ export async function installDefaultAgentSkills(params: {
   skillSync: SkillSyncLike;
 }): Promise<{ skills: AgentSkillRow[]; openclaw: { changed: boolean } }> {
   await ensureBuiltinSkills();
+  // Re-sync the agent's CURRENT approved skills union the defaults. On a fresh
+  // agent both are empty (DEFAULT_AGENT_SKILL_SLUGS moved to the platform layer),
+  // so nothing is attached; on an existing agent (repair, lazy first-chat
+  // provision) this preserves the owner's chosen skills instead of wiping them,
+  // while still rewriting the manifest and shedding any RETIRED_SKILL_SLUGS.
+  const existing = await approvedSkillsForAgent(params.agentId);
   return replaceAgentSkills({
     ...params,
-    slugs: [...DEFAULT_AGENT_SKILL_SLUGS],
+    slugs: [...new Set([...existing, ...DEFAULT_AGENT_SKILL_SLUGS])],
   });
 }
 
