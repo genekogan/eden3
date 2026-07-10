@@ -11,10 +11,15 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { api } from "@/lib/api";
 import type { AgentExportBundle } from "@/lib/types";
+import { AgentAvatar } from "@/components/agent-avatar";
+import {
+  conceptImageFileError,
+  fileToUpload,
+} from "@/components/agents/agent-concepts";
 import {
   apiErrorDetail,
   availabilityFromProbe,
@@ -120,7 +125,32 @@ export function AgentCreateForm() {
   const [usernameState, setUsernameState] = useState<UsernameState>(IDLE);
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [avatarFile, setAvatarFile] = useState<File | null>(null);
+  const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
   const probeSeq = useRef(0);
+
+  // Revoke the previous object URL whenever the preview changes / unmounts.
+  useEffect(() => {
+    if (!avatarPreview) return;
+    return () => URL.revokeObjectURL(avatarPreview);
+  }, [avatarPreview]);
+
+  const pickAvatar = (file: File | null) => {
+    if (!file) return;
+    const problem = conceptImageFileError(file);
+    if (problem) {
+      setFormError(problem);
+      return;
+    }
+    setFormError(null);
+    setAvatarFile(file);
+    setAvatarPreview(URL.createObjectURL(file));
+  };
+
+  const clearAvatar = () => {
+    setAvatarFile(null);
+    setAvatarPreview(null);
+  };
 
   const checkAvailability = async () => {
     const candidate = normalizeUsername(username);
@@ -152,12 +182,15 @@ export function AgentCreateForm() {
   const applyTemplate = (template: (typeof AGENT_TEMPLATES)[number]) => {
     setImportBundle(null);
     setImportName(null);
-    if (!username.trim()) setUsername(template.username);
-    if (!name.trim()) setName(template.name);
-    if (!description.trim()) setDescription(template.description);
-    if (!greeting.trim()) setGreeting(template.greeting);
-    if (!voice.trim()) setVoice("");
-    if (!persona.trim()) setPersona(template.persona);
+    // Clicking an archetype card is an explicit "load this template" intent, so
+    // every field is overwritten unconditionally — otherwise the first template
+    // fills the empty fields and every later click no-ops.
+    setUsername(template.username);
+    setName(template.name);
+    setDescription(template.description);
+    setGreeting(template.greeting);
+    setVoice("");
+    setPersona(template.persona);
     setModel(normalizeAgentModel(null));
     setThinkingLevel(normalizeThinkingLevel(null));
     setToolGroups(normalizeToolGroups(null));
@@ -270,7 +303,18 @@ export function AgentCreateForm() {
             thinkingLevel,
             toolGroups,
           });
-      router.push(agentHref(agent.username ?? candidate));
+      const created = agent.username ?? candidate;
+      // Create-then-upload: the agent exists now, so an avatar failure is
+      // non-fatal — the owner can set one from the edit page rather than being
+      // stranded on a form for an agent that was already created.
+      if (avatarFile) {
+        try {
+          await api.agents.uploadAvatar(created, await fileToUpload(avatarFile));
+        } catch {
+          /* best-effort; agent is created regardless */
+        }
+      }
+      router.push(agentHref(created));
     } catch (error) {
       setFormError(apiErrorDetail(error));
       setSubmitting(false);
@@ -366,6 +410,39 @@ export function AgentCreateForm() {
         onSubmit={(e) => void onSubmit(e)}
         className="mt-8 space-y-6 rounded-xl border border-edge bg-surface p-6"
       >
+        <FieldShell
+          id="agent-avatar"
+          label="Avatar"
+          optional
+          hint="PNG, JPEG, or WebP up to 8MB — uploaded once the agent is created. You can change it later."
+        >
+          <div className="flex items-center gap-4">
+            <AgentAvatar src={avatarPreview} name={name || username || "?"} size={56} />
+            <div className="flex flex-wrap items-center gap-2">
+              <label className={quietButtonClass}>
+                {avatarFile ? "Change photo" : "Add photo"}
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  className="sr-only"
+                  disabled={submitting}
+                  onChange={(event) => pickAvatar(event.target.files?.[0] ?? null)}
+                />
+              </label>
+              {avatarFile ? (
+                <button
+                  type="button"
+                  onClick={clearAvatar}
+                  disabled={submitting}
+                  className={quietButtonClass}
+                >
+                  Remove
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </FieldShell>
+
         <FieldShell
           id="agent-username"
           label="Username"
@@ -511,9 +588,17 @@ export function AgentCreateForm() {
               label="Skills"
               hint="Default skills attach on create; curated and approved user skills attach from the profile skills tab."
             >
-              <Link href="/skills" className={quietButtonClass}>
-                Browse skills
-              </Link>
+              {/* New tab: skills aren't selectable at create time (they attach on
+                  create / from the profile), so a same-tab nav would discard the
+                  half-built form. */}
+              <a
+                href="/skills"
+                target="_blank"
+                rel="noopener noreferrer"
+                className={quietButtonClass}
+              >
+                Browse skills ↗
+              </a>
             </FieldShell>
           </div>
 

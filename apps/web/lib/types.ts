@@ -479,6 +479,13 @@ export interface AgentCreateInput {
 /** PATCH /api/agents/:username — create fields plus owner-only visibility. */
 export type AgentUpdateInput = Partial<AgentCreateInput> & { public?: boolean };
 
+/** POST /api/agents/:username/avatar (base64-JSON upload; png/jpeg/webp ≤ 8MB). */
+export interface AgentAvatarUploadInput {
+  filename?: string;
+  mime: string;
+  dataBase64: string;
+}
+
 export interface CollectionCreateInput {
   name: string;
   description?: string;
