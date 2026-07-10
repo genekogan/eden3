@@ -3,9 +3,12 @@ import {
   describeSchedule,
   formatClock,
   parseClock,
+  parseDatetimeLocal,
   timezoneOptions,
+  toDatetimeLocalValue,
   weekdayLabel,
 } from "./schedule";
+import { formFromSchedule, scheduleFromForm } from "./schedule-fields";
 
 describe("describeSchedule", () => {
   it("renders daily schedules", () => {
@@ -52,6 +55,94 @@ describe("describeSchedule", () => {
     expect(describeSchedule(null)).toBe("No schedule");
     expect(describeSchedule(undefined)).toBe("No schedule");
     expect(describeSchedule({})).toBe("Unscheduled");
+  });
+
+  it("renders one-time {at} schedules in the viewer's locale", () => {
+    const at = "2026-07-11T15:00:00.000Z";
+    const rendered = describeSchedule({ at });
+    expect(rendered).toMatch(/^Once on /);
+    expect(rendered).toContain("2026");
+    expect(describeSchedule({ at: "garbage" })).toBe("Once (invalid time)");
+  });
+
+  it("renders hourly schedules (hour '*')", () => {
+    expect(describeSchedule({ hour: "*", minute: 15, timezone: "UTC" })).toBe(
+      "Hourly at :15 · UTC",
+    );
+  });
+});
+
+describe("datetime-local helpers", () => {
+  it("round-trips instants through the input value format", () => {
+    const instant = new Date(2026, 6, 11, 15, 30); // local wall clock
+    const value = toDatetimeLocalValue(instant);
+    expect(value).toBe("2026-07-11T15:30");
+    expect(parseDatetimeLocal(value)).toBe(instant.toISOString());
+  });
+
+  it("rejects unparsable values", () => {
+    expect(parseDatetimeLocal("")).toBeNull();
+    expect(parseDatetimeLocal("tomorrow")).toBeNull();
+  });
+});
+
+describe("scheduleFromForm / formFromSchedule", () => {
+  const base = {
+    cadence: "daily" as const,
+    onceAt: "2099-01-01T09:00",
+    minute: "0",
+    weekday: "mon",
+    time: "09:30",
+    timezone: "UTC",
+  };
+
+  it("builds daily and weekly dicts", () => {
+    expect(scheduleFromForm(base)).toEqual({ hour: 9, minute: 30, timezone: "UTC" });
+    expect(
+      scheduleFromForm({ ...base, cadence: "weekly", weekday: "fri" }),
+    ).toEqual({
+      hour: 9,
+      minute: 30,
+      day_of_week: "fri",
+      timezone: "UTC",
+    });
+  });
+
+  it("builds hourly dicts with hour '*' and validates the minute", () => {
+    expect(scheduleFromForm({ ...base, cadence: "hourly", minute: "45" })).toEqual({
+      hour: "*",
+      minute: 45,
+      timezone: "UTC",
+    });
+    expect(scheduleFromForm({ ...base, cadence: "hourly", minute: "61" })).toBeNull();
+    expect(scheduleFromForm({ ...base, cadence: "hourly", minute: "x" })).toBeNull();
+  });
+
+  it("builds one-time {at} schedules and rejects past instants", () => {
+    const future = scheduleFromForm({ ...base, cadence: "once" });
+    expect(future).toEqual({ at: parseDatetimeLocal(base.onceAt) });
+    expect(
+      scheduleFromForm({ ...base, cadence: "once", onceAt: "2001-01-01T00:00" }),
+    ).toBeNull();
+  });
+
+  it("prefills the form from every stored shape", () => {
+    expect(formFromSchedule({ hour: 14, minute: 5, timezone: "UTC" })).toMatchObject({
+      cadence: "daily",
+      time: "14:05",
+      timezone: "UTC",
+    });
+    expect(
+      formFromSchedule({ hour: 9, minute: 0, day_of_week: "fri", timezone: "UTC" }),
+    ).toMatchObject({ cadence: "weekly", weekday: "fri", time: "09:00" });
+    expect(formFromSchedule({ hour: "*", minute: 45, timezone: "UTC" })).toMatchObject({
+      cadence: "hourly",
+      minute: "45",
+    });
+    const at = "2026-07-11T15:00:00.000Z";
+    const onceForm = formFromSchedule({ at });
+    expect(onceForm.cadence).toBe("once");
+    expect(parseDatetimeLocal(onceForm.onceAt)).toBe(at);
   });
 });
 

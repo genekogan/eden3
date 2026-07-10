@@ -5,24 +5,25 @@
  *
  *   agent picker (debounced search over GET /api/agents?q=)
  *   name + prompt
- *   schedule builder: daily/weekly, HH:MM, timezone (defaults to browser tz)
+ *   schedule builder: once/hourly/daily/weekly (see schedule-fields.tsx)
  *
  * Submits POST /api/tasks {agentUsername, name, prompt, schedule} with
- * day_of_week as a cron day name ("mon") for weekly cadences. Dependency-free
- * dialog: backdrop + Escape close, body scroll lock while open.
+ * day_of_week as a cron day name ("mon") for weekly cadences and {at} for
+ * one-time runs. Dependency-free dialog: backdrop + Escape close, body
+ * scroll lock while open.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
-import type { AgentDto, TaskScheduleInput, TriggerDto } from "@/lib/types";
+import type { AgentDto, CronSchedule, TriggerDto } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
+import { describeSchedule } from "./schedule";
 import {
-  browserTimezone,
-  describeSchedule,
-  parseClock,
-  timezoneOptions,
-  WEEKDAYS,
-} from "./schedule";
+  defaultScheduleForm,
+  ScheduleFields,
+  scheduleFromForm,
+  type ScheduleFormState,
+} from "./schedule-fields";
 
 const FIELD_LABEL =
   "font-mono text-[10px] uppercase tracking-[0.2em] text-faint";
@@ -58,14 +59,9 @@ export function NewTaskModal({
   const [agent, setAgent] = useState<AgentDto | null>(null);
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
-  const [cadence, setCadence] = useState<"daily" | "weekly">("daily");
-  const [weekday, setWeekday] = useState<string>("mon");
-  const [time, setTime] = useState("09:00");
-  const [timezone, setTimezone] = useState("UTC");
+  const [form, setForm] = useState<ScheduleFormState>(defaultScheduleForm);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  const zones = useMemo(() => timezoneOptions(timezone), [timezone]);
 
   // Fresh form every time the modal opens.
   useEffect(() => {
@@ -76,10 +72,7 @@ export function NewTaskModal({
     setAgent(null);
     setName("");
     setPrompt("");
-    setCadence("daily");
-    setWeekday("mon");
-    setTime("09:00");
-    setTimezone(browserTimezone());
+    setForm(defaultScheduleForm());
     setSubmitting(false);
     setError(null);
   }, [open]);
@@ -125,15 +118,7 @@ export function NewTaskModal({
 
   if (!open) return null;
 
-  const clock = parseClock(time);
-  const schedule: TaskScheduleInput | null = clock
-    ? {
-        hour: clock.hour,
-        minute: clock.minute,
-        timezone,
-        ...(cadence === "weekly" ? { day_of_week: weekday } : {}),
-      }
-    : null;
+  const schedule = scheduleFromForm(form);
   const canSubmit =
     !submitting &&
     agent !== null &&
@@ -312,65 +297,13 @@ export function NewTaskModal({
           <fieldset>
             <legend className={FIELD_LABEL}>Schedule</legend>
             <div className="mt-1.5 space-y-2.5">
-              <div className="inline-flex rounded-lg border border-edge bg-background p-0.5">
-                {(["daily", "weekly"] as const).map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    onClick={() => setCadence(option)}
-                    aria-pressed={cadence === option}
-                    className={`rounded-md px-3 py-1.5 text-xs capitalize transition-colors ${
-                      cadence === option
-                        ? "bg-accent/15 text-accent-soft"
-                        : "text-muted hover:text-foreground"
-                    }`}
-                  >
-                    {option}
-                  </button>
-                ))}
-              </div>
-
-              <div className="flex flex-wrap gap-2.5">
-                {cadence === "weekly" ? (
-                  <select
-                    value={weekday}
-                    onChange={(event) => setWeekday(event.target.value)}
-                    aria-label="Day of week"
-                    className={`${FIELD_INPUT} w-auto flex-1`}
-                  >
-                    {WEEKDAYS.map((day) => (
-                      <option key={day.value} value={day.value}>
-                        {day.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : null}
-                <input
-                  type="time"
-                  value={time}
-                  onChange={(event) => setTime(event.target.value)}
-                  aria-label="Time of day"
-                  required
-                  className={`${FIELD_INPUT} w-32`}
-                />
-                <select
-                  value={timezone}
-                  onChange={(event) => setTimezone(event.target.value)}
-                  aria-label="Timezone"
-                  className={`${FIELD_INPUT} min-w-0 flex-1`}
-                >
-                  {zones.map((zone) => (
-                    <option key={zone} value={zone}>
-                      {zone.replace(/_/g, " ")}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
+              <ScheduleFields form={form} onChange={setForm} />
               <p className="text-xs text-faint">
                 {schedule
-                  ? `Runs ${lowerFirst(describeSchedule(schedule))}`
-                  : "Pick a valid time."}
+                  ? `Runs ${lowerFirst(describeSchedule(schedule as CronSchedule))}`
+                  : form.cadence === "once"
+                    ? "Pick a future time."
+                    : "Pick a valid time."}
               </p>
             </div>
           </fieldset>

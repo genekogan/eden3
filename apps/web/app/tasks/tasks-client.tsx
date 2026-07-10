@@ -4,21 +4,22 @@
  * /tasks — the current user's scheduled triggers.
  *
  * GET /api/tasks lists them; rows show name, agent, a human-readable
- * schedule, a status chip, and last/next run when the API includes them.
- * Pause/resume/delete all go through PATCH /api/tasks/:id {status}
- * (delete = status "finished", then the row leaves the list). "New task"
+ * schedule (once/hourly/daily/weekly), a status chip, real "last run /
+ * next run" stamps, the last error when present, a link to the latest
+ * run's output session, and a Run-now button (POST /api/tasks/:id/runs).
+ * Pause/resume/edit/delete go through PATCH /api/tasks/:id. "New task"
  * opens the modal (POST /api/tasks).
  *
  * TriggerDto only carries agentId, so agent identities resolve from
  * GET /api/agents pages (plus any `agent` summary the API embeds).
  */
 
+import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type {
   AccountSummary,
   AgentDto,
-  TaskScheduleInput,
   TriggerDto,
   TriggerStatus,
 } from "@/lib/types";
@@ -26,13 +27,13 @@ import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton";
 import { formatRelativeTime } from "@/lib/format";
+import { describeSchedule } from "./schedule";
 import {
-  browserTimezone,
-  describeSchedule,
-  parseClock,
-  timezoneOptions,
-  WEEKDAYS,
-} from "./schedule";
+  formFromSchedule,
+  ScheduleFields,
+  scheduleFromForm,
+  type ScheduleFormState,
+} from "./schedule-fields";
 import { NewTaskModal } from "./new-task-modal";
 
 type AgentRef = Pick<AgentDto, "username" | "userImage"> & {
@@ -58,24 +59,6 @@ function embeddedAgent(trigger: TriggerDto): AgentRef | null {
     };
   }
   return null;
-}
-
-/** last/next run timestamps if the API provides them (not in the base DTO). */
-function runTimes(trigger: TriggerDto): { last?: string; next?: string } {
-  const obj = trigger as unknown as Record<string, unknown>;
-  const pick = (...keys: string[]): string | undefined => {
-    for (const key of keys) {
-      const value = obj[key];
-      if (typeof value === "string" && value !== "") return value;
-    }
-    return undefined;
-  };
-  const result: { last?: string; next?: string } = {};
-  const last = pick("lastRunAt", "last_run_time", "lastRun");
-  const next = pick("nextRunAt", "next_run_time", "nextRun", "nextRunTime");
-  if (last) result.last = last;
-  if (next) result.next = next;
-  return result;
 }
 
 function errorCopy(error: unknown): { title: string; hint: string } {
@@ -136,42 +119,6 @@ function StatusChip({ status }: { status: string | null }) {
   );
 }
 
-function scheduleFormState(schedule: TriggerDto["schedule"]): {
-  cadence: "daily" | "weekly";
-  weekday: string;
-  time: string;
-  timezone: string;
-} {
-  const record =
-    schedule && typeof schedule === "object"
-      ? (schedule as Record<string, unknown>)
-      : {};
-  const hour =
-    typeof record.hour === "number"
-      ? record.hour
-      : typeof record.hour === "string"
-        ? Number.parseInt(record.hour, 10)
-        : 9;
-  const minute =
-    typeof record.minute === "number"
-      ? record.minute
-      : typeof record.minute === "string"
-        ? Number.parseInt(record.minute, 10)
-        : 0;
-  const dayOfWeek = record.day_of_week;
-  return {
-    cadence: dayOfWeek === undefined ? "daily" : "weekly",
-    weekday: typeof dayOfWeek === "string" ? dayOfWeek : "mon",
-    time: `${String(Number.isFinite(hour) ? hour : 9).padStart(2, "0")}:${String(
-      Number.isFinite(minute) ? minute : 0,
-    ).padStart(2, "0")}`,
-    timezone:
-      typeof record.timezone === "string" && record.timezone !== ""
-        ? record.timezone
-        : browserTimezone(),
-  };
-}
-
 function EditTaskModal({
   task,
   onClose,
@@ -181,25 +128,14 @@ function EditTaskModal({
   onClose: () => void;
   onSaved: (task: TriggerDto) => void;
 }) {
-  const initial = scheduleFormState(task.schedule);
   const [name, setName] = useState(task.name ?? "");
   const [prompt, setPrompt] = useState(task.prompt ?? "");
-  const [cadence, setCadence] = useState<"daily" | "weekly">(initial.cadence);
-  const [weekday, setWeekday] = useState(initial.weekday);
-  const [time, setTime] = useState(initial.time);
-  const [timezone, setTimezone] = useState(initial.timezone);
+  const [form, setForm] = useState<ScheduleFormState>(() =>
+    formFromSchedule(task.schedule),
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const zones = timezoneOptions(timezone);
-  const clock = parseClock(time);
-  const schedule: TaskScheduleInput | null = clock
-    ? {
-        hour: clock.hour,
-        minute: clock.minute,
-        timezone,
-        ...(cadence === "weekly" ? { day_of_week: weekday } : {}),
-      }
-    : null;
+  const schedule = scheduleFromForm(form);
   const canSave = !saving && name.trim() !== "" && prompt.trim() !== "" && schedule !== null;
 
   const save = async () => {
@@ -295,60 +231,8 @@ function EditTaskModal({
           </div>
           <fieldset>
             <legend className={fieldLabel}>Schedule</legend>
-            <div className="mt-1.5 space-y-2.5">
-              <div className="inline-flex rounded-lg border border-edge bg-background p-0.5">
-                {(["daily", "weekly"] as const).map((option) => (
-                  <button
-                    key={option}
-                    type="button"
-                    onClick={() => setCadence(option)}
-                    aria-pressed={cadence === option}
-                    className={`rounded-md px-3 py-1.5 text-xs capitalize transition-colors ${
-                      cadence === option
-                        ? "bg-accent/15 text-accent-soft"
-                        : "text-muted hover:text-foreground"
-                    }`}
-                  >
-                    {option}
-                  </button>
-                ))}
-              </div>
-              <div className="flex flex-wrap gap-2.5">
-                {cadence === "weekly" ? (
-                  <select
-                    value={weekday}
-                    onChange={(event) => setWeekday(event.target.value)}
-                    aria-label="Day of week"
-                    className={`${fieldInput} w-auto flex-1`}
-                  >
-                    {WEEKDAYS.map((day) => (
-                      <option key={day.value} value={day.value}>
-                        {day.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : null}
-                <input
-                  type="time"
-                  value={time}
-                  onChange={(event) => setTime(event.target.value)}
-                  aria-label="Time of day"
-                  required
-                  className={`${fieldInput} w-32`}
-                />
-                <select
-                  value={timezone}
-                  onChange={(event) => setTimezone(event.target.value)}
-                  aria-label="Timezone"
-                  className={`${fieldInput} min-w-0 flex-1`}
-                >
-                  {zones.map((zone) => (
-                    <option key={zone} value={zone}>
-                      {zone.replace(/_/g, " ")}
-                    </option>
-                  ))}
-                </select>
-              </div>
+            <div className="mt-1.5">
+              <ScheduleFields form={form} onChange={setForm} />
             </div>
           </fieldset>
 
@@ -395,7 +279,9 @@ export function TasksClient() {
   const [editingTask, setEditingTask] = useState<TriggerDto | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<{ kind: "error" | "success"; text: string } | null>(
+    null,
+  );
   const alive = useRef(true);
   const confirmTimer = useRef<number | null>(null);
 
@@ -436,7 +322,7 @@ export function TasksClient() {
     } catch (error) {
       if (!alive.current) return;
       if (soft) {
-        setNote(errorCopy(error).hint);
+        setNote({ kind: "error", text: errorCopy(error).hint });
       } else {
         setLoadError(error);
         setPhase("error");
@@ -468,13 +354,32 @@ export function TasksClient() {
   ) => {
     setBusyId(task.id);
     try {
-      await api.tasks.update(task.id, { status });
+      const updated = await api.tasks.update(task.id, { status });
       if (!alive.current) return;
       setTasks((prev) =>
-        prev.map((t) => (t.id === task.id ? { ...t, status } : t)),
+        prev.map((t) => (t.id === task.id ? updated : t)),
       );
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error).hint);
+      if (alive.current) setNote({ kind: "error", text: errorCopy(error).hint });
+    } finally {
+      if (alive.current) setBusyId(null);
+    }
+  };
+
+  const runNow = async (task: TriggerDto) => {
+    setBusyId(task.id);
+    try {
+      const run = await api.tasks.runNow(task.id);
+      if (!alive.current) return;
+      setNote(
+        run.outcome.errorCode
+          ? { kind: "error", text: `Run finished with an error: ${run.outcome.errorCode}` }
+          : { kind: "success", text: `"${task.name ?? "Task"}" ran — output is in its session.` },
+      );
+      // Authoritative refresh: lastRunTime/lastRunSessionId/status changed.
+      void load(true);
+    } catch (error) {
+      if (alive.current) setNote({ kind: "error", text: errorCopy(error).hint });
     } finally {
       if (alive.current) setBusyId(null);
     }
@@ -497,7 +402,7 @@ export function TasksClient() {
       if (!alive.current) return;
       setTasks((prev) => prev.filter((t) => t.id !== task.id));
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error).hint);
+      if (alive.current) setNote({ kind: "error", text: errorCopy(error).hint });
     } finally {
       if (alive.current) setBusyId(null);
     }
@@ -533,9 +438,13 @@ export function TasksClient() {
       {note ? (
         <p
           role="status"
-          className="mt-6 rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-xs text-rose-300"
+          className={`mt-6 rounded-lg border px-3 py-2 text-xs ${
+            note.kind === "success"
+              ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"
+              : "border-rose-400/25 bg-rose-400/10 text-rose-300"
+          }`}
         >
-          {note}
+          {note.text}
         </p>
       ) : null}
 
@@ -567,11 +476,11 @@ export function TasksClient() {
               const agent = task.agentId
                 ? (agents.get(task.agentId) ?? embeddedAgent(task))
                 : embeddedAgent(task);
-              const runs = runTimes(task);
               const status = (task.status ?? "").toLowerCase();
               const busy = busyId === task.id;
               const pausable = status === "active" || status === "running";
               const resumable = status === "paused";
+              const runnable = status === "active";
               return (
                 <li
                   key={task.id}
@@ -603,19 +512,51 @@ export function TasksClient() {
                           {task.prompt}
                         </p>
                       ) : null}
-                      {runs.last || runs.next ? (
+                      {task.lastRunTime || task.nextScheduledRun || task.lastRunSessionId ? (
                         <p className="mt-1.5 font-mono text-[10px] uppercase tracking-wider text-faint">
-                          {runs.last
-                            ? `last run ${formatRelativeTime(runs.last)}`
-                            : null}
-                          {runs.last && runs.next ? " · " : null}
-                          {runs.next
-                            ? `next ${formatRelativeTime(runs.next)}`
-                            : null}
+                          {[
+                            task.lastRunTime
+                              ? `last run ${formatRelativeTime(task.lastRunTime)}`
+                              : null,
+                            task.nextScheduledRun
+                              ? `next run ${formatRelativeTime(task.nextScheduledRun)}`
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")}
+                          {task.lastRunSessionId ? (
+                            <>
+                              {task.lastRunTime || task.nextScheduledRun ? " · " : null}
+                              <Link
+                                href={`/sessions/${task.lastRunSessionId}`}
+                                className="text-accent-soft underline-offset-2 hover:underline"
+                              >
+                                View output
+                              </Link>
+                            </>
+                          ) : null}
+                        </p>
+                      ) : null}
+                      {task.lastError ? (
+                        <p
+                          className="mt-1.5 line-clamp-2 text-xs text-rose-300"
+                          title={task.lastError}
+                        >
+                          {task.lastError}
                         </p>
                       ) : null}
                     </div>
                     <div className="flex shrink-0 items-center gap-2">
+                      {runnable ? (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => void runNow(task)}
+                          className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs text-accent-soft transition-colors hover:border-accent/70 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          {busy ? "Running…" : "Run now"}
+                        </button>
+                      ) : null}
                       {pausable || resumable ? (
                         <button
                           type="button"
