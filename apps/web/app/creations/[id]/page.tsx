@@ -103,6 +103,9 @@ export default async function CreationPage({ params }: Props) {
     ) {
       notFound();
     }
+    // Surface the real cause in the server log — the rendered fallback only
+    // shows a friendly hint, which makes SSR fetch failures invisible.
+    console.error(`[creations/${decoded}] SSR load failed:`, error);
     failure = error;
   }
 

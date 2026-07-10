@@ -1,5 +1,8 @@
-"use client";
-
+// NOTE: deliberately NOT a "use client" module. This is a plain utility
+// module: client components import it for ClerkJS loading/mounting, and the
+// shared api client calls getClerkToken() from BOTH environments — on the
+// server it must return null, not become a client-reference proxy (calling
+// one from an RSC throws, which broke /creations/:id SSR — BUG-W5-2).
 export interface ClerkJs {
   isSignedIn: boolean;
   session?: {
