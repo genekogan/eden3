@@ -882,22 +882,37 @@ export function AgentProfile({ username }: { username: string }) {
                 >
                   {exporting ? "Exporting…" : "Export"}
                 </button>
+              </>
+            ) : null}
+          </div>
+          {isOwner ? (
+            <details className="mt-4 max-w-2xl rounded-lg border border-edge/70 bg-raised/30 px-3.5 py-2.5 [&_summary::-webkit-details-marker]:hidden">
+              <summary className="cursor-pointer list-none text-xs text-faint transition-colors hover:text-muted">
+                Advanced
+              </summary>
+              <div className="mt-3 space-y-2.5">
+                <p className="text-xs leading-relaxed text-faint">
+                  Your edits — persona, model, skills — apply to the next message
+                  on their own. Restarting only re-asserts the runtime after an
+                  infrastructure hiccup: it re-renders workspace files, re-registers
+                  the model, and re-syncs skills. Conversations and files are
+                  untouched.
+                </p>
                 <button
                   type="button"
                   onClick={() => void repairAgent()}
                   disabled={repairing}
-                  title="Re-assert the runtime: re-render workspace files, re-register the model, re-sync skills. Your conversations and files are untouched."
-                  className={quietButtonClass}
+                  className="rounded-md border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/40 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
                 >
                   {repairing ? "Restarting…" : "Restart runtime"}
                 </button>
-              </>
-            ) : null}
-          </div>
-          {repairNote ? (
-            <p className="mt-3 rounded-lg border border-edge bg-raised/40 px-3 py-2 text-xs text-muted">
-              {repairNote}
-            </p>
+                {repairNote ? (
+                  <p className="rounded-lg border border-edge bg-raised/40 px-3 py-2 text-xs text-muted">
+                    {repairNote}
+                  </p>
+                ) : null}
+              </div>
+            </details>
           ) : null}
           {exportError ? (
             <p className="mt-3 rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
