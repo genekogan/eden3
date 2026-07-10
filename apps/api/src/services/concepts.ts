@@ -74,6 +74,55 @@ export const CONCEPTS_DIRNAME = 'concepts';
 export const CONCEPT_FILENAME = 'CONCEPT.md';
 export const CONCEPTS_INDEX_FILENAME = 'INDEX.md';
 
+/**
+ * Always-loaded operating rules that point the agent AT the projected
+ * `concepts/` dir. New agents get this baked into their AGENTS.md by the
+ * gateway's workspace template (packages/gateway/workspace-templates/AGENTS.md);
+ * agents provisioned before concepts existed have an AGENTS.md on disk that the
+ * provisioner SKIPS (skip-if-exists), so {@link ensureConceptsPointer} backfills
+ * the same pointer the first time an owner projects a concept. Marker-guarded
+ * (mirrors the TOOLS.md skills manifest) so the append stays idempotent.
+ */
+const AGENTS_FILENAME = 'AGENTS.md';
+const CONCEPTS_DOC_BEGIN = '<!-- EDEN3_CONCEPTS_BEGIN -->';
+const CONCEPTS_DOC_END = '<!-- EDEN3_CONCEPTS_END -->';
+
+/** The pointer body appended to an existing AGENTS.md (voice matches the template). */
+function conceptsPointerSection(): string {
+  return [
+    CONCEPTS_DOC_BEGIN,
+    '## Concepts (visual style references)',
+    '',
+    '- Concepts are named aesthetics your owner taught you, each a folder of reference images. If `concepts/INDEX.md` exists, read it — it lists every concept and how to apply it.',
+    '- For work "in the style of <name>", open `concepts/<slug>/CONCEPT.md` and pass its reference-image file paths to `image_generate` via the `images` parameter.',
+    '- When a concept clearly fits the request, default to its references without being asked.',
+    CONCEPTS_DOC_END,
+  ].join('\n');
+}
+
+/**
+ * Ensure the agent's always-loaded AGENTS.md points at `concepts/`. No-op when
+ * the file is missing (agent not fully provisioned — the provisioner writes it,
+ * with the template section, on the next provision/repair) or when a concepts
+ * pointer is already present (the baked-in template section is detected by its
+ * `concepts/INDEX.md` reference, a prior append by the begin marker). Best-effort
+ * and idempotent; safe to call after every projection.
+ */
+export async function ensureConceptsPointer(workspacePath: string): Promise<void> {
+  const agentsPath = path.resolve(workspacePath, AGENTS_FILENAME);
+  let current: string;
+  try {
+    current = await fs.readFile(agentsPath, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
+  }
+  // Already wired — either the baked-in template section or a prior append.
+  if (current.includes(CONCEPTS_DOC_BEGIN) || current.includes('concepts/INDEX.md')) return;
+  const next = `${current.trimEnd()}\n\n${conceptsPointerSection()}\n`;
+  await fs.writeFile(agentsPath, next, { mode: 0o600 });
+}
+
 /** File-extension for a stored image (mirrors the media store's mapping). */
 const IMAGE_EXTENSIONS: Record<string, string> = {
   'image/png': '.png',
@@ -226,6 +275,15 @@ async function rebuildConceptsDir(agentAccountId: string): Promise<ConceptProjec
     return { projected: true, concepts: 0, images: 0 };
   }
   await fs.mkdir(root, { recursive: true });
+
+  // Backfill the always-loaded pointer so existing agents (whose AGENTS.md the
+  // provisioner skipped) discover concepts the moment their owner projects one.
+  // Best-effort: a missing/unwritable AGENTS.md must not fail the projection.
+  try {
+    await ensureConceptsPointer(agent.workspace_path);
+  } catch {
+    // Pointer backfill is advisory — the next mutation (or a repair) retries.
+  }
 
   let copiedImages = 0;
   const rendered: RenderedConcept[] = [];

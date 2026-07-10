@@ -601,3 +601,82 @@ describe('concept images', () => {
     expect(await fileExists(path.join(workspaceDir, 'concepts'))).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// AGENTS.md pointer backfill (existing agents provisioned before concepts)
+// ---------------------------------------------------------------------------
+
+describe('AGENTS.md concepts pointer backfill', () => {
+  const agentsPath = () => path.join(workspaceDir, 'AGENTS.md');
+
+  it('appends a marker-guarded concepts section to an AGENTS.md that predates concepts', async () => {
+    // Simulate an already-provisioned agent whose on-disk AGENTS.md has no
+    // concepts pointer (the provisioner skip-if-exists preserved the old one).
+    await fs.writeFile(
+      agentsPath(),
+      '# Operating rules (Muse on Eden)\n\n## Conduct\n\n- Be kind.\n',
+    );
+
+    const created = await app.inject({
+      method: 'POST',
+      url: `/agents/${agentName}/concepts`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { name: 'Backfill Style' },
+    });
+    expect(created.statusCode).toBe(201);
+
+    const agentsMd = await fs.readFile(agentsPath(), 'utf8');
+    expect(agentsMd).toContain('<!-- EDEN3_CONCEPTS_BEGIN -->');
+    expect(agentsMd).toContain('## Concepts (visual style references)');
+    expect(agentsMd).toContain('concepts/INDEX.md');
+    expect(agentsMd).toContain('in the style of');
+    expect(agentsMd).toContain('`images` parameter');
+    // Original content is preserved (append, not overwrite).
+    expect(agentsMd).toContain('- Be kind.');
+
+    // Idempotent: a second mutation must not add a second section.
+    const patched = await app.inject({
+      method: 'PATCH',
+      url: `/agents/${agentName}/concepts/backfill-style`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { description: 'edited twice' },
+    });
+    expect(patched.statusCode).toBe(200);
+    const twice = await fs.readFile(agentsPath(), 'utf8');
+    expect(twice.split('<!-- EDEN3_CONCEPTS_BEGIN -->').length - 1).toBe(1);
+
+    await app.inject({
+      method: 'DELETE',
+      url: `/agents/${agentName}/concepts/backfill-style`,
+      headers: { cookie: devCookie(ownerId) },
+    });
+  });
+
+  it('does not append when AGENTS.md already points at concepts (template section present)', async () => {
+    // A freshly-provisioned agent's AGENTS.md already carries the template
+    // section (detected by its concepts/INDEX.md reference) — no double-add.
+    await fs.writeFile(
+      agentsPath(),
+      '# Operating rules\n\n## Concepts (visual style references)\n\n- read `concepts/INDEX.md`.\n',
+    );
+
+    const created = await app.inject({
+      method: 'POST',
+      url: `/agents/${agentName}/concepts`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { name: 'No Duplicate' },
+    });
+    expect(created.statusCode).toBe(201);
+
+    const agentsMd = await fs.readFile(agentsPath(), 'utf8');
+    expect(agentsMd).not.toContain('<!-- EDEN3_CONCEPTS_BEGIN -->');
+    // The single pre-existing section is untouched.
+    expect(agentsMd.split('## Concepts (visual style references)').length - 1).toBe(1);
+
+    await app.inject({
+      method: 'DELETE',
+      url: `/agents/${agentName}/concepts/no-duplicate`,
+      headers: { cookie: devCookie(ownerId) },
+    });
+  });
+});

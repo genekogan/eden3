@@ -24,6 +24,7 @@ import { ApiError } from '../errors';
 import { DEFAULT_AGENT_MODEL, type GatewayGlue } from '../gateway-glue';
 import { concurrentTurnLimit, dailyMannaSpend } from '../services/chat-limits';
 import { installDefaultAgentSkills } from '../services/agent-skills';
+import { projectAgentConcepts } from '../services/concepts';
 import { runTurn, type TurnAgent, type TurnSink } from '../services/turns';
 import { canAccessSession } from './sessions';
 import { enqueueLazyMemoryDistillation } from '../services/memory-distillation';
@@ -131,6 +132,15 @@ async function ensureChattableAgent(
         provisionedAt: new Date(),
       })
       .where(eq(agents.accountId, account.id));
+    // Concepts created while the agent was dormant (workspace_path was null, so
+    // the mutation's projection no-opped) get their first projection here, now
+    // that the workspace exists. Best-effort: never block the first turn.
+    try {
+      await projectAgentConcepts(account.id);
+    } catch (err) {
+      // Self-heals on the owner's next concept mutation.
+      void err;
+    }
     enqueueLazyMemoryDistillation(
       {
         agentAccountId: account.id,
