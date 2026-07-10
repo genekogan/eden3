@@ -1,8 +1,10 @@
+import { readOpenClawConfig } from '@eden3/gateway';
 import { pg } from '@eden3/db';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
 import { ApiError } from '../errors';
+import { defaultOpenclawDataDir } from '../gateway-glue';
 
 const summaryQuery = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30),
@@ -110,6 +112,83 @@ function signedDeltaPct(deltaUsd: number, invoiceCostUsd: number, computedCostUs
 }
 
 export const operatorRoutes: FastifyPluginAsync = async (app) => {
+  // ---- GET /operator/health — one-look runtime panel (admin) --------------
+  // The 80/20 of "is the appliance healthy": gateway reachability + agent
+  // count, egress proxy mode, scheduler state, database label. Exec-approval
+  // queues deliberately have no surface here: sandboxes run ask=off with the
+  // container as the boundary (SPEC Q1), so there is no approval queue.
+  app.get('/health', { preHandler: app.requireAuth }, async (req) => {
+    if (!req.account?.isAdmin) {
+      throw new ApiError(403, 'forbidden', 'Admin access required');
+    }
+
+    const gateway = await (async () => {
+      if (!app.gatewayCompat) return { configured: false as const };
+      try {
+        const dataDir = defaultOpenclawDataDir();
+        const config = await readOpenClawConfig(dataDir);
+        const agents = config.agents as { list?: unknown[] } | undefined;
+        const registered = Array.isArray(agents?.list) ? agents.list.length : 0;
+        const base = process.env.OPENCLAW_GATEWAY_URL ?? 'http://127.0.0.1:18789';
+        const started = Date.now();
+        const res = await fetch(`${base}/v1/models`, {
+          headers: { authorization: `Bearer ${process.env.OPENCLAW_GATEWAY_TOKEN ?? ''}` },
+          signal: AbortSignal.timeout(5_000),
+        });
+        const models = res.ok
+          ? (((await res.json()) as { data?: unknown[] }).data?.length ?? 0)
+          : 0;
+        return {
+          configured: true as const,
+          reachable: res.ok,
+          latencyMs: Date.now() - started,
+          registeredAgents: registered,
+          routableModels: models,
+        };
+      } catch (err) {
+        return {
+          configured: true as const,
+          reachable: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    })();
+
+    const egressProxy = await (async () => {
+      try {
+        const res = await fetch(
+          process.env.EDEN3_EGRESS_HEALTH_URL ?? 'http://127.0.0.1:18080/health',
+          { signal: AbortSignal.timeout(3_000) },
+        );
+        if (!res.ok) return { reachable: false as const };
+        const body = (await res.json()) as { mode?: string };
+        return { reachable: true as const, mode: body.mode ?? 'allowlist' };
+      } catch {
+        // The proxy listens only on the docker networks by default — not
+        // reachable from the host unless EDEN3_EGRESS_HEALTH_URL is mapped.
+        return { reachable: null };
+      }
+    })();
+
+    const database = (() => {
+      try {
+        return new URL(process.env.DATABASE_URL ?? '').pathname.replace(/^\//, '') || null;
+      } catch {
+        return null;
+      }
+    })();
+
+    return {
+      ok: true,
+      gateway,
+      egressProxy,
+      database,
+      scheduler: app.taskScheduler
+        ? { running: app.taskScheduler.running }
+        : { running: false },
+    };
+  });
+
   app.get('/usage/summary', { preHandler: app.requireAuth }, async (req) => {
     if (!req.account?.isAdmin) {
       throw new ApiError(403, 'forbidden', 'Admin access required');

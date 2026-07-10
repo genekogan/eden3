@@ -83,6 +83,45 @@ afterAll(async () => {
   await pg.end({ timeout: 5 });
 });
 
+describe('GET /operator/health', () => {
+  it('401s anonymous and 403s non-admins', async () => {
+    expect((await app.inject({ method: 'GET', url: '/operator/health' })).statusCode).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/operator/health',
+          headers: { cookie: devCookie(viewerId) },
+        })
+      ).statusCode,
+    ).toBe(403);
+  });
+
+  it('reports gateway/egress/scheduler/database health for admins', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/operator/health',
+      headers: { cookie: devCookie(adminId) },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      ok: boolean;
+      gateway: { configured: boolean } & Record<string, unknown>;
+      egressProxy: unknown;
+      scheduler: { running: boolean };
+      database: string | null;
+    };
+    expect(body.ok).toBe(true);
+    // Gateway may or may not be wired depending on env — assert the shape,
+    // not a specific configured state.
+    expect(body.gateway).toHaveProperty('configured');
+    expect(typeof body.gateway.configured).toBe('boolean');
+    expect(body).toHaveProperty('egressProxy');
+    expect(body).toHaveProperty('scheduler');
+    expect(typeof body.scheduler.running).toBe('boolean');
+  });
+});
+
 describe('GET /operator/usage/summary', () => {
   it('401s anonymous requests', async () => {
     const res = await app.inject({ method: 'GET', url: '/operator/usage/summary' });

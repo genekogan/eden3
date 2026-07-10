@@ -616,6 +616,8 @@ export function AgentProfile({ username }: { username: string }) {
   const [exportError, setExportError] = useState<string | null>(null);
   const [likeBusy, setLikeBusy] = useState(false);
   const [likeError, setLikeError] = useState<string | null>(null);
+  const [repairing, setRepairing] = useState(false);
+  const [repairNote, setRepairNote] = useState<string | null>(null);
   const seq = useRef(0);
 
   // Load profile + current dev user (owner gating) in parallel.
@@ -766,6 +768,20 @@ export function AgentProfile({ username }: { username: string }) {
     }
   };
 
+  const repairAgent = async () => {
+    if (repairing) return;
+    setRepairing(true);
+    setRepairNote(null);
+    try {
+      await api.agents.repair(agent.username);
+      setRepairNote("Runtime re-asserted — persona, model, and skills re-synced.");
+    } catch (error) {
+      setRepairNote(describeApiFailure(error));
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   const toggleAgentLike = async () => {
     if (likeBusy) return;
     setLikeBusy(true);
@@ -866,9 +882,23 @@ export function AgentProfile({ username }: { username: string }) {
                 >
                   {exporting ? "Exporting…" : "Export"}
                 </button>
+                <button
+                  type="button"
+                  onClick={() => void repairAgent()}
+                  disabled={repairing}
+                  title="Re-assert the runtime: re-render workspace files, re-register the model, re-sync skills. Your conversations and files are untouched."
+                  className={quietButtonClass}
+                >
+                  {repairing ? "Restarting…" : "Restart runtime"}
+                </button>
               </>
             ) : null}
           </div>
+          {repairNote ? (
+            <p className="mt-3 rounded-lg border border-edge bg-raised/40 px-3 py-2 text-xs text-muted">
+              {repairNote}
+            </p>
+          ) : null}
           {exportError ? (
             <p className="mt-3 rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
               {exportError}

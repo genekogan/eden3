@@ -25,6 +25,7 @@ import { streamSseBody, subscribeSessionEvents } from "./sse";
 import type { SessionEventStreamOptions, StreamSseOptions } from "./sse";
 import { getClerkToken } from "./clerk";
 import type {
+  AgentActivityEvent,
   AgentCreateInput,
   AgentDto,
   AgentExportResponse,
@@ -54,6 +55,7 @@ import type {
   MannaTransactionDto,
   MessageDto,
   Paginated,
+  OperatorHealth,
   OperatorUsageSummary,
   AgentSkillsResponse,
   SessionDetail,
@@ -548,6 +550,16 @@ export const api = {
       return post<AgentMemoryRebuildResponse>(`/agents/${enc(username)}/memory/rebuild`);
     },
 
+    /** POST /api/agents/:username/repair -> owner re-asserts the runtime (restart). */
+    repair(username: string): Promise<{ ok: boolean; repaired: string }> {
+      return post(`/agents/${enc(username)}/repair`);
+    },
+
+    /** GET /api/agents/:username/activity -> owner logs peek (recent usage events). */
+    activity(username: string): Promise<{ items: AgentActivityEvent[] }> {
+      return get<{ items: AgentActivityEvent[] }>(`/agents/${enc(username)}/activity`);
+    },
+
     /** POST /api/agents/import -> create/provision from portable bundle. */
     importBundle(input: AgentImportInput): Promise<AgentImportResult> {
       return post<AgentImportResult>("/agents/import", input);
@@ -902,6 +914,11 @@ export const api = {
       params: { days?: number; limit?: number; userId?: string; agentId?: string } = {},
     ): Promise<OperatorUsageSummary> {
       return get<OperatorUsageSummary>(`/operator/usage/summary${qs(params)}`);
+    },
+
+    /** GET /api/operator/health — admin-only runtime health panel. */
+    async health(): Promise<OperatorHealth> {
+      return get<OperatorHealth>("/operator/health");
     },
   },
 

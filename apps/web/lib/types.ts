@@ -247,6 +247,20 @@ export interface ConceptImageUploadInput {
   dataBase64: string;
 }
 
+/** GET /api/agents/:username/activity item — owner logs peek. */
+export interface AgentActivityEvent {
+  id: string;
+  eventType: string;
+  status: string;
+  sessionId: string | null;
+  model: string | null;
+  manna: number | null;
+  latencyMs: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+}
+
 /** GET /api/manna */
 export interface MannaSummary {
   balance: number;
@@ -403,6 +417,27 @@ export interface OperatorRecentUsageEvent {
   errorCode: string | null;
   errorMessage: string | null;
   createdAt: string;
+}
+
+/** GET /api/operator/health — runtime health panel. */
+export interface OperatorHealth {
+  ok: boolean;
+  gateway:
+    | { configured: false }
+    | {
+        configured: true;
+        reachable: boolean;
+        latencyMs?: number;
+        registeredAgents?: number;
+        routableModels?: number;
+        error?: string;
+      };
+  egressProxy:
+    | { reachable: true; mode: string }
+    | { reachable: false }
+    | { reachable: null };
+  database: string | null;
+  scheduler: { running: boolean };
 }
 
 export interface OperatorUsageSummary {

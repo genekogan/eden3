@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type {
+  OperatorHealth,
   OperatorRecentUsageEvent,
   OperatorStatusBreakdown,
   OperatorUsageBreakdown,
@@ -52,6 +53,81 @@ function errorCopy(error: unknown): { title: string; hint: string } {
     return { title: "Couldn't load operator data", hint: error.message };
   }
   return { title: "API offline", hint: "Start @eden3/api on :4301 and retry." };
+}
+
+function HealthDot({ tone }: { tone: "ok" | "warn" | "bad" | "muted" }) {
+  const color =
+    tone === "ok"
+      ? "bg-emerald-400"
+      : tone === "warn"
+        ? "bg-amber-400"
+        : tone === "bad"
+          ? "bg-rose-400"
+          : "bg-faint";
+  return <span aria-hidden className={`inline-block size-2 rounded-full ${color}`} />;
+}
+
+function HealthPanel({ health }: { health: OperatorHealth }) {
+  const gateway = health.gateway;
+  const gatewayTone: "ok" | "warn" | "bad" = !gateway.configured
+    ? "warn"
+    : gateway.reachable
+      ? "ok"
+      : "bad";
+  const gatewayLine = !gateway.configured
+    ? "not configured"
+    : gateway.reachable
+      ? `reachable · ${gateway.routableModels ?? 0} models · ${gateway.registeredAgents ?? 0} agents${gateway.latencyMs != null ? ` · ${gateway.latencyMs}ms` : ""}`
+      : `unreachable${gateway.error ? ` · ${gateway.error}` : ""}`;
+
+  const egress = health.egressProxy;
+  const egressTone: "ok" | "warn" | "muted" =
+    egress.reachable === true ? "ok" : egress.reachable === false ? "warn" : "muted";
+  const egressLine =
+    egress.reachable === true
+      ? `${egress.mode === "open" ? "open exterior / sealed interior" : egress.mode}`
+      : egress.reachable === false
+        ? "unreachable"
+        : "not mapped to host";
+
+  const rows: Array<{ label: string; tone: "ok" | "warn" | "bad" | "muted"; line: string }> = [
+    { label: "Gateway", tone: gatewayTone, line: gatewayLine },
+    { label: "Egress proxy", tone: egressTone, line: egressLine },
+    {
+      label: "Scheduler",
+      tone: health.scheduler.running ? "ok" : "warn",
+      line: health.scheduler.running ? "running" : "stopped",
+    },
+    {
+      label: "Database",
+      tone: health.database === "eden3" ? "ok" : "warn",
+      line: health.database ?? "unknown",
+    },
+  ];
+
+  return (
+    <section
+      aria-label="Runtime health"
+      className="rounded-xl border border-edge bg-surface p-5"
+    >
+      <p className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
+        Runtime health
+      </p>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {rows.map((row) => (
+          <div key={row.label} className="rounded-lg border border-edge/60 bg-raised/40 p-3">
+            <div className="flex items-center gap-2">
+              <HealthDot tone={row.tone} />
+              <span className="text-sm text-foreground">{row.label}</span>
+            </div>
+            <p className="mt-1 truncate font-mono text-[11px] text-muted" title={row.line}>
+              {row.line}
+            </p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
 }
 
 function Metric({
@@ -237,6 +313,7 @@ function RecentActivity({ rows }: { rows: OperatorRecentUsageEvent[] }) {
 
 export function OperatorClient() {
   const [summary, setSummary] = useState<OperatorUsageSummary | null>(null);
+  const [health, setHealth] = useState<OperatorHealth | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [error, setError] = useState<unknown>(null);
   const [days, setDays] = useState(7);
@@ -246,9 +323,13 @@ export function OperatorClient() {
     async (soft = false) => {
       if (!soft) setPhase("loading");
       try {
-        const data = await api.operator.usageSummary({ days, limit: 25 });
+        const [data, healthData] = await Promise.all([
+          api.operator.usageSummary({ days, limit: 25 }),
+          api.operator.health().catch(() => null),
+        ]);
         if (!alive.current) return;
         setSummary(data);
+        setHealth(healthData);
         setPhase("ready");
         setError(null);
       } catch (err) {
@@ -331,6 +412,7 @@ export function OperatorClient() {
         </div>
       ) : summary ? (
         <main className="mt-8 space-y-6">
+          {health ? <HealthPanel health={health} /> : null}
           <section
             aria-label="Usage totals"
             className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"

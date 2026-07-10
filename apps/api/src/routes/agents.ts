@@ -470,6 +470,111 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
+  // ---- POST /agents/:username/repair — re-assert the runtime (owner) ------
+  // The owner-facing "restart" button: re-renders workspace templates
+  // (skip-if-exists — user files untouched), re-asserts gateway registration
+  // + model, and re-syncs skills. Fixes drifted/broken runtime state without
+  // touching the DB row or conversation history.
+  app.post('/:username/repair', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can repair this agent');
+    }
+    if (!agent.openclawId) {
+      return sendError(reply, 409, 'agent_not_provisioned', 'This agent has no runtime yet — open its profile to provision it');
+    }
+    try {
+      const result = await app.gatewayGlue.provisioner.provisionAgent({
+        openclawId: agent.openclawId,
+        name: agent.name ?? account.username,
+        username: account.username,
+        description: agent.description ?? '',
+        persona: agent.persona ?? '',
+        greeting: agent.greeting ?? '',
+        voice: agent.voice ?? '',
+        thinkingLevel: agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
+        model: agent.model ?? DEFAULT_AGENT_MODEL,
+      });
+      await installDefaultAgentSkills({
+        agentId: account.id,
+        openclawId: agent.openclawId,
+        workspacePath: result.hostWorkspaceDir ?? agent.workspacePath ?? '',
+        skillSync: app.gatewayGlue.skillSync,
+      });
+      return { ok: true, repaired: agent.openclawId };
+    } catch (err) {
+      req.log.error({ err }, `repair failed for "${account.username}"`);
+      return sendError(
+        reply,
+        502,
+        'repair_failed',
+        err instanceof Error ? err.message : 'The runtime did not accept the repair',
+      );
+    }
+  });
+
+  // ---- GET /agents/:username/activity — owner logs peek -------------------
+  // Recent runtime activity for ONE agent, visible to its owner: turn/
+  // generation events with status, model, manna, latency, and error detail.
+  // This is the "what has my agent been doing / why did it fail" surface.
+  app.get('/:username/activity', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can view agent activity');
+    }
+    const rows = await pg<
+      {
+        id: string;
+        event_type: string;
+        status: string;
+        session_id: string | null;
+        model: string | null;
+        manna: number | null;
+        latency_ms: number | null;
+        error_code: string | null;
+        error_message: string | null;
+        created_at: string;
+      }[]
+    >`
+      select id, event_type, status, session_id, model, manna, latency_ms,
+             error_code, error_message, created_at
+      from usage_events
+      where agent_id = ${account.id}
+      order by created_at desc
+      limit 25
+    `;
+    return {
+      items: rows.map((row) => ({
+        id: row.id,
+        eventType: row.event_type,
+        status: row.status,
+        sessionId: row.session_id,
+        model: row.model,
+        manna: row.manna,
+        latencyMs: row.latency_ms,
+        errorCode: row.error_code,
+        errorMessage: row.error_message,
+        createdAt: new Date(row.created_at).toISOString(),
+      })),
+    };
+  });
+
   app.post('/:username/memory/rebuild', { preHandler: app.requireAuth }, async (req, reply) => {
     const { username } = usernameParamsSchema.parse(req.params);
     const resolved = await resolveAgentByUsername(username);
