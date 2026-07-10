@@ -94,6 +94,7 @@ beforeAll(async () => {
   await mkdir(path.join(wsFiles, 'data'), { recursive: true });
   await mkdir(path.join(wsFiles, 'node_modules', 'pkg'), { recursive: true });
   await writeFile(path.join(wsFiles, 'notes.md'), NOTES_CONTENT);
+  await writeFile(path.join(wsFiles, 'SOUL.md'), 'You are the Files Agent.');
   await writeFile(path.join(wsFiles, 'art', 'plan.md'), 'make art\n');
   await writeFile(path.join(wsFiles, 'memory', 'users', 'alice.md'), '# alice\n');
   await writeFile(path.join(wsFiles, 'data', 'blob.bin'), Buffer.from([0x00, 0x01, 0xff, 0x00, 0x7f]));
@@ -561,6 +562,62 @@ describe('PUT /agents/:username/workspace/file', () => {
       payload: { path: 'notes.md', content: 'x', baseSha256: 'not-a-sha' },
     });
     expect(res.statusCode).toBe(400);
+  });
+
+  it('mirrors a SOUL.md save back into agents.persona (single source of truth)', async () => {
+    const loaded = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentFiles, 'SOUL.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    const revised = 'You are the Files Agent, REVISED EDITION.';
+    const save = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: { path: 'SOUL.md', content: revised, baseSha256: loaded.sha256 },
+    });
+    expect(save.statusCode).toBe(200);
+    const savedSha = (save.json() as TextFileBody).file.sha256;
+
+    // DB persona now matches the saved SOUL.md bytes verbatim.
+    const [row] = await pg<{ persona: string | null }[]>`
+      select g.persona from agents g join accounts a on a.id = g.account_id
+      where a.username = ${agentFiles}
+    `;
+    expect(row!.persona).toBe(revised);
+
+    // Editing a NON-SOUL file must not touch persona.
+    const notes = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentFiles, 'notes.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: { path: 'notes.md', content: '# Notes\nedited\n', baseSha256: notes.sha256 },
+    });
+    const [afterNotes] = await pg<{ persona: string | null }[]>`
+      select g.persona from agents g join accounts a on a.id = g.account_id
+      where a.username = ${agentFiles}
+    `;
+    expect(afterNotes!.persona).toBe(revised);
+
+    // Clearing SOUL.md stores NULL (mirrors '' -> null in the create/patch path).
+    const cleared = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: { path: 'SOUL.md', content: '', baseSha256: savedSha },
+    });
+    expect(cleared.statusCode).toBe(200);
+    const [afterClear] = await pg<{ persona: string | null }[]>`
+      select g.persona from agents g join accounts a on a.id = g.account_id
+      where a.username = ${agentFiles}
+    `;
+    expect(afterClear!.persona).toBeNull();
   });
 });
 

@@ -159,13 +159,13 @@ export interface ProvisionAgentParams {
   username: string;
   /** One-line role description ({{DESCRIPTION}}). */
   description: string;
-  /** Persona body for SOUL.md ({{PERSONA}}). */
+  /** Canonical persona — rendered verbatim as the whole SOUL.md body ({{PERSONA}}). */
   persona: string;
-  /** First-time-visitor greeting ({{GREETING}}). */
+  /** First-time-visitor greeting rendered into IDENTITY.md ({{GREETING}}). */
   greeting: string;
   /** Voice/tone or external voice identifier rendered into IDENTITY.md. */
   voice?: string;
-  /** Runtime reasoning posture rendered into SOUL.md; default "balanced". */
+  /** Runtime reasoning posture rendered into IDENTITY.md; default "balanced". */
   thinkingLevel?: string;
   /** Gateway model ref, e.g. "anthropic/claude-haiku-4-5". */
   model: string;

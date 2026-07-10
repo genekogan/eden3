@@ -1,5 +1,5 @@
 import { resolveAgentByUsername } from '@eden3/core';
-import type { Account, Agent } from '@eden3/db';
+import { pg, type Account, type Agent } from '@eden3/db';
 import { ZipArchive } from 'archiver';
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import path from 'node:path';
@@ -46,6 +46,16 @@ const saveBodySchema = z.object({
   // bytes on disk or the save is rejected (never silently clobber the agent).
   baseSha256: z.string().regex(/^(new|[0-9a-f]{64})$/, 'baseSha256 must be "new" or a sha256 hex'),
 });
+
+/**
+ * SOUL.md IS the agent's persona (single source of truth). Editing it in the
+ * workspace browser must write the same bytes back into `agents.persona` so the
+ * DB never diverges from the file — otherwise the next profile edit re-renders
+ * SOUL.md from a stale DB persona and silently clobbers the hand-edit. The
+ * gateway template renders SOUL.md verbatim from `{{PERSONA}}`, so this is an
+ * exact round-trip (see packages/gateway/workspace-templates/SOUL.md).
+ */
+const SOUL_WORKSPACE_FILE = 'SOUL.md';
 
 async function resolveManagedWorkspace(
   req: FastifyRequest,
@@ -139,7 +149,7 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
         `Content exceeds the ${WORKSPACE_TEXT_MAX_BYTES / 1024}KB text limit`,
       );
     }
-    const { root } = await resolveManagedWorkspace(req, username);
+    const { account, root } = await resolveManagedWorkspace(req, username);
     const result = await writeWorkspaceFile({
       root,
       path: body.path,
@@ -159,6 +169,15 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
         currentMtime: result.currentMtime,
       });
     }
+
+    // SOUL.md === agents.persona. Mirror the saved bytes back into the DB so the
+    // two never diverge. Empty file -> NULL (matches the create/patch handlers,
+    // which store '' as null and render it back to an empty SOUL.md).
+    if (result.file.path === SOUL_WORKSPACE_FILE) {
+      const persona = body.content === '' ? null : body.content;
+      await pg`update agents set persona = ${persona} where account_id = ${account.id}`;
+    }
+
     return { file: result.file };
   });
 };
