@@ -218,7 +218,10 @@ async function upsertSubscription(params: {
   monthlyManna: number;
   currentPeriodEnd: Date | null;
   cancelAtPeriodEnd: boolean;
+  /** Stripe `event.created` — guards against out-of-order webhook delivery. */
+  eventCreatedAt: Date | null;
 }): Promise<void> {
+  const eventAt = params.eventCreatedAt;
   await db
     .insert(billingSubscriptions)
     .values({
@@ -230,6 +233,7 @@ async function upsertSubscription(params: {
       monthlyManna: params.monthlyManna,
       currentPeriodEnd: params.currentPeriodEnd,
       cancelAtPeriodEnd: params.cancelAtPeriodEnd,
+      lastStripeEventAt: eventAt,
       updatedAt: new Date(),
     })
     .onConflictDoUpdate({
@@ -242,9 +246,27 @@ async function upsertSubscription(params: {
         monthlyManna: params.monthlyManna,
         currentPeriodEnd: params.currentPeriodEnd,
         cancelAtPeriodEnd: params.cancelAtPeriodEnd,
+        lastStripeEventAt: eventAt,
         updatedAt: new Date(),
       },
+      // Last-writer-wins was wrong for webhooks: Stripe delivers out of
+      // order, so a stale `customer.subscription.updated` could resurrect a
+      // canceled row. Apply only when this event is not older than the last
+      // one recorded (rows/events without timestamps keep old behavior).
+      setWhere:
+        eventAt === null
+          ? undefined
+          : // ISO text + cast: raw sql`` params bypass the column's Date
+            // mapping, and postgres.js rejects a bare Date here.
+            sql`${billingSubscriptions.lastStripeEventAt} is null or ${billingSubscriptions.lastStripeEventAt} <= ${eventAt.toISOString()}::timestamptz`,
     });
+}
+
+/** Stripe `event.created` (unix seconds) as a Date, when present. */
+function eventCreatedAtOf(event: StripeEvent): Date | null {
+  return typeof event.created === 'number' && Number.isFinite(event.created)
+    ? new Date(event.created * 1000)
+    : null;
 }
 
 async function handleCheckoutCompleted(event: StripeEvent): Promise<{ action: string; alreadyApplied?: boolean }> {
@@ -267,6 +289,7 @@ async function handleCheckoutCompleted(event: StripeEvent): Promise<{ action: st
         monthlyManna: asNumber(metadataValue(session, 'monthlyManna')) ?? tierAmount(tier) ?? 0,
         currentPeriodEnd: null,
         cancelAtPeriodEnd: false,
+        eventCreatedAt: eventCreatedAtOf(event),
       });
     }
     return { action: 'subscription_recorded' };
@@ -311,6 +334,7 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
       monthlyManna,
       currentPeriodEnd: currentPeriodEndFrom(metadataValue(invoice, 'currentPeriodEnd')),
       cancelAtPeriodEnd: false,
+      eventCreatedAt: eventCreatedAtOf(event),
     });
   }
 
@@ -343,6 +367,7 @@ async function handleSubscriptionChanged(event: StripeEvent): Promise<{ action: 
     monthlyManna: asNumber(metadataValue(subscription, 'monthlyManna')) ?? tierAmount(tier) ?? 0,
     currentPeriodEnd: currentPeriodEndFrom(subscription.current_period_end),
     cancelAtPeriodEnd: asBoolean(subscription.cancel_at_period_end),
+    eventCreatedAt: eventCreatedAtOf(event),
   });
   return { action: 'subscription_updated' };
 }
@@ -489,6 +514,11 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
       if (!voucher) throw new ApiError(404, 'voucher_not_found', 'Voucher code not found');
 
       const idempotencyKey = `voucher:${voucher.id}:${account.accountId}`;
+      // Serialize same-user redeems of the same voucher: without this, two
+      // concurrent requests both pass the pre-check and both increment
+      // redeemed_count while only one credit lands (a burned slot). The lock
+      // holds to commit, so the loser's pre-check below sees the winner.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${idempotencyKey}, 7))`);
       const [existing] = await tx
         .select()
         .from(mannaTransactions)

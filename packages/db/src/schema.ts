@@ -424,6 +424,10 @@ export const billingSubscriptions = pgTable(
     monthlyManna: integer('monthly_manna').notNull().default(0),
     currentPeriodEnd: timestamptz('current_period_end'),
     cancelAtPeriodEnd: boolean('cancel_at_period_end').notNull().default(false),
+    // Stripe `event.created` of the newest event applied to this row — the
+    // upsert refuses to let a late-delivered older event (e.g. an `updated`
+    // arriving after `deleted`) overwrite newer state.
+    lastStripeEventAt: timestamptz('last_stripe_event_at'),
     createdAt: timestamptz('created_at').notNull().defaultNow(),
     updatedAt: timestamptz('updated_at').notNull().defaultNow(),
   },

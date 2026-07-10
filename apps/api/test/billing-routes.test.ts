@@ -370,6 +370,50 @@ describe('POST /billing/webhook', () => {
     expect(sub?.status).toBe('canceled');
   });
 
+  it('ignores an out-of-order older subscription event (no resurrection after cancel)', async () => {
+    const subId = `${marker}_sub_order`;
+    const base = {
+      customer: `${marker}_cus`,
+      metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
+    };
+
+    // Newest state first: canceled at t=2000.
+    const cancel = await postWebhook({
+      id: `${marker}_evt_order_cancel`,
+      type: 'customer.subscription.deleted',
+      created: 2000,
+      data: { object: { ...base, id: subId, status: 'canceled' } },
+    });
+    expect(cancel.statusCode).toBe(200);
+
+    // A stale `updated` from t=1000 arrives late — it must NOT win.
+    const stale = await postWebhook({
+      id: `${marker}_evt_order_stale`,
+      type: 'customer.subscription.updated',
+      created: 1000,
+      data: { object: { ...base, id: subId, status: 'active' } },
+    });
+    expect(stale.statusCode).toBe(200);
+
+    const [afterStale] = await pg<Array<{ status: string }>>`
+      select status from billing_subscriptions where stripe_subscription_id = ${subId}
+    `;
+    expect(afterStale?.status).toBe('canceled');
+
+    // A genuinely newer event still applies.
+    const newer = await postWebhook({
+      id: `${marker}_evt_order_newer`,
+      type: 'customer.subscription.updated',
+      created: 3000,
+      data: { object: { ...base, id: subId, status: 'active' } },
+    });
+    expect(newer.statusCode).toBe(200);
+    const [afterNewer] = await pg<Array<{ status: string }>>`
+      select status from billing_subscriptions where stripe_subscription_id = ${subId}
+    `;
+    expect(afterNewer?.status).toBe('active');
+  });
+
   it('rejects bad signatures before handling the event', async () => {
     const payload = JSON.stringify({ id: `${marker}_bad`, type: 'checkout.session.completed', data: { object: {} } });
     const res = await app.inject({
@@ -419,6 +463,40 @@ describe('POST /billing/vouchers/redeem', () => {
     const voucherRows = (await ledgerRows(userId)).filter((row) => row.code === code);
     expect(voucherRows).toHaveLength(1);
     expect(voucherRows[0]).toMatchObject({ type: 'credit:voucher', amount: '777.0000' });
+  });
+
+  it('handles a concurrent same-user redeem burst: one credit, one counted redemption', async () => {
+    const code = `${marker}_voucher_race`;
+    await pg`
+      insert into manna_vouchers (code, amount, max_redemptions)
+      values (${code}, 555, 5)
+    `;
+
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        app.inject({
+          method: 'POST',
+          url: '/billing/vouchers/redeem',
+          headers: { cookie: devCookie(userId) },
+          payload: { code },
+        }),
+      ),
+    );
+
+    for (const res of responses) expect(res.statusCode).toBe(200);
+    const applied = responses.filter(
+      (res) => (res.json() as { alreadyApplied: boolean }).alreadyApplied === false,
+    );
+    expect(applied).toHaveLength(1);
+
+    // Exactly one ledger credit AND exactly one redemption slot consumed —
+    // the pre-fix behavior burned a slot per racing request.
+    const voucherRows = (await ledgerRows(userId)).filter((row) => row.code === code);
+    expect(voucherRows).toHaveLength(1);
+    const [voucher] = await pg<{ redeemed_count: number }[]>`
+      select redeemed_count from manna_vouchers where code = ${code}
+    `;
+    expect(voucher?.redeemed_count).toBe(1);
   });
 
   it('rejects expired vouchers', async () => {

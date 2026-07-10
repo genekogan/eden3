@@ -60,11 +60,16 @@ const emptyTools: ToolsClientLike = {
     contentTruncated: false,
   }),
 };
+// When set, chatTurn blocks before completing — lets tests hold a run
+// mid-flight to prove concurrency behavior deterministically.
+let turnGate: Promise<void> | null = null;
+
 const fakeCompat: CompatClientLike = {
   async *chatTurn(params): AsyncGenerator<GatewayTurnEvent, void, void> {
     compatCalls.push(params);
     yield { type: 'turn.started' };
     yield { type: 'token', delta: 'scheduled ' };
+    if (turnGate) await turnGate;
     yield {
       type: 'turn.completed',
       text: 'scheduled done',
@@ -356,6 +361,64 @@ describe('POST /tasks', () => {
     expect(typeof listedTask?.lastRunTime).toBe('string');
     expect(Date.parse(listedTask!.lastRunTime!)).not.toBeNaN();
     expect(listedTask?.lastError).toBeNull();
+  });
+
+  it('rejects a concurrent second fire of the same task (atomic running claim)', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'No double fire',
+        prompt: 'Run once at a time.',
+        schedule,
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const { task } = created.json() as TaskBody;
+
+    // Hold the first run mid-turn, then fire again while it's running.
+    let releaseGate!: () => void;
+    turnGate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    try {
+      const first = app.inject({
+        method: 'POST',
+        url: `/tasks/${task.id}/runs`,
+        headers: { cookie: devCookie(userId) },
+      });
+      // Wait until the first run has actually claimed the task.
+      await expect
+        .poll(
+          async () => {
+            const [row] = await pg<{ status: string }[]>`
+              select status from triggers where id = ${task.id}`;
+            return row?.status;
+          },
+          { timeout: 5000 },
+        )
+        .toBe('running');
+
+      const second = await app.inject({
+        method: 'POST',
+        url: `/tasks/${task.id}/runs`,
+        headers: { cookie: devCookie(userId) },
+      });
+      expect(second.statusCode).toBe(409);
+      expect((second.json() as { error: { code: string } }).error.code).toBe('task_not_active');
+
+      releaseGate();
+      const firstRes = await first;
+      expect(firstRes.statusCode).toBe(201);
+    } finally {
+      turnGate = null;
+    }
+
+    const [row] = await pg<{ status: string }[]>`
+      select status from triggers where id = ${task.id}`;
+    expect(row?.status).toBe('active');
   });
 });
 

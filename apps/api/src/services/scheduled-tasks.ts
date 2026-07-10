@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { gatewaySessionKey, resolveSession, type AuthSession } from '@eden3/core';
 import { accounts, agents, db, sessionAgents, sessionUsers, sessions, triggers, type Session, type Trigger } from '@eden3/db';
 import { DEFAULT_AGENT_MODEL, DEFAULT_AGENT_THINKING_LEVEL } from '@eden3/shared';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
 import { ApiError } from '../errors';
 import type { EventsBus } from '../events-bus';
@@ -160,10 +160,17 @@ export async function runScheduledTask(
   const agent = await loadTaskAgent(trigger);
   const session = await resolveRunSession(trigger, owner, agent);
 
-  await db
+  // Atomic active->running claim: two concurrent fire requests (user +
+  // admin, or a retried scheduler tick) cannot both run the task — the loser
+  // sees zero rows claimed and 409s like any non-active task.
+  const claimed = await db
     .update(triggers)
     .set({ status: 'running', lastError: null, updatedAt: new Date() })
-    .where(eq(triggers.id, trigger.id));
+    .where(and(eq(triggers.id, trigger.id), eq(triggers.status, 'active')))
+    .returning({ id: triggers.id });
+  if (claimed.length === 0) {
+    throw new ApiError(409, 'task_not_active', `Task ${trigger.id} is already running`);
+  }
 
   let outcome: TurnOutcome;
   try {
