@@ -57,7 +57,7 @@ describe("studio catalog", () => {
 
   it("ships a 4-tool fallback catalog with launch metered pricing", () => {
     expect(FALLBACK_TOOLS.map((t) => [t.name, t.costManna])).toEqual([
-      ["image_generate", 181],
+      ["image_generate", 34],
       ["video_generate", 608],
       ["music_generate", 54],
       ["tts", 28],

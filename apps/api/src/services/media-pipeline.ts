@@ -3,8 +3,8 @@ import path from 'node:path';
 import {
   InsufficientMannaError,
   LocalMediaStore,
-  PRICING,
   debit,
+  defaultChatMediaManna,
   type DbHandle,
   type LedgerResult,
   type MediaStore,
@@ -513,11 +513,16 @@ export class MediaPipeline {
     let debitError: IngestFileResult['debitError'] = null;
     let billedAccountId: string | null = null;
     const action = pricedActionForTool(opts.tool, kind);
-    if (sessionId && sessionOwnerId && action) {
+    if (sessionId && sessionOwnerId && action && action !== 'chatTurn') {
+      // Metered default-route price (flux image 34 / kling-5s video 608 / …)
+      // — the pipeline can't know the exact model/duration, so it bills the
+      // gateway's configured default route instead of the old flat legacy
+      // prices that undercharged real provider cost by up to 20×.
+      const amount = defaultChatMediaManna(action);
       try {
         ledger = await debit({
           accountId: sessionOwnerId,
-          amount: PRICING[action],
+          amount,
           type: `spend:${action}`,
           idempotencyKey: mediaDebitIdempotencyKey(put.sha256, sessionId),
           db: this.db,
@@ -529,7 +534,7 @@ export class MediaPipeline {
         if (err instanceof InsufficientMannaError) {
           debitError = 'insufficient_manna';
           this.log.warn(
-            `media-pipeline: session owner ${sessionOwnerId} could not cover ${PRICING[action]} manna for ${put.sha256} (insufficient balance) — media kept, not charged`,
+            `media-pipeline: session owner ${sessionOwnerId} could not cover ${amount} manna for ${put.sha256} (insufficient balance) — media kept, not charged`,
           );
         } else {
           debitError = 'debit_failed';

@@ -404,3 +404,42 @@ export function mannaForEstimate(
 ): number {
   return mannaFromUsd(estimate.totalCostUsd, options);
 }
+
+/**
+ * Metered manna price of the DEFAULT provider route for each in-chat media
+ * kind, at the default quantity (image 1 · video 5s · music 1 clip · tts 120
+ * chars). Used by the media pipeline to charge agent-generated (async
+ * in-chat) media honestly: the pipeline has no task→file identity from
+ * OpenClaw (spike probe #4), so it cannot know the exact model/duration used
+ * — it bills the default route the gateway is configured to use. Replaces
+ * the legacy flat PRICING for media (image 5 / video 25 / … undercharged the
+ * real provider cost by up to 20×).
+ */
+export function defaultChatMediaManna(action: 'image' | 'video' | 'music' | 'tts'): number {
+  switch (action) {
+    case 'image':
+      return mannaForEstimate(
+        costFromParams({ provider: 'fal', model: 'fal-ai/flux/dev', units: { image: 1 } }),
+      );
+    case 'video':
+      return mannaForEstimate(
+        costFromParams({
+          provider: 'fal',
+          model: 'fal-ai/kling-video/v3/pro/text-to-video',
+          units: { video_second: 5 },
+        }),
+      );
+    case 'music':
+      return mannaForEstimate(
+        costFromParams({
+          provider: 'google',
+          model: 'lyria-3-clip-preview',
+          units: { music_clip: 1 },
+        }),
+      );
+    case 'tts':
+      return mannaForEstimate(
+        costFromParams({ provider: 'elevenlabs', model: 'tts', units: { audio_character: 120 } }),
+      );
+  }
+}

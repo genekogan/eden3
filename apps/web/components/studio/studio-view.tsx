@@ -27,8 +27,10 @@ import {
   FALLBACK_TOOLS,
   buildArgs,
   categorizeTool,
+  defaultModelKey,
   describeFailure,
   durationSpec,
+  modelOptions,
   promptKey,
   promptPlaceholder,
   sortTools,
@@ -65,6 +67,8 @@ export function StudioView() {
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [prompt, setPrompt] = useState("");
   const [duration, setDuration] = useState("");
+  // "" = the tool's default model tier; a key from tool.models otherwise.
+  const [model, setModel] = useState("");
   const [phase, setPhase] = useState<Phase>(IDLE);
   const [manna, setManna] = useState<MannaSummary | null>(null);
   const [sessionItems, setSessionItems] = useState<StripItem[]>([]);
@@ -136,10 +140,15 @@ export function StudioView() {
   const selected =
     tools.find((tool) => tool.name === selectedName) ?? tools[0] ?? null;
   const category = selected ? categorizeTool(selected) : "other";
+  const tierOptions = selected ? modelOptions(selected) : [];
+  const activeModelKey = model || (selected ? defaultModelKey(selected) : "");
+  const activeTier = tierOptions.find((o) => o.key === activeModelKey) ?? null;
   const catalogCost =
-    selected && typeof selected.costManna === "number"
-      ? selected.costManna
-      : null;
+    activeTier != null
+      ? activeTier.costManna
+      : selected && typeof selected.costManna === "number"
+        ? selected.costManna
+        : null;
   const quoteCost = quoteState.status === "ready" ? quoteState.quote.manna : null;
   const cost = quoteCost ?? catalogCost;
   const spendable = manna ? manna.balance + manna.subscriptionBalance : null;
@@ -158,7 +167,7 @@ export function StudioView() {
       setQuoteState({ status: "idle" });
       return;
     }
-    const args = buildArgs(selected, trimmedPrompt, duration);
+    const args = buildArgs(selected, trimmedPrompt, duration, model);
     const key = `${selected.name}:${JSON.stringify(args)}`;
     let cancelled = false;
     setQuoteState((prev) => (prev.status === "ready" && prev.key === key ? prev : { status: "loading", key }));
@@ -176,12 +185,13 @@ export function StudioView() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [selected, trimmedPrompt, duration]);
+  }, [selected, trimmedPrompt, duration, model]);
 
   // ---- actions -----------------------------------------------------------
   const selectTool = useCallback((name: string) => {
     setSelectedName(name);
     setDuration("");
+    setModel("");
     setPhase((prev) => (prev.kind === "generating" ? prev : IDLE));
   }, []);
 
@@ -201,7 +211,7 @@ export function StudioView() {
 
     try {
       const result = await api.studio.generate(
-        { tool: selected.name, args: buildArgs(selected, trimmedPrompt, duration) },
+        { tool: selected.name, args: buildArgs(selected, trimmedPrompt, duration, model) },
         { signal: controller.signal },
       );
       if (!alive.current) return;
@@ -227,7 +237,7 @@ export function StudioView() {
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
     }
-  }, [selected, phase.kind, trimmedPrompt, duration, cost, manna]);
+  }, [selected, phase.kind, trimmedPrompt, duration, model, cost, manna]);
 
   const cancel = useCallback(() => {
     abortRef.current?.abort();
@@ -326,6 +336,38 @@ export function StudioView() {
               placeholder={promptPlaceholder(category)}
               className="mt-2 w-full resize-y rounded-lg border border-edge bg-raised p-3.5 text-sm leading-relaxed text-foreground placeholder:text-faint"
             />
+
+            {tierOptions.length > 0 ? (
+              <fieldset className="mt-3">
+                <legend className="text-xs text-muted">Model</legend>
+                <div className="mt-1.5 flex flex-wrap gap-2">
+                  {tierOptions.map((option) => {
+                    const active = option.key === activeModelKey;
+                    return (
+                      <label
+                        key={option.key}
+                        className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-1.5 text-xs transition-colors ${
+                          active
+                            ? "border-accent/60 bg-accent/10 text-foreground"
+                            : "border-edge bg-raised text-muted hover:text-foreground"
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="studio-model"
+                          className="sr-only"
+                          checked={active}
+                          onChange={() => setModel(option.key)}
+                          disabled={phase.kind === "generating"}
+                        />
+                        <span>{option.label}</span>
+                        <MannaAmount amount={option.costManna} className="text-faint" />
+                      </label>
+                    );
+                  })}
+                </div>
+              </fieldset>
+            ) : null}
 
             {spec ? (
               <div className="mt-3 flex items-center gap-3">

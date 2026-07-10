@@ -113,6 +113,10 @@ describe('ensureBaseline', () => {
               },
             },
           },
+          imageGenerationModel: {
+            primary: 'fal/fal-ai/flux/dev',
+            fallbacks: ['google/gemini-3-pro-image-preview'],
+          },
         },
       },
       tools: {

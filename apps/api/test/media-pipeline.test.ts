@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { LocalMediaStore, PRICING, credit, getBalance } from '@eden3/core';
+import { LocalMediaStore, credit, defaultChatMediaManna, getBalance } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import type { SessionEvent } from '@eden3/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -93,7 +93,7 @@ beforeAll(async () => {
   sessionId = sessions[0]!.id;
   brokeSessionId = sessions[1]!.id;
 
-  await credit({ accountId: userId, amount: 20, type: 'credit:test' });
+  await credit({ accountId: userId, amount: 2_000, type: 'credit:test' });
 });
 
 afterAll(async () => {
@@ -181,11 +181,14 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     // manna: 5 debited from the session owner with the sha+session key
     expect(result.billedAccountId).toBe(userId);
     expect(result.debitError).toBeNull();
-    expect(result.debit?.balance.total).toBe(before.total - 5);
+    expect(result.debit?.balance.total).toBe(before.total - defaultChatMediaManna('image'));
     const [tx] = await pg<{ amount: string; type: string }[]>`
       select amount, type from manna_transactions
       where idempotency_key = ${mediaDebitIdempotencyKey(result.sha256, sessionId)}`;
-    expect(tx).toMatchObject({ amount: '-5.0000', type: 'spend:image' });
+    expect(tx).toMatchObject({
+      amount: `-${defaultChatMediaManna('image')}.0000`,
+      type: 'spend:image',
+    });
 
     // events published on the session channel
     const types = events.filter((e) => e.sessionId === sessionId).map((e) => e.event.type);
@@ -223,7 +226,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
       events.length = 0;
       await credit({
         accountId: userId,
-        amount: PRICING[mediaCase.action] + 1,
+        amount: defaultChatMediaManna(mediaCase.action) + 1,
         type: 'credit:test',
       });
       const file = fakeBinaryFile(mediaCase.fileName);
@@ -262,11 +265,13 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
 
       expect(result.billedAccountId).toBe(userId);
       expect(result.debitError).toBeNull();
-      expect(result.debit?.balance.total).toBe(before.total - PRICING[mediaCase.action]);
+      expect(result.debit?.balance.total).toBe(
+        before.total - defaultChatMediaManna(mediaCase.action),
+      );
       const [tx] = await pg<{ amount: string; type: string }[]>`
         select amount, type from manna_transactions
         where idempotency_key = ${mediaDebitIdempotencyKey(result.sha256, sessionId)}`;
-      expect(Number(tx!.amount)).toBe(-PRICING[mediaCase.action]);
+      expect(Number(tx!.amount)).toBe(-defaultChatMediaManna(mediaCase.action));
       expect(tx!.type).toBe(`spend:${mediaCase.action}`);
 
       const event = events.find((e) => e.event.type === 'media.attached')?.event;
@@ -342,7 +347,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     expect(Number(msgCount!.count)).toBe(1);
 
     // Charged exactly once (idempotent media debit key).
-    expect((await getBalance(userId)).total).toBe(before.total - 5);
+    expect((await getBalance(userId)).total).toBe(before.total - defaultChatMediaManna('image'));
     const [debitCount] = await pg<{ count: string }[]>`
       select count(*) from manna_transactions
       where idempotency_key = ${mediaDebitIdempotencyKey(a.sha256, sessionId)}`;
@@ -379,7 +384,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
 
   it('late history-sync attachment completes a parked file on the existing completion row', async () => {
     events.length = 0;
-    await credit({ accountId: userId, amount: 5, type: 'credit:test' });
+    await credit({ accountId: userId, amount: defaultChatMediaManna('image'), type: 'credit:test' });
     const file = fakePngFile('parked-attach.png');
     const parked = await pipeline.ingestFile(file, { tool: 'image_generate' });
     expect(parked.creation).toBeNull();
@@ -426,7 +431,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
         and attachments @> ${JSON.stringify([{ creationId: attached.creation!.id }])}::jsonb`;
     expect(Number(messageCount!.count)).toBe(1);
 
-    expect(attached.debit?.balance.total).toBe(before.total - 5);
+    expect(attached.debit?.balance.total).toBe(before.total - defaultChatMediaManna('image'));
     const event = events.find((e) => e.event.type === 'media.attached')?.event;
     expect(event).toMatchObject({
       type: 'media.attached',
@@ -446,7 +451,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     // move the attachment onto the completion row, strip its sentinel, delete
     // the orphan, and never double-charge.
     events.length = 0;
-    await credit({ accountId: userId, amount: 5, type: 'credit:test' });
+    await credit({ accountId: userId, amount: defaultChatMediaManna('image'), type: 'credit:test' });
     const file = fakePngFile('orphan-rehome.png');
 
     // 1. in-session ingest with NO messageId → creation + orphan empty message.
@@ -457,7 +462,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     expect(orphaned.message!.content).toBeNull();
     const orphanId = orphaned.message!.id;
     const afterCharge = await getBalance(userId);
-    expect(afterCharge.total).toBe(balBefore.total - PRICING.image);
+    expect(afterCharge.total).toBe(balBefore.total - defaultChatMediaManna('image'));
 
     // 2. the real streamed completion row lands later, carrying the sentinel.
     const [row] = await pg<{ id: string }[]>`

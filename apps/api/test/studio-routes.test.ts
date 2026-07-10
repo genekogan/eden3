@@ -75,7 +75,12 @@ const fakeWatcher = {
   },
 };
 
-let invokeCalls: Array<{ tool: string; agentId: string; sessionKey?: string }> = [];
+let invokeCalls: Array<{
+  tool: string;
+  agentId: string;
+  sessionKey?: string;
+  args?: Record<string, unknown>;
+}> = [];
 let invokeError: Error | null = null;
 let invokeHang = false;
 let nextTtsFallback: TtsFallbackGenerator | null = null;
@@ -87,7 +92,12 @@ const fakeToolsClient = {
     sessionKey?: string;
     signal?: AbortSignal;
   }) {
-    invokeCalls.push({ tool: params.tool, agentId: params.agentId, sessionKey: params.sessionKey });
+    invokeCalls.push({
+      tool: params.tool,
+      agentId: params.agentId,
+      sessionKey: params.sessionKey,
+      args: params.args,
+    });
     if (invokeError) throw invokeError;
     if (invokeHang) {
       await new Promise<never>((_resolve, reject) => {
@@ -219,8 +229,8 @@ describe('GET /studio/tools', () => {
     });
     expect(body.pricing.image_generate).toBe(imageQuote.manna);
     expect(body.tools[0]!.metering).toMatchObject({
-      provider: 'google',
-      model: 'gemini-3-pro-image',
+      provider: 'fal',
+      model: 'fal-ai/flux/dev',
     });
     expect(STUDIO_TOOLS).toHaveLength(4);
     expect(GENERATION_TIMEOUTS_MS.video_generate).toBe(600_000);
@@ -240,6 +250,39 @@ describe('GET /studio/tools', () => {
       units: { audio_character: 11 },
     });
     expect(body.quote.manna).toBe(3);
+  });
+
+  it('quotes the cheap flux default and the labeled gemini premium opt-in (C4 reprice)', async () => {
+    const standard = await app.inject({
+      method: 'POST',
+      url: '/studio/quote',
+      payload: { tool: 'image_generate', args: { prompt: 'x' } },
+    });
+    expect(standard.statusCode).toBe(200);
+    expect((standard.json() as { quote: Record<string, unknown> }).quote).toMatchObject({
+      provider: 'fal',
+      model: 'fal-ai/flux/dev',
+      manna: 34,
+    });
+
+    const premium = await app.inject({
+      method: 'POST',
+      url: '/studio/quote',
+      payload: { tool: 'image_generate', args: { prompt: 'x', model: 'gemini-pro' } },
+    });
+    expect(premium.statusCode).toBe(200);
+    expect((premium.json() as { quote: Record<string, unknown> }).quote).toMatchObject({
+      provider: 'google',
+      model: 'gemini-3-pro-image-preview',
+      manna: 181,
+    });
+
+    const unknown = await app.inject({
+      method: 'POST',
+      url: '/studio/quote',
+      payload: { tool: 'image_generate', args: { prompt: 'x', model: 'dall-e-1' } },
+    });
+    expect(unknown.statusCode).toBe(400);
   });
 });
 
@@ -312,8 +355,8 @@ describe('POST /studio/generate', () => {
     expect(body.url).toMatch(/^http:\/\/media\.test\/media\/[0-9a-f]{64}\.png$/);
     expect(body.mime).toBe('image/png');
     expect(body.metering).toMatchObject({
-      provider: 'google',
-      model: 'gemini-3-pro-image',
+      provider: 'fal',
+      model: 'fal-ai/flux/dev',
       manna: imageQuote.manna,
       costUsd: imageQuote.costUsd,
     });
@@ -326,6 +369,9 @@ describe('POST /studio/generate', () => {
 
     expect(invokeCalls).toHaveLength(1);
     expect(invokeCalls[0]).toMatchObject({ tool: 'image_generate', agentId: 'main' });
+    // The billed default (fal-ai/flux/dev) is also the routed one: the invoke
+    // carries the OpenClaw per-request model ref.
+    expect(invokeCalls[0]!.args).toMatchObject({ model: 'fal/fal-ai/flux/dev' });
     expect(invokeCalls[0]!.sessionKey).toMatch(/^eden3:studio:[0-9a-f-]{36}$/);
 
     const [creation] = await pg<
@@ -385,8 +431,8 @@ describe('POST /studio/generate', () => {
       status: 'completed',
       userId: richUserId,
       agentId: null,
-      provider: 'google',
-      model: 'gemini-3-pro-image',
+      provider: 'fal',
+      model: 'fal-ai/flux/dev',
       costUsd: imageQuote.costUsd.toFixed(8),
       manna: imageQuote.manna,
       errorCode: null,
@@ -579,8 +625,8 @@ describe('POST /studio/generate', () => {
       eventType: 'studio_generation',
       status: 'error',
       userId: richUserId,
-      provider: 'google',
-      model: 'gemini-3-pro-image',
+      provider: 'fal',
+      model: 'fal-ai/flux/dev',
       costUsd: '0.00000000',
       manna: 0,
       errorCode: 'gateway_error',

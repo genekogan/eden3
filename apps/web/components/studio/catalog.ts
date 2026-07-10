@@ -11,7 +11,7 @@
  */
 
 import { ApiError, isEndpointMissing } from "../../lib/api";
-import type { StudioTool } from "../../lib/types";
+import type { StudioTool, StudioToolModelOption } from "../../lib/types";
 
 // ---------------------------------------------------------------------------
 // Categories
@@ -90,7 +90,11 @@ export const FALLBACK_TOOLS: StudioTool[] = [
     name: "image_generate",
     description: "Generate an image from a text prompt.",
     outputType: "image",
-    costManna: 181,
+    costManna: 34,
+    models: [
+      { key: "flux-dev", label: "Standard · Flux", costManna: 34, default: true },
+      { key: "gemini-pro", label: "Premium · Gemini 3 Pro", costManna: 181 },
+    ],
     parameters: null,
   },
   {
@@ -273,16 +277,31 @@ export function durationSpec(tool: StudioTool): DurationSpec | null {
   };
 }
 
-/** Args for POST /api/studio/generate — prompt (or text) + optional duration. */
+/** Model tier options exposed by the tool, when it has more than one. */
+export function modelOptions(tool: StudioTool): StudioToolModelOption[] {
+  return Array.isArray(tool.models) && tool.models.length > 1 ? tool.models : [];
+}
+
+/** The tool's default model key ("" when the tool has no model tiers). */
+export function defaultModelKey(tool: StudioTool): string {
+  const options = modelOptions(tool);
+  return options.find((o) => o.default)?.key ?? options[0]?.key ?? "";
+}
+
+/** Args for POST /api/studio/generate — prompt (or text) + optional duration/model. */
 export function buildArgs(
   tool: StudioTool,
   prompt: string,
   duration: string,
+  model = "",
 ): Record<string, unknown> {
   const args: Record<string, unknown> = { [promptKey(tool)]: prompt.trim() };
   if (durationSpec(tool) && duration.trim() !== "") {
     const seconds = Number(duration);
     if (Number.isFinite(seconds) && seconds > 0) args.duration = seconds;
+  }
+  if (model && modelOptions(tool).some((o) => o.key === model)) {
+    args.model = model;
   }
   return args;
 }

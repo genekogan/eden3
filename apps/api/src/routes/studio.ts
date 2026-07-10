@@ -135,11 +135,48 @@ function textLength(args: Record<string, unknown>): number {
   return text.length;
 }
 
+/**
+ * Image model tiers (repriced 2026-07-10): the default is the cheap
+ * flux-dev route (34 manna — eden1's `create` averaged ~28 manna, so this
+ * restores familiar purchasing power); premium models are explicit opt-ins
+ * labeled with their real price. `openclawModel` is the per-request
+ * `model` override passed to OpenClaw's image_generate tool.
+ */
+export const IMAGE_MODEL_OPTIONS = {
+  'flux-dev': {
+    label: 'Standard · Flux',
+    description: 'Fast, dependable image model — the default.',
+    provider: 'fal' as CostProvider,
+    model: 'fal-ai/flux/dev',
+    openclawModel: 'fal/fal-ai/flux/dev',
+  },
+  'gemini-pro': {
+    label: 'Premium · Gemini 3 Pro',
+    description: 'Top-tier image quality at a premium price.',
+    provider: 'google' as CostProvider,
+    model: 'gemini-3-pro-image-preview',
+    openclawModel: 'google/gemini-3-pro-image-preview',
+  },
+} as const;
+export type ImageModelKey = keyof typeof IMAGE_MODEL_OPTIONS;
+export const DEFAULT_IMAGE_MODEL: ImageModelKey = 'flux-dev';
+
+function imageModelOption(args: Record<string, unknown>): (typeof IMAGE_MODEL_OPTIONS)[ImageModelKey] {
+  const raw = typeof args.model === 'string' ? args.model : DEFAULT_IMAGE_MODEL;
+  const option = IMAGE_MODEL_OPTIONS[raw as ImageModelKey];
+  if (!option) {
+    throw new RangeError(
+      `unknown image model "${raw}" — expected one of: ${Object.keys(IMAGE_MODEL_OPTIONS).join(', ')}`,
+    );
+  }
+  return option;
+}
+
 const STUDIO_METERING: Record<StudioToolName, StudioMeteringSpec> = {
   image_generate: {
     action: 'image',
-    provider: 'google',
-    model: 'gemini-3-pro-image',
+    provider: IMAGE_MODEL_OPTIONS[DEFAULT_IMAGE_MODEL].provider,
+    model: IMAGE_MODEL_OPTIONS[DEFAULT_IMAGE_MODEL].model,
     unit: 'image',
     defaultQuantity: 1,
     quantityFromArgs: () => 1,
@@ -200,13 +237,21 @@ export function quoteStudioGeneration(
   args: Record<string, unknown> = {},
 ): StudioGenerationQuote {
   const spec = STUDIO_METERING[tool];
-  const quantity = spec.quantityFromArgs(args);
+  // Image is model-aware: args.model selects the billed (and routed) tier.
+  const priced =
+    tool === 'image_generate'
+      ? (() => {
+          const option = imageModelOption(args);
+          return { ...spec, provider: option.provider, model: option.model };
+        })()
+      : spec;
+  const quantity = priced.quantityFromArgs(args);
   const estimate = costFromParams({
-    provider: spec.provider,
-    model: spec.model,
-    units: { [spec.unit]: quantity },
+    provider: priced.provider,
+    model: priced.model,
+    units: { [priced.unit]: quantity },
   });
-  return quoteFromEstimate(tool, spec, estimate);
+  return quoteFromEstimate(tool, priced, estimate);
 }
 
 function defaultQuote(tool: StudioToolName): StudioGenerationQuote {
@@ -231,9 +276,25 @@ export const STUDIO_TOOLS = [
     outputType: 'image',
     costManna: STUDIO_PRICING.image_generate,
     metering: defaultQuote('image_generate'),
+    // Model tiers with real prices — the web renders these as a picker.
+    models: Object.entries(IMAGE_MODEL_OPTIONS).map(([key, option]) => ({
+      key,
+      label: option.label,
+      description: option.description,
+      costManna: quoteStudioGeneration('image_generate', { model: key }).manna,
+      default: key === DEFAULT_IMAGE_MODEL,
+    })),
     parameters: {
       type: 'object',
-      properties: { prompt: { type: 'string', description: 'What to depict.' } },
+      properties: {
+        prompt: { type: 'string', description: 'What to depict.' },
+        model: {
+          type: 'string',
+          enum: Object.keys(IMAGE_MODEL_OPTIONS),
+          default: DEFAULT_IMAGE_MODEL,
+          description: 'Image model tier (premium tiers cost more).',
+        },
+      },
       required: ['prompt'],
     },
   },
@@ -698,9 +759,15 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       timeout.unref();
     });
     try {
+      // Image tier keys map to OpenClaw's per-request `model` override
+      // (provider/model ref) so the routed model matches the billed one.
+      const invokeArgs =
+        body.tool === 'image_generate'
+          ? { ...body.args, model: imageModelOption(body.args).openclawModel }
+          : body.args;
       const invoke = getToolsClient().invokeTool({
         tool: body.tool,
-        args: body.args,
+        args: invokeArgs,
         agentId,
         sessionKey: gatewaySessionKey,
         signal: controller.signal,

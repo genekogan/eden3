@@ -376,6 +376,14 @@ export interface TaskUpdateInput {
  * GET /api/studio/tools item. Only `name` is guaranteed; everything else is
  * best-effort (the tool registry is api-owned and still landing).
  */
+export interface StudioToolModelOption {
+  key: string;
+  label: string;
+  description?: string | null;
+  costManna: number;
+  default?: boolean;
+}
+
 export interface StudioTool {
   name: string;
   description?: string | null;
@@ -384,6 +392,8 @@ export interface StudioTool {
   costManna?: number | null;
   /** Default quote metadata for the canonical/default args, when available. */
   metering?: StudioGenerationQuote | null;
+  /** Model tiers with real prices (cheap default + premium opt-ins). */
+  models?: StudioToolModelOption[] | null;
   /** JSON-schema-ish parameter spec; shape not part of the contract. */
   parameters?: Record<string, unknown> | null;
   [key: string]: unknown;
