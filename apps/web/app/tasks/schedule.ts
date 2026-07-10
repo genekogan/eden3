@@ -2,10 +2,11 @@
  * Schedule helpers for the tasks surface. Pure functions, no React.
  *
  * Triggers store eden1's APScheduler-style cron dict (snake_case, see
- * `cronScheduleDto` in @eden3/shared). Two directions:
- *   - describeSchedule(): render any stored dict as a human line
- *     ("Weekly on Monday at 9:30 AM · UTC").
- *   - the modal builds new dicts from daily/weekly + HH:MM + timezone,
+ * `cronScheduleDto` in @eden3/shared) or the one-time `{at: ISO}` shape.
+ * Two directions:
+ *   - describeSchedule(): render any stored schedule as a human line
+ *     ("Weekly on Monday at 9:30 AM · UTC", "Once on Jul 11, 3:00 PM").
+ *   - the modals build new schedules from once/hourly/daily/weekly inputs,
  *     sending day_of_week as an APScheduler/cron day name ("mon") so the
  *     0=Monday vs 0=Sunday ambiguity never enters the wire format.
  */
@@ -66,6 +67,20 @@ export function describeSchedule(
   schedule: CronSchedule | null | undefined,
 ): string {
   if (!schedule || typeof schedule !== "object") return "No schedule";
+
+  if (schedule.at !== undefined) {
+    const ms = Date.parse(String(schedule.at));
+    if (!Number.isFinite(ms)) return "Once (invalid time)";
+    // Render one-time instants in the viewer's local timezone.
+    const when = new Date(ms).toLocaleString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+    return `Once on ${when}`;
+  }
 
   const hour = asInt(schedule.hour);
   const minute = asInt(schedule.minute);
@@ -148,4 +163,23 @@ export function parseClock(
   if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null;
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
   return { hour, minute };
+}
+
+/**
+ * Parse an `<input type="datetime-local">` value (interpreted in the
+ * browser's timezone) into an ISO-8601 instant; null when unparsable.
+ */
+export function parseDatetimeLocal(value: string): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value.trim())) return null;
+  const ms = new Date(value.trim()).getTime(); // local-time semantics per spec
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/** Format an instant as an `<input type="datetime-local">` value (local tz). */
+export function toDatetimeLocalValue(instant: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    `${instant.getFullYear()}-${pad(instant.getMonth() + 1)}-${pad(instant.getDate())}` +
+    `T${pad(instant.getHours())}:${pad(instant.getMinutes())}`
+  );
 }

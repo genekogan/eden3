@@ -425,7 +425,10 @@ export function mannaTransactionDtoFromRow(row: MannaTransactionRow): MannaTrans
 // Triggers
 // ---------------------------------------------------------------------------
 
-export function triggerDtoFromEntity(trigger: Trigger): TriggerDto {
+export function triggerDtoFromEntity(
+  trigger: Trigger,
+  extras: { lastRunSessionId?: string | null } = {},
+): TriggerDto {
   return {
     id: trigger.id,
     externalId: trigger.externalId,
@@ -437,6 +440,9 @@ export function triggerDtoFromEntity(trigger: Trigger): TriggerDto {
     status: trigger.status,
     lastRunTime: trigger.lastRunTime ? trigger.lastRunTime.toISOString() : null,
     nextScheduledRun: trigger.nextScheduledRun ? trigger.nextScheduledRun.toISOString() : null,
+    // Not a column: resolved from the latest run's usage event (see
+    // routes/triggers.ts lastRunSessionIds) when the caller provides it.
+    lastRunSessionId: extras.lastRunSessionId ?? null,
     lastError: trigger.lastError,
     createdAt: trigger.createdAt.toISOString(),
     updatedAt: trigger.updatedAt.toISOString(),

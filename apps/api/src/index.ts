@@ -15,6 +15,7 @@ await ensureBaseline({ dataDir: defaultOpenclawDataDir() });
 const app = await buildServer({
   logger: { level: 'info', base: undefined }, // compact: no pid/hostname
   media: { autoStartWatcher: true },
+  scheduler: { autoStart: true }, // eden3-side scheduled-task firing
 });
 
 await app.listen({ port: env.API_PORT, host: '127.0.0.1' });

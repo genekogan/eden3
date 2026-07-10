@@ -450,13 +450,18 @@ export interface CollectionCreateInput {
   public?: boolean;
 }
 
-/** Schedule accepted by POST /api/tasks (eden1 cron dict, snake_case). */
-export interface TaskScheduleInput {
-  hour: number;
-  minute: number;
-  day_of_week?: number | string;
-  timezone: string;
-}
+/**
+ * Schedule accepted by POST /api/tasks: the eden1 cron dict (snake_case;
+ * hour "*" = hourly) or a one-time {at: ISO-8601 instant}.
+ */
+export type TaskScheduleInput =
+  | { at: string }
+  | {
+      hour: number | string;
+      minute: number | string;
+      day_of_week?: number | string;
+      timezone: string;
+    };
 
 /** POST /api/tasks */
 export interface TaskCreateInput {
@@ -473,6 +478,19 @@ export interface TaskUpdateInput {
   prompt?: string;
   schedule?: TaskScheduleInput;
   deleted?: true;
+}
+
+/** POST /api/tasks/:id/runs response (`{run}` unwrapped). */
+export interface TaskRunResult {
+  triggerId: string;
+  sessionId: string;
+  outcome: {
+    turnId: string;
+    userMessageId: string;
+    assistantMessageId: string | null;
+    errorCode: string | null;
+  };
+  lastRunTime: string;
 }
 
 // ---------------------------------------------------------------------------

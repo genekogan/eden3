@@ -8,7 +8,17 @@ import {
 } from './docker';
 
 /**
- * Sync eden3 triggers onto OpenClaw cron jobs.
+ * OpenClaw cron-job REMOVAL for eden3 triggers.
+ *
+ * HISTORY: eden3 used to mirror every active trigger onto a gateway cron job
+ * (`syncTrigger` add/replace). That firing path bypassed eden3's metering /
+ * limits / monitoring pipeline entirely, so scheduled firing moved into the
+ * eden3 API (apps/api/src/services/task-scheduler.ts). The gateway must now
+ * hold NO `eden3:*` cron jobs — this module's remaining jobs are
+ * `removeTrigger` (create/edit/pause/delete ensure any stale job is gone) and
+ * `removeAllEden3Jobs` (one-time cleanup on scheduler boot so jobs created
+ * before the switch stop double-firing). `syncTrigger` stays for the removal
+ * path and tests, but nothing eden3-side calls it with `enabled: true`.
  *
  * Cron management is CLI-only (spike probe #9: HTTP `/tools/invoke` correctly
  * denies cron) and the cron CLI talks to the gateway WS, so every command runs
@@ -18,9 +28,8 @@ import {
  * (`openclaw devices list` → `openclaw devices approve <requestId>`).
  *
  * Idempotence: jobs are named `eden3:<triggerId>` and reconciled against
- * `cron list --json` — matching job → no-op; drifted job → remove + re-add;
- * `enabled: false` → remove. `cron rm` takes the job ID (not the name), so the
- * list diff also resolves name → id.
+ * `cron list --json`. `cron rm` takes the job ID (not the name), so the list
+ * diff also resolves name → id.
  */
 
 export class CronSyncError extends Error {
@@ -252,6 +261,17 @@ export class CronSync {
       enabled: false,
     };
     return this.syncTrigger(params);
+  }
+
+  /**
+   * Remove EVERY `eden3:*` gateway cron job (foreign jobs untouched).
+   * One-time cleanup used on eden3 task-scheduler boot: scheduled firing is
+   * eden3-side now, so any surviving gateway job would double-fire its task.
+   */
+  async removeAllEden3Jobs(): Promise<{ removed: number }> {
+    const jobs = await this.listEdenJobs();
+    for (const job of jobs) await this.removeJob(job.id);
+    return { removed: jobs.length };
   }
 
   private async addJob(name: string, params: SyncTriggerParams): Promise<string | undefined> {

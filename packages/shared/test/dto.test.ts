@@ -159,6 +159,8 @@ describe('resource DTOs', () => {
   it('parses triggers with the eden1 snake_case schedule dict', () => {
     const schedule = { hour: 9, minute: '30', day_of_week: 'mon-fri', timezone: 'UTC' };
     expect(cronScheduleDto.parse(schedule)).toEqual(schedule);
+    // One-time shape: fire once at this instant.
+    expect(cronScheduleDto.parse({ at: now })).toEqual({ at: now });
 
     const trigger = {
       id: uuid('9'),
@@ -171,12 +173,14 @@ describe('resource DTOs', () => {
       status: 'active',
       lastRunTime: now,
       nextScheduledRun: null,
+      lastRunSessionId: uuid('4'),
       lastError: null,
       createdAt: now,
       updatedAt: now,
     };
     expect(triggerDto.parse(trigger)).toEqual(trigger);
     expect(triggerDto.safeParse({ ...trigger, schedule: null }).success).toBe(true);
+    expect(triggerDto.safeParse({ ...trigger, lastRunSessionId: null }).success).toBe(true);
   });
 
   it('parses chat request/response', () => {

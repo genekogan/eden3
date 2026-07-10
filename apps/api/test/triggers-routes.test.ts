@@ -24,7 +24,33 @@ loadRootEnv();
 /**
  * Tasks (triggers) API against live Postgres with a FAKE cron-sync (the real
  * gateway CLI path is exercised by test/integration/agents-tasks.itest.ts).
+ *
+ * Scheduled firing is eden3-side now (services/task-scheduler.ts): creates
+ * and edits stamp next_scheduled_run and only ever REMOVE gateway cron jobs
+ * (a legacy `eden3:<id>` job would double-fire the task).
  */
+
+/** Assert an ISO instant renders as the given wall-clock parts in a tz. */
+function expectLocalParts(
+  isoInstant: string,
+  timezone: string,
+  expected: { weekday?: string; hour: number; minute: number },
+): void {
+  const parts: Record<string, string> = {};
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    hourCycle: 'h23',
+    hour: 'numeric',
+    minute: 'numeric',
+    weekday: 'short',
+  });
+  for (const part of formatter.formatToParts(new Date(isoInstant))) {
+    parts[part.type] = part.value;
+  }
+  if (expected.weekday !== undefined) expect(parts.weekday).toBe(expected.weekday);
+  expect(Number(parts.hour)).toBe(expected.hour);
+  expect(Number(parts.minute)).toBe(expected.minute);
+}
 
 const marker = makeMarker('taskapi');
 const agentUsername = `${marker}_bot`;
@@ -149,7 +175,7 @@ describe('POST /tasks', () => {
 
   it('429s before insert/cron-sync when the scheduled-task quota is exhausted', async () => {
     const restore = withEnv('MAX_SCHEDULED_TASKS_PER_USER', '0');
-    const beforeCalls = fakeCron.calls.length;
+    const beforeCalls = fakeCron.removals.length;
     const [beforeRows] = await pg<{ count: string }[]>`
       select count(*)::text as count from triggers where name = ${`${marker} quota blocked`}
     `;
@@ -167,7 +193,7 @@ describe('POST /tasks', () => {
       });
       expect(res.statusCode).toBe(429);
       expect((res.json() as { error: { code: string } }).error.code).toBe('task_quota_exceeded');
-      expect(fakeCron.calls).toHaveLength(beforeCalls);
+      expect(fakeCron.removals).toHaveLength(beforeCalls);
       const [afterRows] = await pg<{ count: string }[]>`
         select count(*)::text as count from triggers where name = ${`${marker} quota blocked`}
       `;
@@ -177,7 +203,8 @@ describe('POST /tasks', () => {
     }
   });
 
-  it('creates the trigger row and syncs a gateway cron job', async () => {
+  it('creates the trigger row, stamps nextScheduledRun, and never adds a gateway job', async () => {
+    const before = Date.now();
     const res = await app.inject({
       method: 'POST',
       url: '/tasks',
@@ -195,25 +222,25 @@ describe('POST /tasks', () => {
     expect(task.status).toBe('active');
     expect(task.userId).toBe(userId);
     expect(task.schedule).toMatchObject(schedule);
+    expect(task.lastRunSessionId).toBeNull();
 
-    const call = fakeCron.calls.find((c) => c.triggerId === task.id);
-    expect(call).toBeDefined();
-    expect(call).toMatchObject({
-      cronExpr: '30 9 * * *',
-      tz: 'UTC',
-      prompt: 'Summarize the news.',
-      enabled: true,
-      openclawAgentId: `${marker}bot`.replace(/_/g, '-'),
-    });
+    // next_scheduled_run is real: the upcoming 09:30 UTC, in the future.
+    expect(task.nextScheduledRun).not.toBeNull();
+    const next = Date.parse(task.nextScheduledRun!);
+    expect(next).toBeGreaterThan(before);
+    expect(next).toBeLessThanOrEqual(before + 25 * 60 * 60 * 1000);
+    expectLocalParts(task.nextScheduledRun!, 'UTC', { hour: 9, minute: 30 });
 
+    // Gateway side: removal-only (a legacy eden3:<id> job would double-fire).
+    expect(fakeCron.removals).toContain(task.id);
     const [row] = await pg<{ openclaw_job_id: string | null; last_synced_at: string | null }[]>`
       select openclaw_job_id, last_synced_at from triggers where id = ${task.id}
     `;
-    expect(row!.openclaw_job_id).toBe(`fake-job-${task.id.slice(0, 8)}`);
+    expect(row!.openclaw_job_id).toBeNull();
     expect(row!.last_synced_at).not.toBeNull();
   });
 
-  it('supports weekly day names and apscheduler day numbers', async () => {
+  it('supports weekly day names and apscheduler day numbers with timezones', async () => {
     const res = await app.inject({
       method: 'POST',
       url: '/tasks',
@@ -227,16 +254,84 @@ describe('POST /tasks', () => {
     });
     expect(res.statusCode).toBe(201);
     const { task } = res.json() as TaskBody;
-    const call = fakeCron.calls.find((c) => c.triggerId === task.id)!;
-    expect(call.cronExpr).toBe('0 8 * * mon');
-    expect(call.tz).toBe('America/New_York');
+    expect(task.nextScheduledRun).not.toBeNull();
+    expectLocalParts(task.nextScheduledRun!, 'America/New_York', {
+      weekday: 'Mon',
+      hour: 8,
+      minute: 0,
+    });
+
+    // APScheduler numbering: 4 = Friday.
+    const numeric = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Weekly numeric',
+        prompt: 'weekly check',
+        schedule: { hour: 8, minute: 0, day_of_week: 4, timezone: 'UTC' },
+      },
+    });
+    expect(numeric.statusCode).toBe(201);
+    const numericTask = (numeric.json() as TaskBody).task;
+    expectLocalParts(numericTask.nextScheduledRun!, 'UTC', {
+      weekday: 'Fri',
+      hour: 8,
+      minute: 0,
+    });
   });
 
-  it('400s invalid schedules via scheduleToCron validation', async () => {
+  it('supports hourly schedules (hour "*")', async () => {
+    const before = Date.now();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Hourly',
+        prompt: 'hourly check',
+        schedule: { hour: '*', minute: 45, timezone: 'UTC' },
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const { task } = res.json() as TaskBody;
+    const next = Date.parse(task.nextScheduledRun!);
+    expect(next).toBeGreaterThan(before);
+    expect(next).toBeLessThanOrEqual(before + 61 * 60 * 1000); // within the hour
+    expect(new Date(next).getUTCMinutes()).toBe(45);
+  });
+
+  it('creates one-time {at} tasks with nextScheduledRun = that instant', async () => {
+    const at = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'One shot',
+        prompt: 'run once',
+        schedule: { at },
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    const { task } = res.json() as TaskBody;
+    expect(task.status).toBe('active');
+    expect(task.schedule).toEqual({ at });
+    expect(task.nextScheduledRun).toBe(at);
+  });
+
+  it('400s invalid schedules (recurring fields, at shapes, past one-times)', async () => {
     for (const bad of [
       { hour: 99, minute: 0 },
       { hour: 9 }, // minute required
       { hour: 9, minute: 'sixty' },
+      { at: 'not-a-timestamp' },
+      { at: new Date(Date.now() - 60_000).toISOString() }, // already passed
+      { at: new Date(Date.now() + 60_000).toISOString(), hour: 9, minute: 0 }, // ambiguous
+      {},
     ]) {
       const res = await app.inject({
         method: 'POST',
@@ -361,6 +456,9 @@ describe('POST /tasks', () => {
     expect(typeof listedTask?.lastRunTime).toBe('string');
     expect(Date.parse(listedTask!.lastRunTime!)).not.toBeNaN();
     expect(listedTask?.lastError).toBeNull();
+    // The run's output session is linked on the task row (resolved from the
+    // run's usage event).
+    expect(listedTask?.lastRunSessionId).toBe(run.sessionId);
   });
 
   it('rejects a concurrent second fire of the same task (atomic running claim)', async () => {
@@ -454,9 +552,11 @@ describe('PATCH /tasks/:id', () => {
     return (res.json() as TaskBody).task;
   }
 
-  it('pauses (cron removed) and resumes (cron re-added)', async () => {
+  it('pauses (next run cleared) and resumes (next run recomputed); gateway stays removal-only', async () => {
     const task = await createTask();
+    expect(task.nextScheduledRun).not.toBeNull();
 
+    const beforeRemovals = fakeCron.removals.filter((id) => id === task.id).length;
     const paused = await app.inject({
       method: 'PATCH',
       url: `/tasks/${task.id}`,
@@ -464,9 +564,10 @@ describe('PATCH /tasks/:id', () => {
       payload: { status: 'paused' },
     });
     expect(paused.statusCode).toBe(200);
-    expect((paused.json() as TaskBody).task.status).toBe('paused');
-    const pauseCall = fakeCron.calls.filter((c) => c.triggerId === task.id).at(-1)!;
-    expect(pauseCall.enabled).toBe(false);
+    const pausedTask = (paused.json() as TaskBody).task;
+    expect(pausedTask.status).toBe('paused');
+    expect(pausedTask.nextScheduledRun).toBeNull();
+    expect(fakeCron.removals.filter((id) => id === task.id).length).toBe(beforeRemovals + 1);
 
     const resumed = await app.inject({
       method: 'PATCH',
@@ -474,12 +575,15 @@ describe('PATCH /tasks/:id', () => {
       headers: { cookie: devCookie(userId) },
       payload: { status: 'active' },
     });
-    expect((resumed.json() as TaskBody).task.status).toBe('active');
-    const resumeCall = fakeCron.calls.filter((c) => c.triggerId === task.id).at(-1)!;
-    expect(resumeCall).toMatchObject({ enabled: true, cronExpr: '30 9 * * *' });
+    const resumedTask = (resumed.json() as TaskBody).task;
+    expect(resumedTask.status).toBe('active');
+    expect(resumedTask.nextScheduledRun).not.toBeNull();
+    expect(Date.parse(resumedTask.nextScheduledRun!)).toBeGreaterThan(Date.now());
+    expectLocalParts(resumedTask.nextScheduledRun!, 'UTC', { hour: 9, minute: 30 });
+    expect(fakeCron.removals.filter((id) => id === task.id).length).toBe(beforeRemovals + 2);
   });
 
-  it('edits name, prompt, and schedule, then resyncs the active cron job', async () => {
+  it('edits name, prompt, and schedule, restamping the next run', async () => {
     const task = await createTask();
     const res = await app.inject({
       method: 'PATCH',
@@ -505,16 +609,40 @@ describe('PATCH /tasks/:id', () => {
       day_of_week: 'fri',
       timezone: 'America/New_York',
     });
-    const editCall = fakeCron.calls.filter((c) => c.triggerId === task.id).at(-1)!;
-    expect(editCall).toMatchObject({
-      enabled: true,
-      cronExpr: '5 14 * * fri',
-      tz: 'America/New_York',
-      prompt: 'edited prompt',
+    expect(edited.nextScheduledRun).not.toBeNull();
+    expectLocalParts(edited.nextScheduledRun!, 'America/New_York', {
+      weekday: 'Fri',
+      hour: 14,
+      minute: 5,
     });
   });
 
-  it('soft-deletes (cron removed, gone from the list)', async () => {
+  it('edits a task onto a one-time {at} schedule', async () => {
+    const task = await createTask();
+    const at = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/tasks/${task.id}`,
+      headers: { cookie: devCookie(userId) },
+      payload: { schedule: { at } },
+    });
+    expect(res.statusCode).toBe(200);
+    const edited = (res.json() as TaskBody).task;
+    expect(edited.schedule).toEqual({ at });
+    expect(edited.nextScheduledRun).toBe(at);
+
+    // A past one-time schedule cannot be saved on an active task.
+    const past = await app.inject({
+      method: 'PATCH',
+      url: `/tasks/${task.id}`,
+      headers: { cookie: devCookie(userId) },
+      payload: { schedule: { at: new Date(Date.now() - 60_000).toISOString() } },
+    });
+    expect(past.statusCode).toBe(400);
+    expect((past.json() as { error: { code: string } }).error.code).toBe('invalid_schedule');
+  });
+
+  it('soft-deletes (gateway job removed, gone from the list)', async () => {
     const task = await createTask();
     const res = await app.inject({
       method: 'PATCH',
@@ -523,8 +651,12 @@ describe('PATCH /tasks/:id', () => {
       payload: { deleted: true },
     });
     expect(res.statusCode).toBe(200);
-    const lastCall = fakeCron.calls.filter((c) => c.triggerId === task.id).at(-1)!;
-    expect(lastCall.enabled).toBe(false);
+    expect(fakeCron.removals).toContain(task.id);
+    const [deletedRow] = await pg<{ next_scheduled_run: string | null; status: string }[]>`
+      select next_scheduled_run, status from triggers where id = ${task.id}
+    `;
+    expect(deletedRow!.next_scheduled_run).toBeNull();
+    expect(deletedRow!.status).toBe('finished');
 
     const mine = (
       await app.inject({ method: 'GET', url: '/tasks', headers: { cookie: devCookie(userId) } })

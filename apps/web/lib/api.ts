@@ -66,6 +66,7 @@ import type {
   StudioGenerationQuote,
   StudioTool,
   TaskCreateInput,
+  TaskRunResult,
   TaskUpdateInput,
   TriggerDto,
   VoucherRedeemResult,
@@ -924,6 +925,14 @@ export const api = {
       return unwrap<TriggerDto>(
         await patch<unknown>(`/tasks/${enc(id)}`, body),
         "task",
+      );
+    },
+
+    /** POST /api/tasks/:id/runs — fire the task now (metered run). */
+    async runNow(id: string): Promise<TaskRunResult> {
+      return unwrap<TaskRunResult>(
+        await post<unknown>(`/tasks/${enc(id)}/runs`, {}),
+        "run",
       );
     },
   },

@@ -89,6 +89,12 @@ export const envSchema = z.object({
   MAX_CONCURRENT_TURNS_BELIEVER: nonnegativeIntSchema.optional(),
   /** Maximum net manna a user may spend on chat turns per UTC day. */
   DAILY_MANNA_SPEND_CAP_PER_USER: nonnegativeIntSchema.default(10_000),
+  /**
+   * Eden3-side scheduled-task scheduler tick interval. 0 disables the
+   * scheduler entirely (it is also disabled when the gateway token is not
+   * configured — scheduled runs execute real agent turns).
+   */
+  TASK_SCHEDULER_INTERVAL_MS: nonnegativeIntSchema.default(30_000),
   /** Fastify JSON/body parser ceiling. */
   API_BODY_LIMIT_BYTES: positiveIntSchema.default(1_000_000),
   /** Fixed-window per-client API rate-limit interval. */
