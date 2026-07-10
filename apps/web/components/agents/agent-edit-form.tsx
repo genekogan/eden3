@@ -446,13 +446,13 @@ export function AgentEditForm({ username }: { username: string }) {
 
         <TextAreaField
           id="edit-persona"
-          label="Persona"
+          label="Persona / Soul"
           value={fields.persona}
           onChange={setField("persona")}
           rows={14}
           mono
           disabled={saving}
-          hint="The system prompt — voice, temperament, obsessions, boundaries."
+          hint="The agent's soul — this is its SOUL.md file. Edits here and in the file browser stay in sync."
         />
 
         <label className="flex items-start gap-3 rounded-lg border border-edge bg-raised/40 p-4">

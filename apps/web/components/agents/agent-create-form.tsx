@@ -525,7 +525,7 @@ export function AgentCreateForm() {
 
         <TextAreaField
           id="agent-persona"
-          label="Persona"
+          label="Persona / Soul"
           value={persona}
           onChange={setPersona}
           rows={10}
@@ -534,7 +534,7 @@ export function AgentCreateForm() {
           placeholder={
             "You are Verdelis, a patient, plant-minded artist…\n\nVoice, temperament, obsessions, boundaries — write it like a system prompt."
           }
-          hint="The system prompt. Private by default; you can refine it any time."
+          hint="The agent's soul — this is its SOUL.md file. Private by default; refine it any time, here or in the file browser."
           disabled={submitting}
         />
 

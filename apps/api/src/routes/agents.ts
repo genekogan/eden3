@@ -36,6 +36,7 @@ import {
 } from '../route-helpers';
 import {
   DEFAULT_AGENT_SKILL_SLUGS,
+  RETIRED_SKILL_SLUGS,
   exportedSkillBundlesForAgent,
   installDefaultAgentSkills,
   replaceAgentSkills,
@@ -281,10 +282,14 @@ async function agentExportBundle(account: Account, agent: Agent) {
 }
 
 function importSkillSlugs(bundle: z.infer<typeof agentExportBundleSchema>): string[] {
+  const retired = new Set<string>(RETIRED_SKILL_SLUGS);
   const slugs = bundle.skills
     .filter((skill) => skill.enabled)
     .map((skill) => skill.slug ?? skill.id)
-    .filter((slug): slug is string => typeof slug === 'string' && slug.trim() !== '');
+    .filter((slug): slug is string => typeof slug === 'string' && slug.trim() !== '')
+    // Old bundles may still carry a retired baseline (e.g. eden-safe-base); it's
+    // no longer an installable skill, so drop it rather than 404 the import.
+    .filter((slug) => !retired.has(slug));
   return [...new Set([...DEFAULT_AGENT_SKILL_SLUGS, ...slugs])];
 }
 

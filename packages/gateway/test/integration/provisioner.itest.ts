@@ -79,11 +79,14 @@ describe('provisioner (live gateway)', () => {
     expect(result.bootstrapSuppressed).toBe(true);
 
     // host workspace: OUR persona rendered over the seed, no placeholder leakage,
-    // no leftover generic default from `agents add`.
+    // no leftover generic default from `agents add`. SOUL.md IS the persona body
+    // (verbatim); the name/identity header lives in IDENTITY.md now.
     const soul = await fs.readFile(path.join(result.hostWorkspaceDir, 'SOUL.md'), 'utf8');
-    expect(soul).toContain('# Itest Scratch');
+    expect(soul).toContain('You are Itest Scratch, a minimal test agent.');
     expect(soul).not.toMatch(/\{\{[A-Z_]+\}\}/);
     expect(soul).not.toContain("You're not a chatbot"); // OpenClaw's seeded default persona
+    const identity = await fs.readFile(path.join(result.hostWorkspaceDir, 'IDENTITY.md'), 'utf8');
+    expect(identity).toContain('Name: Itest Scratch');
 
     // bootstrap-suppression marker present with the load-bearing setupCompletedAt key
     const state = JSON.parse(

@@ -26,9 +26,10 @@ function render(tpl: string, vars: Record<string, string>): string {
 
 const rows = await pg<{
   openclawId: string; username: string; name: string | null; description: string | null;
-  persona: string | null; greeting: string | null;
+  persona: string | null; greeting: string | null; voice: string | null; thinkingLevel: string | null;
 }[]>`
-  select ag.openclaw_id as "openclawId", a.username, ag.name, ag.description, ag.persona, ag.greeting
+  select ag.openclaw_id as "openclawId", a.username, ag.name, ag.description, ag.persona,
+         ag.greeting, ag.voice, ag.thinking_level as "thinkingLevel"
   from agents ag join accounts a on a.id = ag.account_id
   where ag.provision_status in ('ready', 'provisioned') and ag.openclaw_id is not null and ag.is_pilot
   order by a.username asc
@@ -50,6 +51,8 @@ for (const r of rows) {
     DESCRIPTION: r.description ?? '',
     PERSONA: r.persona ?? `You are ${r.name ?? r.username}, an agent on Eden.`,
     GREETING: r.greeting ?? '',
+    VOICE: r.voice ?? 'unspecified',
+    THINKING_LEVEL: r.thinkingLevel ?? 'balanced',
     MEMORY_SEED: '',
     PROVISIONED_AT: new Date().toISOString(),
   };

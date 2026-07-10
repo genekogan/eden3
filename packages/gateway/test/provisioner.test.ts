@@ -225,13 +225,17 @@ describe('AgentProvisioner.provisionAgent', () => {
       const rendered = await fs.readFile(path.join(result.hostWorkspaceDir, name), 'utf8');
       expect(rendered, `${name} should have no {{PLACEHOLDER}} left`).not.toMatch(/\{\{[A-Z_]+\}\}/);
     }
+    // SOUL.md IS the persona body, rendered verbatim (byte-for-byte) — this is
+    // the round-trip contract with the workspace SOUL.md editor + the DB persona.
     const soul = await fs.readFile(path.join(result.hostWorkspaceDir, 'SOUL.md'), 'utf8');
-    expect(soul).toContain('# Banny');
-    expect(soul).toContain('exuberant banana');
-    expect(soul).toContain('Peel free to ask me anything!');
-    expect(soul).toContain('Thinking level: deep.');
+    expect(soul).toBe(PARAMS.persona);
+    // Name/voice/greeting/thinking are structured fields — they render into
+    // IDENTITY.md now, not SOUL.md.
     const identity = await fs.readFile(path.join(result.hostWorkspaceDir, 'IDENTITY.md'), 'utf8');
+    expect(identity).toContain('Name: Banny');
     expect(identity).toContain('Voice: bright banana baritone');
+    expect(identity).toContain('Greeting for first-time visitors: Peel free to ask me anything!');
+    expect(identity).toContain('Thinking level: deep.');
     const memory = await fs.readFile(path.join(result.hostWorkspaceDir, 'MEMORY.md'), 'utf8');
     expect(memory).toContain('- Banny joined Eden in 2023.');
     const state = JSON.parse(
@@ -393,7 +397,8 @@ describe('AgentProvisioner.provisionAgent', () => {
 
     const third = await provisioner.provisionAgent(PARAMS, { force: true });
     expect(third.filesWritten.sort()).toEqual(first.filesWritten.sort());
-    expect(await fs.readFile(soulPath, 'utf8')).toContain('# Banny');
+    // force re-renders SOUL.md back to the canonical persona body (verbatim).
+    expect(await fs.readFile(soulPath, 'utf8')).toBe(PARAMS.persona);
   });
 
   it('does not re-add an already-registered agent', async () => {
@@ -495,10 +500,9 @@ describe('AgentProvisioner.updateAgentPersona', () => {
     expect(updated.filesWritten).toEqual([...PERSONA_TEMPLATE_FILES]);
 
     const soul = await fs.readFile(path.join(first.hostWorkspaceDir, 'SOUL.md'), 'utf8');
-    expect(soul).toContain('# Banny Prime');
-    expect(soul).toContain('solemn sculptor');
-    expect(soul).toContain('Thinking level: fast.');
+    expect(soul).toBe('You are Banny Prime, a solemn sculptor.');
     const identity = await fs.readFile(path.join(first.hostWorkspaceDir, 'IDENTITY.md'), 'utf8');
+    expect(identity).toContain('Thinking level: fast.');
     expect(identity).toContain('Banny Prime');
     expect(identity).toContain('Reformed banana');
     expect(identity).toContain('Voice: quiet stone rasp');
