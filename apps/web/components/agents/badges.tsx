@@ -19,6 +19,17 @@ export function PilotBadge({ className }: { className?: string }) {
   );
 }
 
+/** "private" chip — only the owner ever sees these rows (mine scope). */
+export function PrivateBadge({ className }: { className?: string }) {
+  return (
+    <span
+      className={`inline-flex shrink-0 items-center rounded-full border border-edge bg-raised px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.15em] text-faint ${className ?? ""}`}
+    >
+      private
+    </span>
+  );
+}
+
 /**
  * Provisioning indicator — renders only while an agent is pending/failed
  * (nothing for ready agents, which is almost all of them).

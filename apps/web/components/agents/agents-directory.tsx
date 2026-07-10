@@ -1,14 +1,17 @@
 "use client";
 
 /**
- * /agents — the directory. Debounced search over GET /api/agents?q, cursor
- * "load more", create entry point top-right. Resilient to the api being
- * mid-build (501/404/offline -> quiet dashed card, retryable).
+ * /agents — the directory. Defaults to the viewer's own agents (private ones
+ * included — operator ruling 2026-07-09) with a toggle to browse all public
+ * agents. Debounced search over GET /api/agents?q&scope, cursor "load more",
+ * create entry point top-right. Resilient to the api being mid-build
+ * (501/404/offline -> quiet dashed card, retryable); an anonymous viewer is
+ * dropped to the public directory automatically.
  */
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, isEndpointMissing } from "@/lib/api";
+import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type { AgentDto } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
 import { Skeleton } from "@/components/skeleton";
@@ -63,9 +66,11 @@ function CardSkeleton() {
 }
 
 type DirectoryState = "loading" | "ready" | "error";
+type DirectoryScope = "mine" | "public";
 
 export function AgentsDirectory() {
   const [query, setQuery] = useState("");
+  const [scope, setScope] = useState<DirectoryScope>("mine");
   const [items, setItems] = useState<AgentDto[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [state, setState] = useState<DirectoryState>("loading");
@@ -76,27 +81,33 @@ export function AgentsDirectory() {
   const [reloadKey, setReloadKey] = useState(0);
   const seq = useRef(0);
 
-  // Page 1 — debounced on query, re-armed by "Try again".
+  // Page 1 — debounced on query, re-armed by "Try again" or a scope switch.
   useEffect(() => {
     setState("loading");
     setMoreError(null);
     const timer = window.setTimeout(async () => {
       const id = ++seq.current;
       try {
-        const page = await api.agents.list({ q: query.trim() || undefined });
+        const page = await api.agents.list({ q: query.trim() || undefined, scope });
         if (seq.current !== id) return;
         setItems(page.items);
         setCursor(page.nextCursor);
         setState("ready");
       } catch (error) {
         if (seq.current !== id) return;
+        // "Mine" needs a signed-in viewer; anonymous sessions get the public
+        // directory instead of a sign-in wall.
+        if (scope === "mine" && error instanceof ApiError && error.status === 401) {
+          setScope("public");
+          return;
+        }
         setEndpointMissing(isEndpointMissing(error));
         setErrorText(describeApiFailure(error));
         setState("error");
       }
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [query, reloadKey]);
+  }, [query, scope, reloadKey]);
 
   const loadMore = useCallback(async () => {
     if (!cursor || loadingMore) return;
@@ -105,6 +116,7 @@ export function AgentsDirectory() {
     try {
       const page = await api.agents.list({
         q: query.trim() || undefined,
+        scope,
         cursor,
       });
       setItems((prev) => dedupeById([...prev, ...page.items]));
@@ -114,7 +126,7 @@ export function AgentsDirectory() {
     } finally {
       setLoadingMore(false);
     }
-  }, [cursor, loadingMore, query]);
+  }, [cursor, loadingMore, query, scope]);
 
   const trimmedQuery = query.trim();
 
@@ -150,17 +162,45 @@ export function AgentsDirectory() {
         </div>
       </div>
 
-      <div className="relative mt-8 max-w-sm">
-        <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-faint">
-          <SearchIcon />
-        </span>
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search agents…"
-          aria-label="Search agents"
-          className="w-full rounded-lg border border-edge bg-raised py-2 pl-9 pr-3 text-sm text-foreground placeholder:text-faint transition-colors focus:border-accent/60 focus:outline-none"
-        />
+      <div className="mt-8 flex flex-wrap items-center gap-3">
+        <div
+          role="group"
+          aria-label="Directory scope"
+          className="flex shrink-0 overflow-hidden rounded-lg border border-edge"
+        >
+          {(
+            [
+              ["mine", "My agents"],
+              ["public", "All agents"],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={scope === value}
+              onClick={() => setScope(value)}
+              className={`px-3 py-2 text-sm transition-colors ${
+                scope === value
+                  ? "bg-accent/15 text-accent-soft"
+                  : "bg-raised text-muted hover:text-foreground"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="relative w-full max-w-sm">
+          <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-faint">
+            <SearchIcon />
+          </span>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={scope === "mine" ? "Search your agents…" : "Search agents…"}
+            aria-label="Search agents"
+            className="w-full rounded-lg border border-edge bg-raised py-2 pl-9 pr-3 text-sm text-foreground placeholder:text-faint transition-colors focus:border-accent/60 focus:outline-none"
+          />
+        </div>
       </div>
 
       {state === "loading" ? (
@@ -194,15 +234,34 @@ export function AgentsDirectory() {
           title={
             trimmedQuery
               ? `No agents match “${trimmedQuery}”`
-              : "No agents yet"
+              : scope === "mine"
+                ? "You don't have an agent yet"
+                : "No agents yet"
           }
           hint={
             trimmedQuery
-              ? "Try a different name or handle."
-              : "Be the first — create an agent and give it a persona."
+              ? scope === "mine"
+                ? "Try a different name — or browse all public agents."
+                : "Try a different name or handle."
+              : scope === "mine"
+                ? "Adopt one: start from a template, or let the builder interview you and shape it with you."
+                : "Be the first — create an agent and give it a persona."
           }
           action={
-            trimmedQuery ? undefined : (
+            trimmedQuery ? undefined : scope === "mine" ? (
+              <span className="flex flex-wrap justify-center gap-2">
+                <Link href="/agents/new" className={primaryButtonClass}>
+                  Create agent
+                </Link>
+                <button
+                  type="button"
+                  onClick={() => setScope("public")}
+                  className={quietButtonClass}
+                >
+                  Browse all agents
+                </button>
+              </span>
+            ) : (
               <Link href="/agents/new" className={quietButtonClass}>
                 Create agent
               </Link>

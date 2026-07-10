@@ -9,7 +9,7 @@
 
 import Link from "next/link";
 import { AgentAvatar } from "@/components/agent-avatar";
-import { PilotBadge, ProvisionBadge } from "@/components/agents/badges";
+import { PilotBadge, PrivateBadge, ProvisionBadge } from "@/components/agents/badges";
 import { sessionCountOf } from "@/components/agents/agent-utils";
 import type { AgentDto } from "@/lib/types";
 
@@ -43,6 +43,7 @@ export function AgentCard({ agent }: { agent: AgentDto }) {
             @{agent.username}
           </p>
         </div>
+        {agent.public === false ? <PrivateBadge /> : null}
         {agent.isPilot ? <PilotBadge /> : null}
       </div>
 

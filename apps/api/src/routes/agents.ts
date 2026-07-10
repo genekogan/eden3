@@ -46,8 +46,10 @@ import {
 /**
  * Agents API.
  *
- *   GET    /agents            — public directory (search, keyset pagination,
- *                               creation/session counts, is_pilot flag)
+ *   GET    /agents            — directory (search, keyset pagination,
+ *                               creation/session counts, is_pilot flag);
+ *                               ?scope=mine lists the viewer's own agents
+ *                               including private ones (auth required)
  *   GET    /agents/:username  — profile: account+agent join + recent creations
  *   POST   /agents            — create + provision on the OpenClaw gateway
  *   PATCH  /agents/:username  — owner-only persona/name edit + hot re-render
@@ -59,6 +61,9 @@ import {
 
 const directoryQuerySchema = feedQuerySchema.extend({
   q: z.string().trim().max(200).optional(),
+  // "public" (default) = the browsable directory of public agents.
+  // "mine" = the viewer's own agents, INCLUDING private ones — requires auth.
+  scope: z.enum(['public', 'mine']).default('public'),
 });
 
 const usernameParamsSchema = z.object({ username: z.string().trim().min(1).max(200) });
@@ -102,6 +107,9 @@ const patchBodySchema = z
     model: agentModelSchema.optional(),
     thinkingLevel: agentThinkingLevelSchema.optional(),
     toolGroups: agentToolGroupsSchema.optional(),
+    // Owner-controlled visibility: private agents vanish from every public
+    // surface and 404 for non-owners (UX-1, decided 2026-07-09).
+    public: z.boolean().optional(),
   })
   .strict()
   .refine((body) => Object.keys(body).length > 0, { message: 'no fields to update' });
@@ -286,12 +294,16 @@ async function nativeAgentQuotaError(viewer: AuthSession): Promise<{
 }
 
 export const agentsRoutes: FastifyPluginAsync = async (app) => {
-  // ---- GET /agents — public directory ------------------------------------
-  app.get('/', async (req) => {
-    const { q, cursor, limit } = directoryQuerySchema.parse(req.query);
+  // ---- GET /agents — directory (public, or scope=mine for own agents) -----
+  app.get('/', async (req, reply) => {
+    const { q, cursor, limit, scope } = directoryQuerySchema.parse(req.query);
     const after = parseCursorParam(cursor);
     const pattern = q !== undefined && q !== '' ? `%${escapeLike(q)}%` : null;
     const viewerId = req.account?.accountId ?? null;
+
+    if (scope === 'mine' && viewerId === null) {
+      return sendError(reply, 401, 'auth_required', 'Sign in to see your own agents');
+    }
 
     // `nulls last` matches the index direction (created_at is NOT NULL, so
     // semantics are unchanged — but the planner needs the exact sort order).
@@ -314,7 +326,14 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
       from accounts a
       join agents g on g.account_id = a.id
       where a.deleted = false
-        and g.public = true
+        ${
+          scope === 'mine'
+            ? // Owned agents plus the agent-self case (an agent account viewing
+              // itself), mirroring canManage(). Private rows are included — the
+              // viewer owns them.
+              pg`and (g.owner_id = ${viewerId} or a.id = ${viewerId})`
+            : pg`and g.public = true`
+        }
         ${pattern !== null ? pg`and (a.username ilike ${pattern} or g.name ilike ${pattern})` : pg``}
         ${
           after !== null
@@ -327,7 +346,9 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
     `;
 
     const items = rows.slice(0, limit).map((row) => ({
-      ...agentDtoFromRow(row, { includePersona: row.is_persona_public }),
+      // In mine scope the viewer manages every returned row, so private
+      // persona text is theirs to see (mirrors the profile route's gate).
+      ...agentDtoFromRow(row, { includePersona: scope === 'mine' || row.is_persona_public }),
       creationCount: row.creation_count,
       sessionCount: row.session_count,
     }));
@@ -808,6 +829,7 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
           ...(body.model !== undefined ? { model: body.model } : {}),
           ...(body.thinkingLevel !== undefined ? { thinkingLevel: body.thinkingLevel } : {}),
           ...(body.toolGroups !== undefined ? { toolGroups: body.toolGroups } : {}),
+          ...(body.public !== undefined ? { public: body.public } : {}),
         })
         .where(eq(agents.accountId, account.id))
         .returning();

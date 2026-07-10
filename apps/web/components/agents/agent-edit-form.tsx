@@ -51,6 +51,7 @@ type Fields = {
   model: string;
   thinkingLevel: string;
   toolGroups: string[];
+  public: boolean;
 };
 type EditableKey = keyof Fields;
 
@@ -64,6 +65,7 @@ function fieldsOf(agent: AgentDto): Fields {
     model: normalizeAgentModel(agent.model),
     thinkingLevel: normalizeThinkingLevel(agent.thinkingLevel),
     toolGroups: normalizeToolGroups(agent.toolGroups),
+    public: agent.public !== false,
   };
 }
 
@@ -79,6 +81,7 @@ function diff(baseline: Fields, current: Fields): AgentUpdateInput {
   if (JSON.stringify(current.toolGroups) !== JSON.stringify(baseline.toolGroups)) {
     patch.toolGroups = current.toolGroups;
   }
+  if (current.public !== baseline.public) patch.public = current.public;
   return patch;
 }
 
@@ -114,6 +117,7 @@ export function AgentEditForm({ username }: { username: string }) {
     model: normalizeAgentModel(null),
     thinkingLevel: normalizeThinkingLevel(null),
     toolGroups: normalizeToolGroups(null),
+    public: true,
   });
   const baseline = useRef<Fields>(fields);
   const [saving, setSaving] = useState(false);
@@ -366,6 +370,27 @@ export function AgentEditForm({ username }: { username: string }) {
           disabled={saving}
           hint="The system prompt — voice, temperament, obsessions, boundaries."
         />
+
+        <label className="flex items-start gap-3 rounded-lg border border-edge bg-raised/40 p-4">
+          <input
+            type="checkbox"
+            className="mt-1 h-4 w-4 accent-accent"
+            checked={fields.public}
+            disabled={saving}
+            onChange={(event) =>
+              setFields((prev) => ({ ...prev, public: event.target.checked }))
+            }
+          />
+          <span className="min-w-0">
+            <span className="block text-sm text-foreground">
+              Listed publicly
+            </span>
+            <span className="block text-xs text-faint">
+              Public agents appear in the directory and their profile is open to
+              everyone. Private agents are visible only to you.
+            </span>
+          </span>
+        </label>
 
         <details className="rounded-lg border border-edge bg-raised/40 p-4">
           <summary className="cursor-pointer text-sm text-foreground">

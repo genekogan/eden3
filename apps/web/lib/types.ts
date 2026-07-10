@@ -334,8 +334,8 @@ export interface AgentCreateInput {
   toolGroups?: string[];
 }
 
-/** PATCH /api/agents/:username */
-export type AgentUpdateInput = Partial<AgentCreateInput>;
+/** PATCH /api/agents/:username — create fields plus owner-only visibility. */
+export type AgentUpdateInput = Partial<AgentCreateInput> & { public?: boolean };
 
 export interface CollectionCreateInput {
   name: string;

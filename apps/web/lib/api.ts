@@ -484,9 +484,9 @@ export const api = {
   },
 
   agents: {
-    /** GET /api/agents?q&cursor */
+    /** GET /api/agents?q&cursor&scope — scope "mine" lists the viewer's own agents (incl. private) */
     async list(
-      params: { q?: string; cursor?: string } = {},
+      params: { q?: string; cursor?: string; scope?: "public" | "mine" } = {},
     ): Promise<Paginated<AgentDto>> {
       return toPaginated<AgentDto>(
         await get<unknown>(`/agents${qs(params)}`),
