@@ -70,12 +70,16 @@ function makeScheduler(opts: {
   now?: () => Date;
   cleanupGatewayJobs?: () => Promise<{ removed: number }>;
   intervalMs?: number;
+  reapStaleRunningMs?: number;
 }): TaskScheduler {
   return new TaskScheduler({
     runTask: opts.runTask ?? (async () => {}),
     intervalMs: opts.intervalMs ?? 0,
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.cleanupGatewayJobs ? { cleanupGatewayJobs: opts.cleanupGatewayJobs } : {}),
+    ...(opts.reapStaleRunningMs !== undefined
+      ? { reapStaleRunningMs: opts.reapStaleRunningMs }
+      : {}),
     restrictToTriggerIds: fixtureTriggerIds,
   });
 }
@@ -326,6 +330,55 @@ describe('TaskScheduler.tick', () => {
     release();
     const firstResult = await first;
     expect(firstResult.outcomes.find((o) => o.triggerId === id)?.outcome).toBe('fired');
+  });
+
+  it('reaps a task stranded in running (api crash mid-run) and re-fires it', async () => {
+    // Simulate the strand: status='running', updated_at old, next_scheduled_run
+    // still the pre-fire (past) value — exactly what a crash between the
+    // active→running claim and the next-run stamp leaves behind.
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+      status: 'running',
+    });
+    await pg`update triggers set updated_at = now() - interval '30 minutes' where id = ${id}`;
+
+    const fired: string[] = [];
+    const scheduler = makeScheduler({
+      runTask: async (trigger) => {
+        fired.push(trigger.id);
+      },
+      reapStaleRunningMs: 15 * 60 * 1000,
+    });
+
+    const { outcomes } = await scheduler.tick();
+    // Reaped to active, then fired in the same tick.
+    expect(fired).toContain(id);
+    expect(outcomes.find((o) => o.triggerId === id)?.outcome).toBe('fired');
+    const row = await readTrigger(id);
+    expect(row.status).toBe('active');
+  });
+
+  it('does NOT reap a task that is legitimately mid-run (recently updated)', async () => {
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+      status: 'running',
+    });
+    // updated_at is fresh (just inserted) → within the reap window.
+    const fired: string[] = [];
+    const scheduler = makeScheduler({
+      runTask: async (trigger) => {
+        fired.push(trigger.id);
+      },
+      reapStaleRunningMs: 15 * 60 * 1000,
+    });
+
+    await scheduler.tick();
+    expect(fired).not.toContain(id);
+    const row = await readTrigger(id);
+    expect(row.status).toBe('running'); // left alone
+    await pg`update triggers set status = 'paused' where id = ${id}`; // clear for later ticks
   });
 });
 

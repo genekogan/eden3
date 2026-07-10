@@ -68,6 +68,13 @@ export interface TaskSchedulerOptions {
   intervalMs: number;
   /** Missed-fire grace window (default 6h). */
   graceMs?: number;
+  /**
+   * Reap tasks stuck in `running` longer than this (default 15m — longer than
+   * any turn timeout) back to `active`, so a task stranded by an api
+   * crash/kill between the claim and the next-run stamp fires again instead
+   * of being lost forever.
+   */
+  reapStaleRunningMs?: number;
   /** Injectable clock (tests). */
   now?: () => Date;
   /**
@@ -91,6 +98,7 @@ export class TaskScheduler {
   private readonly runTask: (trigger: Trigger) => Promise<unknown>;
   private readonly intervalMs: number;
   private readonly graceMs: number;
+  private readonly reapStaleRunningMs: number;
   private readonly now: () => Date;
   private readonly cleanupGatewayJobs: (() => Promise<{ removed: number }>) | null;
   private readonly log: SchedulerLogger | null;
@@ -103,6 +111,7 @@ export class TaskScheduler {
     this.runTask = options.runTask;
     this.intervalMs = options.intervalMs;
     this.graceMs = options.graceMs ?? 6 * 60 * 60 * 1000;
+    this.reapStaleRunningMs = options.reapStaleRunningMs ?? 15 * 60 * 1000;
     this.now = options.now ?? (() => new Date());
     this.cleanupGatewayJobs = options.cleanupGatewayJobs ?? null;
     this.log = options.logger ?? null;
@@ -150,6 +159,7 @@ export class TaskScheduler {
    */
   async tick(): Promise<TickResult> {
     const now = this.now();
+    await this.reapStaleRunning(now);
     const due = await db
       .select()
       .from(triggers)
@@ -171,6 +181,39 @@ export class TaskScheduler {
       due.map(async (row) => ({ triggerId: row.id, outcome: await this.processDue(row) })),
     );
     return { outcomes };
+  }
+
+  /**
+   * Reclaim tasks stranded in `running` (an api crash/kill between the
+   * atomic active→running claim and the next-run stamp). Only rows not
+   * touched for `reapStaleRunningMs` — longer than any turn — are reset to
+   * `active`; their next_scheduled_run is still the pre-fire (past) value, so
+   * the normal tick then re-fires or skip-forwards them. Not deleted/finished
+   * rows. Excluded from `restrictToTriggerIds` test scoping.
+   */
+  private async reapStaleRunning(now: Date): Promise<void> {
+    if (this.restrictToTriggerIds !== null && this.restrictToTriggerIds.length === 0) return;
+    const cutoff = new Date(now.getTime() - this.reapStaleRunningMs);
+    const reaped = await db
+      .update(triggers)
+      .set({ status: 'active', updatedAt: now })
+      .where(
+        and(
+          eq(triggers.status, 'running'),
+          eq(triggers.deleted, false),
+          lte(triggers.updatedAt, cutoff),
+          ...(this.restrictToTriggerIds !== null
+            ? [inArray(triggers.id, this.restrictToTriggerIds)]
+            : []),
+        ),
+      )
+      .returning({ id: triggers.id });
+    if (reaped.length > 0) {
+      this.log?.warn(
+        { count: reaped.length, triggerIds: reaped.map((r) => r.id) },
+        'task-scheduler: reclaimed stale running tasks (likely an api restart mid-run)',
+      );
+    }
   }
 
   private async processDue(row: Trigger): Promise<ProcessOutcome> {

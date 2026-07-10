@@ -363,6 +363,39 @@ describe('debit dailyCap (Q7 per-day ceiling, race-free)', () => {
     });
     expect(replay.alreadyApplied).toBe(true);
   });
+
+  it('CONCURRENT same-key replay at the cap edge returns the tx, never a spurious 429', async () => {
+    // The debit amount alone fits the cap, but two concurrent debits with the
+    // SAME key must collapse to one applied charge — the loser of the lock
+    // race must re-read the key and return alreadyApplied, NOT throw
+    // DailyCapExceededError because the winner's spend now fills the cap.
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+    const key = `cap-${randomUUID()}`;
+
+    const results = await Promise.allSettled(
+      Array.from({ length: 4 }, () =>
+        debit({
+          accountId,
+          amount: 300,
+          type: 'spend:image',
+          idempotencyKey: key,
+          dailyCap: { limit: 300 },
+        }),
+      ),
+    );
+
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    expect(fulfilled).toHaveLength(4); // none threw
+    const applied = fulfilled.filter(
+      (r) => !(r as PromiseFulfilledResult<{ alreadyApplied: boolean }>).value.alreadyApplied,
+    );
+    expect(applied).toHaveLength(1); // exactly one real charge
+    // Exactly one ledger row for the key; only 300 spent.
+    const rows = (await ledgerRowsFor(accountId)).filter((r) => r.idempotencyKey === key);
+    expect(rows).toHaveLength(1);
+    expect((await getBalance(accountId)).total).toBe(700);
+  });
 });
 
 describe('refund', () => {

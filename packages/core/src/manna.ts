@@ -304,6 +304,19 @@ export async function debit(params: DebitParams): Promise<LedgerResult> {
         await tx.execute(
           sql`select pg_advisory_xact_lock(hashtextextended(${params.accountId}::text, 42))`,
         );
+        // Re-check idempotency INSIDE the lock: a concurrent replay of the
+        // same key that lost the lock race must return the winner's result,
+        // not a spurious DailyCapExceededError once the winner's spend is
+        // counted below. (Belt-and-suspenders — current callers use fresh
+        // keys, but this keeps the debit() contract correct under replay.)
+        const applied = await findTransactionByKey(tx, params.idempotencyKey);
+        if (applied) {
+          return {
+            transaction: applied,
+            balance: await getBalance(params.accountId, { db: tx }),
+            alreadyApplied: true,
+          };
+        }
         const spentToday = await netSpendSince(
           params.accountId,
           startOfUtcDay(params.dailyCap.now ?? new Date()),
