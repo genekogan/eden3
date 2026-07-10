@@ -19,6 +19,7 @@
 
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { useCallback, useState } from "react";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { MediaFull } from "@/components/media";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
@@ -78,16 +79,88 @@ function TypingDots() {
   );
 }
 
-/** Left column: agent avatar + name/time meta + content. */
+/** Copy the message text to the clipboard, flashing a check for feedback. */
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const onCopy = useCallback(() => {
+    if (!navigator.clipboard) return;
+    void navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      })
+      .catch(() => {});
+  }, [text]);
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      aria-label={copied ? "Copied" : "Copy message"}
+      title={copied ? "Copied" : "Copy message"}
+      className="inline-flex items-center rounded transition-colors hover:text-muted"
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={1.75}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+        className="size-3"
+      >
+        {copied ? (
+          <path d="M20 6 9 17l-5-5" />
+        ) : (
+          <>
+            <rect x="9" y="9" width="11" height="11" rx="2" />
+            <path d="M5 15a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2" />
+          </>
+        )}
+      </svg>
+    </button>
+  );
+}
+
+/**
+ * Subtle hover meta beneath a text bubble: relative time + (optional) copy.
+ * Muted, hidden until the row is hovered or the copy button is focused.
+ * The parent row must be a `group`.
+ */
+function MessageMeta({
+  at,
+  copyText,
+  align = "left",
+}: {
+  at?: string;
+  copyText?: string;
+  align?: "left" | "right";
+}) {
+  if (!at && !copyText) return null;
+  return (
+    <div
+      className={`mt-1 flex items-center gap-2 text-faint opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 ${
+        align === "right" ? "justify-end" : ""
+      }`}
+    >
+      {at ? (
+        <span className="text-[11px]" title={formatDateTime(at)}>
+          {formatRelativeTime(at)}
+        </span>
+      ) : null}
+      {copyText ? <CopyButton text={copyText} /> : null}
+    </div>
+  );
+}
+
+/** Left column: agent avatar + name + content. */
 function AgentRow({
   sender,
-  meta,
   showAvatar = true,
   children,
 }: {
   sender: AccountSummary | null;
-  /** Right side of the name line (usually a timestamp). */
-  meta?: string;
   showAvatar?: boolean;
   children: ReactNode;
 }) {
@@ -106,15 +179,10 @@ function AgentRow({
       </div>
       <div className="min-w-0 flex-1">
         {showAvatar ? (
-          <p className="mb-1 flex items-baseline gap-2 text-xs">
+          <p className="mb-1 text-xs">
             <span className="font-medium text-muted">
               {sender?.username ?? "agent"}
             </span>
-            {meta ? (
-              <span className="text-faint opacity-0 transition-opacity group-hover:opacity-100">
-                {meta}
-              </span>
-            ) : null}
           </p>
         ) : null}
         {children}
@@ -176,12 +244,15 @@ function UserBubble({
   pending?: boolean;
 }) {
   return (
-    <div className="flex justify-end" data-testid="message" data-role="user">
+    <div
+      className="group flex flex-col items-end"
+      data-testid="message"
+      data-role="user"
+    >
       <div
         className={`max-w-[85%] rounded-2xl rounded-br-md border border-accent/20 bg-accent/[0.13] px-4 py-2.5 sm:max-w-[70%] ${
           pending ? "opacity-80" : ""
         }`}
-        {...(at ? { title: formatDateTime(at) } : {})}
       >
         {attachments && attachments.length > 0 ? (
           <AttachmentList attachments={attachments} />
@@ -190,6 +261,7 @@ function UserBubble({
           {content}
         </p>
       </div>
+      <MessageMeta at={at} copyText={content} align="right" />
     </div>
   );
 }
@@ -287,11 +359,7 @@ export function MessageRow({
   const assistantText = stripMediaSentinelLines(message.content ?? "");
   const hasText = assistantText.length > 0;
   return (
-    <AgentRow
-      sender={sender}
-      meta={formatRelativeTime(message.createdAt)}
-      showAvatar={showAvatar}
-    >
+    <AgentRow sender={sender} showAvatar={showAvatar}>
       {hasText ? <Markdown text={assistantText} /> : null}
       {message.toolCalls && message.toolCalls.length > 0 ? (
         <ToolCallDisclosure
@@ -300,6 +368,10 @@ export function MessageRow({
         />
       ) : null}
       <AttachmentList attachments={message.attachments} />
+      <MessageMeta
+        at={message.createdAt}
+        copyText={hasText ? assistantText : undefined}
+      />
     </AgentRow>
   );
 }
