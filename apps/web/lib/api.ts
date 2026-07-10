@@ -44,6 +44,10 @@ import type {
   CollectionDetail,
   CollectionCreateInput,
   CollectionDto,
+  ConceptCreateInput,
+  ConceptDto,
+  ConceptImageUploadInput,
+  ConceptUpdateInput,
   CreationDto,
   DevUser,
   MannaSummary,
@@ -625,6 +629,87 @@ export const api = {
       return toPaginated<CollectionDto>(
         await get<unknown>(`/users/${enc(username)}/collections`),
         "collections",
+      );
+    },
+  },
+
+  concepts: {
+    /** GET /api/agents/:username/concepts — visible to anyone who can see the agent. */
+    async list(username: string): Promise<ConceptDto[]> {
+      return toPaginated<ConceptDto>(
+        await get<unknown>(`/agents/${enc(username)}/concepts`),
+        "concepts",
+      ).items;
+    },
+
+    /** POST /api/agents/:username/concepts (owner; 20-per-agent cap → 429). */
+    async create(username: string, input: ConceptCreateInput): Promise<ConceptDto> {
+      return unwrap<ConceptDto>(
+        await post<unknown>(`/agents/${enc(username)}/concepts`, input),
+        "concept",
+      );
+    },
+
+    /** PATCH /api/agents/:username/concepts/:slug */
+    async update(
+      username: string,
+      slug: string,
+      input: ConceptUpdateInput,
+    ): Promise<ConceptDto> {
+      return unwrap<ConceptDto>(
+        await patch<unknown>(`/agents/${enc(username)}/concepts/${enc(slug)}`, input),
+        "concept",
+      );
+    },
+
+    /** DELETE /api/agents/:username/concepts/:slug (soft-delete). */
+    remove(username: string, slug: string): Promise<{ ok: true }> {
+      return apiFetch<{ ok: true }>(`/agents/${enc(username)}/concepts/${enc(slug)}`, {
+        method: "DELETE",
+      });
+    },
+
+    /** POST /api/agents/:username/concepts/:slug/images (png/jpeg/webp ≤ 8MB, max 8). */
+    async uploadImage(
+      username: string,
+      slug: string,
+      input: ConceptImageUploadInput,
+    ): Promise<ConceptDto> {
+      return unwrap<ConceptDto>(
+        await post<unknown>(
+          `/agents/${enc(username)}/concepts/${enc(slug)}/images`,
+          input,
+        ),
+        "concept",
+      );
+    },
+
+    /** PATCH .../images {imageIds} — reorder (exact permutation of current ids). */
+    async reorderImages(
+      username: string,
+      slug: string,
+      imageIds: string[],
+    ): Promise<ConceptDto> {
+      return unwrap<ConceptDto>(
+        await patch<unknown>(`/agents/${enc(username)}/concepts/${enc(slug)}/images`, {
+          imageIds,
+        }),
+        "concept",
+      );
+    },
+
+    /** DELETE .../images/:imageId */
+    async removeImage(
+      username: string,
+      slug: string,
+      imageId: string,
+    ): Promise<ConceptDto> {
+      return unwrap<ConceptDto>(
+        await apiFetch<unknown>(
+          `/agents/${enc(username)}/concepts/${enc(slug)}/images/${enc(imageId)}`,
+          { method: "DELETE" },
+        ),
+        "concept",
       );
     },
   },
