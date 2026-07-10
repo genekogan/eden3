@@ -19,14 +19,19 @@ loadRootEnv();
  * (docker eden3-openclaw, http://127.0.0.1:18789) and live Postgres.
  *
  * POST /agents provisions a REAL throwaway agent (random id, model haiku) and
- * verifies workspace render + routability; PATCH hot-re-renders SOUL.md;
- * POST/PATCH /tasks round-trip a REAL gateway cron job. Everything created is
- * torn down in afterAll (cron job, agent registration, workspace, db rows).
+ * verifies workspace render + routability; PATCH hot-re-renders SOUL.md.
  *
- * Cron write ops need the container CLI device to hold the `operator.admin`
- * scope; when the gateway reports a pending scope upgrade, cron-dependent
- * assertions SKIP with the unblock command (same policy as the gateway
- * package's provisioner.itest.ts).
+ * Tasks: scheduled firing is EDEN3-SIDE now (services/task-scheduler.ts), so
+ * the gateway must hold NO `eden3:<id>` cron job at any point — create only
+ * ensures removal of stale jobs, and pause/resume/delete keep the gateway
+ * clean. These assertions verify the retirement against the real gateway.
+ * Everything created is torn down in afterAll (agent registration,
+ * workspace, db rows).
+ *
+ * Cron ops (list/rm) need the container CLI device to hold the
+ * `operator.admin` scope; when the gateway reports a pending scope upgrade,
+ * cron-dependent assertions SKIP with the unblock command (same policy as
+ * the gateway package's provisioner.itest.ts).
  */
 
 const BASE_URL = (process.env.OPENCLAW_BASE_URL ?? 'http://127.0.0.1:18789').replace(/\/+$/, '');
@@ -41,6 +46,7 @@ const SCOPE_BLOCK_RE = /scope upgrade|pairing required|operator\.admin/i;
 let app: FastifyInstance;
 let userId = '';
 let taskId = '';
+let legacyTriggerId = '';
 
 const cli = new OpenClawCli();
 const cronSync = new CronSync({ cli });
@@ -60,6 +66,9 @@ afterAll(async () => {
   // Best-effort teardown, most-dependent first. Failures must not mask results.
   if (taskId !== '') {
     await cronSync.removeTrigger(taskId).catch(() => {});
+  }
+  if (legacyTriggerId !== '') {
+    await cronSync.removeTrigger(legacyTriggerId).catch(() => {});
   }
   await cli.execJson(['agents', 'delete', agentUsername, '--force']).catch(() => {});
   await cli.execJson(['agents', 'delete', importedAgentUsername, '--force']).catch(() => {});
@@ -195,8 +204,8 @@ describe('POST /agents (live gateway provisioning)', () => {
   }, 120_000);
 });
 
-describe('POST/PATCH /tasks (live gateway cron)', () => {
-  it('creates a trigger and reconciles a real cron job, then removes it', async (ctx) => {
+describe('POST/PATCH /tasks (gateway cron retired — must stay clean)', () => {
+  it('creates a trigger with NO gateway cron job; pause/resume/delete keep it absent', async (ctx) => {
     const res = await app.inject({
       method: 'POST',
       url: '/tasks',
@@ -212,6 +221,9 @@ describe('POST/PATCH /tasks (live gateway cron)', () => {
     const { task } = res.json() as { task: TriggerDto };
     taskId = task.id;
     expect(task.status).toBe('active');
+    // Eden3-side scheduling is stamped regardless of gateway health.
+    expect(task.nextScheduledRun).not.toBeNull();
+    expect(Date.parse(task.nextScheduledRun!)).toBeGreaterThan(Date.now());
 
     const [row] = await pg<{ openclaw_job_id: string | null; last_error: string | null }[]>`
       select openclaw_job_id, last_error from triggers where id = ${task.id}
@@ -228,13 +240,14 @@ describe('POST/PATCH /tasks (live gateway cron)', () => {
       return;
     }
     expect(row!.last_error).toBeNull();
-    expect(row!.openclaw_job_id).toBeTruthy();
+    expect(row!.openclaw_job_id).toBeNull();
 
-    // The job is live on the gateway under the eden3: name.
+    // The gateway holds NO job for this trigger — firing is eden3-side, and
+    // a gateway job would double-fire (unmetered).
     const names = (await cronSync.listEdenJobs()).map((j) => j.name);
-    expect(names).toContain(`eden3:${task.id}`);
+    expect(names).not.toContain(`eden3:${task.id}`);
 
-    // Pause -> job removed from the gateway.
+    // Pause -> still absent.
     const paused = await app.inject({
       method: 'PATCH',
       url: `/tasks/${task.id}`,
@@ -242,11 +255,13 @@ describe('POST/PATCH /tasks (live gateway cron)', () => {
       payload: { status: 'paused' },
     });
     expect(paused.statusCode).toBe(200);
-    expect((paused.json() as { task: TriggerDto }).task.status).toBe('paused');
+    const pausedTask = (paused.json() as { task: TriggerDto }).task;
+    expect(pausedTask.status).toBe('paused');
+    expect(pausedTask.nextScheduledRun).toBeNull();
     const afterPause = (await cronSync.listEdenJobs()).map((j) => j.name);
     expect(afterPause).not.toContain(`eden3:${task.id}`);
 
-    // Resume -> job re-added; delete -> removed again.
+    // Resume -> next run recomputed eden3-side, gateway still clean.
     const resumed = await app.inject({
       method: 'PATCH',
       url: `/tasks/${task.id}`,
@@ -254,8 +269,10 @@ describe('POST/PATCH /tasks (live gateway cron)', () => {
       payload: { status: 'active' },
     });
     expect(resumed.statusCode).toBe(200);
+    const resumedTask = (resumed.json() as { task: TriggerDto }).task;
+    expect(resumedTask.nextScheduledRun).not.toBeNull();
     const afterResume = (await cronSync.listEdenJobs()).map((j) => j.name);
-    expect(afterResume).toContain(`eden3:${task.id}`);
+    expect(afterResume).not.toContain(`eden3:${task.id}`);
 
     const deleted = await app.inject({
       method: 'PATCH',
@@ -267,4 +284,33 @@ describe('POST/PATCH /tasks (live gateway cron)', () => {
     const afterDelete = (await cronSync.listEdenJobs()).map((j) => j.name);
     expect(afterDelete).not.toContain(`eden3:${task.id}`);
   }, 180_000);
+
+  it('removeAllEden3Jobs sweeps a manually planted legacy job (boot cleanup path)', async (ctx) => {
+    // Plant a legacy-style job the way the retired sync used to, then prove
+    // the scheduler's boot sweep removes it.
+    legacyTriggerId = `legacy-${randomUUID().slice(0, 8)}`;
+    try {
+      await cronSync.syncTrigger({
+        triggerId: legacyTriggerId,
+        openclawAgentId: agentUsername,
+        cronExpr: '0 5 * * *',
+        tz: 'UTC',
+        prompt: 'legacy planted job (safe to delete)',
+        enabled: true,
+      });
+    } catch (err) {
+      if (SCOPE_BLOCK_RE.test(err instanceof Error ? err.message : String(err))) {
+        console.warn('[agents-tasks.itest] SKIPPED legacy-sweep assertions: scope upgrade pending');
+        ctx.skip();
+        return;
+      }
+      throw err;
+    }
+    const planted = (await cronSync.listEdenJobs()).map((j) => j.name);
+    expect(planted).toContain(`eden3:${legacyTriggerId}`);
+
+    await cronSync.removeAllEden3Jobs();
+    const swept = (await cronSync.listEdenJobs()).map((j) => j.name);
+    expect(swept).not.toContain(`eden3:${legacyTriggerId}`);
+  }, 120_000);
 });
