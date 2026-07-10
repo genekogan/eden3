@@ -16,6 +16,8 @@ const expectedTables = {
   agent_likes: schema.agentLikes,
   collections: schema.collections,
   collection_creations: schema.collectionCreations,
+  concepts: schema.concepts,
+  concept_images: schema.conceptImages,
   manna_accounts: schema.mannaAccounts,
   manna_transactions: schema.mannaTransactions,
   usage_events: schema.usageEvents,
