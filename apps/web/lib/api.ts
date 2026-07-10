@@ -695,6 +695,18 @@ export const api = {
       );
     },
 
+    /** POST /api/channels/connections/:id/activate — wire the runtime (Discord first). */
+    activate(
+      id: string,
+      input: { allowFrom: string[] },
+    ): Promise<{
+      ok: boolean;
+      connection: ChannelConnectionDto;
+      runtime: { boundAgent: string; allowFrom: string[]; tokenEnvVar: string };
+    }> {
+      return post(`/channels/connections/${enc(id)}/activate`, input);
+    },
+
     /** DELETE /api/channels/connections/:id. */
     delete(id: string): Promise<{ ok: true }> {
       return apiFetch<{ ok: true }>(`/channels/connections/${enc(id)}`, {

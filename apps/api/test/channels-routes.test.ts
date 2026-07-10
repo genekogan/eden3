@@ -22,7 +22,16 @@ const vault = new AesGcmSecretVault({ key: randomBytes(32).toString('base64') })
 let ownerId = '';
 let strangerId = '';
 let agentId = '';
+let provisionedAgentUsername = '';
 let app: FastifyInstance;
+
+const channelSyncCalls: Array<{ tokenEnvVar: string; allowFrom: string[]; bindAgentId?: string }> = [];
+const fakeChannelSync = {
+  async ensureDiscordChannel(opts: { tokenEnvVar: string; allowFrom: string[]; bindAgentId?: string }) {
+    channelSyncCalls.push(opts);
+    return { changed: true };
+  },
+};
 
 interface ConnectionDto {
   id: string;
@@ -47,7 +56,13 @@ beforeAll(async () => {
   ownerId = await insertUserAccount(`${marker}_owner`);
   strangerId = await insertUserAccount(`${marker}_stranger`);
   agentId = await insertAgentAccount(`${marker}_agent`, { ownerId, public: true });
-  app = await buildServer({ gateway: null, channels: { vault } });
+  provisionedAgentUsername = `${marker}_live`.replace(/_/g, '-');
+  await insertAgentAccount(provisionedAgentUsername, {
+    ownerId,
+    public: true,
+    openclawId: provisionedAgentUsername,
+  });
+  app = await buildServer({ gateway: null, channels: { vault, channelSync: fakeChannelSync } });
   await app.ready();
 });
 
@@ -276,5 +291,124 @@ describe('channel connections', () => {
       },
     });
     expect(forbidden.statusCode).toBe(403);
+  });
+});
+
+describe('channel activation (runtime wiring)', () => {
+  async function createDiscordConnection(token: string, agentUsername?: string): Promise<ConnectionDto> {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/channels/connections',
+      headers: { cookie: devCookie(ownerId) },
+      payload: {
+        channel: 'discord',
+        token,
+        label: `${marker} activation`,
+        ...(agentUsername ? { agentUsername } : {}),
+      },
+    });
+    expect(res.statusCode).toBe(201);
+    return (res.json() as { connection: ConnectionDto }).connection;
+  }
+
+  it('activates a discord connection: syncs runtime config, flips status, audits', async () => {
+    const token = `discord_${marker}_runtime`;
+    const restore = withEnv('DISCORD_BOT_TOKEN', token);
+    try {
+      const connection = await createDiscordConnection(token, provisionedAgentUsername);
+      channelSyncCalls.length = 0;
+      const res = await app.inject({
+        method: 'POST',
+        url: `/channels/connections/${connection.id}/activate`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { allowFrom: ['404322488215142410'] },
+      });
+      expect(res.statusCode).toBe(200);
+      const body = res.json() as {
+        ok: boolean;
+        connection: { status: string };
+        runtime: { boundAgent: string; allowFrom: string[]; tokenEnvVar: string };
+      };
+      expect(body.ok).toBe(true);
+      expect(body.connection.status).toBe('active');
+      expect(body.runtime).toEqual({
+        boundAgent: provisionedAgentUsername,
+        allowFrom: ['404322488215142410'],
+        tokenEnvVar: 'DISCORD_BOT_TOKEN',
+      });
+      expect(channelSyncCalls).toEqual([
+        {
+          tokenEnvVar: 'DISCORD_BOT_TOKEN',
+          allowFrom: ['404322488215142410'],
+          bindAgentId: provisionedAgentUsername,
+        },
+      ]);
+      const audits = await pg<{ action: string }[]>`
+        select action from secret_access_audit_events
+        where secret_id = ${connection.id}
+        order by created_at asc
+      `;
+      expect(audits.map((row) => row.action)).toEqual(['store', 'activate']);
+    } finally {
+      restore();
+    }
+  });
+
+  it('409s when the stored token differs from the runtime env token', async () => {
+    const restore = withEnv('DISCORD_BOT_TOKEN', 'the-real-runtime-token');
+    try {
+      const connection = await createDiscordConnection(
+        `discord_${marker}_stale`,
+        provisionedAgentUsername,
+      );
+      channelSyncCalls.length = 0;
+      const res = await app.inject({
+        method: 'POST',
+        url: `/channels/connections/${connection.id}/activate`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { allowFrom: ['404322488215142410'] },
+      });
+      expect(res.statusCode).toBe(409);
+      expect((res.json() as { error: { code: string } }).error.code).toBe('runtime_token_mismatch');
+      expect(channelSyncCalls).toEqual([]);
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects activation without an attached agent, for other channel kinds, and for strangers', async () => {
+    const noAgent = await createDiscordConnection(`discord_${marker}_noagent`);
+    const res = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${noAgent.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { allowFrom: ['404322488215142410'] },
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('channel_agent_required');
+
+    const slackRes = await app.inject({
+      method: 'POST',
+      url: '/channels/connections',
+      headers: { cookie: devCookie(ownerId) },
+      payload: { channel: 'slack', token: 'slack-fixture-token-not-real', agentUsername: provisionedAgentUsername },
+    });
+    expect(slackRes.statusCode).toBe(201);
+    const slack = (slackRes.json() as { connection: ConnectionDto }).connection;
+    const notSupported = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${slack.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { allowFrom: ['404322488215142410'] },
+    });
+    expect(notSupported.statusCode).toBe(501);
+
+    const stranger = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${noAgent.id}/activate`,
+      headers: { cookie: devCookie(strangerId) },
+      payload: { allowFrom: ['404322488215142410'] },
+    });
+    expect(stranger.statusCode).toBe(404);
   });
 });

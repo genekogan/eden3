@@ -105,6 +105,7 @@ export function ChannelsClient() {
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [mockMessages, setMockMessages] = useState<Record<string, string>>({});
+  const [activateIds, setActivateIds] = useState<Record<string, string>>({});
   const [mockResults, setMockResults] = useState<
     Record<string, ChannelMockMessageResult | string>
   >({});
@@ -170,6 +171,29 @@ export function ChannelsClient() {
       setAgentUsername("");
       setToken("");
       setChannel("discord");
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error).hint);
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const activate = async (connection: ChannelConnectionDto) => {
+    const userId = (activateIds[connection.id] ?? "").trim();
+    if (!/^\d{5,25}$/.test(userId)) {
+      setNote("Enter your numeric Discord user ID (Settings → Advanced → Developer Mode → right-click yourself → Copy User ID).");
+      return;
+    }
+    setBusy(`activate:${connection.id}`);
+    try {
+      const result = await api.channels.activate(connection.id, { allowFrom: [userId] });
+      if (!alive.current) return;
+      setConnections((prev) =>
+        prev.map((item) => (item.id === connection.id ? result.connection : item)),
+      );
+      setNote(
+        `Discord runtime wired: DMs from ${userId} route to ${result.runtime.boundAgent}. The gateway needs its ${result.runtime.tokenEnvVar} env set (operator step).`,
+      );
     } catch (error) {
       if (alive.current) setNote(errorCopy(error).hint);
     } finally {
@@ -411,6 +435,35 @@ export function ChannelsClient() {
                         {mockBusy ? "Routing…" : "Test"}
                       </button>
                     </div>
+
+                    {connection.channel === "discord" && connection.agentId ? (
+                      <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+                        <input
+                          value={activateIds[connection.id] ?? ""}
+                          onChange={(event) =>
+                            setActivateIds((prev) => ({
+                              ...prev,
+                              [connection.id]: event.target.value,
+                            }))
+                          }
+                          placeholder="Your Discord user ID (allowlist)"
+                          maxLength={25}
+                          className={inputClass}
+                        />
+                        <button
+                          type="button"
+                          disabled={busy === `activate:${connection.id}`}
+                          onClick={() => void activate(connection)}
+                          className="rounded-lg border border-accent/40 px-3.5 py-2 text-sm text-accent-soft transition-colors hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          {busy === `activate:${connection.id}`
+                            ? "Wiring…"
+                            : connection.status === "active"
+                              ? "Re-activate"
+                              : "Activate"}
+                        </button>
+                      </div>
+                    ) : null}
 
                     {mock ? (
                       <p
