@@ -36,7 +36,6 @@ describe('ensureDiscordChannel', () => {
     expect(config.channels).toEqual({
       discord: {
         enabled: true,
-        token: { source: 'env', id: 'DISCORD_BOT_TOKEN' },
         dmPolicy: 'allowlist',
         allowFrom: ['404322488215142410'],
       },
@@ -47,10 +46,10 @@ describe('ensureDiscordChannel', () => {
         match: { channel: 'discord', peer: { kind: 'dm', id: '404322488215142410' } },
       },
     ]);
-    // The token value never appears in the file — only the env var NAME
-    // (the token key must map to an object ref, not a string).
+    // No token key at all (bare-env fallback; the env-ref shape crash-loops
+    // this OpenClaw release) and no token value anywhere in the file.
     const raw = await fs.readFile(openclawConfigPath(dataDir), 'utf8');
-    expect(raw).not.toMatch(/"token":\s*"/);
+    expect(raw).not.toContain('token');
     // Unrelated keys pass through.
     expect((await readOpenClawConfig(dataDir)).gateway).toEqual({ mode: 'local' });
   });
@@ -85,10 +84,28 @@ describe('ensureDiscordChannel', () => {
     expect(second.changed).toBe(false);
   });
 
-  it('requires at least one allowFrom id', async () => {
+  it('requires at least one allowFrom id and the canonical token env name', async () => {
     await expect(
-      ensureDiscordChannel({ dataDir, tokenEnvVar: 'X', allowFrom: [] }),
+      ensureDiscordChannel({ dataDir, tokenEnvVar: 'DISCORD_BOT_TOKEN', allowFrom: [] }),
     ).rejects.toThrow(ConfigGenError);
+    await expect(
+      ensureDiscordChannel({ dataDir, tokenEnvVar: 'X', allowFrom: ['1234567'] }),
+    ).rejects.toThrow(ConfigGenError);
+  });
+
+  it('strips a leftover token key from the earlier env-ref attempt', async () => {
+    await seedConfig({
+      channels: {
+        discord: { enabled: true, token: { source: 'env', id: 'DISCORD_BOT_TOKEN' } },
+      },
+    });
+    const { config } = await ensureDiscordChannel({
+      dataDir,
+      tokenEnvVar: 'DISCORD_BOT_TOKEN',
+      allowFrom: ['404322488215142410'],
+    });
+    const discord = (config.channels as Record<string, Record<string, unknown>>).discord!;
+    expect('token' in discord).toBe(false);
   });
 });
 

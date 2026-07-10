@@ -13,22 +13,29 @@ import {
  * actually send and receive (the custody rows in Postgres are only the
  * encrypted token record + audit trail).
  *
- * Launch scope: Discord. Token custody for the RUNTIME is env-var-based
- * (`token: { source: 'env', id: <VAR> }` with the variable provided to the
- * gateway container via infra/openclaw/.env) — the plaintext token never
- * lands in openclaw.json. Multi-account per-user runtime tokens need
- * OpenClaw's `accounts` map with per-account env ids; deferred until a
- * second live connection exists.
+ * Launch scope: Discord. Token custody for the RUNTIME is env-var-based:
+ * the gateway container carries DISCORD_BOT_TOKEN (infra/openclaw/.env) and
+ * the channel uses OpenClaw's documented bare-env fallback — NO token key is
+ * written to openclaw.json at all. (Verified live on 2026.6.10: the newer
+ * docs' `token: {source:'env', id}` shape is REJECTED by this release's
+ * schema — allowed sources are string|file|exec — and one invalid key
+ * crash-loops the gateway.) Multi-account per-user runtime tokens need
+ * OpenClaw's `accounts` map; deferred until a second live connection exists.
  *
  * CAUTION (same as config-gen): the gateway validates the config schema
- * strictly — one invalid key rejects the WHOLE file. Only keys documented
- * for the pinned OpenClaw release are written here:
- * `channels.discord.{enabled,token,dmPolicy,allowFrom}` and top-level
+ * strictly — one invalid key rejects the WHOLE file. Only keys verified
+ * valid on the pinned OpenClaw release are written here:
+ * `channels.discord.{enabled,dmPolicy,allowFrom}` and top-level
  * `bindings[]` ({agentId, match:{channel,peer:{kind,id}}}).
  */
 
 export interface DiscordChannelOptions extends ConfigGenOptions {
-  /** Env var name (inside the gateway container) holding the bot token. */
+  /**
+   * Env var name (inside the gateway container) holding the bot token.
+   * Informational on this OpenClaw release: only the documented default
+   * (DISCORD_BOT_TOKEN) is honored via the bare-env fallback, so any other
+   * name is rejected loudly rather than silently not working.
+   */
   tokenEnvVar: string;
   /**
    * Discord user ids allowed to DM the bot (`dmPolicy: "allowlist"`). Keeps
@@ -78,6 +85,11 @@ export async function ensureDiscordChannel(
   if (options.allowFrom.length === 0) {
     throw new ConfigGenError('ensureDiscordChannel: allowFrom must name at least one user id');
   }
+  if (options.tokenEnvVar !== 'DISCORD_BOT_TOKEN') {
+    throw new ConfigGenError(
+      `ensureDiscordChannel: this OpenClaw release only reads the bare DISCORD_BOT_TOKEN env fallback (got "${options.tokenEnvVar}")`,
+    );
+  }
   const dataDir = options.dataDir ?? resolveDataDir();
   const config = await readOpenClawConfig(dataDir);
   let changed = false;
@@ -89,9 +101,15 @@ export async function ensureDiscordChannel(
   }
   const discord = discordRaw as Record<string, unknown>;
 
+  // No token key on purpose — see the module docblock (bare-env fallback).
+  // Strip one left behind by the earlier env-ref attempt: it crash-loops
+  // the gateway on this release.
+  if ('token' in discord) {
+    delete discord.token;
+    changed = true;
+  }
   const desired: Record<string, unknown> = {
     enabled: true,
-    token: { source: 'env', id: options.tokenEnvVar },
     dmPolicy: 'allowlist',
     allowFrom: [...options.allowFrom],
   };
