@@ -41,6 +41,8 @@ function EnvChip() {
 const ICONS = {
   newChat:
     "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2zM12 7.5v5M9.5 10h5",
+  chats:
+    "M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2zM18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1",
   agents:
     "M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75",
   explore:
@@ -79,6 +81,7 @@ function NavIcon({ d }: { d: string }) {
 }
 
 const NAV = [
+  { href: "/sessions", label: "Chats", icon: ICONS.chats },
   { href: "/agents", label: "Agents", icon: ICONS.agents },
   { href: "/explore", label: "Explore", icon: ICONS.explore },
   { href: "/studio", label: "Studio", icon: ICONS.studio },
@@ -95,8 +98,8 @@ export function Sidebar() {
   const pathname = usePathname();
   const isActive = (href: string) =>
     pathname === href || pathname.startsWith(`${href}/`);
-  // Session permalinks are chat surfaces — light up "New Chat" for them too.
-  const chatActive = isActive("/chat") || isActive("/sessions");
+  // "New Chat" owns /chat; the session list + permalinks light up "Chats".
+  const chatActive = isActive("/chat");
 
   return (
     // Collapses to an icon rail below lg; labels and the manna chip return at lg+.

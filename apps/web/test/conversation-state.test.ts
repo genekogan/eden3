@@ -300,6 +300,37 @@ describe("media lifecycle", () => {
     expect(again.local.filter((i) => i.kind === "media")).toHaveLength(1);
   });
 
+  it("keeps ONE media item when the same creation re-homes to a new messageId", () => {
+    // The pipeline parks the asset on a transient message (B), then re-homes
+    // it onto the real completion row (C) and re-emits media.attached with the
+    // SAME creationId but a DIFFERENT messageId. Both events pass the
+    // `${messageId}:${creationId}` guard — the merge must key on the creation
+    // so the image doesn't briefly render twice.
+    const parkedMessageId = "5c1f5b7e-3d2a-4e8b-9f10-2a3b4c5d6e7f";
+    const rehomedMessageId = "6c1f5b7e-3d2a-4e8b-9f10-2a3b4c5d6e7f";
+    const parked: SessionEvent = {
+      type: "media.attached",
+      sessionId: SESSION_ID,
+      messageId: parkedMessageId,
+      url: "/media/ab/cd.png",
+      mime: "image/png",
+      creationId: CREATION_ID,
+    };
+    const rehomed: SessionEvent = { ...parked, messageId: rehomedMessageId };
+
+    const state = run([
+      { type: "channel/event", event: parked, at: AT },
+      { type: "channel/event", event: rehomed, at: AT },
+    ]);
+    const media = state.local.filter(
+      (i): i is MediaItem => i.kind === "media",
+    );
+    expect(media).toHaveLength(1);
+    expect(media[0]?.attachments).toEqual([
+      { url: "/media/ab/cd.png", mime: "image/png", creationId: CREATION_ID },
+    ]);
+  });
+
   it("suppresses channel media.pending while a POST stream is active", () => {
     const active = run([
       { type: "send", clientId: "c1", content: "make art", at: AT },
