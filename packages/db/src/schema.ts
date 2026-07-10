@@ -238,6 +238,13 @@ export const creations = pgTable(
     index('creations_feed_idx')
       .on(t.createdAt.desc())
       .where(sql`${t.public} = true and ${t.deleted} = false`),
+    // Composite keyset index matching the explore feed's exact ORDER BY
+    // (created_at desc, id desc) + cursor predicate. Turns the first page of
+    // the 1.78M-row public feed from a ~1.5s parallel-sort into a sub-ms
+    // index top-N. Partial to stay small (public, non-deleted only).
+    index('creations_feed_keyset_idx')
+      .on(t.createdAt.desc(), t.id.desc())
+      .where(sql`${t.public} = true and ${t.deleted} = false`),
     index('creations_user_created_idx').on(t.userId, t.createdAt.desc()),
     index('creations_agent_created_idx').on(t.agentId, t.createdAt.desc()),
   ],

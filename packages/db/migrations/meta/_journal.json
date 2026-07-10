@@ -120,6 +120,13 @@
       "when": 1783662263705,
       "tag": "0016_harsh_avengers",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1783666931254,
+      "tag": "0017_short_power_pack",
+      "breakpoints": true
     }
   ]
 }

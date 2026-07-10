@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS "creations_feed_keyset_idx" ON "creations" USING btree ("created_at" DESC NULLS LAST,"id" DESC NULLS LAST) WHERE "creations"."public" = true and "creations"."deleted" = false;
