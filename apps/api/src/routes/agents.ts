@@ -1,8 +1,12 @@
 import {
+  LocalMediaStore,
   getEnv,
+  normalizeMime,
+  probeImageSize,
   resolveAccountByUsername,
   resolveAgentByUsername,
   type AuthSession,
+  type MediaStore,
 } from '@eden3/core';
 import { accounts, agents, db, pg, type Account, type Agent } from '@eden3/db';
 import {
@@ -161,6 +165,33 @@ const importBodySchema = z.object({
   bundle: agentExportBundleSchema,
 });
 
+// ---- Avatar upload (mirrors the concept-image validation) -----------------
+const ALLOWED_AVATAR_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp']);
+const MAX_AVATAR_BYTES = 8 * 1024 * 1024;
+/** base64 inflates ~4/3; 12MB leaves room for the JSON envelope around 8MB. */
+const AVATAR_UPLOAD_BODY_LIMIT_BYTES = 12 * 1024 * 1024;
+
+const avatarBodySchema = z.object({
+  filename: z.string().trim().min(1).max(300).optional(),
+  mime: z.string().trim().min(1).max(200),
+  /** Raw base64 (a data: URL prefix is tolerated and stripped). */
+  dataBase64: z.string().min(1),
+});
+
+/** Decode base64 (tolerating a `data:` URL prefix); null on empty/invalid. */
+function decodeUploadData(dataBase64: string): Buffer | null {
+  const raw =
+    dataBase64.includes(',') && dataBase64.trimStart().startsWith('data:')
+      ? dataBase64.slice(dataBase64.indexOf(',') + 1)
+      : dataBase64;
+  try {
+    const buffer = Buffer.from(raw, 'base64');
+    return buffer.length > 0 ? buffer : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Fresh fragment per query (postgres.js fragments are single-use-safe). */
 const agentRowColumns = () => pg`
   a.id, a.external_id, a.username, a.user_image, a.created_at, a.updated_at,
@@ -294,7 +325,18 @@ async function nativeAgentQuotaError(viewer: AuthSession): Promise<{
   return null;
 }
 
-export const agentsRoutes: FastifyPluginAsync = async (app) => {
+export interface AgentsRoutesOptions {
+  /** Media store override (tests). Default: LocalMediaStore over env MEDIA_DIR. */
+  store?: MediaStore;
+}
+
+export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app, opts) => {
+  let lazyStore: MediaStore | null = opts.store ?? null;
+  const getStore = (): MediaStore => {
+    lazyStore ??= new LocalMediaStore();
+    return lazyStore;
+  };
+
   // ---- GET /agents — directory (public, or scope=mine for own agents) -----
   app.get('/', async (req, reply) => {
     const { q, cursor, limit, scope } = directoryQuerySchema.parse(req.query);
@@ -1011,6 +1053,97 @@ export const agentsRoutes: FastifyPluginAsync = async (app) => {
       agent: agentDtoFromEntities(updatedAgent.account, updatedAgent.agent, {
         includePersona: true,
       }),
+    };
+  });
+
+  // ---- POST /agents/:username/avatar — owner/admin avatar upload ----------
+  // Base64-JSON upload (png/jpeg/webp ≤ 8MB) stored through the same
+  // content-addressed media store as concept images / studio media, then
+  // written to accounts.user_image. Returns the refreshed agent DTO.
+  app.post(
+    '/:username/avatar',
+    { preHandler: app.requireAuth, bodyLimit: AVATAR_UPLOAD_BODY_LIMIT_BYTES },
+    async (req, reply) => {
+      const { username } = usernameParamsSchema.parse(req.params);
+      const body = avatarBodySchema.parse(req.body);
+      const resolved = await resolveAgentByUsername(username);
+      if (!resolved) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      const { account, agent } = resolved;
+      if (!canManage(req.account, account, agent)) {
+        if (!agent.public) {
+          return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+        }
+        return sendError(reply, 403, 'forbidden', 'Only the owner can change this agent avatar');
+      }
+
+      const mime = normalizeMime(body.mime);
+      if (!ALLOWED_AVATAR_MIMES.has(mime)) {
+        return sendError(
+          reply,
+          400,
+          'unsupported_image_type',
+          `Unsupported image type "${mime}" — expected png, jpeg, or webp`,
+        );
+      }
+      const buffer = decodeUploadData(body.dataBase64);
+      if (!buffer) {
+        return sendError(reply, 400, 'invalid_image_data', 'dataBase64 is not valid base64');
+      }
+      if (buffer.length > MAX_AVATAR_BYTES) {
+        return sendError(
+          reply,
+          400,
+          'image_too_large',
+          `Image is ${buffer.length} bytes — the limit is ${MAX_AVATAR_BYTES} (8MB)`,
+        );
+      }
+      if (!probeImageSize(buffer)) {
+        return sendError(
+          reply,
+          400,
+          'invalid_image_data',
+          'File does not look like a valid png/jpeg/webp image',
+        );
+      }
+
+      const stored = await getStore().put(buffer, { mime });
+      const [updatedAccount] = await db
+        .update(accounts)
+        .set({ userImage: stored.url, updatedAt: new Date() })
+        .where(eq(accounts.id, account.id))
+        .returning();
+
+      return {
+        agent: agentDtoFromEntities(updatedAccount ?? account, agent, { includePersona: true }),
+      };
+    },
+  );
+
+  // ---- DELETE /agents/:username/avatar — clear the avatar ----------------
+  app.delete('/:username/avatar', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can change this agent avatar');
+    }
+
+    const [updatedAccount] = await db
+      .update(accounts)
+      .set({ userImage: null, updatedAt: new Date() })
+      .where(eq(accounts.id, account.id))
+      .returning();
+
+    return {
+      agent: agentDtoFromEntities(updatedAccount ?? account, agent, { includePersona: true }),
     };
   });
 };
