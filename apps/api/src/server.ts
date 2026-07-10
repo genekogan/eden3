@@ -41,6 +41,7 @@ import { sessionsRoutes } from './routes/sessions';
 import { skillsRoutes } from './routes/skills';
 import { studioRoutes } from './routes/studio';
 import { triggersRoutes } from './routes/triggers';
+import { workspaceRoutes } from './routes/workspace';
 
 const requireCjs = createRequire(import.meta.url);
 const pkg = requireCjs('../package.json') as { version: string };
@@ -300,6 +301,8 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(agentsRoutes, { prefix: '/agents' });
   // Concepts share the /agents path root (/agents/:username/concepts/*).
   await app.register(conceptsRoutes, { prefix: '/agents' });
+  // Owner-only workspace file browser (tree/read/download/export/save).
+  await app.register(workspaceRoutes, { prefix: '/agents' });
   await app.register(skillsRoutes);
   await app.register(creationsRoutes, { prefix: '/creations' });
   await app.register(feedRoutes, { prefix: '/feed' });

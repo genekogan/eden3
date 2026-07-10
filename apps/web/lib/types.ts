@@ -126,6 +126,66 @@ export interface AgentImportResult {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Workspace browser (GET/PUT /api/agents/:username/workspace*)
+// ---------------------------------------------------------------------------
+
+export interface WorkspaceFileEntry {
+  path: string;
+  kind: "file" | "dir";
+  sizeBytes: number;
+  /** ISO-8601 mtime. */
+  mtime: string;
+  /** Present for files ≤ 1MB — the conflict-detection base for saves. */
+  sha256?: string;
+}
+
+/** GET /api/agents/:username/workspace */
+export interface WorkspaceTreeResponse {
+  entries: WorkspaceFileEntry[];
+  /** True when the listing hit the 2,000-entry server cap. */
+  truncated: boolean;
+}
+
+export type WorkspaceFileContent =
+  | {
+      path: string;
+      kind: "text";
+      content: string;
+      sizeBytes: number;
+      mtime: string;
+      sha256: string;
+    }
+  | { path: string; kind: "binary"; sizeBytes: number; mtime: string };
+
+/** GET /api/agents/:username/workspace/file?path= */
+export interface WorkspaceFileResponse {
+  file: WorkspaceFileContent;
+}
+
+/** PUT /api/agents/:username/workspace/file — baseSha256 "new" creates. */
+export interface WorkspaceSaveInput {
+  path: string;
+  content: string;
+  baseSha256: string;
+}
+
+export interface WorkspaceSaveResponse {
+  file: {
+    path: string;
+    kind: "text";
+    sizeBytes: number;
+    mtime: string;
+    sha256: string;
+  };
+}
+
+/** 409 body of a conflicted save (the agent wrote meanwhile). */
+export interface WorkspaceWriteConflict {
+  currentSha256: string | null;
+  currentMtime: string | null;
+}
+
 /** GET /api/sessions/:id — messages ascending; permalinks accept 24-hex ids. */
 export interface SessionDetail {
   session: SessionDto;

@@ -179,7 +179,8 @@ interface AgentInteractionRow {
   viewer_has_liked: boolean;
 }
 
-function canManage(viewer: AuthSession | null, account: Account, agent: Agent): boolean {
+/** Owner/admin gate shared with the workspace routes (routes/workspace.ts). */
+export function canManage(viewer: AuthSession | null, account: Account, agent: Agent): boolean {
   if (!viewer) return false;
   if (viewer.isAdmin) return true;
   return viewer.accountId === agent.ownerId || viewer.accountId === account.id;

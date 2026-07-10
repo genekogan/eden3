@@ -69,6 +69,10 @@ import type {
   TaskUpdateInput,
   TriggerDto,
   VoucherRedeemResult,
+  WorkspaceFileResponse,
+  WorkspaceSaveInput,
+  WorkspaceSaveResponse,
+  WorkspaceTreeResponse,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -154,6 +158,18 @@ async function apiFetch<T>(
 
 function get<T>(path: string): Promise<T> {
   return apiFetch<T>(path);
+}
+
+/** Fetch a raw (non-JSON) response body — file downloads / zip exports. */
+async function apiBlob(path: string): Promise<Blob> {
+  const clerkToken = await getClerkToken();
+  const res = await fetch(`${apiBase()}${path}`, {
+    cache: "no-store",
+    credentials: typeof window !== "undefined" ? "include" : undefined,
+    headers: clerkToken ? { authorization: `Bearer ${clerkToken}` } : undefined,
+  });
+  if (!res.ok) throw await toApiError(res, path);
+  return res.blob();
 }
 
 function post<T>(
@@ -542,6 +558,49 @@ export const api = {
         await patch<unknown>(`/agents/${enc(username)}`, patchBody),
         "agent",
       );
+    },
+
+    /** GET /api/agents/:username/workspace — owner/admin recursive file tree. */
+    workspaceTree(username: string): Promise<WorkspaceTreeResponse> {
+      return get<WorkspaceTreeResponse>(`/agents/${enc(username)}/workspace`);
+    },
+
+    /** GET /api/agents/:username/workspace/file?path= — text content or binary meta. */
+    workspaceFile(username: string, path: string): Promise<WorkspaceFileResponse> {
+      return get<WorkspaceFileResponse>(
+        `/agents/${enc(username)}/workspace/file?path=${enc(path)}`,
+      );
+    },
+
+    /**
+     * PUT /api/agents/:username/workspace/file — conflict-checked save.
+     * Throws ApiError(409, body: {currentSha256, currentMtime}) when the agent
+     * changed the file since it was loaded — callers must surface that, never
+     * silently overwrite.
+     */
+    workspaceSave(
+      username: string,
+      input: WorkspaceSaveInput,
+    ): Promise<WorkspaceSaveResponse> {
+      return apiFetch<WorkspaceSaveResponse>(`/agents/${enc(username)}/workspace/file`, {
+        method: "PUT",
+        body: JSON.stringify(input),
+      });
+    },
+
+    /** Same-origin raw-bytes URL (inline <img> rendering in the file viewer). */
+    workspaceDownloadUrl(username: string, path: string): string {
+      return `/api/agents/${enc(username)}/workspace/download?path=${enc(path)}`;
+    },
+
+    /** GET /api/agents/:username/workspace/download?path= as a Blob. */
+    workspaceDownload(username: string, path: string): Promise<Blob> {
+      return apiBlob(`/agents/${enc(username)}/workspace/download?path=${enc(path)}`);
+    },
+
+    /** GET /api/agents/:username/workspace/export — whole workspace zip (SPEC Q11). */
+    workspaceExport(username: string): Promise<Blob> {
+      return apiBlob(`/agents/${enc(username)}/workspace/export`);
     },
 
     /** POST /api/agents/:username/like */
