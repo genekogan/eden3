@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "usage_events_turn_unique" ON "usage_events" USING btree ("event_type","turn_id") WHERE turn_id is not null;

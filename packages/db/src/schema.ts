@@ -608,6 +608,12 @@ export const usageEvents = pgTable(
     index('usage_events_agent_created_idx').on(t.agentId, t.createdAt.desc()),
     index('usage_events_session_created_idx').on(t.sessionId, t.createdAt.desc()),
     index('usage_events_turn_idx').on(t.turnId),
+    // Unique per (event_type, turn) — chat sets turnId, studio rows are null
+    // and exempt. A crashed/retried turn pipeline cannot double-record: the
+    // insert pairs with ON CONFLICT DO NOTHING against this index.
+    uniqueIndex('usage_events_turn_unique')
+      .on(t.eventType, t.turnId)
+      .where(sql`turn_id is not null`),
   ],
 );
 
