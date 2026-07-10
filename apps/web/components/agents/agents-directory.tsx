@@ -249,17 +249,28 @@ export function AgentsDirectory() {
           }
           action={
             trimmedQuery ? undefined : scope === "mine" ? (
-              <span className="flex flex-wrap justify-center gap-2">
-                <Link href="/agents/new" className={primaryButtonClass}>
-                  Create agent
-                </Link>
-                <button
-                  type="button"
-                  onClick={() => setScope("public")}
-                  className={quietButtonClass}
+              <span className="flex flex-col items-center gap-3">
+                <span className="flex flex-wrap justify-center gap-2">
+                  <Link href="/agents/new" className={primaryButtonClass}>
+                    Create agent
+                  </Link>
+                  <Link href="/agents/builder" className={quietButtonClass}>
+                    Try the builder
+                  </Link>
+                  <button
+                    type="button"
+                    onClick={() => setScope("public")}
+                    className={quietButtonClass}
+                  >
+                    Browse all agents
+                  </button>
+                </span>
+                <Link
+                  href="/chat?agent=eden"
+                  className="text-xs text-accent-soft transition-colors hover:text-accent"
                 >
-                  Browse all agents
-                </button>
+                  Not sure where to start? Say hi to Eden, the built-in guide →
+                </Link>
               </span>
             ) : (
               <Link href="/agents/new" className={quietButtonClass}>
