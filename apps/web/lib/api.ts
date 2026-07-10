@@ -26,6 +26,7 @@ import type { SessionEventStreamOptions, StreamSseOptions } from "./sse";
 import { getClerkToken } from "./clerk";
 import type {
   AgentActivityEvent,
+  AgentAvatarUploadInput,
   AgentCreateInput,
   AgentDto,
   AgentExportResponse,
@@ -614,6 +615,25 @@ export const api = {
     /** GET /api/agents/:username/workspace/export — whole workspace zip (SPEC Q11). */
     workspaceExport(username: string): Promise<Blob> {
       return apiBlob(`/agents/${enc(username)}/workspace/export`);
+    },
+
+    /** POST /api/agents/:username/avatar — owner avatar upload (png/jpeg/webp ≤ 8MB). */
+    async uploadAvatar(
+      username: string,
+      input: AgentAvatarUploadInput,
+    ): Promise<AgentDto> {
+      return unwrap<AgentDto>(
+        await post<unknown>(`/agents/${enc(username)}/avatar`, input),
+        "agent",
+      );
+    },
+
+    /** DELETE /api/agents/:username/avatar — clears the avatar. */
+    async removeAvatar(username: string): Promise<AgentDto> {
+      return unwrap<AgentDto>(
+        await apiFetch<unknown>(`/agents/${enc(username)}/avatar`, { method: "DELETE" }),
+        "agent",
+      );
     },
 
     /** POST /api/agents/:username/like */

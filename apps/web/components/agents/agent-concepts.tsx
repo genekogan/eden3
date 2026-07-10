@@ -40,7 +40,8 @@ export function conceptImageFileError(file: {
   return null;
 }
 
-async function fileToUpload(file: File): Promise<ConceptImageUploadInput> {
+/** Read a File into the base64-JSON upload shape shared by concepts + avatars. */
+export async function fileToUpload(file: File): Promise<ConceptImageUploadInput> {
   const dataUrl = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result));

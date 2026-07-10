@@ -12,10 +12,14 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type { AgentDto, AgentUpdateInput } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
+import {
+  conceptImageFileError,
+  fileToUpload,
+} from "@/components/agents/agent-concepts";
 import { EmptyState } from "@/components/empty-state";
 import { Skeleton, SkeletonText } from "@/components/skeleton";
 import { agentHref } from "@/components/agents/agent-card";
@@ -125,6 +129,9 @@ export function AgentEditForm({ username }: { username: string }) {
   const [toast, setToast] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const seq = useRef(0);
+  const avatarInput = useRef<HTMLInputElement | null>(null);
+  const [avatarBusy, setAvatarBusy] = useState<"upload" | "remove" | null>(null);
+  const [avatarNote, setAvatarNote] = useState<string | null>(null);
 
   useEffect(() => {
     const id = ++seq.current;
@@ -206,6 +213,51 @@ export function AgentEditForm({ username }: { username: string }) {
       setSaveError(apiErrorDetail(error));
     } finally {
       setSaving(false);
+    }
+  };
+
+  // Avatar changes are their own action (immediate, not part of the dirty
+  // persona diff): update local agent.userImage so the preview refreshes.
+  const applyAvatarUpdate = (updated: AgentDto) => {
+    setGate((prev) =>
+      prev.kind === "ready"
+        ? { kind: "ready", agent: { ...prev.agent, ...updated } }
+        : prev,
+    );
+  };
+
+  const onAvatarPicked = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+    if (!file || gate.kind !== "ready" || avatarBusy) return;
+    const problem = conceptImageFileError(file);
+    if (problem) {
+      setAvatarNote(problem);
+      return;
+    }
+    setAvatarBusy("upload");
+    setAvatarNote(null);
+    try {
+      applyAvatarUpdate(
+        await api.agents.uploadAvatar(gate.agent.username, await fileToUpload(file)),
+      );
+    } catch (error) {
+      setAvatarNote(apiErrorDetail(error));
+    } finally {
+      setAvatarBusy(null);
+    }
+  };
+
+  const removeAvatar = async () => {
+    if (gate.kind !== "ready" || avatarBusy) return;
+    setAvatarBusy("remove");
+    setAvatarNote(null);
+    try {
+      applyAvatarUpdate(await api.agents.removeAvatar(gate.agent.username));
+    } catch (error) {
+      setAvatarNote(apiErrorDetail(error));
+    } finally {
+      setAvatarBusy(null);
     }
   };
 
@@ -303,7 +355,7 @@ export function AgentEditForm({ username }: { username: string }) {
     <>
       <div className="mt-4 flex items-center gap-4">
         <AgentAvatar account={agent} size={48} />
-        <div>
+        <div className="min-w-0">
           <h1 className="text-2xl font-light tracking-tight md:text-3xl">
             Edit {agent.name?.trim() || `@${agent.username}`}
           </h1>
@@ -312,6 +364,38 @@ export function AgentEditForm({ username }: { username: string }) {
           </p>
         </div>
       </div>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input
+          ref={avatarInput}
+          type="file"
+          accept="image/png,image/jpeg,image/webp"
+          onChange={(event) => void onAvatarPicked(event)}
+          className="hidden"
+        />
+        <button
+          type="button"
+          onClick={() => avatarInput.current?.click()}
+          disabled={avatarBusy !== null || saving}
+          className={quietButtonClass}
+        >
+          {avatarBusy === "upload" ? "Uploading…" : "Change photo"}
+        </button>
+        {agent.userImage ? (
+          <button
+            type="button"
+            onClick={() => void removeAvatar()}
+            disabled={avatarBusy !== null || saving}
+            className={quietButtonClass}
+          >
+            {avatarBusy === "remove" ? "Removing…" : "Remove"}
+          </button>
+        ) : null}
+        {avatarNote ? (
+          <p className="text-xs text-rose-300">{avatarNote}</p>
+        ) : null}
+      </div>
+
       <p className="mt-3 max-w-lg text-sm leading-relaxed text-muted">
         Changes are hot — the persona you save here shapes the very next
         message, no restart.
