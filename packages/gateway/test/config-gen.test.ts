@@ -117,6 +117,10 @@ describe('ensureBaseline', () => {
             primary: 'fal/fal-ai/flux/dev',
             fallbacks: ['google/gemini-3-pro-image-preview'],
           },
+          memorySearch: {
+            enabled: true,
+            provider: 'openai',
+          },
         },
       },
       tools: {
