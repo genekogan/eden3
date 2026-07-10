@@ -13,7 +13,9 @@
  * model), so every apply is defensive:
  *   - token/turn events from the channel are ignored when a non-remote
  *     assistant-stream item already renders that turnId (the POST stream owns it),
- *   - media.attached applies once per `${messageId}:${creationId}`,
+ *   - media.attached applies once per creation — the pipeline can re-home an
+ *     asset onto a new messageId, so the bubble's identity is the creationId,
+ *     not the gateway messageId,
  *   - history merges reconcile: finished local items whose rows now exist
  *     server-side are dropped instead of duplicated.
  */
@@ -328,10 +330,30 @@ function applyMediaAttached(
   const key = `${event.messageId}:${event.creationId}`;
   if (state.seenMedia.includes(key)) return state;
 
+  // A media bubble's identity is the stable `creationId`, not the mutable
+  // gateway `messageId`. The pipeline can fire a SECOND media.attached for the
+  // same creation after re-homing the asset off a transient message onto the
+  // real completion row (apps/api/src/services/media-pipeline.ts:298-315) —
+  // same creationId, new messageId. The `${messageId}:${creationId}` key lets
+  // both through, so guard on the creation itself: if it's already on screen
+  // (a live media bubble or a fetched row), record the key and bail instead of
+  // rendering the image twice.
+  const creationOnScreen =
+    state.local.some(
+      (item) =>
+        item.kind === "media" &&
+        item.attachments.some((a) => a.creationId === event.creationId),
+    ) ||
+    state.serverMessages.some((message) =>
+      message.attachments.some((a) => a.creationId === event.creationId),
+    );
+
   let next: ConversationState = {
     ...state,
     seenMedia: [...state.seenMedia, key],
   };
+
+  if (creationOnScreen) return next;
 
   // Retire the oldest shimmer — pending/attached carry no correlation id.
   const shimmerIndex = next.local.findIndex(
@@ -353,14 +375,24 @@ function applyMediaAttached(
     creationId: event.creationId,
   };
 
-  // Prefer merging into the fetched server row for that message.
+  // Prefer merging into the fetched server row — by message id, or by an
+  // already-attached creation (a re-home moves the asset onto a new message id
+  // while the original row may still carry the same creation).
   const rowIndex = next.serverMessages.findIndex(
-    (message) => message.id === event.messageId,
+    (message) =>
+      message.id === event.messageId ||
+      message.attachments.some((a) => a.creationId === event.creationId),
   );
   if (rowIndex !== -1) {
     const row = next.serverMessages[rowIndex];
     if (!row) return next;
-    if (row.attachments.some((existing) => existing.url === event.url)) {
+    if (
+      row.attachments.some(
+        (existing) =>
+          existing.url === event.url ||
+          existing.creationId === event.creationId,
+      )
+    ) {
       return next;
     }
     const serverMessages = [...next.serverMessages];
@@ -371,14 +403,25 @@ function applyMediaAttached(
     return { ...next, serverMessages };
   }
 
-  // Otherwise merge into (or create) a local media item.
+  // Otherwise merge into (or create) a local media item, matched on the stable
+  // creation id (any attachment carrying it) OR the gateway message id, so a
+  // re-homed event updates the existing bubble instead of spawning a new one.
   const localIndex = next.local.findIndex(
-    (item) => item.kind === "media" && item.messageId === event.messageId,
+    (item) =>
+      item.kind === "media" &&
+      (item.messageId === event.messageId ||
+        item.attachments.some((a) => a.creationId === event.creationId)),
   );
   if (localIndex !== -1) {
     const item = next.local[localIndex];
     if (!item || item.kind !== "media") return next;
-    if (item.attachments.some((existing) => existing.url === event.url)) {
+    if (
+      item.attachments.some(
+        (existing) =>
+          existing.url === event.url ||
+          existing.creationId === event.creationId,
+      )
+    ) {
       return next;
     }
     const local = [...next.local];
@@ -392,7 +435,7 @@ function applyMediaAttached(
   mediaKeySeq += 1;
   const mediaItem: MediaItem = {
     kind: "media",
-    clientId: `media:${event.messageId}:${mediaKeySeq}`,
+    clientId: `media:${event.creationId}:${mediaKeySeq}`,
     messageId: event.messageId,
     attachments: [attachment],
     at,
