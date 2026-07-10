@@ -11,7 +11,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, FormEvent } from "react";
+import type { ChangeEvent, DragEvent, FormEvent } from "react";
 import { api } from "@/lib/api";
 import type { ConceptDto, ConceptImageUploadInput } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
@@ -121,6 +121,7 @@ function ConceptDetail({
   const [busy, setBusy] = useState<"save" | "upload" | "delete" | "image" | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement | null>(null);
 
   // Re-seed the form when another card is selected.
@@ -152,9 +153,8 @@ function ConceptDetail({
     }
   };
 
-  const uploadFiles = async (event: ChangeEvent<HTMLInputElement>) => {
-    const files = [...(event.target.files ?? [])];
-    event.target.value = "";
+  // Shared upload path fed by BOTH the file input and drag-and-drop.
+  const uploadFiles = async (files: File[]) => {
     if (files.length === 0 || busy) return;
     const room = MAX_IMAGES - concept.images.length;
     if (room <= 0) {
@@ -163,7 +163,6 @@ function ConceptDetail({
     }
     setBusy("upload");
     setNote(null);
-    let latest: ConceptDto = concept;
     try {
       for (const file of files.slice(0, room)) {
         const problem = conceptImageFileError(file);
@@ -171,12 +170,9 @@ function ConceptDetail({
           setNote(`${file.name}: ${problem}`);
           continue;
         }
-        latest = await api.concepts.uploadImage(
-          username,
-          concept.slug,
-          await fileToUpload(file),
+        onChanged(
+          await api.concepts.uploadImage(username, concept.slug, await fileToUpload(file)),
         );
-        onChanged(latest);
       }
       if (files.length > room) {
         setNote(`Only ${room} more image${room === 1 ? "" : "s"} fit — the limit is ${MAX_IMAGES}.`);
@@ -186,6 +182,19 @@ function ConceptDetail({
     } finally {
       setBusy(null);
     }
+  };
+
+  const onInputChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = [...(event.target.files ?? [])];
+    event.target.value = "";
+    void uploadFiles(files);
+  };
+
+  const onDrop = (event: DragEvent) => {
+    event.preventDefault();
+    setDragOver(false);
+    if (!canManage || busy) return;
+    void uploadFiles([...event.dataTransfer.files]);
   };
 
   const moveImage = async (index: number, delta: -1 | 1) => {
@@ -308,13 +317,23 @@ function ConceptDetail({
         </div>
       )}
       {canManage ? (
-        <div className="mt-3">
+        <div
+          onDragOver={(event) => {
+            event.preventDefault();
+            if (!dragOver) setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={onDrop}
+          className={`mt-3 rounded-lg border border-dashed p-3 text-center transition-colors ${
+            dragOver ? "border-accent/60 bg-accent/5" : "border-edge"
+          }`}
+        >
           <input
             ref={fileInput}
             type="file"
             accept="image/png,image/jpeg,image/webp"
             multiple
-            onChange={(event) => void uploadFiles(event)}
+            onChange={onInputChange}
             className="hidden"
           />
           <button
@@ -327,6 +346,7 @@ function ConceptDetail({
               ? "Uploading…"
               : `Add images (${concept.images.length}/${MAX_IMAGES})`}
           </button>
+          <p className="mt-1.5 text-[11px] text-faint">or drop images here</p>
         </div>
       ) : null}
 
@@ -444,9 +464,28 @@ export function AgentConceptsPanel({
   const [newName, setNewName] = useState("");
   const [newDescription, setNewDescription] = useState("");
   const [newInstructions, setNewInstructions] = useState("");
+  // Images can't attach until the concept has an id, so they're staged locally
+  // and uploaded in a second step once create() returns (see createConcept).
+  const [newImages, setNewImages] = useState<File[]>([]);
+  const [createDragOver, setCreateDragOver] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const createFileInput = useRef<HTMLInputElement | null>(null);
   const seq = useRef(0);
+
+  const stageCreateImages = (files: File[]) => {
+    if (files.length === 0) return;
+    setNewImages((prev) => [...prev, ...files].slice(0, MAX_IMAGES));
+  };
+
+  const resetCreateForm = () => {
+    setShowCreate(false);
+    setNewName("");
+    setNewDescription("");
+    setNewInstructions("");
+    setNewImages([]);
+    setCreateError(null);
+  };
 
   useEffect(() => {
     const id = ++seq.current;
@@ -472,17 +511,39 @@ export function AgentConceptsPanel({
     setCreateBusy(true);
     setCreateError(null);
     try {
-      const concept = await api.concepts.create(username, {
+      // Step 1: create the concept (need its id/slug before images can attach).
+      let concept = await api.concepts.create(username, {
         name,
         description: newDescription.trim() || undefined,
         instructions: newInstructions.trim() || undefined,
       });
+      // Step 2: upload any staged reference images onto the new concept. A
+      // failure here keeps the created concept (committed below) and surfaces
+      // the error rather than losing the row.
+      for (const file of newImages.slice(0, MAX_IMAGES)) {
+        const problem = conceptImageFileError(file);
+        if (problem) {
+          setCreateError(`${file.name}: ${problem}`);
+          continue;
+        }
+        try {
+          concept = await api.concepts.uploadImage(
+            username,
+            concept.slug,
+            await fileToUpload(file),
+          );
+        } catch (error) {
+          setCreateError(describeApiFailure(error));
+          break;
+        }
+      }
       setConcepts((prev) => [...prev, concept]);
       setSelectedId(concept.id);
       setShowCreate(false);
       setNewName("");
       setNewDescription("");
       setNewInstructions("");
+      setNewImages([]);
     } catch (error) {
       setCreateError(describeApiFailure(error));
     } finally {
@@ -539,17 +600,85 @@ export function AgentConceptsPanel({
           maxLength={4000}
           className={textareaClass}
         />
+        <div
+          onDragOver={(event) => {
+            event.preventDefault();
+            if (!createDragOver) setCreateDragOver(true);
+          }}
+          onDragLeave={() => setCreateDragOver(false)}
+          onDrop={(event) => {
+            event.preventDefault();
+            setCreateDragOver(false);
+            stageCreateImages([...event.dataTransfer.files]);
+          }}
+          className={`rounded-lg border border-dashed p-3 text-center transition-colors ${
+            createDragOver ? "border-accent/60 bg-accent/5" : "border-edge"
+          }`}
+        >
+          <input
+            ref={createFileInput}
+            type="file"
+            accept="image/png,image/jpeg,image/webp"
+            multiple
+            onChange={(event) => {
+              stageCreateImages([...(event.target.files ?? [])]);
+              event.target.value = "";
+            }}
+            className="hidden"
+          />
+          <button
+            type="button"
+            onClick={() => createFileInput.current?.click()}
+            disabled={createBusy || newImages.length >= MAX_IMAGES}
+            className={quietButtonClass}
+          >
+            {newImages.length > 0
+              ? `Reference images (${newImages.length}/${MAX_IMAGES})`
+              : "Add reference images"}
+          </button>
+          <p className="mt-1.5 text-[11px] text-faint">or drop images here — optional</p>
+          {newImages.length > 0 ? (
+            <ul className="mt-2 space-y-1 text-left">
+              {newImages.map((file, index) => (
+                <li
+                  key={`${file.name}-${index}`}
+                  className="flex items-center justify-between gap-2 font-mono text-[10px] text-faint"
+                >
+                  <span className="truncate">
+                    {index + 1}. {file.name}
+                  </span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${file.name}`}
+                    disabled={createBusy}
+                    onClick={() =>
+                      setNewImages((prev) => prev.filter((_, i) => i !== index))
+                    }
+                    className="shrink-0 rounded border border-edge px-1.5 text-muted transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    ×
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
         <div className="flex items-center gap-2">
           <button
             type="submit"
             disabled={createBusy || newName.trim() === ""}
             className={primaryButtonClass}
           >
-            {createBusy ? "Creating…" : "Create concept"}
+            {createBusy
+              ? newImages.length > 0
+                ? "Creating & uploading…"
+                : "Creating…"
+              : "Create concept"}
           </button>
           <button
             type="button"
-            onClick={() => setShowCreate(false)}
+            onClick={resetCreateForm}
+            disabled={createBusy}
             className={quietButtonClass}
           >
             Cancel
