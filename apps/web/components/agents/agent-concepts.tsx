@@ -247,7 +247,7 @@ function ConceptDetail({
   };
 
   return (
-    <div className="mt-4 rounded-xl border border-edge bg-surface p-5">
+    <div className="mt-4 min-w-0 rounded-xl border border-edge bg-surface p-4 sm:p-5">
       {note ? (
         <p className="mb-4 rounded-lg border border-accent/25 bg-accent/10 px-3 py-2 text-xs text-accent-soft">
           {note}
@@ -714,7 +714,7 @@ export function AgentConceptsPanel({
 
   return (
     <div>
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex min-w-0 flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-sm text-muted">
           Ask for work “in the style of” any concept below.
         </p>
@@ -739,7 +739,7 @@ export function AgentConceptsPanel({
               type="button"
               aria-expanded={isSelected}
               onClick={() => setSelectedId(isSelected ? null : concept.id)}
-              className={`group overflow-hidden rounded-xl border text-left transition-colors ${
+              className={`group min-w-0 overflow-hidden rounded-xl border text-left transition-colors ${
                 isSelected
                   ? "border-accent/60 bg-accent/5"
                   : "border-edge bg-surface hover:border-accent/40"

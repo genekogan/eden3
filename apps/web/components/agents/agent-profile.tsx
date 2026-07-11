@@ -66,7 +66,7 @@ function CreationTile({ creation }: { creation: CreationDto }) {
   return (
     <Link
       href={`/creations/${encodeURIComponent(creation.id)}`}
-      className="group relative block overflow-hidden rounded-xl transition-opacity hover:opacity-90"
+      className="group relative block aspect-square min-w-0 overflow-hidden rounded-xl transition-opacity hover:opacity-90"
     >
       <MediaThumb creation={creation} />
     </Link>
@@ -169,7 +169,7 @@ function AgentCreations({
 
   return (
     <div>
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 sm:gap-3 lg:grid-cols-4">
         {items.map((creation) => (
           <CreationTile key={creation.id} creation={creation} />
         ))}
@@ -211,7 +211,7 @@ function AboutSection({
   const persona = agent.persona?.trim();
 
   return (
-    <div className="max-w-2xl space-y-8">
+    <div className="max-w-2xl min-w-0 space-y-8">
       <section>
         <h2 className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
           Greeting
@@ -236,7 +236,7 @@ function AboutSection({
             This agent's persona is private.
           </p>
         ) : persona ? (
-          <div className="mt-3 whitespace-pre-wrap rounded-xl border border-edge bg-surface p-5 font-mono text-[13px] leading-relaxed text-muted">
+          <div className="mt-3 whitespace-pre-wrap break-words rounded-xl border border-edge bg-surface p-4 font-mono text-[13px] leading-relaxed text-muted [overflow-wrap:anywhere] sm:p-5">
             {persona}
           </div>
         ) : (
@@ -289,14 +289,14 @@ function skillBadgeClass(status: string): string {
 
 function InstalledSkill({ skill }: { skill: AgentSkillDto }) {
   return (
-    <article className="rounded-xl border border-edge bg-surface p-4">
+    <article className="min-w-0 rounded-xl border border-edge bg-surface p-4">
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-sm font-medium text-foreground">{skill.name}</h3>
         <span className={`rounded-full border px-2 py-0.5 text-[11px] ${skillBadgeClass(skill.status)}`}>
           {skill.status}
         </span>
       </div>
-      <p className="mt-1 font-mono text-xs text-faint">{skill.slug}</p>
+      <p className="mt-1 break-all font-mono text-xs text-faint">{skill.slug}</p>
       {skill.description ? (
         <p className="mt-3 text-sm leading-relaxed text-muted">{skill.description}</p>
       ) : null}
@@ -407,7 +407,7 @@ function AgentSkillsPanel({
                 />
                 <div className="min-w-0">
                   <p className="text-sm font-medium text-foreground">{skill.name}</p>
-                  <p className="mt-1 font-mono text-xs text-faint">{skill.slug}</p>
+                  <p className="mt-1 break-all font-mono text-xs text-faint">{skill.slug}</p>
                   {skill.description ? (
                     <p className="mt-2 text-sm leading-relaxed text-muted">{skill.description}</p>
                   ) : null}
@@ -515,7 +515,7 @@ function AgentMemoryPanel({
   ];
 
   return (
-    <div className="space-y-5">
+    <div className="min-w-0 space-y-5">
       {note ? (
         <p className="rounded-lg border border-accent/25 bg-accent/10 px-3 py-2 text-xs text-accent-soft">
           {note}
@@ -533,7 +533,7 @@ function AgentMemoryPanel({
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
         spellCheck={false}
-        className="min-h-[360px] w-full resize-y rounded-lg border border-edge bg-black/20 p-4 font-mono text-[13px] leading-relaxed text-muted outline-none transition-colors focus:border-accent/60"
+        className="min-h-[360px] w-full max-w-full resize-y rounded-lg border border-edge bg-black/20 p-4 font-mono text-[13px] leading-relaxed text-muted outline-none transition-colors focus:border-accent/60"
       />
       <div className="flex flex-wrap items-center gap-2">
         <button
@@ -560,8 +560,8 @@ function AgentMemoryPanel({
           </h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             {snapshot.userFiles.map((file) => (
-              <article key={file.filename} className="rounded-lg border border-edge bg-surface p-3">
-                <p className="font-mono text-xs text-muted">{file.filename}</p>
+              <article key={file.filename} className="min-w-0 rounded-lg border border-edge bg-surface p-3">
+                <p className="break-all font-mono text-xs text-muted">{file.filename}</p>
                 <p className="mt-1 text-xs text-faint">{file.chars} chars</p>
                 {file.summary ? (
                   <p className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-muted">
@@ -805,19 +805,19 @@ export function AgentProfile({ username }: { username: string }) {
   };
 
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 py-10 md:px-10">
+    <div className="mx-auto w-full min-w-0 max-w-5xl overflow-x-clip px-3 py-6 sm:px-6 sm:py-10 md:px-10">
       {/* Header */}
       <div className="flex flex-col gap-6 sm:flex-row sm:items-start">
         <AgentAvatar account={agent} size={80} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2.5">
-            <h1 className="text-2xl font-light tracking-tight md:text-3xl">
+            <h1 className="min-w-0 break-words text-2xl font-light tracking-tight [overflow-wrap:anywhere] md:text-3xl">
               {displayName}
             </h1>
             {agent.isPilot ? <PilotBadge /> : null}
             <ProvisionBadge status={agent.provisionStatus} />
           </div>
-          <p className="mt-1 font-mono text-sm text-faint">@{agent.username}</p>
+          <p className="mt-1 break-all font-mono text-sm text-faint">@{agent.username}</p>
           {agent.description?.trim() ? (
             <p className="mt-3 max-w-2xl text-sm leading-relaxed text-muted">
               {agent.description}
@@ -947,7 +947,11 @@ export function AgentProfile({ username }: { username: string }) {
       ) : null}
 
       {/* Tabs */}
-      <div role="tablist" aria-label="Agent sections" className="mt-10 flex gap-6 border-b border-edge">
+      <div
+        role="tablist"
+        aria-label="Agent sections"
+        className="mt-8 grid min-w-0 grid-cols-3 gap-1 rounded-xl border border-edge bg-surface p-1 sm:mt-10 sm:flex sm:gap-6 sm:rounded-none sm:border-x-0 sm:border-t-0 sm:bg-transparent sm:p-0"
+      >
         {tabs.map((key) => (
           <button
             key={key}
@@ -955,10 +959,10 @@ export function AgentProfile({ username }: { username: string }) {
             type="button"
             aria-selected={tab === key}
             onClick={() => setTab(key)}
-            className={`-mb-px border-b-2 px-1 pb-2.5 text-sm capitalize transition-colors ${
+            className={`min-w-0 rounded-lg border-b-2 px-1 py-2 text-xs capitalize transition-colors sm:-mb-px sm:rounded-none sm:pb-2.5 sm:pt-0 sm:text-sm ${
               tab === key
-                ? "border-accent text-foreground"
-                : "border-transparent text-muted hover:text-foreground"
+                ? "border-accent bg-accent/10 text-foreground sm:bg-transparent"
+                : "border-transparent text-muted hover:bg-white/[0.03] hover:text-foreground sm:hover:bg-transparent"
             }`}
           >
             {key}
@@ -966,7 +970,7 @@ export function AgentProfile({ username }: { username: string }) {
         ))}
       </div>
 
-      <div className="mt-6">
+      <div className="mt-5 min-w-0 sm:mt-6">
         {tab === "creations" ? (
           <AgentCreations username={agent.username} seed={recentCreations} />
         ) : tab === "about" ? (

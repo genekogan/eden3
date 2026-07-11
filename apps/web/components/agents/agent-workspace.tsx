@@ -363,7 +363,7 @@ export function AgentWorkspacePanel({
   const dirty = viewer.kind === "text" && viewer.draft !== viewer.loadedContent;
 
   return (
-    <div>
+    <div className="min-w-0">
       {/* Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
@@ -374,7 +374,7 @@ export function AgentWorkspacePanel({
             </span>
           ) : null}
         </p>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={() => void loadTree()}
@@ -402,7 +402,7 @@ export function AgentWorkspacePanel({
 
       <div className="mt-4 flex flex-col gap-6 md:flex-row">
         {/* Tree */}
-        <aside className="shrink-0 md:w-64 md:border-r md:border-edge md:pr-4">
+        <aside className="min-w-0 max-w-full shrink-0 md:w-64 md:border-r md:border-edge md:pr-4">
           <TreeRows
             nodes={tree}
             depth={0}
@@ -421,7 +421,7 @@ export function AgentWorkspacePanel({
         </aside>
 
         {/* Viewer */}
-        <section className="min-w-0 flex-1">
+        <section className="min-w-0 max-w-full flex-1">
           {viewer.kind === "idle" ? (
             <p className="pt-8 text-center text-sm text-faint">Select a file to view it.</p>
           ) : viewer.kind === "loading" ? (
@@ -501,7 +501,7 @@ export function AgentWorkspacePanel({
                     value={viewer.draft}
                     onChange={(event) => setViewer({ ...viewer, draft: event.target.value })}
                     spellCheck={false}
-                    className="min-h-[360px] w-full resize-y rounded-lg border border-edge bg-black/20 p-4 font-mono text-[13px] leading-relaxed text-muted outline-none transition-colors focus:border-accent/60"
+                    className="min-h-[360px] w-full max-w-full resize-y rounded-lg border border-edge bg-black/20 p-4 font-mono text-[13px] leading-relaxed text-muted outline-none transition-colors focus:border-accent/60"
                   />
                   <div className="flex items-center gap-3">
                     <button
