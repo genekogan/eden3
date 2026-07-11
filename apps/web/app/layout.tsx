@@ -21,7 +21,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <body className="bg-background font-sans text-foreground antialiased">
         <div className="flex min-h-dvh">
           <Sidebar />
-          <main className="relative min-w-0 flex-1">
+          <main className="relative min-w-0 flex-1 pt-14 sm:pt-0">
             <ErrorBoundary>
               <DevUserGate>{children}</DevUserGate>
             </ErrorBoundary>

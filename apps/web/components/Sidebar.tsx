@@ -99,14 +99,124 @@ const NAV = [
 
 export function Sidebar() {
   const pathname = usePathname();
+  const [mobileOpen, setMobileOpen] = useState(false);
   const isActive = (href: string) =>
     pathname === href || pathname.startsWith(`${href}/`);
   // "New Chat" owns /chat; the session list + permalinks light up "Chats".
   const chatActive = isActive("/chat");
 
+  useEffect(() => setMobileOpen(false), [pathname]);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [mobileOpen]);
+
   return (
-    // Collapses to an icon rail below lg; labels and the manna chip return at lg+.
-    <aside className="sticky top-0 flex h-dvh w-14 shrink-0 flex-col border-r border-edge bg-surface lg:w-56">
+    <>
+      {/* Phones get the full viewport: navigation lives in a top bar + sheet. */}
+      <header className="fixed inset-x-0 top-0 z-50 flex h-14 items-center justify-between border-b border-edge bg-surface/95 px-3 backdrop-blur sm:hidden">
+        <Link
+          href="/"
+          aria-label="Eden home"
+          className="font-mono text-sm tracking-[0.35em] text-foreground"
+        >
+          EDEN<span className="text-accent">3</span>
+        </Link>
+        <div className="flex items-center gap-2">
+          <MannaBadge className="w-fit" />
+          <Link
+            href="/chat"
+            aria-label="New Chat"
+            className={`flex size-9 items-center justify-center rounded-lg border transition-colors ${
+              chatActive
+                ? "border-accent/60 bg-accent/15 text-accent-soft"
+                : "border-edge text-muted"
+            }`}
+          >
+            <NavIcon d={ICONS.newChat} />
+          </Link>
+          <button
+            type="button"
+            aria-label={mobileOpen ? "Close navigation" : "Open navigation"}
+            aria-expanded={mobileOpen}
+            aria-controls="mobile-navigation-sheet"
+            onClick={() => setMobileOpen((open) => !open)}
+            className="flex size-9 items-center justify-center rounded-lg border border-edge text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+          >
+            <span aria-hidden className="relative block h-3.5 w-4">
+              <span
+                className={`absolute left-0 top-0 h-px w-4 bg-current transition-transform ${
+                  mobileOpen ? "translate-y-[6px] rotate-45" : ""
+                }`}
+              />
+              <span
+                className={`absolute left-0 top-[6px] h-px w-4 bg-current transition-opacity ${
+                  mobileOpen ? "opacity-0" : ""
+                }`}
+              />
+              <span
+                className={`absolute bottom-0 left-0 h-px w-4 bg-current transition-transform ${
+                  mobileOpen ? "-translate-y-[7px] -rotate-45" : ""
+                }`}
+              />
+            </span>
+          </button>
+        </div>
+      </header>
+
+      {mobileOpen ? (
+        <div
+          id="mobile-navigation-sheet"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Navigation"
+          className="fixed inset-x-0 bottom-0 top-14 z-40 overflow-y-auto bg-background/98 px-3 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-4 backdrop-blur sm:hidden"
+        >
+          <Link
+            href="/chat"
+            className="flex items-center justify-center gap-2 rounded-xl border border-accent/35 bg-accent/10 px-4 py-3 text-sm text-accent-soft"
+          >
+            <NavIcon d={ICONS.newChat} />
+            New Chat
+          </Link>
+          <nav className="mt-3 grid grid-cols-3 gap-2" aria-label="Mobile primary">
+            {NAV.map((item) => {
+              const active = isActive(item.href);
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  aria-current={active ? "page" : undefined}
+                  className={`flex min-w-0 flex-col items-center gap-1.5 rounded-xl border px-2 py-3 text-xs transition-colors ${
+                    active
+                      ? "border-accent/35 bg-accent/10 text-foreground"
+                      : "border-edge bg-surface text-muted"
+                  }`}
+                >
+                  <span className={active ? "text-accent-soft" : "text-faint"}>
+                    <NavIcon d={item.icon} />
+                  </span>
+                  <span className="max-w-full truncate">{item.label}</span>
+                </Link>
+              );
+            })}
+          </nav>
+          <div className="mt-4">
+            <AuthUserControl variant="panel" />
+          </div>
+        </div>
+      ) : null}
+
+      {/* Tablet/desktop rail; labels and the manna chip return at lg+. */}
+      <aside
+        data-testid="desktop-sidebar"
+        className="sticky top-0 hidden h-dvh w-14 shrink-0 flex-col border-r border-edge bg-surface sm:flex lg:w-56"
+      >
       <div className="flex justify-center pb-5 pt-6 lg:justify-start lg:px-5">
         <Link
           href="/"
@@ -179,6 +289,7 @@ export function Sidebar() {
         <MannaBadge className="w-fit" />
       </div>
       <AuthUserControl />
-    </aside>
+      </aside>
+    </>
   );
 }
