@@ -219,7 +219,7 @@ describe('AgentProvisioner.provisionAgent', () => {
     expect(result.filesSkipped).toEqual([]);
     expect(result.bootstrapSuppressed).toBe(true);
     expect(result.hostWorkspaceDir).toBe(path.join(dataDir, 'workspace-banny'));
-    expect(result.containerWorkspaceDir).toBe('/home/node/.openclaw/workspace-banny');
+    expect(result.containerWorkspaceDir).toBe(path.join(dataDir, 'workspace-banny'));
 
     for (const name of templateNames) {
       const rendered = await fs.readFile(path.join(result.hostWorkspaceDir, name), 'utf8');
@@ -351,7 +351,7 @@ describe('AgentProvisioner.provisionAgent', () => {
     expect(memory).not.toContain('Banny joined');
   });
 
-  it('registers via agents add with the CONTAINER workspace path', async () => {
+  it('registers via agents add with the Docker-host-visible workspace path', async () => {
     const cli = new FakeCli();
     const provisioner = makeProvisioner({ cli });
     const result = await provisioner.provisionAgent(PARAMS);
@@ -365,7 +365,7 @@ describe('AgentProvisioner.provisionAgent', () => {
       'banny',
       '--non-interactive',
       '--workspace',
-      '/home/node/.openclaw/workspace-banny',
+      path.join(dataDir, 'workspace-banny'),
       '--model',
       'anthropic/claude-haiku-4-5',
     ]);

@@ -82,7 +82,7 @@ beforeAll(() => {
 });
 
 describe('agent skills (live gateway)', () => {
-  it('uses only enabled workspace skills during an agent turn', async () => {
+  it('projects only enabled workspace skills into an agent turn', async () => {
     const marker = `EDEN3_SKILL_${randomUUID().slice(0, 8)}`;
     await provisioner.provisionAgent(
       {
@@ -99,6 +99,16 @@ describe('agent skills (live gateway)', () => {
     );
 
     const skillDir = path.join(DATA_DIR, `workspace-${AGENT_ID}`, 'skills', SKILL_SLUG);
+    // Production projection removes disabled skill directories; model that
+    // physical contract now that rw sandboxes see the canonical workspace.
+    await fs.rm(skillDir, { recursive: true, force: true });
+    await setAgentSkills(AGENT_ID, [], { dataDir: DATA_DIR });
+    await validateOpenClawConfig();
+    const disabled = await ask(
+      'skill marker? If you do not have an enabled skill with an exact marker, reply with NO_SKILL.',
+    );
+    expect(disabled).not.toContain(marker);
+
     await fs.mkdir(skillDir, { recursive: true });
     await fs.writeFile(
       path.join(skillDir, 'SKILL.md'),
@@ -116,14 +126,6 @@ describe('agent skills (live gateway)', () => {
       ].join('\n'),
       { mode: 0o600 },
     );
-
-    await setAgentSkills(AGENT_ID, [], { dataDir: DATA_DIR });
-    await validateOpenClawConfig();
-    const disabled = await ask(
-      'skill marker? If you do not have an enabled skill with an exact marker, reply with NO_SKILL.',
-    );
-    expect(disabled).not.toContain(marker);
-
     await setAgentSkills(AGENT_ID, [SKILL_SLUG], { dataDir: DATA_DIR });
     const toolsPath = path.join(DATA_DIR, `workspace-${AGENT_ID}`, 'TOOLS.md');
     const toolsBase = await fs.readFile(toolsPath, 'utf8');

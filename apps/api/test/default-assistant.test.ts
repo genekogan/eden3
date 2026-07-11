@@ -98,7 +98,7 @@ describe('default Eden assistant', () => {
       expect(config.agents.list[0]).toMatchObject({
         id: DEFAULT_EDEN_OPENCLAW_ID,
         name: 'Eden',
-        workspace: '/home/node/.openclaw/workspace',
+        workspace: path.join(dataDir, 'workspace'),
       });
     } finally {
       await fs.rm(dataDir, { recursive: true, force: true });

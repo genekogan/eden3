@@ -15,9 +15,10 @@ import type { GatewayClientOptions } from './types';
  * `GET /v1/models`.
  *
  * Paths: the workspace is written on the HOST at
- * `<dataDir>/workspace-<openclawId>` while the gateway must be told the
- * CONTAINER path `/home/node/.openclaw/workspace-<openclawId>` (the data dir
- * is bind-mounted at `/home/node/.openclaw`).
+ * `<dataDir>/workspace-<openclawId>`. The same host-absolute dataDir is mirrored
+ * into the gateway container because OpenClaw launches sibling sandbox
+ * containers through the host Docker socket: sandbox bind sources must exist
+ * in the Docker host namespace, not only inside the gateway container.
  *
  * ORDERING (critical — see fix in this file): `openclaw agents add` SEEDS the
  * workspace with OpenClaw's DEFAULT template files (generic SOUL.md, a
@@ -227,7 +228,7 @@ export interface ProvisionerOptions {
   dataDir?: string;
   /** Template source; default `packages/gateway/workspace-templates/`. */
   templatesDir?: string;
-  /** Container-side data dir (bind mount target). */
+  /** Gateway-visible data dir. Defaults to dataDir's Docker-host-visible path. */
   containerDataDir?: string;
   /** Routability poll deadline (default 15s per task spec). */
   routableTimeoutMs?: number;
@@ -237,8 +238,6 @@ export interface ProvisionerOptions {
 }
 
 const DEFAULT_TEMPLATES_DIR = fileURLToPath(new URL('../workspace-templates/', import.meta.url));
-const DEFAULT_CONTAINER_DATA_DIR = '/home/node/.openclaw';
-
 export class AgentProvisioner {
   private readonly gateway: GatewayClientOptions;
   private readonly cli: OpenClawCliLike;
@@ -255,7 +254,7 @@ export class AgentProvisioner {
     this.cli = options.cli ?? new OpenClawCli();
     this.dataDir = options.dataDir ?? resolveDataDir();
     this.templatesDir = options.templatesDir ?? DEFAULT_TEMPLATES_DIR;
-    this.containerDataDir = options.containerDataDir ?? DEFAULT_CONTAINER_DATA_DIR;
+    this.containerDataDir = options.containerDataDir ?? this.dataDir;
     this.routableTimeoutMs = options.routableTimeoutMs ?? 15_000;
     this.routablePollIntervalMs = options.routablePollIntervalMs ?? 500;
     this.now = options.now ?? (() => new Date());

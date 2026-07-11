@@ -50,7 +50,6 @@ export interface EnsureDefaultEdenAssistantOptions {
 
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const WORKSPACE_TEMPLATES_DIR = path.join(REPO_ROOT, 'packages', 'gateway', 'workspace-templates');
-const DEFAULT_CONTAINER_DATA_DIR = '/home/node/.openclaw';
 
 export async function ensureDefaultEdenAssistant(
   options: EnsureDefaultEdenAssistantOptions = {},
@@ -182,7 +181,7 @@ async function ensureMainAgentUsesDefaultWorkspace(dataDir: string): Promise<voi
       typeof item === 'object' && item !== null && item.id === DEFAULT_EDEN_OPENCLAW_ID,
   );
   if (!entry) return;
-  const workspace = `${DEFAULT_CONTAINER_DATA_DIR}/workspace`;
+  const workspace = path.join(dataDir, 'workspace');
   if (entry.name === DEFAULT_EDEN_PROFILE.name && entry.workspace === workspace) return;
   entry.name = DEFAULT_EDEN_PROFILE.name;
   entry.workspace = workspace;

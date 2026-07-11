@@ -99,7 +99,7 @@ describe('ensureBaseline', () => {
           sandbox: {
             mode: 'all',
             scope: 'session',
-            workspaceAccess: 'none',
+            workspaceAccess: 'rw',
             docker: {
               network: SANDBOX_EGRESS_NETWORK,
               binds: [],
@@ -193,7 +193,7 @@ describe('ensureBaseline', () => {
           sandbox: {
             mode: 'all',
             scope: 'session',
-            workspaceAccess: 'none',
+            workspaceAccess: 'rw',
             docker: {
               network: SANDBOX_EGRESS_NETWORK,
               binds: [],
@@ -325,6 +325,22 @@ describe('ensureBaseline', () => {
     });
     expect('askFallback' in tools.exec).toBe(false);
     expect(tools.elevated.enabled).toBe(false);
+  });
+
+  it('migrates registered workspaces to Docker-host-visible dataDir paths', async () => {
+    await seedConfig({
+      agents: {
+        list: [
+          { id: 'main', workspace: '/home/node/.openclaw/workspace' },
+          { id: 'testbot', workspace: '/home/node/.openclaw/workspace-testbot' },
+        ],
+      },
+    });
+
+    const { config } = await ensureBaseline({ dataDir });
+    const list = (config.agents as { list: Record<string, unknown>[] }).list;
+    expect(list[0]?.workspace).toBe(path.join(dataDir, 'workspace'));
+    expect(list[1]?.workspace).toBe(path.join(dataDir, 'workspace-testbot'));
   });
 });
 
