@@ -35,6 +35,8 @@
 @layer base {
   html {
     color-scheme: dark;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
   }
 
   body {
@@ -64,5 +66,20 @@
       animation-duration: 0.01ms !important;
       transition-duration: 0.01ms !important;
     }
+  }
+}
+
+/*
+ * iPhone Safari zooms the visual viewport when a focused form control has a
+ * computed font size below 16px. That zoom can survive client-side navigation,
+ * making the next page look horizontally oversized even when its document has
+ * no overflow. Keep compact desktop controls, but prevent that mobile-only
+ * auto-zoom trigger everywhere.
+ */
+@media (max-width: 639px) {
+  input,
+  select,
+  textarea {
+    font-size: 16px;
   }
 }
