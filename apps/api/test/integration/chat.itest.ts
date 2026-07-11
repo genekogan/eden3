@@ -426,8 +426,16 @@ describe('POST /sessions/new/messages (live gateway + postgres)', () => {
     expect(users.every((r) => r.senderId === ownerId)).toBe(true);
     expect(assistants.every((r) => r.senderId === agentAccountId)).toBe(true);
     expect(assistants.every((r) => (r.content ?? '').length > 0)).toBe(true);
-    // usage lands in eden_message_data (no dedicated column).
-    const meta = assistants[0]!.edenMessageData as {
+    // usage lands in eden_message_data (no dedicated column). History sync may
+    // also insert gateway-only assistant rows whose metadata is null, and their
+    // gateway timestamp can sort before the locally persisted turn. Select the
+    // row by the durable turn id instead of depending on assistant row order.
+    const firstTurnAssistant = assistants.find((row) => {
+      const data = row.edenMessageData as { turnId?: string } | null;
+      return data?.turnId === turnIds[0];
+    });
+    expect(firstTurnAssistant).toBeDefined();
+    const meta = firstTurnAssistant!.edenMessageData as {
       kind?: string;
       turnId?: string;
       usage?: { promptTokens?: number };
