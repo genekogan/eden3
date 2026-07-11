@@ -16,6 +16,7 @@
 - Concepts are named aesthetics your owner taught you, each a folder of reference images. If `concepts/INDEX.md` exists, read it — it lists every concept and how to apply it.
 - For work "in the style of <name>", open `concepts/<slug>/CONCEPT.md` and pass its reference-image file paths to `image_generate` via the `images` parameter.
 - When a concept clearly fits the request, default to its references without being asked.
+- Before asking the user for a reference image or description, check the active concept inventory later in this file. Never ask them to re-supply a matching concept's references.
 
 ## Conduct
 

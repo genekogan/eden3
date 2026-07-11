@@ -128,6 +128,10 @@ beforeAll(async () => {
   await fs.mkdir(workspaceDir, { recursive: true });
   await fs.mkdir(capWorkspaceDir, { recursive: true });
   await fs.mkdir(mediaDir, { recursive: true });
+  await fs.writeFile(
+    path.join(workspaceDir, 'AGENTS.md'),
+    '# Operating rules (Muse on Eden)\n\n## Conduct\n\n- Be kind.\n',
+  );
   // The upload route stores through @eden3/core LocalMediaStore (env MEDIA_DIR);
   // point it at a temp dir before the server (and its /media static mount) boots.
   process.env.MEDIA_DIR = mediaDir;
@@ -444,6 +448,10 @@ describe('concept images', () => {
       'utf8',
     );
     expect(conceptMd).toContain('concepts/sunset-watercolor/ref-1.png (1x1)');
+    const agentsMd = await fs.readFile(path.join(workspaceDir, 'AGENTS.md'), 'utf8');
+    expect(agentsMd).toContain('### Sunset Watercolor!');
+    expect(agentsMd).toContain('- Instructions: Updated: lean on cadmium orange.');
+    expect(agentsMd).toContain('- References: `concepts/sunset-watercolor/ref-1.png`');
   });
 
   it('rejects unsupported mime types, oversized files, and non-image bytes', async () => {
@@ -627,10 +635,11 @@ describe('AGENTS.md concepts pointer backfill', () => {
 
     const agentsMd = await fs.readFile(agentsPath(), 'utf8');
     expect(agentsMd).toContain('<!-- EDEN3_CONCEPTS_BEGIN -->');
-    expect(agentsMd).toContain('## Concepts (visual style references)');
-    expect(agentsMd).toContain('concepts/INDEX.md');
-    expect(agentsMd).toContain('in the style of');
-    expect(agentsMd).toContain('`images` parameter');
+    expect(agentsMd).toContain('## Active concepts (always check before image generation)');
+    expect(agentsMd).toContain('### Backfill Style');
+    expect(agentsMd).toContain('`concepts/backfill-style/CONCEPT.md`');
+    expect(agentsMd).toContain('Do not ask the user to re-upload or describe');
+    expect(agentsMd).toContain('`image_generate` via `images`');
     // Original content is preserved (append, not overwrite).
     expect(agentsMd).toContain('- Be kind.');
 
@@ -652,9 +661,9 @@ describe('AGENTS.md concepts pointer backfill', () => {
     });
   });
 
-  it('does not append when AGENTS.md already points at concepts (template section present)', async () => {
-    // A freshly-provisioned agent's AGENTS.md already carries the template
-    // section (detected by its concepts/INDEX.md reference) — no double-add.
+  it('adds a concrete inventory alongside the template pointer without duplicating it', async () => {
+    // A freshly-provisioned agent's AGENTS.md carries the generic template
+    // section; projection adds the current concrete inventory beside it.
     await fs.writeFile(
       agentsPath(),
       '# Operating rules\n\n## Concepts (visual style references)\n\n- read `concepts/INDEX.md`.\n',
@@ -669,8 +678,10 @@ describe('AGENTS.md concepts pointer backfill', () => {
     expect(created.statusCode).toBe(201);
 
     const agentsMd = await fs.readFile(agentsPath(), 'utf8');
-    expect(agentsMd).not.toContain('<!-- EDEN3_CONCEPTS_BEGIN -->');
-    // The single pre-existing section is untouched.
+    expect(agentsMd).toContain('<!-- EDEN3_CONCEPTS_BEGIN -->');
+    expect(agentsMd).toContain('### No Duplicate');
+    expect(agentsMd).toContain('`concepts/no-duplicate/CONCEPT.md`');
+    // The single generic template section is untouched and not duplicated.
     expect(agentsMd.split('## Concepts (visual style references)').length - 1).toBe(1);
 
     await app.inject({

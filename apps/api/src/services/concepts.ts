@@ -75,40 +75,57 @@ export const CONCEPT_FILENAME = 'CONCEPT.md';
 export const CONCEPTS_INDEX_FILENAME = 'INDEX.md';
 
 /**
- * Always-loaded operating rules that point the agent AT the projected
+ * Always-loaded operating rules that inventory the projected concepts in
  * `concepts/` dir. New agents get this baked into their AGENTS.md by the
  * gateway's workspace template (packages/gateway/workspace-templates/AGENTS.md);
  * agents provisioned before concepts existed have an AGENTS.md on disk that the
  * provisioner SKIPS (skip-if-exists), so {@link ensureConceptsPointer} backfills
- * the same pointer the first time an owner projects a concept. Marker-guarded
- * (mirrors the TOOLS.md skills manifest) so the append stays idempotent.
+ * a concrete inventory the first time an owner projects a concept. The marker
+ * block is replaced after every mutation, so stale names/references disappear.
  */
 const AGENTS_FILENAME = 'AGENTS.md';
 const CONCEPTS_DOC_BEGIN = '<!-- EDEN3_CONCEPTS_BEGIN -->';
 const CONCEPTS_DOC_END = '<!-- EDEN3_CONCEPTS_END -->';
 
-/** The pointer body appended to an existing AGENTS.md (voice matches the template). */
-function conceptsPointerSection(): string {
+/** Always-loaded inventory projected into AGENTS.md from the canonical DB rows. */
+function conceptsPointerSection(concepts: RenderedConcept[]): string {
+  const inventory = concepts.flatMap((concept) => {
+    const references = concept.files.map(
+      (file) => `${CONCEPTS_DIRNAME}/${concept.row.slug}/${file.name}`,
+    );
+    return [
+      `### ${concept.row.name}`,
+      '',
+      `- Purpose: ${concept.row.description?.trim() || 'Use this named visual reference when requested.'}`,
+      `- Instructions: ${concept.row.instructions?.trim().replace(/\s+/g, ' ') || 'Use the listed files as visual references.'}`,
+      `- Brief: \`${CONCEPTS_DIRNAME}/${concept.row.slug}/${CONCEPT_FILENAME}\``,
+      `- References: ${references.length > 0 ? references.map((file) => `\`${file}\``).join(', ') : '(none uploaded)'}`,
+      '',
+    ];
+  });
   return [
     CONCEPTS_DOC_BEGIN,
-    '## Concepts (visual style references)',
+    '## Active concepts (always check before image generation)',
     '',
-    '- Concepts are named aesthetics your owner taught you, each a folder of reference images. If `concepts/INDEX.md` exists, read it — it lists every concept and how to apply it.',
-    '- For work "in the style of <name>", open `concepts/<slug>/CONCEPT.md` and pass its reference-image file paths to `image_generate` via the `images` parameter.',
-    '- When a concept clearly fits the request, default to its references without being asked.',
+    '- The concepts listed below are available now. Before asking a user for a reference image, physical description, or style clarification, check this inventory.',
+    '- If an image request names or clearly depicts a listed concept, read its brief and pass every listed reference path to `image_generate` via `images`.',
+    '- Carry the concept purpose and instructions into the generation prompt; for a named person or character, explicitly preserve their identity from the references.',
+    '- Do not ask the user to re-upload or describe something already supplied by a matching concept. Use the concept automatically unless the request conflicts with its instructions.',
+    '',
+    ...inventory,
     CONCEPTS_DOC_END,
   ].join('\n');
 }
 
 /**
- * Ensure the agent's always-loaded AGENTS.md points at `concepts/`. No-op when
- * the file is missing (agent not fully provisioned — the provisioner writes it,
- * with the template section, on the next provision/repair) or when a concepts
- * pointer is already present (the baked-in template section is detected by its
- * `concepts/INDEX.md` reference, a prior append by the begin marker). Best-effort
- * and idempotent; safe to call after every projection.
+ * Synchronize the always-loaded AGENTS.md concept inventory. No-op when the
+ * file is missing; marker-guarded replacement preserves every non-concept rule.
+ * An empty concept list removes the generated block.
  */
-export async function ensureConceptsPointer(workspacePath: string): Promise<void> {
+export async function ensureConceptsPointer(
+  workspacePath: string,
+  concepts: RenderedConcept[] = [],
+): Promise<void> {
   const agentsPath = path.resolve(workspacePath, AGENTS_FILENAME);
   let current: string;
   try {
@@ -117,9 +134,18 @@ export async function ensureConceptsPointer(workspacePath: string): Promise<void
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw err;
   }
-  // Already wired — either the baked-in template section or a prior append.
-  if (current.includes(CONCEPTS_DOC_BEGIN) || current.includes('concepts/INDEX.md')) return;
-  const next = `${current.trimEnd()}\n\n${conceptsPointerSection()}\n`;
+  const markerPattern = new RegExp(
+    `${CONCEPTS_DOC_BEGIN.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[\\s\\S]*?${CONCEPTS_DOC_END.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`,
+  );
+  const withoutInventory = current.replace(markerPattern, '').trimEnd();
+  if (concepts.length === 0) {
+    if (withoutInventory !== current.trimEnd()) {
+      await fs.writeFile(agentsPath, `${withoutInventory}\n`, { mode: 0o600 });
+    }
+    return;
+  }
+  const next = `${withoutInventory}\n\n${conceptsPointerSection(concepts)}\n`;
+  if (next === current) return;
   await fs.writeFile(agentsPath, next, { mode: 0o600 });
 }
 
@@ -253,6 +279,28 @@ export async function projectAgentConcepts(
   return serialized(agentAccountId, () => rebuildConceptsDir(agentAccountId));
 }
 
+/** Refresh all active concept inventories on API boot (deployment migration). */
+export async function refreshActiveConceptInventories(): Promise<{
+  agents: number;
+  projected: number;
+  failed: number;
+}> {
+  const rows = await pg<{ agent_id: string }[]>`
+    select distinct agent_id from concepts where deleted = false order by agent_id
+  `;
+  let projected = 0;
+  let failed = 0;
+  for (const row of rows) {
+    try {
+      const result = await projectAgentConcepts(row.agent_id);
+      if (result.projected) projected += 1;
+    } catch {
+      failed += 1;
+    }
+  }
+  return { agents: rows.length, projected, failed };
+}
+
 async function rebuildConceptsDir(agentAccountId: string): Promise<ConceptProjectionResult> {
   const [agent] = await pg<{ workspace_path: string | null }[]>`
     select workspace_path from agents where account_id = ${agentAccountId}
@@ -272,18 +320,10 @@ async function rebuildConceptsDir(agentAccountId: string): Promise<ConceptProjec
   // Full rebuild: wipe and rewrite. The dir is entirely eden3-owned.
   await fs.rm(root, { recursive: true, force: true });
   if (conceptRows.length === 0) {
+    await ensureConceptsPointer(agent.workspace_path, []);
     return { projected: true, concepts: 0, images: 0 };
   }
   await fs.mkdir(root, { recursive: true });
-
-  // Backfill the always-loaded pointer so existing agents (whose AGENTS.md the
-  // provisioner skipped) discover concepts the moment their owner projects one.
-  // Best-effort: a missing/unwritable AGENTS.md must not fail the projection.
-  try {
-    await ensureConceptsPointer(agent.workspace_path);
-  } catch {
-    // Pointer backfill is advisory — the next mutation (or a repair) retries.
-  }
 
   let copiedImages = 0;
   const rendered: RenderedConcept[] = [];
@@ -319,5 +359,9 @@ async function rebuildConceptsDir(agentAccountId: string): Promise<ConceptProjec
   await fs.writeFile(path.join(root, CONCEPTS_INDEX_FILENAME), indexMarkdown(rendered), {
     mode: 0o600,
   });
+  // Project a compact, concrete inventory into the always-loaded AGENTS.md.
+  // This makes concept selection proactive instead of relying on the model to
+  // remember to discover INDEX.md before it asks the user for references.
+  await ensureConceptsPointer(agent.workspace_path, rendered);
   return { projected: true, concepts: rendered.length, images: copiedImages };
 }

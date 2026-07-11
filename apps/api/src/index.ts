@@ -7,10 +7,12 @@ import { ensureBaseline } from '@eden3/gateway';
 
 import { defaultOpenclawDataDir } from './gateway-glue';
 import { buildServer } from './server';
+import { refreshActiveConceptInventories } from './services/concepts';
 
 loadRootEnv();
 const env = getEnv();
 await ensureBaseline({ dataDir: defaultOpenclawDataDir() });
+await refreshActiveConceptInventories();
 
 const app = await buildServer({
   logger: { level: 'info', base: undefined }, // compact: no pid/hostname
