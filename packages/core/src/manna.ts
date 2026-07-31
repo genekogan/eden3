@@ -106,6 +106,24 @@ export class DailyCapExceededError extends Error {
   }
 }
 
+/** Thrown when a debit would exceed a transactionally-enforced rolling scope cap. */
+export class RollingSpendCapExceededError extends Error {
+  constructor(
+    readonly scope: string,
+    readonly scopeId: string,
+    readonly spent: number,
+    readonly requested: number,
+    readonly cap: number,
+    readonly windowMs: number,
+  ) {
+    super(
+      `${scope} rolling manna cap exceeded: scope ${scopeId} spent ${spent} in the ` +
+        `last ${windowMs}ms, requested ${requested} more, cap is ${cap}`,
+    );
+    this.name = 'RollingSpendCapExceededError';
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Balances
 // ---------------------------------------------------------------------------
@@ -212,8 +230,47 @@ export interface DebitParams {
    * (the classic route-level TOCTOU this replaces).
    */
   dailyCap?: { limit: number; now?: Date };
+  /**
+   * Optional rolling spend ceiling for a caller-defined scope. Debit keys for
+   * the scope must be produced by {@link scopedLedgerIdempotencyKey}; the
+   * ledger prefix is the durable attribution used by the cap query. The
+   * per-scope advisory lock is held only for this short ledger transaction,
+   * never across provider work.
+   */
+  rollingCap?: {
+    scope: string;
+    scopeId: string;
+    limit: number;
+    windowMs: number;
+    now?: Date;
+  };
   /** Run inside an existing drizzle client/transaction. */
   db?: DbHandle;
+}
+
+const LEDGER_SCOPE_PART = /^[a-z][a-z0-9-]{0,31}$/;
+const LEDGER_SCOPE_ID = /^[a-zA-Z0-9._-]{1,128}$/;
+
+function scopedLedgerPrefix(scope: string, scopeId: string): string {
+  if (!LEDGER_SCOPE_PART.test(scope)) {
+    throw new RangeError(`ledger scope must match ${LEDGER_SCOPE_PART}, got ${scope}`);
+  }
+  if (!LEDGER_SCOPE_ID.test(scopeId)) {
+    throw new RangeError(`ledger scope id must match ${LEDGER_SCOPE_ID}, got ${scopeId}`);
+  }
+  return `budget:${scope}:${scopeId}:`;
+}
+
+/** Stable idempotency-key namespace for rolling-cap-attributed debits. */
+export function scopedLedgerIdempotencyKey(
+  scope: string,
+  scopeId: string,
+  operationId: string,
+): string {
+  if (!operationId || operationId.length > 200 || /[\r\n]/.test(operationId)) {
+    throw new RangeError('ledger operation id must be 1-200 characters without newlines');
+  }
+  return `${scopedLedgerPrefix(scope, scopeId)}${operationId}`;
 }
 
 /** Start of the UTC day containing `now` — the daily-cap window boundary. */
@@ -222,9 +279,11 @@ function startOfUtcDay(now: Date): Date {
 }
 
 /**
- * Net metered spend (spends minus refunds, floor 0) for one account since
- * `since`, computed on the ledger. Exposed for the API's fast-path check;
- * the authoritative, race-free check runs inside {@link debit}.
+ * Net metered spend for one account since `since`, grouped by the original
+ * debit's timestamp. A linked refund reduces that debit even when written
+ * later; a refund of an older debit cannot erase newer-window spend. Exposed
+ * for the API's fast-path check; the authoritative, race-free check runs
+ * inside {@link debit}.
  */
 export async function netSpendSince(
   accountId: string,
@@ -233,17 +292,56 @@ export async function netSpendSince(
 ): Promise<number> {
   const dbc = opts.db ?? db;
   const rows = (await dbc.execute(sql`
-    select coalesce(sum(
-      case
-        when mt.type like 'spend%' and mt.amount < 0 then -mt.amount
-        when mt.type like 'refund%' and mt.amount > 0 then -mt.amount
-        else 0
-      end
-    ), 0)::numeric::text as spend
-    from manna_transactions mt
-    join manna_accounts ma on ma.id = mt.manna_account_id
+    select coalesce(sum(greatest(
+      -original.amount - coalesce(linked_refunds.amount, 0),
+      0
+    )), 0)::numeric::text as spend
+    from manna_transactions original
+    join manna_accounts ma on ma.id = original.manna_account_id
+    left join lateral (
+      select coalesce(sum(refund_tx.amount), 0) as amount
+      from manna_transactions refund_tx
+      where refund_tx.refunds_transaction_id = original.id
+        and refund_tx.type like 'refund%'
+        and refund_tx.amount > 0
+    ) linked_refunds on true
     where ma.account_id = ${accountId}
-      and mt.created_at >= ${since.toISOString()}
+      and original.type like 'spend%'
+      and original.amount < 0
+      and original.created_at >= ${since.toISOString()}
+  `)) as unknown as { spend: string | null }[];
+  return Math.max(0, Number(rows[0]?.spend ?? 0));
+}
+
+/**
+ * Net debit amount for one rolling-cap scope, grouped by the original debit's
+ * timestamp. Linked refunds reduce that debit even when the refund itself was
+ * written later; this avoids a refund near the window boundary incorrectly
+ * offsetting newer work after its original debit ages out.
+ */
+export async function scopedNetSpendSince(
+  scope: string,
+  scopeId: string,
+  since: Date,
+  opts: { db?: DbHandle } = {},
+): Promise<number> {
+  const dbc = opts.db ?? db;
+  const prefix = scopedLedgerPrefix(scope, scopeId);
+  const rows = (await dbc.execute(sql`
+    select coalesce(sum(greatest(
+      -original.amount - coalesce(linked_refunds.amount, 0),
+      0
+    )), 0)::numeric::text as spend
+    from manna_transactions original
+    left join lateral (
+      select coalesce(sum(refund_tx.amount), 0) as amount
+      from manna_transactions refund_tx
+      where refund_tx.refunds_transaction_id = original.id
+        and refund_tx.amount > 0
+    ) linked_refunds on true
+    where original.amount < 0
+      and original.idempotency_key like ${`${prefix}%`}
+      and original.created_at >= ${since.toISOString()}
   `)) as unknown as { spend: string | null }[];
   return Math.max(0, Number(rows[0]?.spend ?? 0));
 }
@@ -297,13 +395,38 @@ export async function debit(params: DebitParams): Promise<LedgerResult> {
 
       const account = await getOrCreateMannaAccount(params.accountId, { db: tx });
 
-      if (params.dailyCap) {
-        // Serialize cap-checked debits per account for the rest of this tx —
-        // two concurrent debits cannot both read a stale daily sum and both
-        // land. hashtextextended gives a stable bigint lock key per uuid.
-        await tx.execute(
-          sql`select pg_advisory_xact_lock(hashtextextended(${params.accountId}::text, 42))`,
-        );
+      if (params.dailyCap || params.rollingCap) {
+        // Lock ordering is global and deliberate: account/day first, then the
+        // rolling scope. Every multi-cap debit follows this order, preventing
+        // deadlocks while serializing concurrent reservations/settlements.
+        if (params.dailyCap) {
+          // hash seed 42 is the existing per-account daily budget namespace.
+          await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${params.accountId}::text, 42))`,
+          );
+        }
+        if (params.rollingCap) {
+          scopedLedgerPrefix(params.rollingCap.scope, params.rollingCap.scopeId);
+          if (!Number.isFinite(params.rollingCap.limit) || params.rollingCap.limit < 0) {
+            throw new RangeError('rolling cap limit must be finite and nonnegative');
+          }
+          if (!Number.isFinite(params.rollingCap.windowMs) || params.rollingCap.windowMs <= 0) {
+            throw new RangeError('rolling cap windowMs must be finite and positive');
+          }
+          const expectedPrefix = scopedLedgerPrefix(
+            params.rollingCap.scope,
+            params.rollingCap.scopeId,
+          );
+          if (!params.idempotencyKey.startsWith(expectedPrefix)) {
+            throw new RangeError(
+              `rolling-cap debit key must start with ${expectedPrefix}`,
+            );
+          }
+          // hash seed 43 is disjoint from daily-account and task-limit locks.
+          await tx.execute(
+            sql`select pg_advisory_xact_lock(hashtextextended(${`${params.rollingCap.scope}:${params.rollingCap.scopeId}`}::text, 43))`,
+          );
+        }
         // Re-check idempotency INSIDE the lock: a concurrent replay of the
         // same key that lost the lock race must return the winner's result,
         // not a spurious DailyCapExceededError once the winner's spend is
@@ -317,18 +440,39 @@ export async function debit(params: DebitParams): Promise<LedgerResult> {
             alreadyApplied: true,
           };
         }
-        const spentToday = await netSpendSince(
-          params.accountId,
-          startOfUtcDay(params.dailyCap.now ?? new Date()),
-          { db: tx },
-        );
-        if (spentToday + params.amount > params.dailyCap.limit) {
-          throw new DailyCapExceededError(
+        if (params.dailyCap) {
+          const spentToday = await netSpendSince(
             params.accountId,
-            spentToday,
-            params.amount,
-            params.dailyCap.limit,
+            startOfUtcDay(params.dailyCap.now ?? new Date()),
+            { db: tx },
           );
+          if (spentToday + params.amount > params.dailyCap.limit) {
+            throw new DailyCapExceededError(
+              params.accountId,
+              spentToday,
+              params.amount,
+              params.dailyCap.limit,
+            );
+          }
+        }
+        if (params.rollingCap) {
+          const now = params.rollingCap.now ?? new Date();
+          const spent = await scopedNetSpendSince(
+            params.rollingCap.scope,
+            params.rollingCap.scopeId,
+            new Date(now.getTime() - params.rollingCap.windowMs),
+            { db: tx },
+          );
+          if (spent + params.amount > params.rollingCap.limit) {
+            throw new RollingSpendCapExceededError(
+              params.rollingCap.scope,
+              params.rollingCap.scopeId,
+              spent,
+              params.amount,
+              params.rollingCap.limit,
+              params.rollingCap.windowMs,
+            );
+          }
         }
       }
 

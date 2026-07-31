@@ -20,6 +20,7 @@ export const pg = postgres(databaseUrl, {
   max: 10,
   onnotice: () => {},
 });
+export type PgClient = typeof pg;
 
 /** Drizzle client bound to the eden3 schema. */
 export const db = drizzle(pg, { schema });

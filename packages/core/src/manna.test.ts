@@ -5,8 +5,10 @@ import { eq, inArray } from 'drizzle-orm';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
+  DailyCapExceededError,
   InsufficientMannaError,
   PRICING,
+  RollingSpendCapExceededError,
   credit,
   debit,
   getBalance,
@@ -15,6 +17,8 @@ import {
   numericToNumber,
   refund,
   refundIdempotencyKey,
+  scopedLedgerIdempotencyKey,
+  scopedNetSpendSince,
 } from './manna';
 
 /**
@@ -395,6 +399,145 @@ describe('debit dailyCap (Q7 per-day ceiling, race-free)', () => {
     const rows = (await ledgerRowsFor(accountId)).filter((r) => r.idempotencyKey === key);
     expect(rows).toHaveLength(1);
     expect((await getBalance(accountId)).total).toBe(700);
+  });
+
+  it('does not let a current refund of an older debit erase current-day spend', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+    const oldKey = `old-cap-${randomUUID()}`;
+    const old = await debit({
+      accountId,
+      amount: 80,
+      type: 'spend:chat',
+      idempotencyKey: oldKey,
+    });
+    await db
+      .update(mannaTransactions)
+      .set({ createdAt: new Date(Date.now() - 48 * 60 * 60 * 1000) })
+      .where(eq(mannaTransactions.id, old.transaction.id));
+    await refund({ originalIdempotencyKey: oldKey, type: 'refund:chat' });
+
+    await debit({
+      accountId,
+      amount: 80,
+      type: 'spend:chat',
+      idempotencyKey: `today-cap-${randomUUID()}`,
+      dailyCap: { limit: 80 },
+    });
+    await expect(
+      debit({
+        accountId,
+        amount: 1,
+        type: 'spend:chat',
+        idempotencyKey: `today-over-${randomUUID()}`,
+        dailyCap: { limit: 80 },
+      }),
+    ).rejects.toBeInstanceOf(DailyCapExceededError);
+  });
+});
+
+describe('debit rollingCap (scoped, race-free)', () => {
+  it('never lets adversarial concurrent debits collectively exceed the rolling cap', async () => {
+    const accountId = await makeAccount();
+    const scopeId = randomUUID();
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+    const rollingCap = {
+      scope: 'automation',
+      scopeId,
+      limit: 80,
+      windowMs: 60 * 60 * 1000,
+    };
+
+    const settled = await Promise.allSettled(
+      Array.from({ length: 10 }, () =>
+        debit({
+          accountId,
+          amount: 30,
+          type: 'spend:chat',
+          idempotencyKey: scopedLedgerIdempotencyKey('automation', scopeId, randomUUID()),
+          rollingCap,
+        }),
+      ),
+    );
+
+    const ok = settled.filter((result) => result.status === 'fulfilled');
+    const failed = settled.filter((result) => result.status === 'rejected');
+    expect(ok).toHaveLength(2);
+    expect(failed).toHaveLength(8);
+    for (const result of failed) {
+      expect((result as PromiseRejectedResult).reason).toBeInstanceOf(
+        RollingSpendCapExceededError,
+      );
+    }
+    expect(
+      await scopedNetSpendSince(
+        'automation',
+        scopeId,
+        new Date(Date.now() - 60 * 60 * 1000),
+      ),
+    ).toBe(60);
+    expect((await getBalance(accountId)).total).toBe(940);
+  });
+
+  it('uses linked refunds to release headroom without a window-boundary undercount', async () => {
+    const accountId = await makeAccount();
+    const scopeId = randomUUID();
+    const firstKey = scopedLedgerIdempotencyKey('automation', scopeId, randomUUID());
+    const rollingCap = {
+      scope: 'automation',
+      scopeId,
+      limit: 80,
+      windowMs: 60 * 60 * 1000,
+    };
+    await credit({ accountId, amount: 1_000, type: 'credit:test' });
+    const first = await debit({
+      accountId,
+      amount: 80,
+      type: 'spend:chat',
+      idempotencyKey: firstKey,
+      rollingCap,
+    });
+    await refund({ originalIdempotencyKey: firstKey, type: 'refund:chat' });
+    // Age only the original out of the rolling window. A naive
+    // transaction-created-at sum would still count the newer refund and let
+    // it offset unrelated current work.
+    await db
+      .update(mannaTransactions)
+      .set({ createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000) })
+      .where(eq(mannaTransactions.id, first.transaction.id));
+
+    expect(
+      await scopedNetSpendSince(
+        'automation',
+        scopeId,
+        new Date(Date.now() - 60 * 60 * 1000),
+      ),
+    ).toBe(0);
+    await expect(
+      debit({
+        accountId,
+        amount: 80,
+        type: 'spend:chat',
+        idempotencyKey: scopedLedgerIdempotencyKey('automation', scopeId, randomUUID()),
+        rollingCap,
+      }),
+    ).resolves.toMatchObject({ alreadyApplied: false });
+    expect(
+      await scopedNetSpendSince(
+        'automation',
+        scopeId,
+        new Date(Date.now() - 60 * 60 * 1000),
+      ),
+    ).toBe(80);
+    await expect(
+      debit({
+        accountId,
+        amount: 1,
+        type: 'spend:chat',
+        idempotencyKey: scopedLedgerIdempotencyKey('automation', scopeId, randomUUID()),
+        rollingCap,
+      }),
+    ).rejects.toBeInstanceOf(RollingSpendCapExceededError);
   });
 });
 

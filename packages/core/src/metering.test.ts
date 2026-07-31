@@ -56,6 +56,25 @@ describe('CostTable', () => {
     expect(warm.totalCostUsd).toBeLessThan(cold.totalCostUsd);
   });
 
+  it('prices Sonnet 4.6 cache writes separately for notional subscription billing', () => {
+    const estimate = costFromLlmUsage({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      promptTokens: 1_000_000,
+      cachedTokens: 900_000,
+      cacheWriteTokens: 200_000,
+      completionTokens: 10_000,
+    });
+
+    expect(estimate.totalCostUsd).toBeCloseTo(1.47, 10);
+    expect(estimate.lineItems.map((line) => line.unit)).toEqual([
+      'input_1m_tokens',
+      'cache_read_1m_tokens',
+      'cache_write_1m_tokens',
+      'output_1m_tokens',
+    ]);
+  });
+
   it('prices comparable Haiku < Sonnet < Opus turns', () => {
     const usage = { promptTokens: 50_000, completionTokens: 5_000 };
     const haiku = costFromLlmUsage({ provider: 'anthropic', model: 'claude-haiku-4-5', ...usage });

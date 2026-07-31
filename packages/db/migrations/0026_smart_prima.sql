@@ -1,0 +1,2 @@
+ALTER TABLE "triggers" ADD COLUMN "pending_occurrence_claim_id" uuid;--> statement-breakpoint
+ALTER TABLE "triggers" ADD CONSTRAINT "triggers_pending_occurrence_claim_shape_check" CHECK ("triggers"."pending_occurrence_id" is not null or "triggers"."pending_occurrence_claim_id" is null);

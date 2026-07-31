@@ -50,11 +50,40 @@ export type ProvisionStatus = z.infer<typeof provisionStatusSchema>;
 export const AGENT_MODEL_OPTIONS = [
   'anthropic/claude-haiku-4-5',
   'anthropic/claude-sonnet-4-5',
+  'anthropic/claude-sonnet-4-6',
   'anthropic/claude-opus-4-6',
 ] as const;
 export const DEFAULT_AGENT_MODEL = AGENT_MODEL_OPTIONS[0];
 export const agentModelSchema = z.enum(AGENT_MODEL_OPTIONS);
 export type AgentModel = z.infer<typeof agentModelSchema>;
+
+/** OpenClaw 7.1 model-scoped execution backends supported by Eden3. */
+export const AGENT_RUNTIME_OPTIONS = ['openclaw', 'claude-cli'] as const;
+export const agentRuntimeSchema = z.enum(AGENT_RUNTIME_OPTIONS);
+export type AgentRuntime = z.infer<typeof agentRuntimeSchema>;
+
+/**
+ * Runtime defaults are model-scoped because OpenClaw stores `agentRuntime`
+ * under `agents.defaults.models.<provider/model>`. Sonnet 4.6 is the explicit
+ * subscription-backed lane; existing API-backed models remain API-backed
+ * until an operator flips them.
+ */
+export const DEFAULT_AGENT_RUNTIME_BY_MODEL: Readonly<Record<AgentModel, AgentRuntime>> = {
+  'anthropic/claude-haiku-4-5': 'openclaw',
+  'anthropic/claude-sonnet-4-5': 'openclaw',
+  'anthropic/claude-sonnet-4-6': 'claude-cli',
+  'anthropic/claude-opus-4-6': 'openclaw',
+};
+
+export function defaultAgentRuntimeForModel(model: AgentModel): AgentRuntime {
+  return DEFAULT_AGENT_RUNTIME_BY_MODEL[model];
+}
+
+export const modelRuntimeDto = z.object({
+  model: agentModelSchema,
+  agentRuntime: agentRuntimeSchema,
+});
+export type ModelRuntimeDto = z.infer<typeof modelRuntimeDto>;
 
 export const AGENT_THINKING_LEVELS = ['fast', 'balanced', 'deep'] as const;
 export const DEFAULT_AGENT_THINKING_LEVEL = 'balanced';
@@ -89,6 +118,8 @@ export const agentDto = z.object({
   greeting: z.string().nullable(),
   voice: z.string().nullable(),
   model: agentModelSchema,
+  /** Effective model-scoped OpenClaw runtime; never a per-agent override. */
+  agentRuntime: agentRuntimeSchema,
   thinkingLevel: agentThinkingLevelSchema,
   toolGroups: agentToolGroupsSchema,
   userImage: z.string().nullable(),
@@ -117,6 +148,10 @@ export const sessionDto = z.object({
   status: z.string().nullable(),
   sessionType: z.string().nullable(),
   platform: z.string().nullable(),
+  /** Hosted channel mirror; null for normal webchat sessions. */
+  channelConnectionId: uuidSchema.nullable(),
+  /** Channel mirrors are observable in Eden but cannot be injected into. */
+  readOnly: z.boolean(),
   /** Agent accounts.id members (session_agents). */
   agentIds: z.array(uuidSchema),
   /** User accounts.id members (session_users). */

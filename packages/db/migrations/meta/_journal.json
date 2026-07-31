@@ -127,6 +127,69 @@
       "when": 1783666931254,
       "tag": "0017_short_power_pack",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1785480937268,
+      "tag": "0018_loose_lilandra",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1785481056339,
+      "tag": "0019_safe_makkari",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1785483464407,
+      "tag": "0020_freezing_butterfly",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1785489618749,
+      "tag": "0021_channel_runtime_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1785491516325,
+      "tag": "0022_channel_turn_provenance_repair",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1785495486526,
+      "tag": "0023_data_plane_reconciliation",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1785496521069,
+      "tag": "0024_runtime_recovery_hardening",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1785500736651,
+      "tag": "0025_dry_hercules",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1785502950020,
+      "tag": "0026_smart_prima",
+      "breakpoints": true
     }
   ]
 }

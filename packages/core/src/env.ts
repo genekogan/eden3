@@ -13,6 +13,7 @@ import { z } from 'zod';
 const portSchema = z.coerce.number().int().min(1).max(65535);
 const positiveIntSchema = z.coerce.number().int().min(1);
 const nonnegativeIntSchema = z.coerce.number().int().min(0);
+const utcHourSchema = z.coerce.number().int().min(0).max(23);
 const csvSchema = z.preprocess(
   (value) =>
     typeof value === 'string'
@@ -27,9 +28,26 @@ const authProviderSchema = z
   .enum(['dev', 'clerk', 'hybrid'])
   .default('dev');
 
+function databaseNameFromUrl(raw: string): string | null {
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') return null;
+    const name = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
+    return /^[A-Za-z0-9_-]+$/.test(name) ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 export const envSchema = z.object({
   /** Postgres (docker, localhost:5433). */
   DATABASE_URL: z.string().min(1).default('postgres://eden3:eden3@localhost:5433/eden3'),
+  /**
+   * Logical Postgres database selected for the API and both trusted Compose
+   * sidecars. When omitted it is derived from DATABASE_URL; when supplied it
+   * must match, so staging cannot silently split API and sidecar state.
+   */
+  EDEN3_DATABASE_NAME: z.string().regex(/^[A-Za-z0-9_-]+$/).optional(),
   /** Local fork of prod Mongo (docker, localhost:27018). */
   MONGO_URL: z.string().min(1).default('mongodb://127.0.0.1:27018/eden-prod'),
   /** OpenClaw gateway (single-tenant trusted backend). */
@@ -95,6 +113,10 @@ export const envSchema = z.object({
    * configured — scheduled runs execute real agent turns).
    */
   TASK_SCHEDULER_INTERVAL_MS: nonnegativeIntSchema.default(30_000),
+  /** Eden-managed active-agent memory sweep polling; 0 disables it. */
+  MEMORY_DREAM_SCHEDULER_INTERVAL_MS: nonnegativeIntSchema.default(60_000),
+  /** First UTC hour in which the once-daily idempotent memory sweep may claim. */
+  MEMORY_DREAM_HOUR_UTC: utcHourSchema.default(7),
   /** Fastify JSON/body parser ceiling. */
   API_BODY_LIMIT_BYTES: positiveIntSchema.default(1_000_000),
   /** Fixed-window per-client API rate-limit interval. */
@@ -120,6 +142,26 @@ export const envSchema = z.object({
   /** Checkout redirects. Defaults are local web pages that can be implemented later. */
   BILLING_SUCCESS_URL: z.string().min(1).optional(),
   BILLING_CANCEL_URL: z.string().min(1).optional(),
+}).transform((env, ctx) => {
+  const fromUrl = databaseNameFromUrl(env.DATABASE_URL);
+  if (fromUrl === null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['DATABASE_URL'],
+      message: 'must be a postgres URL with one valid logical database name',
+    });
+  }
+  if (env.EDEN3_DATABASE_NAME !== undefined && fromUrl !== null && env.EDEN3_DATABASE_NAME !== fromUrl) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['EDEN3_DATABASE_NAME'],
+      message: `must match DATABASE_URL database "${fromUrl}"`,
+    });
+  }
+  return {
+    ...env,
+    EDEN3_DATABASE_NAME: env.EDEN3_DATABASE_NAME ?? fromUrl ?? '',
+  };
 });
 
 export type Env = z.infer<typeof envSchema>;

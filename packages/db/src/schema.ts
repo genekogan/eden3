@@ -3,6 +3,7 @@ import type { AnyPgColumn } from 'drizzle-orm/pg-core';
 import {
   bigint,
   boolean,
+  check,
   customType,
   index,
   integer,
@@ -87,7 +88,21 @@ export const agents = pgTable('agents', {
   isSynthetic: boolean('is_synthetic').notNull().default(false),
   provisionStatus: text('provision_status').notNull().default('pending'),
   provisionedAt: timestamptz('provisioned_at'),
-});
+  /** Monotonic desired runtime/workspace configuration revision. */
+  runtimeSyncVersion: integer('runtime_sync_version').notNull().default(0),
+  /** Highest desired revision fully read back from the runtime. */
+  runtimeSyncedVersion: integer('runtime_synced_version').notNull().default(0),
+  /** Fenced, renewable claim for crash-safe asynchronous convergence. */
+  runtimeSyncClaimToken: uuid('runtime_sync_claim_token'),
+  runtimeSyncLeaseExpiresAt: timestamptz('runtime_sync_lease_expires_at'),
+  runtimeSyncError: text('runtime_sync_error'),
+}, (t) => [
+  index('agents_runtime_sync_pending_idx')
+    .on(t.runtimeSyncVersion, t.runtimeSyncLeaseExpiresAt)
+    .where(
+      sql`${t.provisionStatus} = 'ready' and ${t.openclawId} is not null and ${t.workspacePath} is not null and ${t.runtimeSyncVersion} > ${t.runtimeSyncedVersion}`,
+    ),
+]);
 
 // ---------------------------------------------------------------------------
 // sessions
@@ -117,6 +132,20 @@ export const sessions = pgTable(
     isPublic: boolean('is_public'),
     /** Platform channel descriptor ({type, key, …}); objects in real docs. */
     channel: jsonb('channel'),
+    /** Hosted Discord/Telegram connection mirrored by this read-only session. */
+    channelConnectionId: uuid('channel_connection_id').references(
+      (): AnyPgColumn => channelConnections.id,
+      { onDelete: 'set null' },
+    ),
+    /** Non-reversible connection-scoped identifier for the external peer. */
+    channelPeerFingerprint: text('channel_peer_fingerprint'),
+    /**
+     * Non-reversible connection-scoped identifier for the provider
+     * conversation. Unlike `channelPeerFingerprint`, this is stable for a
+     * group conversation whose individual senders change from message to
+     * message.
+     */
+    channelConversationFingerprint: text('channel_conversation_fingerprint'),
     gatewaySessionKey: text('gateway_session_key').unique(),
     gatewayPrimedAt: timestamptz('gateway_primed_at'),
     lastMessageAt: timestamptz('last_message_at'),
@@ -130,6 +159,15 @@ export const sessions = pgTable(
       .on(t.externalId)
       .where(sql`${t.externalId} is not null`),
     index('sessions_owner_last_message_idx').on(t.ownerId, t.lastMessageAt.desc()),
+    index('sessions_channel_connection_idx').on(t.channelConnectionId, t.lastMessageAt.desc()),
+    uniqueIndex('sessions_channel_peer_uq')
+      .on(t.channelConnectionId, t.channelPeerFingerprint)
+      .where(sql`${t.channelConnectionId} is not null and ${t.channelPeerFingerprint} is not null`),
+    uniqueIndex('sessions_channel_conversation_uq')
+      .on(t.channelConnectionId, t.channelConversationFingerprint)
+      .where(
+        sql`${t.channelConnectionId} is not null and ${t.channelConversationFingerprint} is not null`,
+      ),
   ],
 );
 
@@ -196,11 +234,14 @@ export const messages = pgTable(
     attachments: jsonb('attachments'),
     reactions: jsonb('reactions'),
     replyToExternalId: text('reply_to_external_id'),
+    /** Provider sequence/update id when supplied; breaks equal-timestamp ties. */
+    sourceSequence: bigint('source_sequence', { mode: 'number' }),
     createdAt: timestamptz('created_at').notNull().defaultNow(),
   },
   (t) => [
     uniqueIndex('messages_session_external_uq').on(t.sessionId, t.externalId),
     index('messages_session_created_idx').on(t.sessionId, t.createdAt),
+    index('messages_channel_order_idx').on(t.sessionId, t.createdAt, t.sourceSequence, t.id),
   ],
 );
 
@@ -310,6 +351,43 @@ export const agentLikes = pgTable(
   (t) => [
     primaryKey({ columns: [t.userId, t.agentId] }),
     index('agent_likes_agent_idx').on(t.agentId),
+  ],
+);
+
+// Durable source ownership for legacy social edges. A source document can
+// change target over time, so the composite key includes the resolved edge;
+// `last_seen_run_id` lets a full source pass retire the prior mapping and
+// remove the target relation only when no other legacy source still owns it.
+// `target_id` is polymorphic (creation/account) and intentionally has no FK.
+export const etlSocialEdges = pgTable(
+  'etl_social_edges',
+  {
+    sourceCollection: text('source_collection').notNull(),
+    sourceExternalId: text('source_external_id').notNull(),
+    edgeKind: text('edge_kind').$type<'creation_like' | 'agent_like'>().notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    targetId: uuid('target_id').notNull(),
+    lastSeenRunId: uuid('last_seen_run_id').notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({
+      columns: [
+        t.sourceCollection,
+        t.sourceExternalId,
+        t.edgeKind,
+        t.userId,
+        t.targetId,
+      ],
+    }),
+    index('etl_social_edges_source_run_idx').on(
+      t.sourceCollection,
+      t.lastSeenRunId,
+    ),
+    index('etl_social_edges_target_idx').on(t.edgeKind, t.userId, t.targetId),
   ],
 );
 
@@ -534,6 +612,16 @@ export const channelConnections = pgTable(
     agentId: uuid('agent_id').references(() => accounts.id),
     channel: text('channel').notNull(),
     label: text('label'),
+    /** Stable named-account key used by OpenClaw routing bindings. */
+    runtimeAccountId: text('runtime_account_id'),
+    desiredState: text('desired_state')
+      .$type<'inactive' | 'active'>()
+      .notNull()
+      .default('inactive'),
+    observedState: text('observed_state')
+      .$type<'unknown' | 'validating' | 'verified' | 'starting' | 'live' | 'stopped' | 'error'>()
+      .notNull()
+      .default('unknown'),
     status: text('status').notNull().default('connected'),
     tokenCiphertext: text('token_ciphertext').notNull(),
     tokenIv: text('token_iv').notNull(),
@@ -541,6 +629,12 @@ export const channelConnections = pgTable(
     tokenSha256: text('token_sha256').notNull(),
     tokenPreview: text('token_preview'),
     keyVersion: text('key_version').notNull().default('v1'),
+    lastErrorCode: text('last_error_code'),
+    lastErrorMessage: text('last_error_message'),
+    lastValidatedAt: timestamptz('last_validated_at'),
+    retryCount: integer('retry_count').notNull().default(0),
+    nextRetryAt: timestamptz('next_retry_at'),
+    activatedAt: timestamptz('activated_at'),
     metadata: jsonb('metadata'),
     createdAt: timestamptz('created_at').notNull().defaultNow(),
     updatedAt: timestamptz('updated_at').notNull().defaultNow(),
@@ -548,6 +642,145 @@ export const channelConnections = pgTable(
   (t) => [
     index('channel_connections_account_idx').on(t.accountId),
     index('channel_connections_agent_idx').on(t.agentId),
+    uniqueIndex('channel_connections_runtime_account_uq')
+      .on(t.channel, t.runtimeAccountId)
+      .where(sql`${t.runtimeAccountId} is not null`),
+  ],
+);
+
+/**
+ * External identities are connection-scoped: the same provider peer talking
+ * to two Eden bots is deliberately two principals. Raw peer ids are encrypted;
+ * joins and isolation use only the deterministic connection-scoped digest.
+ */
+export const channelExternalIdentities = pgTable(
+  'channel_external_identities',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    connectionId: uuid('connection_id')
+      .notNull()
+      .references(() => channelConnections.id, { onDelete: 'cascade' }),
+    peerFingerprint: text('peer_fingerprint').notNull(),
+    peerCiphertext: text('peer_ciphertext').notNull(),
+    peerIv: text('peer_iv').notNull(),
+    peerAuthTag: text('peer_auth_tag').notNull(),
+    peerPreview: text('peer_preview'),
+    keyVersion: text('key_version').notNull().default('v1'),
+    linkedAccountId: uuid('linked_account_id').references(() => accounts.id, {
+      onDelete: 'set null',
+    }),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('channel_external_identities_peer_uq').on(
+      t.connectionId,
+      t.peerFingerprint,
+    ),
+    index('channel_external_identities_linked_account_idx').on(t.linkedAccountId),
+  ],
+);
+
+export const channelPairingRequests = pgTable(
+  'channel_pairing_requests',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    connectionId: uuid('connection_id')
+      .notNull()
+      .references(() => channelConnections.id, { onDelete: 'cascade' }),
+    identityId: uuid('identity_id')
+      .notNull()
+      .references(() => channelExternalIdentities.id, { onDelete: 'cascade' }),
+    status: text('status')
+      .$type<'pending' | 'approved' | 'denied' | 'expired'>()
+      .notNull()
+      .default('pending'),
+    requestedAt: timestamptz('requested_at').notNull().defaultNow(),
+    expiresAt: timestamptz('expires_at').notNull(),
+    decidedAt: timestamptz('decided_at'),
+    decidedByAccountId: uuid('decided_by_account_id').references(() => accounts.id, {
+      onDelete: 'set null',
+    }),
+    metadata: jsonb('metadata'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('channel_pairing_requests_connection_status_idx').on(
+      t.connectionId,
+      t.status,
+      t.requestedAt.desc(),
+    ),
+    uniqueIndex('channel_pairing_requests_pending_uq')
+      .on(t.connectionId, t.identityId)
+      .where(sql`${t.status} = 'pending'`),
+  ],
+);
+
+/** Durable idempotency/state record for channel-originated manna settlement. */
+export const channelTurns = pgTable(
+  'channel_turns',
+  {
+    turnId: uuid('turn_id').primaryKey(),
+    connectionId: uuid('connection_id').references(() => channelConnections.id, {
+      onDelete: 'set null',
+    }),
+    accountId: uuid('account_id').references(() => accounts.id, { onDelete: 'set null' }),
+    agentId: uuid('agent_id').references(() => accounts.id, { onDelete: 'set null' }),
+    sessionId: uuid('session_id').references(() => sessions.id, { onDelete: 'set null' }),
+    externalMessageId: text('external_message_id'),
+    status: text('status')
+      .$type<
+        | 'reserving'
+        | 'reserved'
+        | 'settling'
+        | 'refunding'
+        | 'settled'
+        | 'delivery_pending'
+        | 'delivered'
+        | 'refunded'
+        | 'error'
+      >()
+      .notNull()
+      .default('reserved'),
+    /** Immutable billing/routing provenance captured before provider work. */
+    channel: text('channel'),
+    runtimeAccountId: text('runtime_account_id'),
+    model: text('model'),
+    agentRuntime: text('agent_runtime'),
+    pricingBasis: text('pricing_basis'),
+    /**
+     * Whether immutable execution provenance was frozen before work or
+     * recovered from a matching terminal usage event. Any other value is
+     * deliberately non-billable and may only pass through the refund path.
+     */
+    provenanceStatus: text('provenance_status')
+      .$type<
+        | 'unknown'
+        | 'frozen'
+        | 'recovered_usage_event'
+        | 'legacy_terminal_unknown'
+        | 'legacy_refund_pending'
+      >()
+      .notNull()
+      .default('unknown'),
+    reservedManna: integer('reserved_manna').notNull(),
+    meteredManna: integer('metered_manna'),
+    errorCode: text('error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+    completedAt: timestamptz('completed_at'),
+  },
+  (t) => [
+    index('channel_turns_connection_created_idx').on(t.connectionId, t.createdAt.desc()),
+    index('channel_turns_open_updated_idx')
+      .on(t.status, t.updatedAt)
+      .where(
+        sql`${t.status} in ('reserving', 'reserved', 'settling', 'delivery_pending', 'refunding', 'error')`,
+      ),
+    uniqueIndex('channel_turns_external_message_uq')
+      .on(t.connectionId, t.externalMessageId)
+      .where(sql`${t.connectionId} is not null and ${t.externalMessageId} is not null`),
   ],
 );
 
@@ -659,10 +892,16 @@ export const usageEvents = pgTable(
     turnId: uuid('turn_id'),
     provider: text('provider'),
     model: text('model'),
+    /** Real provider invoice cost vs API-equivalent subscription notional pricing. */
+    pricingBasis: text('pricing_basis')
+      .$type<'provider-api' | 'notional-subscription'>()
+      .notNull()
+      .default('provider-api'),
     tableVersion: text('table_version'),
     promptTokens: integer('prompt_tokens'),
     completionTokens: integer('completion_tokens'),
     cachedTokens: integer('cached_tokens'),
+    cacheWriteTokens: integer('cache_write_tokens'),
     totalTokens: integer('total_tokens'),
     costUsd: numeric('cost_usd', { precision: 20, scale: 8 }),
     manna: integer('manna'),
@@ -686,6 +925,157 @@ export const usageEvents = pgTable(
   ],
 );
 
+// Cross-process lease for subscription-backed Claude turns. Transcript usage
+// is timestamp-window based, so two concurrent turns in one gateway session
+// would otherwise both claim the same provider messages. The API heartbeats a
+// lease and releases it after settlement; a crashed owner becomes reclaimable
+// only after lease_expires_at.
+export const claudeSessionTurnClaims = pgTable(
+  'claude_session_turn_claims',
+  {
+    sessionKey: text('session_key').primaryKey(),
+    turnId: uuid('turn_id').notNull().unique(),
+    claimedAt: timestamptz('claimed_at').notNull().defaultNow(),
+    leaseExpiresAt: timestamptz('lease_expires_at').notNull(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [index('claude_session_turn_claims_expiry_idx').on(t.leaseExpiresAt)],
+);
+
+// ---------------------------------------------------------------------------
+// Eden-managed OpenClaw memory lifecycle — provenance, active-only sweeps,
+// per-agent dream runs, and privacy-preserving retrieval measurements.
+// ---------------------------------------------------------------------------
+export const memoryRevisions = pgTable(
+  'memory_revisions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    agentAccountId: uuid('agent_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    openclawId: text('openclaw_id').notNull(),
+    actorAccountId: uuid('actor_account_id').references(() => accounts.id, {
+      onDelete: 'set null',
+    }),
+    operation: text('operation')
+      .$type<'automatic-seed' | 'manual-reseed' | 'owner-correction' | 'dream-promotion'>()
+      .notNull(),
+    previousSha256: text('previous_sha256'),
+    sha256: text('sha256').notNull(),
+    chars: integer('chars').notNull(),
+    metadata: jsonb('metadata'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('memory_revisions_agent_created_idx').on(t.agentAccountId, t.createdAt.desc()),
+    index('memory_revisions_openclaw_created_idx').on(t.openclawId, t.createdAt.desc()),
+  ],
+);
+
+export const memoryDreamSweeps = pgTable(
+  'memory_dream_sweeps',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    sweepKey: text('sweep_key').notNull().unique(),
+    windowStart: timestamptz('window_start').notNull(),
+    status: text('status')
+      .$type<'running' | 'done' | 'partial' | 'error'>()
+      .notNull()
+      .default('running'),
+    eligibleCount: integer('eligible_count').notNull().default(0),
+    activeCount: integer('active_count').notNull().default(0),
+    skippedCount: integer('skipped_count').notNull().default(0),
+    succeededCount: integer('succeeded_count').notNull().default(0),
+    failedCount: integer('failed_count').notNull().default(0),
+    skippedAgents: jsonb('skipped_agents').notNull().default(sql`'[]'::jsonb`),
+    error: text('error'),
+    /** Fencing token for the current coordinator lease (null once terminal). */
+    claimToken: uuid('claim_token'),
+    /** Heartbeated coordinator lease; only an expired token may be replaced. */
+    leaseExpiresAt: timestamptz('lease_expires_at'),
+    startedAt: timestamptz('started_at').notNull().defaultNow(),
+    completedAt: timestamptz('completed_at'),
+    durationMs: integer('duration_ms'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('memory_dream_sweeps_window_idx').on(t.windowStart.desc()),
+    index('memory_dream_sweeps_lease_idx').on(t.leaseExpiresAt),
+  ],
+);
+
+export const memoryDreamRuns = pgTable(
+  'memory_dream_runs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    sweepId: uuid('sweep_id')
+      .notNull()
+      .references(() => memoryDreamSweeps.id, { onDelete: 'cascade' }),
+    agentAccountId: uuid('agent_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    openclawId: text('openclaw_id').notNull(),
+    status: text('status')
+      .$type<'running' | 'done' | 'skipped' | 'error' | 'recovery_pending'>()
+      .notNull()
+      .default('running'),
+    lastActivityAt: timestamptz('last_activity_at'),
+    agentRuntime: text('agent_runtime'),
+    pricingBasis: text('pricing_basis'),
+    deepCandidates: integer('deep_candidates'),
+    promotedCount: integer('promoted_count'),
+    usageEventId: uuid('usage_event_id').references(() => usageEvents.id, {
+      onDelete: 'set null',
+    }),
+    previousSha256: text('previous_sha256'),
+    sha256: text('sha256'),
+    provenance: jsonb('provenance'),
+    error: text('error'),
+    /** Fencing token for the process currently executing this run. */
+    claimToken: uuid('claim_token'),
+    /** Heartbeated run lease; deliberately longer than the provider ceiling. */
+    leaseExpiresAt: timestamptz('lease_expires_at'),
+    /** Durable checkpoint written before the metered provider handoff. */
+    providerStatus: text('provider_status')
+      .$type<'not_started' | 'started' | 'terminal' | 'indeterminate'>()
+      .notNull()
+      .default('not_started'),
+    providerStartedAt: timestamptz('provider_started_at'),
+    startedAt: timestamptz('started_at').notNull().defaultNow(),
+    completedAt: timestamptz('completed_at'),
+    durationMs: integer('duration_ms'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('memory_dream_runs_sweep_agent_uq').on(t.sweepId, t.agentAccountId),
+    uniqueIndex('memory_dream_runs_live_agent_uq')
+      .on(t.agentAccountId)
+      .where(sql`${t.status} in ('running', 'recovery_pending')`),
+    index('memory_dream_runs_agent_created_idx').on(t.agentAccountId, t.createdAt.desc()),
+    index('memory_dream_runs_lease_idx').on(t.leaseExpiresAt),
+  ],
+);
+
+export const memoryRetrievalProbes = pgTable(
+  'memory_retrieval_probes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    agentAccountId: uuid('agent_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    openclawId: text('openclaw_id').notNull(),
+    /** Hash only: probe text can itself contain private user details. */
+    querySha256: text('query_sha256').notNull(),
+    status: text('status').$type<'done' | 'error'>().notNull(),
+    latencyMs: integer('latency_ms').notNull(),
+    resultCount: integer('result_count').notNull().default(0),
+    topScore: numeric('top_score', { precision: 8, scale: 6 }),
+    error: text('error'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [index('memory_retrieval_probes_agent_created_idx').on(t.agentAccountId, t.createdAt.desc())],
+);
+
 // ---------------------------------------------------------------------------
 // triggers — scheduled prompts, synced to OpenClaw cron jobs.
 // ---------------------------------------------------------------------------
@@ -706,6 +1096,19 @@ export const triggers = pgTable(
     sessionTarget: text('session_target'),
     lastRunTime: timestamptz('last_run_time'),
     nextScheduledRun: timestamptz('next_scheduled_run'),
+    /**
+     * Durable execution identity from active->running claim until every
+     * possible debit is terminally settled/refunded. Scheduler recovery uses
+     * this even if the normal due instant is old or moved.
+     */
+    pendingOccurrenceId: uuid('pending_occurrence_id'),
+    pendingOccurrenceKind: text('pending_occurrence_kind').$type<'manual' | 'scheduled'>(),
+    pendingOccurrenceAt: timestamptz('pending_occurrence_at'),
+    /**
+     * Per-claim generation fence. Reclaiming the same occurrence always gets a
+     * new UUID, so a stale process cannot debit or finalize after quarantine.
+     */
+    pendingOccurrenceClaimId: uuid('pending_occurrence_claim_id'),
     errorCount: integer('error_count'),
     lastError: text('last_error'),
     openclawJobId: text('openclaw_job_id'),
@@ -718,6 +1121,13 @@ export const triggers = pgTable(
     uniqueIndex('triggers_external_id_uq')
       .on(t.externalId)
       .where(sql`${t.externalId} is not null`),
+    index('triggers_pending_occurrence_idx')
+      .on(t.pendingOccurrenceId, t.updatedAt)
+      .where(sql`${t.pendingOccurrenceId} is not null`),
+    check(
+      'triggers_pending_occurrence_claim_shape_check',
+      sql`${t.pendingOccurrenceId} is not null or ${t.pendingOccurrenceClaimId} is null`,
+    ),
   ],
 );
 
@@ -741,6 +1151,54 @@ export const mediaAssets = pgTable('media_assets', {
   creationId: uuid('creation_id'),
   pickedUpAt: timestamptz('picked_up_at').notNull().defaultNow(),
 });
+
+// ---------------------------------------------------------------------------
+// etl_runs — immutable source boundaries for one bounded ETL attempt.
+//
+// Every canonical Mongo collection receives one identical prior-whole-second
+// ObjectId cap before the first stage starts. The contract requires append-only
+// membership with globally nondecreasing ObjectId timestamps; delayed,
+// backdated, or clock-skewed inserts at/below the cap remain the explicit
+// no-snapshot limitation.
+// Verifiers use only the latest completed compatible run, so ordinary source
+// growth strictly after the cap is informational.
+// ---------------------------------------------------------------------------
+export const etlRuns = pgTable(
+  'etl_runs',
+  {
+    id: uuid('id').primaryKey(),
+    sourceDatabase: text('source_database').notNull(),
+    mode: text('mode').$type<'full' | 'delta'>().notNull(),
+    documentLimit: integer('document_limit'),
+    selectedCollections: jsonb('selected_collections').$type<string[]>().notNull(),
+    sourceCutoffs: jsonb('source_cutoffs')
+      .$type<Record<string, string>>()
+      .notNull(),
+    status: text('status')
+      .$type<'running' | 'completed' | 'failed'>()
+      .notNull()
+      .default('running'),
+    startedAt: timestamptz('started_at').notNull(),
+    finishedAt: timestamptz('finished_at'),
+    error: text('error'),
+  },
+  (t) => [
+    check('etl_runs_mode_check', sql`${t.mode} in ('full', 'delta')`),
+    check(
+      'etl_runs_status_check',
+      sql`${t.status} in ('running', 'completed', 'failed')`,
+    ),
+    check(
+      'etl_runs_limit_check',
+      sql`${t.documentLimit} is null or ${t.documentLimit} > 0`,
+    ),
+    check(
+      'etl_runs_terminal_shape_check',
+      sql`(${t.status} = 'running' and ${t.finishedAt} is null) or (${t.status} in ('completed', 'failed') and ${t.finishedAt} is not null)`,
+    ),
+    index('etl_runs_latest_idx').on(t.startedAt),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // etl_state — per-collection watermarks; delta re-run = final-sync rehearsal.
@@ -775,6 +1233,8 @@ export type CreationLike = typeof creationLikes.$inferSelect;
 export type NewCreationLike = typeof creationLikes.$inferInsert;
 export type AgentLike = typeof agentLikes.$inferSelect;
 export type NewAgentLike = typeof agentLikes.$inferInsert;
+export type EtlSocialEdge = typeof etlSocialEdges.$inferSelect;
+export type NewEtlSocialEdge = typeof etlSocialEdges.$inferInsert;
 export type Collection = typeof collections.$inferSelect;
 export type NewCollection = typeof collections.$inferInsert;
 export type CollectionCreation = typeof collectionCreations.$inferSelect;
@@ -792,6 +1252,12 @@ export type MannaVoucher = typeof mannaVouchers.$inferSelect;
 export type NewMannaVoucher = typeof mannaVouchers.$inferInsert;
 export type ChannelConnection = typeof channelConnections.$inferSelect;
 export type NewChannelConnection = typeof channelConnections.$inferInsert;
+export type ChannelExternalIdentity = typeof channelExternalIdentities.$inferSelect;
+export type NewChannelExternalIdentity = typeof channelExternalIdentities.$inferInsert;
+export type ChannelPairingRequest = typeof channelPairingRequests.$inferSelect;
+export type NewChannelPairingRequest = typeof channelPairingRequests.$inferInsert;
+export type ChannelTurn = typeof channelTurns.$inferSelect;
+export type NewChannelTurn = typeof channelTurns.$inferInsert;
 export type SecretAccessAuditEvent = typeof secretAccessAuditEvents.$inferSelect;
 export type NewSecretAccessAuditEvent = typeof secretAccessAuditEvents.$inferInsert;
 export type SkillDefinition = typeof skillDefinitions.$inferSelect;
@@ -802,9 +1268,21 @@ export type DistillState = typeof distillState.$inferSelect;
 export type NewDistillState = typeof distillState.$inferInsert;
 export type UsageEvent = typeof usageEvents.$inferSelect;
 export type NewUsageEvent = typeof usageEvents.$inferInsert;
+export type ClaudeSessionTurnClaim = typeof claudeSessionTurnClaims.$inferSelect;
+export type NewClaudeSessionTurnClaim = typeof claudeSessionTurnClaims.$inferInsert;
+export type MemoryRevision = typeof memoryRevisions.$inferSelect;
+export type NewMemoryRevision = typeof memoryRevisions.$inferInsert;
+export type MemoryDreamSweep = typeof memoryDreamSweeps.$inferSelect;
+export type NewMemoryDreamSweep = typeof memoryDreamSweeps.$inferInsert;
+export type MemoryDreamRun = typeof memoryDreamRuns.$inferSelect;
+export type NewMemoryDreamRun = typeof memoryDreamRuns.$inferInsert;
+export type MemoryRetrievalProbe = typeof memoryRetrievalProbes.$inferSelect;
+export type NewMemoryRetrievalProbe = typeof memoryRetrievalProbes.$inferInsert;
 export type Trigger = typeof triggers.$inferSelect;
 export type NewTrigger = typeof triggers.$inferInsert;
 export type MediaAsset = typeof mediaAssets.$inferSelect;
 export type NewMediaAsset = typeof mediaAssets.$inferInsert;
+export type EtlRun = typeof etlRuns.$inferSelect;
+export type NewEtlRun = typeof etlRuns.$inferInsert;
 export type EtlState = typeof etlState.$inferSelect;
 export type NewEtlState = typeof etlState.$inferInsert;

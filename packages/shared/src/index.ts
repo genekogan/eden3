@@ -2,3 +2,4 @@
 // event model (per-session channel) with encode/decode helpers.
 export * from './dto';
 export * from './events';
+export * from './persona-doctrine';
