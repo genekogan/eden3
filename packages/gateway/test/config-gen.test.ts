@@ -862,6 +862,7 @@ describe('ensureBaseline', () => {
               allowConversationAccess: false,
               allowPromptInjection: false,
             },
+            config: null,
           },
         },
       },
