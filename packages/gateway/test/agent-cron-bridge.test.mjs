@@ -176,6 +176,26 @@ describe('Unix socket client/server framing', () => {
     });
   });
 
+  it('keeps the socket open across asynchronous database-like dispatch', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'eden3-agent-cron-'));
+    const socketPath = path.join(dir, 'cron.sock');
+    const server = createBridgeServer(async (payload) => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return { echo: payload.action };
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    sockets.push({ server, dir });
+
+    await expect(requestAgentCron(request('list'), { socketPath })).resolves.toMatchObject({
+      protocolVersion: 1,
+      ok: true,
+      echo: 'list',
+    });
+  });
+
   it('returns narrow structured errors without leaking unexpected failures', async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'eden3-agent-cron-'));
     const socketPath = path.join(dir, 'cron.sock');

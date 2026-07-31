@@ -403,7 +403,7 @@ describe('ensureBaseline', () => {
         },
       },
       tools: {
-        profile: 'coding',
+        profile: 'full',
         deny: ['cron'],
         allow: [
           'group:runtime',
