@@ -363,6 +363,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       model: 'claude-sonnet-4-6',
       agentRuntime: 'claude-cli',
     });
+    expect(businessCalls[2].options).toEqual({ timeoutMs: 20_000 });
     expect(businessCalls[3].body).toMatchObject({
       connectionId: CONNECTION_A,
       runtimeAccountId: 'account-a',
@@ -947,6 +948,91 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(
       calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
     ).toBe(false);
+  });
+
+  it('normalizes Discord user delivery targets before acknowledging the exact run', async () => {
+    const { bridge, calls } = mockBridge();
+    receiveA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await bridge.onReplyPayloadSending(
+      {
+        kind: 'final',
+        runId: RUN_A,
+        payload: { text: 'assistant answer' },
+        usageState: {
+          usage: { input: 3, output: 2, total: 5 },
+          provider: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+        },
+      },
+      {
+        runId: RUN_A,
+        sessionKey: SESSION_A,
+        channelId: 'discord',
+        accountId: 'account-a',
+        messageId: '1532630091471786166',
+      },
+    );
+
+    await bridge.onMessageSent(
+      { to: `user:${PEER_A}`, content: 'assistant answer', runId: RUN_A, success: true },
+      {
+        channelId: 'discord',
+        accountId: 'account-a',
+        conversationId: `user:${PEER_A}`,
+        runId: RUN_A,
+      },
+    );
+
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivered`),
+    ).toBe(true);
+  });
+
+  it('acknowledges an exact Discord run delivered through its opaque DM channel target', async () => {
+    const { bridge, calls } = mockBridge();
+    receiveA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await bridge.onReplyPayloadSending(
+      {
+        kind: 'final',
+        runId: RUN_A,
+        payload: { text: 'assistant answer' },
+        usageState: {
+          usage: { input: 3, output: 2, total: 5 },
+          provider: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+        },
+      },
+      {
+        runId: RUN_A,
+        sessionKey: SESSION_A,
+        channelId: 'discord',
+        accountId: 'account-a',
+        messageId: '1532630091471786166',
+      },
+    );
+
+    const dmTarget = 'channel:963544662646354001';
+    await bridge.onMessageSent(
+      { to: dmTarget, content: 'assistant answer', runId: RUN_A, success: true },
+      {
+        channelId: 'discord',
+        accountId: 'account-a',
+        conversationId: dmTarget,
+        runId: RUN_A,
+      },
+    );
+
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivered`),
+    ).toBe(true);
   });
 
   it('keeps retried reply approval idempotent in exact outbound correlation', async () => {

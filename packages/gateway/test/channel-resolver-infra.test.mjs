@@ -85,11 +85,17 @@ describe('channel resolver infrastructure contract', () => {
   });
 
   it('installs only the bounded exec client in the OpenClaw image', async () => {
-    const dockerfile = await readFile(`${INFRA}openclaw/Dockerfile`, 'utf8');
+    const [dockerfile, client] = await Promise.all([
+      readFile(`${INFRA}openclaw/Dockerfile`, 'utf8'),
+      readFile(`${INFRA}openclaw/eden-channel-secret-resolver.mjs`, 'utf8'),
+    ]);
     expect(dockerfile).toContain(
-      'COPY eden-channel-secret-resolver.mjs /usr/local/bin/eden-channel-secret-resolver',
+      'COPY --chown=node:node eden-channel-secret-resolver.mjs /usr/local/bin/eden-channel-secret-resolver',
     );
     expect(dockerfile).toContain('/usr/local/bin/eden-channel-secret-resolver');
     expect(dockerfile).not.toContain('channel-secret-resolver/server.mjs');
+    // OpenClaw intentionally scrubs PATH for exec SecretRefs. The image's
+    // pinned Node binary lives in /usr/local/bin, so env(1) cannot resolve it.
+    expect(client).toMatch(/^#!\/usr\/local\/bin\/node\n/);
   });
 });
