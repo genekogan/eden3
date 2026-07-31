@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 
 import { beforeAll, describe, expect, it } from 'vitest';
 
+import { OpenClawCompatClient } from '../../src/compat-client';
 import { OpenClawCli } from '../../src/docker';
 import { AgentProvisioner } from '../../src/provisioner';
 
@@ -28,18 +29,12 @@ const MODEL = 'anthropic/claude-haiku-4-5';
 const COMPOSE_WRAPPER = path.join(REPO_ROOT, 'scripts', 'compose.mjs');
 
 const cli = new OpenClawCli();
+const compat = new OpenClawCompatClient({ baseUrl: BASE_URL, token: TOKEN });
 const provisioner = new AgentProvisioner({
   gateway: { baseUrl: BASE_URL, token: TOKEN },
   cli,
   dataDir: DATA_DIR,
 });
-
-type AgentCliResult = {
-  status?: string;
-  result?: {
-    payloads?: Array<{ text?: string | null }>;
-  };
-};
 
 function personaFor(marker: string): string {
   return [
@@ -50,23 +45,17 @@ function personaFor(marker: string): string {
 }
 
 async function askMarker(): Promise<string> {
-  const result = await cli.execJson<AgentCliResult>(
-    [
-      'agent',
-      '--agent',
-      AGENT_ID,
-      '--session-key',
-      `agent:${AGENT_ID}:eden3:s:${randomUUID()}`,
-      '--message',
-      'persona marker? Reply with only the marker.',
-      '--json',
-      '--timeout',
-      '120',
-    ],
-    { timeoutMs: 130_000 },
-  );
-  expect(result.status).toBe('ok');
-  return (result.result?.payloads ?? []).map((p) => p.text ?? '').join('\n').trim();
+  let completedText: string | undefined;
+  for await (const event of compat.chatTurn({
+    agentId: AGENT_ID,
+    sessionKey: `eden3:s:${randomUUID()}`,
+    userMessage: 'persona marker? Reply with only the marker.',
+  })) {
+    if (event.type === 'error') throw new Error(`persona turn failed: ${event.message}`);
+    if (event.type === 'turn.completed') completedText = event.text;
+  }
+  if (completedText === undefined) throw new Error('persona turn ended without turn.completed');
+  return completedText.trim();
 }
 
 async function restartOpenClaw(): Promise<void> {
