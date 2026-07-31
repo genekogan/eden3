@@ -4,6 +4,7 @@ import {
   OpenClawCli,
   OpenClawCliError,
   extractJson,
+  prepareAgentMemoryIndexTarget,
   type ProcessRunner,
 } from '../src/docker';
 
@@ -84,6 +85,41 @@ describe('OpenClawCli.exec', () => {
     await cli.exec(['x'], { timeoutMs: 5 });
     expect(calls[0]!.timeoutMs).toBe(1000);
     expect(calls[1]!.timeoutMs).toBe(5);
+  });
+});
+
+describe('prepareAgentMemoryIndexTarget', () => {
+  it('creates the fixed target inside the gateway volume without shell interpolation', async () => {
+    const { runner, calls } = makeRunner({});
+    await prepareAgentMemoryIndexTarget('banny', { runner, env: {} });
+    expect(calls[0]!.file).toBe('docker');
+    expect(calls[0]!.args.slice(0, 7)).toEqual([
+      'exec',
+      '-u',
+      'node',
+      'eden3-openclaw',
+      'sh',
+      '-c',
+      expect.stringContaining('install -d'),
+    ]);
+    expect(calls[0]!.args.slice(7)).toEqual([
+      'prepare-memory-index',
+      '/home/node/.openclaw/state/agent-memory',
+      '/home/node/.openclaw/state/agent-memory/banny.sqlite',
+    ]);
+  });
+
+  it('rejects unsafe ids before spawning and reports container failures', async () => {
+    const first = makeRunner({});
+    await expect(
+      prepareAgentMemoryIndexTarget('../escape', { runner: first.runner, env: {} }),
+    ).rejects.toThrow('invalid OpenClaw agent id');
+    expect(first.calls).toHaveLength(0);
+
+    const failed = makeRunner({ exitCode: 65, stderr: 'target conflict' });
+    await expect(
+      prepareAgentMemoryIndexTarget('banny', { runner: failed.runner, env: {} }),
+    ).rejects.toThrow('target conflict');
   });
 });
 

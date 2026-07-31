@@ -7,6 +7,7 @@ import {
   CronSync,
   OpenClawCli,
   OpenClawMemoryCli,
+  OpenClawToolsClient,
   getModelAgentRuntime,
   getModelRuntimeCatalog,
   setAgentSkills,
@@ -171,7 +172,7 @@ export class GatewayGlue {
 
   get memoryRuntime(): MemoryRuntimeLike {
     if (this.memoryRuntimeOverride) return this.memoryRuntimeOverride;
-    this.lazyMemoryRuntime ??= new OpenClawMemoryCli(new OpenClawCli());
+    this.lazyMemoryRuntime ??= buildDefaultMemoryRuntime();
     return this.lazyMemoryRuntime;
   }
 }
@@ -204,6 +205,25 @@ function buildDefaultProvisioner(): AgentProvisioner {
     gateway: { baseUrl: env.OPENCLAW_BASE_URL, token },
     dataDir: defaultOpenclawDataDir(),
   });
+}
+
+function buildDefaultMemoryRuntime(): MemoryRuntimeLike {
+  const env = getEnv();
+  const token = env.OPENCLAW_GATEWAY_TOKEN;
+  if (token === undefined || token === '') {
+    throw new ApiError(
+      503,
+      'gateway_unconfigured',
+      'OPENCLAW_GATEWAY_TOKEN is not set — memory runtime is unavailable',
+    );
+  }
+  const cli = new OpenClawMemoryCli(new OpenClawCli());
+  const tools = new OpenClawToolsClient({ baseUrl: env.OPENCLAW_BASE_URL, token });
+  return {
+    promoteAgent: (agentId) => cli.promoteAgent(agentId),
+    searchAgent: (agentId, query, maxResults) =>
+      tools.memorySearch({ agentId, query, ...(maxResults !== undefined ? { maxResults } : {}) }),
+  };
 }
 
 declare module 'fastify' {

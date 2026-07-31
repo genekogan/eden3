@@ -107,6 +107,77 @@ describe('OpenClawToolsClient.invokeTool', () => {
   });
 });
 
+describe('OpenClawToolsClient.memorySearch', () => {
+  it('uses the live gateway tool path and reports the in-gateway tool duration', async () => {
+    const { fetchImpl, calls } = makeFetch(() =>
+      jsonResponse({
+        ok: true,
+        result: {
+          details: {
+            results: [
+              {
+                path: 'MEMORY.md',
+                startLine: 2,
+                endLine: 4,
+                score: 0.91,
+                snippet: 'covenant',
+                vectorScore: 0.88,
+              },
+            ],
+            provider: 'openai',
+            model: 'text-embedding-3-small',
+            debug: { searchMs: 1180, toolMs: 1215 },
+          },
+        },
+      }),
+    );
+    const result = await client(fetchImpl).memorySearch({
+      agentId: 'abraham',
+      query: ' covenant ',
+      maxResults: 5,
+    });
+
+    expect(JSON.parse(String(calls[0]!.init.body))).toEqual({
+      tool: 'memory_search',
+      args: { query: 'covenant', maxResults: 5 },
+      agentId: 'abraham',
+    });
+    expect(result).toEqual({
+      agentId: 'abraham',
+      latencyMs: 1215,
+      results: [
+        {
+          path: 'MEMORY.md',
+          startLine: 2,
+          endLine: 4,
+          score: 0.91,
+          snippet: 'covenant',
+        },
+      ],
+    });
+  });
+
+  it('rejects invalid bounds and surfaces failure details', async () => {
+    const { fetchImpl, calls } = makeFetch(() =>
+      jsonResponse({
+        ok: true,
+        result: { details: { status: 'error', error: 'embedding provider unavailable' } },
+      }),
+    );
+    const tools = client(fetchImpl);
+    await expect(tools.memorySearch({ agentId: 'a', query: ' ', maxResults: 5 })).rejects.toThrow(
+      'must not be empty',
+    );
+    await expect(tools.memorySearch({ agentId: 'a', query: 'x', maxResults: 21 })).rejects.toThrow(
+      '1 to 20',
+    );
+    expect(calls).toHaveLength(0);
+    await expect(tools.memorySearch({ agentId: 'a', query: 'x' })).rejects.toThrow(
+      'embedding provider unavailable',
+    );
+  });
+});
+
 describe('OpenClawToolsClient.sessionsHistory', () => {
   /** Live success payload shape (probed 2026-07-02, see tools-client.ts). */
   const liveDetails = {

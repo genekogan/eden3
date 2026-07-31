@@ -1,11 +1,16 @@
+import { performance } from 'node:perf_hooks';
+
+import type { MemorySearchHit, MemorySearchResult } from './memory-cli';
 import {
   GatewayHttpError,
   GatewayToolError,
   asyncToolDetailsSchema,
+  memorySearchDetailsSchema,
   scopedSessionKey,
   sessionsHistoryDetailsSchema,
   toolInvokeEnvelopeSchema,
   type GatewayClientOptions,
+  type MemorySearchToolParams,
   type SessionsHistoryParams,
   type SessionsHistoryResult,
   type ToolInvokeEnvelope,
@@ -143,6 +148,66 @@ export class OpenClawToolsClient {
         ? { taskId: parsed.data.taskId }
         : {}),
       details,
+    };
+  }
+
+  /**
+   * Run memory_search inside the already-live gateway process. Starting a
+   * second full OpenClaw CLI process takes tens of seconds at fleet size and
+   * is not the runtime path agents use. `debug.toolMs` is the gateway's own
+   * measured tool duration; wall time is a defensive fallback only.
+   */
+  async memorySearch(params: MemorySearchToolParams): Promise<MemorySearchResult> {
+    const query = params.query.trim();
+    if (query === '') throw new TypeError('memory search query must not be empty');
+    const maxResults = params.maxResults ?? 5;
+    if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 20) {
+      throw new TypeError('memory search maxResults must be an integer from 1 to 20');
+    }
+    const started = performance.now();
+    const envelope = await this.invokeRaw({
+      tool: 'memory_search',
+      args: { query, maxResults },
+      agentId: params.agentId,
+      ...(params.signal ? { signal: params.signal } : {}),
+    });
+    if (!envelope.ok) {
+      throw new GatewayToolError(
+        envelope.error?.message ?? 'memory_search invocation failed',
+        'memory_search',
+        envelope.error,
+      );
+    }
+    const parsed = memorySearchDetailsSchema.safeParse(envelope.result?.details);
+    if (!parsed.success) {
+      throw new GatewayToolError(
+        'memory_search returned unparseable details',
+        'memory_search',
+        envelope.result?.details,
+      );
+    }
+    const details = parsed.data;
+    if (details.status === 'forbidden' || details.status === 'error' || details.error !== undefined) {
+      throw new GatewayToolError(
+        `memory_search ${details.status ?? 'error'}: ${details.error ?? 'unknown failure'}`,
+        'memory_search',
+        details,
+      );
+    }
+    const results: MemorySearchHit[] = (details.results ?? []).map((raw) => {
+      const hit: MemorySearchHit = {};
+      if (raw.path !== undefined) hit.path = raw.path;
+      if (raw.startLine !== undefined) hit.startLine = raw.startLine;
+      if (raw.endLine !== undefined) hit.endLine = raw.endLine;
+      if (raw.score !== undefined) hit.score = raw.score;
+      if (raw.snippet !== undefined) hit.snippet = raw.snippet;
+      return hit;
+    });
+    return {
+      agentId: params.agentId,
+      latencyMs:
+        details.debug?.toolMs ?? Math.max(0, Math.round((performance.now() - started) * 1000) / 1000),
+      results,
     };
   }
 

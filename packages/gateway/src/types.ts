@@ -263,6 +263,43 @@ export interface ToolInvokeResult {
   details: unknown;
 }
 
+// --- memory_search --------------------------------------------------------
+
+export const memorySearchDetailsSchema = z
+  .object({
+    status: z.string().optional(),
+    error: z.string().optional(),
+    results: z
+      .array(
+        z
+          .object({
+            path: z.string().optional(),
+            startLine: z.number().optional(),
+            endLine: z.number().optional(),
+            score: z.number().optional(),
+            snippet: z.string().optional(),
+          })
+          .passthrough(),
+      )
+      .optional(),
+    debug: z
+      .object({
+        /** Full in-gateway tool execution, excluding HTTP transport. */
+        toolMs: z.number().nonnegative().optional(),
+        searchMs: z.number().nonnegative().optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+export interface MemorySearchToolParams {
+  agentId: string;
+  query: string;
+  maxResults?: number;
+  signal?: AbortSignal;
+}
+
 // --- sessions_history ------------------------------------------------------
 
 export const historyContentBlockSchema = z

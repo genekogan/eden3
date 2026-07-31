@@ -74,6 +74,64 @@ const defaultRunner: ProcessRunner = (file, args, { timeoutMs }) =>
     );
   });
 
+const MEMORY_INDEX_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const MEMORY_INDEX_ROOT = '/home/node/.openclaw/state/agent-memory';
+const PREPARE_MEMORY_INDEX_SCRIPT =
+  'set -eu; install -d -m 0755 "$1"; if [ ! -e "$2" ]; then install -m 0644 /dev/null "$2"; elif [ ! -f "$2" ]; then echo "memory index target is not a regular file" >&2; exit 65; fi';
+
+export interface PrepareAgentMemoryIndexTargetOptions {
+  container?: string;
+  timeoutMs?: number;
+  runner?: ProcessRunner;
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Ensure the target of an agent's host-visible SQLite symlink exists inside
+ * the gateway's VM-native named volume. A fresh dangling symlink would make
+ * OpenClaw fall back to checking its SSHFS parent and correctly refuse it.
+ */
+export async function prepareAgentMemoryIndexTarget(
+  openclawId: string,
+  options: PrepareAgentMemoryIndexTargetOptions = {},
+): Promise<void> {
+  if (!MEMORY_INDEX_ID_PATTERN.test(openclawId)) {
+    throw new TypeError(`invalid OpenClaw agent id ${JSON.stringify(openclawId)}`);
+  }
+  const env = options.env ?? process.env;
+  const fromEnv = env.OPENCLAW_CONTAINER;
+  const container =
+    options.container ?? (fromEnv !== undefined && fromEnv !== '' ? fromEnv : DEFAULT_CONTAINER);
+  const target = `${MEMORY_INDEX_ROOT}/${openclawId}.sqlite`;
+  const runner = options.runner ?? defaultRunner;
+  const { stdout, stderr, exitCode } = await runner(
+    'docker',
+    [
+      'exec',
+      '-u',
+      'node',
+      container,
+      'sh',
+      '-c',
+      PREPARE_MEMORY_INDEX_SCRIPT,
+      'prepare-memory-index',
+      MEMORY_INDEX_ROOT,
+      target,
+    ],
+    { timeoutMs: options.timeoutMs ?? 10_000 },
+  );
+  if (exitCode !== 0) {
+    const detail = (stderr.trim() !== '' ? stderr : stdout).trim().slice(0, 400);
+    throw new OpenClawCliError(
+      `prepare memory index target failed (exit ${exitCode ?? 'spawn/timeout'})${detail !== '' ? `: ${detail}` : ''}`,
+      ['memory-index', 'prepare', openclawId],
+      exitCode,
+      stdout,
+      stderr,
+    );
+  }
+}
+
 export interface OpenClawCliOptions {
   /** Docker container name; default `OPENCLAW_CONTAINER` env or "eden3-openclaw". */
   container?: string;

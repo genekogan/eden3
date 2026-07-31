@@ -17,7 +17,11 @@ import {
   setAgentModel,
   withOpenClawConfigLock,
 } from './config-gen';
-import { OpenClawCli, type OpenClawCliLike } from './docker';
+import {
+  OpenClawCli,
+  prepareAgentMemoryIndexTarget,
+  type OpenClawCliLike,
+} from './docker';
 import type { GatewayClientOptions } from './types';
 
 /**
@@ -58,12 +62,59 @@ export class ProvisionError extends Error {
 /** Conservative id shape — path-safe on host + container, CLI-safe. */
 const OPENCLAW_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
+/** VM-native index root mounted by compose through the existing oc_state volume. */
+export const AGENT_MEMORY_INDEX_CONTAINER_ROOT = '/home/node/.openclaw/state/agent-memory';
+
 export function assertValidOpenclawId(openclawId: string): void {
   if (!OPENCLAW_ID_PATTERN.test(openclawId)) {
     throw new ProvisionError(
       `invalid openclawId "${openclawId}" — expected ${OPENCLAW_ID_PATTERN} (lowercase alphanumeric, "-", "_")`,
     );
   }
+}
+
+/**
+ * Point one agent's fixed OpenClaw SQLite path at VM-native storage. The
+ * surrounding agent directory remains host-visible; only the rebuildable
+ * search index leaves the SSHFS bind mount that SQLite refuses to use.
+ */
+export async function ensureAgentMemoryIndexLink(
+  dataDir: string,
+  openclawId: string,
+): Promise<string> {
+  assertValidOpenclawId(openclawId);
+  const agentDir = path.join(dataDir, 'agents', openclawId, 'agent');
+  const indexPath = path.join(agentDir, 'openclaw-agent.sqlite');
+  const expectedTarget = path.posix.join(
+    AGENT_MEMORY_INDEX_CONTAINER_ROOT,
+    `${openclawId}.sqlite`,
+  );
+  await fs.mkdir(agentDir, { recursive: true });
+
+  try {
+    const current = await fs.lstat(indexPath);
+    if (current.isSymbolicLink()) {
+      const target = await fs.readlink(indexPath);
+      if (target === expectedTarget) return indexPath;
+      throw new ProvisionError(
+        `memory index for "${openclawId}" points at unexpected target ${JSON.stringify(target)}`,
+      );
+    }
+    if (!current.isFile()) {
+      throw new ProvisionError(`memory index for "${openclawId}" is not a regular file`);
+    }
+    if (current.size > 0) {
+      throw new ProvisionError(
+        `memory index for "${openclawId}" contains SSHFS data; restart the gateway to migrate it safely`,
+      );
+    }
+    await fs.rm(indexPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+
+  await fs.symlink(expectedTarget, indexPath);
+  return indexPath;
 }
 
 /** Placeholder keys the workspace templates may use ({{KEY}} syntax). */
@@ -329,6 +380,8 @@ export interface ProvisionerOptions {
   routableStabilityMs?: number;
   /** Clock override for {{PROVISIONED_AT}} (tests). */
   now?: () => Date;
+  /** VM-native SQLite target preparer override (tests). */
+  prepareMemoryIndexTarget?: (openclawId: string) => Promise<void>;
 }
 
 const DEFAULT_TEMPLATES_DIR = fileURLToPath(new URL('../workspace-templates/', import.meta.url));
@@ -344,6 +397,7 @@ export class AgentProvisioner {
   private readonly routableStabilityMs: number;
   private readonly now: () => Date;
   private readonly fetchImpl: typeof fetch;
+  private readonly prepareMemoryIndexTarget: (openclawId: string) => Promise<void>;
 
   constructor(options: ProvisionerOptions) {
     this.gateway = options.gateway;
@@ -357,6 +411,8 @@ export class AgentProvisioner {
     this.routableStabilityMs = options.routableStabilityMs ?? 1_000;
     this.now = options.now ?? (() => new Date());
     this.fetchImpl = options.gateway.fetchImpl ?? fetch;
+    this.prepareMemoryIndexTarget =
+      options.prepareMemoryIndexTarget ?? prepareAgentMemoryIndexTarget;
   }
 
   hostWorkspaceDir(openclawId: string): string {
@@ -475,14 +531,13 @@ export class AgentProvisioner {
           this.containerWorkspaceDir(params.openclawId),
           { dataDir: this.dataDir },
         );
-        await fs.mkdir(path.join(this.dataDir, 'agents', params.openclawId, 'agent'), {
-          recursive: true,
-        });
       }
     } else if (existing.model !== undefined && existing.model !== params.model) {
       await setAgentModel(params.openclawId, params.model, { dataDir: this.dataDir });
       modelUpdated = true;
     }
+    await ensureAgentMemoryIndexLink(this.dataDir, params.openclawId);
+    await this.prepareMemoryIndexTarget(params.openclawId);
 
     // 3. render our workspace files OVER whatever the seed wrote so our persona
     //    wins. The bootstrap-suppression marker is handled separately in step 4

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   AgentProvisioner,
+  AGENT_MEMORY_INDEX_CONTAINER_ROOT,
   BOOTSTRAP_FILENAME,
   PERSONA_TEMPLATE_FILES,
   ProvisionError,
@@ -128,6 +129,7 @@ function makeProvisioner(overrides: {
   fetchImpl?: typeof fetch;
   routableTimeoutMs?: number;
   routableStabilityMs?: number;
+  prepareMemoryIndexTarget?: (openclawId: string) => Promise<void>;
 }): AgentProvisioner {
   const idsRef = { ids: ['openclaw/main', 'openclaw/banny'] };
   const { fetchImpl } = modelsFetch(idsRef);
@@ -148,6 +150,7 @@ function makeProvisioner(overrides: {
     // second to every provisioner test.
     routableStabilityMs: overrides.routableStabilityMs ?? 0,
     now: () => new Date('2026-07-03T00:00:00.000Z'),
+    prepareMemoryIndexTarget: overrides.prepareMemoryIndexTarget ?? (async () => {}),
   });
 }
 
@@ -253,7 +256,43 @@ describe('AgentProvisioner.provisionAgent', () => {
     // memory dirs for the agent's own journals + per-user notes
     const usersDir = await fs.stat(path.join(result.hostWorkspaceDir, 'memory', 'users'));
     expect(usersDir.isDirectory()).toBe(true);
+    const memoryIndexPath = path.join(
+      dataDir,
+      'agents',
+      PARAMS.openclawId,
+      'agent',
+      'openclaw-agent.sqlite',
+    );
+    expect(await fs.readlink(memoryIndexPath)).toBe(
+      `${AGENT_MEMORY_INDEX_CONTAINER_ROOT}/${PARAMS.openclawId}.sqlite`,
+    );
     await expect(assertWorkspacePersonaDoctrine(result.hostWorkspaceDir)).resolves.toBeUndefined();
+  });
+
+  it('replaces an empty SSHFS index placeholder but refuses to discard a nonempty index', async () => {
+    const agentDir = path.join(dataDir, 'agents', PARAMS.openclawId, 'agent');
+    const indexPath = path.join(agentDir, 'openclaw-agent.sqlite');
+    await fs.mkdir(agentDir, { recursive: true });
+    await fs.writeFile(indexPath, '');
+
+    const prepared: string[] = [];
+    const provisioner = makeProvisioner({
+      prepareMemoryIndexTarget: async (openclawId) => {
+        prepared.push(openclawId);
+      },
+    });
+    await provisioner.provisionAgent(PARAMS);
+    expect(prepared).toEqual([PARAMS.openclawId]);
+    expect(await fs.readlink(indexPath)).toBe(
+      `${AGENT_MEMORY_INDEX_CONTAINER_ROOT}/${PARAMS.openclawId}.sqlite`,
+    );
+
+    await fs.rm(indexPath);
+    await fs.writeFile(indexPath, 'preserve me');
+    await expect(provisioner.provisionAgent(PARAMS)).rejects.toThrow(
+      /contains SSHFS data; restart the gateway to migrate it safely/,
+    );
+    expect(await fs.readFile(indexPath, 'utf8')).toBe('preserve me');
   });
 
   it('rejects a banal or oversized persona before registration or workspace mutation', async () => {
