@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   HistorySync,
+  PEER_CONTEXT_HEADER,
   PRIMER_HEADER,
   SAME_TURN_DEDUPE_WINDOW_MS,
   extractAttachmentPaths,
@@ -134,6 +135,16 @@ describe('planHistorySync', () => {
     const plan = planHistorySync(rows, [gwMessage('user', primed, 'p1')]);
     expect(plan.inserts).toEqual([]);
     expect(plan.backfills).toEqual([{ messageId: 'row-primed', externalId: 'gw:p1' }]);
+  });
+
+  it('dedupes a fresh web turn carrying the trusted peer envelope', () => {
+    const wrapped = `${PEER_CONTEXT_HEADER}\n- Immutable Eden account ID: account-a\n\nremember violet quartz`;
+    const rows: ExistingMessageLike[] = [
+      { id: 'row-peer', externalId: null, role: 'user', content: 'remember violet quartz' },
+    ];
+    const plan = planHistorySync(rows, [gwMessage('user', wrapped, 'peer1')]);
+    expect(plan.inserts).toEqual([]);
+    expect(plan.backfills).toEqual([{ messageId: 'row-peer', externalId: 'gw:peer1' }]);
   });
 
   it('backfills a multi-block reply onto the streamed row (whitespace-insensitive)', () => {

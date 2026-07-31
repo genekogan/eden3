@@ -77,6 +77,13 @@ export const GATEWAY_EXTERNAL_ID_PREFIX = 'gw:';
  */
 export const PRIMER_HEADER = '[Resumed Eden conversation — recent transcript:]';
 
+/**
+ * First line of the trusted current-peer envelope prepended to every web turn.
+ * Like the migration primer, this is gateway-only context: Postgres keeps the
+ * user's verbatim message, so transcript reconciliation must suffix-match it.
+ */
+export const PEER_CONTEXT_HEADER = '[Eden trusted current-peer context:]';
+
 /** Lines like `MEDIA:<path>` (live shape) or `Attachment: <path>` (spike shape). */
 const ATTACHMENT_LINE_RE = /^\s*(?:MEDIA|Attachment):\s*(\S[^\r\n]*?)\s*$/gim;
 
@@ -273,7 +280,9 @@ export function planHistorySync(
     }
 
     const content = historyMessageText(message);
-    const isPrimed = message.role === 'user' && content.startsWith(PRIMER_HEADER);
+    const hasEdenContext =
+      message.role === 'user' &&
+      (content.startsWith(PRIMER_HEADER) || content.startsWith(PEER_CONTEXT_HEADER));
     const contentKey = dedupeKey(content);
     const match = backfillable.find(
       (row) =>
@@ -284,7 +293,7 @@ export function planHistorySync(
         (dedupeKey(row.content ?? '') === contentKey ||
           // Primed first message of a resumed session: gateway holds
           // primer+content, our row holds the verbatim content.
-          (isPrimed && !!row.content && contentKey.endsWith(dedupeKey(row.content)))),
+          (hasEdenContext && !!row.content && contentKey.endsWith(dedupeKey(row.content)))),
     );
     if (match) {
       consumed.add(match.id);
