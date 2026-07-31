@@ -198,9 +198,10 @@ export async function runScheduledTask(
       status: 'active',
       lastRunTime,
       lastError: outcome.errorCode,
-      ...(outcome.errorCode
-        ? { errorCount: sql`coalesce(${triggers.errorCount}, 0) + 1` }
-        : {}),
+      // error_count is a CONSECUTIVE-failure streak: a clean run resets it,
+      // so the scheduler's auto-pause threshold only trips on unbroken runs
+      // of failures, not on lifetime totals.
+      errorCount: outcome.errorCode ? sql`coalesce(${triggers.errorCount}, 0) + 1` : 0,
       updatedAt: lastRunTime,
     })
     .where(eq(triggers.id, trigger.id));

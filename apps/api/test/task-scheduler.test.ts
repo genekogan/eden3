@@ -71,6 +71,7 @@ function makeScheduler(opts: {
   cleanupGatewayJobs?: () => Promise<{ removed: number }>;
   intervalMs?: number;
   reapStaleRunningMs?: number;
+  maxConsecutiveFailures?: number;
 }): TaskScheduler {
   return new TaskScheduler({
     runTask: opts.runTask ?? (async () => {}),
@@ -79,6 +80,9 @@ function makeScheduler(opts: {
     ...(opts.cleanupGatewayJobs ? { cleanupGatewayJobs: opts.cleanupGatewayJobs } : {}),
     ...(opts.reapStaleRunningMs !== undefined
       ? { reapStaleRunningMs: opts.reapStaleRunningMs }
+      : {}),
+    ...(opts.maxConsecutiveFailures !== undefined
+      ? { maxConsecutiveFailures: opts.maxConsecutiveFailures }
       : {}),
     restrictToTriggerIds: fixtureTriggerIds,
   });
@@ -242,6 +246,66 @@ describe('TaskScheduler.tick', () => {
     expect(new Date(row.next_scheduled_run!).getTime()).toBeGreaterThan(Date.now());
     expect(row.last_error).toBe('Task agent is not ready');
     expect(row.error_count).toBe(1);
+  });
+
+  it('auto-pauses a recurring task once consecutive failures reach the threshold', async () => {
+    // 19 prior consecutive failures; this tick's ApiError makes 20 = the default threshold.
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+      errorCount: 19,
+    });
+    const scheduler = makeScheduler({
+      runTask: async () => {
+        throw new ApiError(402, 'insufficient_manna', 'insufficient manna: account x has 0, needs 1');
+      },
+    });
+
+    await scheduler.tick();
+    const row = await readTrigger(id);
+    expect(row.status).toBe('paused');
+    expect(row.error_count).toBe(20);
+    expect(row.last_error).toMatch(
+      /^auto-paused after 20 consecutive failures; last: insufficient manna/,
+    );
+  });
+
+  it('keeps a failing task active while below the consecutive-failure threshold', async () => {
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+      errorCount: 5,
+    });
+    const scheduler = makeScheduler({
+      runTask: async () => {
+        throw new ApiError(402, 'insufficient_manna', 'insufficient manna: account x has 0, needs 1');
+      },
+    });
+
+    await scheduler.tick();
+    const row = await readTrigger(id);
+    expect(row.status).toBe('active');
+    expect(row.error_count).toBe(6);
+    expect(new Date(row.next_scheduled_run!).getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('never auto-pauses when maxConsecutiveFailures is disabled (<= 0)', async () => {
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+      errorCount: 500,
+    });
+    const scheduler = makeScheduler({
+      maxConsecutiveFailures: 0,
+      runTask: async () => {
+        throw new ApiError(402, 'insufficient_manna', 'insufficient manna: account x has 0, needs 1');
+      },
+    });
+
+    await scheduler.tick();
+    const row = await readTrigger(id);
+    expect(row.status).toBe('active');
+    expect(row.error_count).toBe(501);
   });
 
   it('leaves the row untouched on lost-claim/concurrency errors (retry next tick)', async () => {

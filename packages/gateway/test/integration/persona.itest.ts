@@ -79,7 +79,10 @@ async function restartOpenClaw(): Promise<void> {
     maxBuffer: 4 * 1024 * 1024,
   });
 
-  const deadline = Date.now() + 60_000;
+  // Solo restart-to-healthy is ~25s, but under suite load with a large
+  // provisioned fleet (200 agents on the staging DB) boot can exceed 60s —
+  // observed 2026-07-30. Generous budget; the assertion is durability, not speed.
+  const deadline = Date.now() + 180_000;
   let last = '';
   while (Date.now() < deadline) {
     try {

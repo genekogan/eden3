@@ -87,6 +87,14 @@ export interface TaskSchedulerOptions {
   /** Max due rows per tick. */
   batchLimit?: number;
   /**
+   * Auto-pause a recurring task after this many CONSECUTIVE scheduler-run
+   * failures (default 20). A success resets the streak (runScheduledTask
+   * zeroes error_count). Guards against zombie tasks — e.g. a migrated
+   * trigger whose owner has 0 manna failing every fire, forever. Manual
+   * "run now" failures never auto-pause. <= 0 disables.
+   */
+  maxConsecutiveFailures?: number;
+  /**
    * TEST SEAM: when set, ticks only consider these trigger ids — suites run
    * full ticks against the shared dev database without touching real rows.
    * Production never sets this.
@@ -103,6 +111,7 @@ export class TaskScheduler {
   private readonly cleanupGatewayJobs: (() => Promise<{ removed: number }>) | null;
   private readonly log: SchedulerLogger | null;
   private readonly batchLimit: number;
+  private readonly maxConsecutiveFailures: number;
   private readonly restrictToTriggerIds: string[] | null;
   private readonly inFlight = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
@@ -116,6 +125,7 @@ export class TaskScheduler {
     this.cleanupGatewayJobs = options.cleanupGatewayJobs ?? null;
     this.log = options.logger ?? null;
     this.batchLimit = options.batchLimit ?? 50;
+    this.maxConsecutiveFailures = options.maxConsecutiveFailures ?? 20;
     this.restrictToTriggerIds = options.restrictToTriggerIds ?? null;
   }
 
@@ -247,9 +257,44 @@ export class TaskScheduler {
         this.log?.error({ err, triggerId: row.id }, 'task-scheduler: scheduled run failed');
       }
       await this.stampNextRun(row);
+      if (failed) await this.maybeAutoPause(row);
       return failed ? 'failed' : 'fired';
     } finally {
       this.inFlight.delete(row.id);
+    }
+  }
+
+  /**
+   * Pause a recurring task whose consecutive scheduler-failure streak has hit
+   * the threshold, so a permanently-broken task (owner out of manna, agent
+   * gone) stops burning a failed attempt every fire, forever. error_count IS
+   * the streak: every failure path increments it and a successful run resets
+   * it to 0. Only status='active' rows are touched (one-time tasks are
+   * already 'finished' by stampNextRun; paused/deleted stay as they are).
+   */
+  private async maybeAutoPause(row: Trigger): Promise<void> {
+    if (this.maxConsecutiveFailures <= 0) return;
+    const paused = await db
+      .update(triggers)
+      .set({
+        status: 'paused',
+        lastError: sql`left('auto-paused after ' || coalesce(${triggers.errorCount}, 0) || ' consecutive failures; last: ' || coalesce(${triggers.lastError}, 'unknown error'), 2000)`,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(triggers.id, row.id),
+          eq(triggers.status, 'active'),
+          eq(triggers.deleted, false),
+          sql`coalesce(${triggers.errorCount}, 0) >= ${this.maxConsecutiveFailures}`,
+        ),
+      )
+      .returning({ id: triggers.id, errorCount: triggers.errorCount });
+    if (paused.length > 0) {
+      this.log?.warn(
+        { triggerId: row.id, consecutiveFailures: paused[0]?.errorCount },
+        'task-scheduler: auto-paused task after repeated consecutive failures',
+      );
     }
   }
 
