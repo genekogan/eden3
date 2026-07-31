@@ -20,7 +20,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { api, ApiError, isEndpointMissing, onDevUserChange } from "@/lib/api";
-import { isClerkEnabled, loadClerk, type ClerkJs } from "@/lib/clerk";
+import { loadClerk, selectAuthMode, type ClerkJs } from "@/lib/clerk";
 import { DevUserSwitcher } from "@/components/DevUserSwitcher";
 
 type GateState =
@@ -31,11 +31,10 @@ type GateState =
   | "unguarded"; // /dev/me not implemented/erroring — let pages self-report
 
 export function DevUserGate({ children }: { children: ReactNode }) {
-  if (process.env.NEXT_PUBLIC_EDEN3_DEV_IMPERSONATION === "1") {
+  if (selectAuthMode() === "dev-impersonation") {
     return <DevImpersonationGate>{children}</DevImpersonationGate>;
   }
-  if (isClerkEnabled()) return <ClerkGate>{children}</ClerkGate>;
-  return <DevImpersonationGate>{children}</DevImpersonationGate>;
+  return <ClerkGate>{children}</ClerkGate>;
 }
 
 function DevImpersonationGate({ children }: { children: ReactNode }) {

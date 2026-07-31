@@ -7,6 +7,9 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 process.env.PLAYWRIGHT_BROWSERS_PATH ??= path.join(ROOT, 'var/playwright-browsers');
 const browserName = process.env.PLAYWRIGHT_BROWSER ?? 'firefox';
 const channel = process.env.PLAYWRIGHT_CHANNEL;
+const forceEvidence = process.env.PLAYWRIGHT_FORCE_EVIDENCE === '1';
+const outputDir = process.env.PLAYWRIGHT_OUTPUT_DIR ?? 'var/acceptance/artifacts';
+const reportDir = process.env.PLAYWRIGHT_REPORT_DIR ?? 'var/acceptance/report';
 const browserHome = path.join(ROOT, 'var/chrome-home');
 mkdirSync(browserHome, { recursive: true });
 const chromiumLaunchOptions = {
@@ -29,8 +32,8 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: 0,
-  reporter: [['list'], ['html', { outputFolder: 'var/acceptance/report', open: 'never' }]],
-  outputDir: 'var/acceptance/artifacts',
+  reporter: [['list'], ['html', { outputFolder: reportDir, open: 'never' }]],
+  outputDir,
   use: {
     baseURL: process.env.WEB_URL ?? 'http://localhost:4300',
     browserName,
@@ -38,8 +41,8 @@ export default defineConfig({
     headless: process.env.PLAYWRIGHT_HEADLESS !== '0',
     ...(browserName === 'chromium' ? { launchOptions: chromiumLaunchOptions } : {}),
     screenshot: 'on',
-    video: 'retain-on-failure',
-    trace: 'retain-on-failure',
+    video: forceEvidence ? 'on' : 'retain-on-failure',
+    trace: forceEvidence ? 'on' : 'retain-on-failure',
     actionTimeout: 30_000,
   },
 });

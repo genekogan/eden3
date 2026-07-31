@@ -64,7 +64,31 @@ export interface AgentMemorySnapshot extends AgentMemoryStatus {
     username: string;
     chars: number;
     summary: string | null;
+    content: string;
   }>;
+  dreamDiary: {
+    filename: "DREAMS.md";
+    chars: number;
+    content: string | null;
+  };
+  dreamReports: Array<{
+    phase: "deep" | "rem";
+    filename: string;
+    path: string;
+    chars: number;
+    content: string;
+    updatedAt: string;
+  }>;
+  latestRevision: {
+    id: string;
+    operation: "automatic-seed" | "manual-reseed" | "owner-correction" | "dream-promotion";
+    actorAccountId: string | null;
+    previousSha256: string | null;
+    sha256: string;
+    chars: number;
+    metadata: unknown;
+    createdAt: string;
+  } | null;
 }
 
 export interface AgentMemoryResponse {
@@ -302,12 +326,23 @@ export interface VoucherRedeemResult {
   };
 }
 
-export type ChannelKind =
-  | "discord"
-  | "telegram"
-  | "whatsapp"
-  | "slack"
-  | "voice";
+export type ChannelKind = "discord" | "telegram";
+
+export interface ChannelDestinationDto {
+  guildId: string;
+  guildName: string;
+  channelId: string;
+  channelName: string;
+}
+
+export interface ChannelPairingRequestDto {
+  id: string;
+  status: "pending" | "approved" | "denied" | "expired";
+  peerPreview: string | null;
+  requestedAt: string;
+  expiresAt: string;
+  decidedAt: string | null;
+}
 
 export interface ChannelConnectionDto {
   id: string;
@@ -315,8 +350,31 @@ export interface ChannelConnectionDto {
   agentId: string | null;
   channel: ChannelKind;
   label: string | null;
+  runtimeAccountId: string | null;
   status: string;
+  desiredState: "inactive" | "active";
+  observedState:
+    | "unknown"
+    | "validating"
+    | "verified"
+    | "starting"
+    | "live"
+    | "stopped"
+    | "error";
   tokenPreview: string | null;
+  lastError: { code: string; message: string } | null;
+  lastValidatedAt: string | null;
+  retryCount: number;
+  nextRetryAt: string | null;
+  activatedAt: string | null;
+  bot: { id: string | null; username: string | null; displayName: string | null } | null;
+  config: {
+    dmPolicy: "pairing" | "allowlist";
+    allowFrom: string[];
+    deliveryScope: "direct_messages_only";
+    /** Always empty for hosted connections; retained for response compatibility. */
+    discordGuilds: Array<{ guildId: string; channelIds: string[] }>;
+  };
   createdAt: string;
   updatedAt: string;
 }
@@ -411,6 +469,7 @@ export interface OperatorRecentUsageEvent {
   turnId: string | null;
   provider: string | null;
   model: string | null;
+  pricingBasis: "provider-api" | "notional-subscription";
   costUsd: number;
   manna: number;
   latencyMs: number | null;

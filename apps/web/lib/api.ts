@@ -35,6 +35,8 @@ import type {
   AgentMemoryRebuildResponse,
   AgentMemoryResponse,
   AgentProfile,
+  AgentModel,
+  AgentRuntime,
   AgentUpdateInput,
   AuthMeResponse,
   BillingCheckoutSession,
@@ -42,7 +44,9 @@ import type {
   BillingSubscriptionSummary,
   ChannelConnectionCreateInput,
   ChannelConnectionDto,
+  ChannelDestinationDto,
   ChannelMockMessageResult,
+  ChannelPairingRequestDto,
   CollectionDetail,
   CollectionCreateInput,
   CollectionDto,
@@ -55,6 +59,7 @@ import type {
   MannaSummary,
   MannaTransactionDto,
   MessageDto,
+  ModelRuntimeDto,
   Paginated,
   OperatorHealth,
   OperatorUsageSummary,
@@ -464,6 +469,13 @@ export const api = {
     },
   },
 
+  account: {
+    /** GET /api/account/export — complete owner-scoped account ZIP. */
+    exportBundle(): Promise<Blob> {
+      return apiBlob("/account/export");
+    },
+  },
+
   sessions: {
     /** GET /api/sessions?cursor */
     async list(params: { cursor?: string } = {}): Promise<Paginated<SessionDto>> {
@@ -547,9 +559,11 @@ export const api = {
       });
     },
 
-    /** POST /api/agents/:username/memory/rebuild -> force transcript distillation. */
+    /** Explicit owner reseed; this is the only path allowed to replace native/dream-owned memory. */
     rebuildMemory(username: string): Promise<AgentMemoryRebuildResponse> {
-      return post<AgentMemoryRebuildResponse>(`/agents/${enc(username)}/memory/rebuild`);
+      return post<AgentMemoryRebuildResponse>(`/agents/${enc(username)}/memory/rebuild`, {
+        confirm: "reseed",
+      });
     },
 
     /** POST /api/agents/:username/repair -> owner re-asserts the runtime (restart). */
@@ -652,9 +666,15 @@ export const api = {
   },
 
   feed: {
-    /** GET /api/feed/creations?cursor&agent&user -> {creations[], nextCursor} */
+    /** GET /api/feed/creations?cursor&agent&user&favorites -> {creations[], nextCursor} */
     async creations(
-      params: { q?: string; cursor?: string; agent?: string; user?: string } = {},
+      params: {
+        q?: string;
+        cursor?: string;
+        agent?: string;
+        user?: string;
+        favorites?: "mine";
+      } = {},
     ): Promise<Paginated<CreationDto>> {
       return toPaginated<CreationDto>(
         await get<unknown>(`/feed/creations${qs(params)}`),
@@ -873,16 +893,48 @@ export const api = {
       );
     },
 
-    /** POST /api/channels/connections/:id/activate — wire the runtime (Discord first). */
+    /** Validate the stored token again, optionally rotating it first. */
+    retry(id: string, token?: string): Promise<{ ok: boolean; connection: ChannelConnectionDto }> {
+      return post(`/channels/connections/${enc(id)}/retry`, token ? { token } : {});
+    },
+
+    destinations(id: string): Promise<{ items: ChannelDestinationDto[] }> {
+      return get(`/channels/connections/${enc(id)}/destinations`);
+    },
+
+    /** Project a named Discord/Telegram account backed by a vault SecretRef. */
     activate(
       id: string,
-      input: { allowFrom: string[] },
+      input: {
+        dmPolicy: "pairing" | "allowlist";
+        allowFrom: string[];
+      },
     ): Promise<{
       ok: boolean;
       connection: ChannelConnectionDto;
-      runtime: { boundAgent: string; allowFrom: string[]; tokenEnvVar: string };
+      runtime: { boundAgent: string; runtimeAccountId: string };
     }> {
       return post(`/channels/connections/${enc(id)}/activate`, input);
+    },
+
+    deactivate(id: string): Promise<{ ok: boolean; connection: ChannelConnectionDto }> {
+      return post(`/channels/connections/${enc(id)}/deactivate`, {});
+    },
+
+    pairing(id: string): Promise<{ items: ChannelPairingRequestDto[] }> {
+      return get(`/channels/connections/${enc(id)}/pairing`);
+    },
+
+    decidePairing(
+      id: string,
+      requestId: string,
+      decision: "approve" | "deny",
+      input: { linkToMyAccount?: boolean; pairingCode?: string } = {},
+    ): Promise<{ ok: true; linkedToMyAccount?: boolean }> {
+      return post(
+        `/channels/connections/${enc(id)}/pairing/${enc(requestId)}/${decision}`,
+        decision === "approve" ? input : {},
+      );
     },
 
     /** DELETE /api/channels/connections/:id. */
@@ -950,6 +1002,22 @@ export const api = {
     /** GET /api/operator/health — admin-only runtime health panel. */
     async health(): Promise<OperatorHealth> {
       return get<OperatorHealth>("/operator/health");
+    },
+
+    /** GET /api/operator/model-runtimes — effective model-scoped runtime catalog. */
+    async modelRuntimes(): Promise<{ models: ModelRuntimeDto[] }> {
+      return get<{ models: ModelRuntimeDto[] }>("/operator/model-runtimes");
+    },
+
+    /** POST /api/operator/model-runtimes — hot-toggle one model's runtime. */
+    async setModelRuntime(input: {
+      model: AgentModel;
+      agentRuntime: AgentRuntime;
+    }): Promise<ModelRuntimeDto & { changed: boolean }> {
+      return post<ModelRuntimeDto & { changed: boolean }>(
+        "/operator/model-runtimes",
+        input,
+      );
     },
   },
 

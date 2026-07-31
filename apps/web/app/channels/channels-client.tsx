@@ -1,20 +1,12 @@
 "use client";
 
-/**
- * /channels — user-owned channel token custody and sandbox routing checks.
- *
- * Tokens are submitted once to the API and never rendered again. The list uses
- * the safe DTO from GET /channels/connections: status, channel, label, last-four
- * token preview, and timestamps.
- */
-
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type {
   ChannelConnectionCreateInput,
   ChannelConnectionDto,
   ChannelKind,
-  ChannelMockMessageResult,
+  ChannelPairingRequestDto,
 } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton";
@@ -23,67 +15,56 @@ import { formatRelativeTime } from "@/lib/format";
 const CHANNELS: Array<{ value: ChannelKind; label: string }> = [
   { value: "discord", label: "Discord" },
   { value: "telegram", label: "Telegram" },
-  { value: "whatsapp", label: "WhatsApp" },
-  { value: "slack", label: "Slack" },
-  { value: "voice", label: "Voice" },
 ];
 
-const CHANNEL_LABELS = Object.fromEntries(
-  CHANNELS.map((item) => [item.value, item.label]),
-) as Record<ChannelKind, string>;
+const LABELS: Record<ChannelKind, string> = {
+  discord: "Discord",
+  telegram: "Telegram",
+};
+
+interface ConnectionDraft {
+  dmPolicy: "pairing" | "allowlist";
+  allowFrom: string;
+}
 
 type Phase = "loading" | "ready" | "error";
 
-function errorCopy(error: unknown): { title: string; hint: string } {
-  if (isEndpointMissing(error)) {
-    return {
-      title: "Channels aren't wired up yet",
-      hint: "GET /api/channels/connections is still landing in the backend workflow.",
-    };
-  }
-  if (error instanceof ApiError) {
-    if (error.status === 401 || error.status === 403) {
-      return {
-        title: "No user selected",
-        hint: "Pick a dev user in the sidebar switcher to manage channels.",
-      };
-    }
-    if (error.status === 503) {
-      return {
-        title: "Secret vault unavailable",
-        hint: error.message,
-      };
-    }
-    return { title: "Couldn't load channels", hint: error.message };
-  }
-  return {
-    title: "API offline",
-    hint: "Start @eden3/api on :4301 and retry.",
-  };
+function errorCopy(error: unknown): string {
+  if (isEndpointMissing(error)) return "Connections are not available in this API build.";
+  if (error instanceof ApiError) return error.message;
+  return "The API is offline. Start @eden3/api and retry.";
 }
 
-function statusTone(status: string): string {
-  const key = status.toLowerCase();
-  if (key === "connected") {
+function tokenPreview(connection: ChannelConnectionDto): string {
+  return connection.tokenPreview ? `•••• ${connection.tokenPreview}` : "encrypted";
+}
+
+function statusTone(connection: ChannelConnectionDto): string {
+  if (connection.observedState === "live") {
     return "border-emerald-400/25 bg-emerald-400/10 text-emerald-300";
   }
-  if (key === "error") {
+  if (connection.observedState === "error") {
     return "border-rose-400/25 bg-rose-400/10 text-rose-300";
+  }
+  if (connection.observedState === "starting") {
+    return "border-amber-400/25 bg-amber-400/10 text-amber-200";
   }
   return "border-edge bg-white/[0.04] text-muted";
 }
 
-function tokenPreview(connection: ChannelConnectionDto): string {
-  return connection.tokenPreview ? `•••• ${connection.tokenPreview}` : "stored";
+function initialDraft(connection: ChannelConnectionDto): ConnectionDraft {
+  return {
+    dmPolicy: connection.config.dmPolicy,
+    allowFrom: connection.config.allowFrom.join(", "),
+  };
 }
 
-function FormField({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function parseAllowFrom(value: string): string[] | null {
+  const ids = [...new Set(value.split(/[\s,]+/).map((id) => id.trim()).filter(Boolean))];
+  return ids.every((id) => /^-?\d{3,25}$/.test(id)) ? ids : null;
+}
+
+function FormField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="block">
       <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">
@@ -97,132 +78,187 @@ function FormField({
 export function ChannelsClient() {
   const [connections, setConnections] = useState<ChannelConnectionDto[]>([]);
   const [phase, setPhase] = useState<Phase>("loading");
-  const [loadError, setLoadError] = useState<unknown>(null);
   const [channel, setChannel] = useState<ChannelKind>("discord");
   const [label, setLabel] = useState("");
   const [agentUsername, setAgentUsername] = useState("");
   const [token, setToken] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [mockMessages, setMockMessages] = useState<Record<string, string>>({});
-  const [activateIds, setActivateIds] = useState<Record<string, string>>({});
-  const [mockResults, setMockResults] = useState<
-    Record<string, ChannelMockMessageResult | string>
-  >({});
+  const [drafts, setDrafts] = useState<Record<string, ConnectionDraft>>({});
+  const [pairings, setPairings] = useState<Record<string, ChannelPairingRequestDto[]>>({});
+  const [pairingLinks, setPairingLinks] = useState<Record<string, boolean>>({});
+  const [pairingCodes, setPairingCodes] = useState<Record<string, string>>({});
+  const [rotateTokens, setRotateTokens] = useState<Record<string, string>>({});
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const alive = useRef(true);
-  const confirmTimer = useRef<number | null>(null);
 
-  const load = useCallback(async (soft = false) => {
-    if (!soft) setPhase("loading");
+  const mergeConnection = useCallback((connection: ChannelConnectionDto) => {
+    setConnections((current) =>
+      current.some((item) => item.id === connection.id)
+        ? current.map((item) => (item.id === connection.id ? connection : item))
+        : [connection, ...current],
+    );
+    setDrafts((current) => ({
+      ...current,
+      [connection.id]: current[connection.id] ?? initialDraft(connection),
+    }));
+  }, []);
+
+  const load = useCallback(async () => {
+    setPhase("loading");
     try {
       const { items } = await api.channels.list();
       if (!alive.current) return;
       setConnections(items);
+      setDrafts(Object.fromEntries(items.map((item) => [item.id, initialDraft(item)])));
       setPhase("ready");
-      setLoadError(null);
     } catch (error) {
       if (!alive.current) return;
-      if (soft) setNote(errorCopy(error).hint);
-      else {
-        setLoadError(error);
-        setPhase("error");
-      }
+      setNote(errorCopy(error));
+      setPhase("error");
     }
   }, []);
 
   useEffect(() => {
     alive.current = true;
+    const requestedAgent = new URLSearchParams(window.location.search).get("agent");
+    if (requestedAgent) setAgentUsername(requestedAgent.replace(/^@/, ""));
     void load();
     return () => {
       alive.current = false;
-      if (confirmTimer.current != null) window.clearTimeout(confirmTimer.current);
     };
   }, [load]);
 
-  useEffect(() => {
-    if (!note) return;
-    const timer = window.setTimeout(() => setNote(null), 7000);
-    return () => window.clearTimeout(timer);
-  }, [note]);
-
   const create = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const trimmedToken = token.trim();
-    if (!trimmedToken) {
-      setNote("Token is required.");
+    const cleanToken = token.trim();
+    const cleanAgent = agentUsername.trim().replace(/^@/, "");
+    if (!cleanToken || !cleanAgent) {
+      setNote("A bot token and owned agent username are required.");
       return;
     }
-    setBusy("create");
-    setNote(null);
     const input: ChannelConnectionCreateInput = {
       channel,
-      token: trimmedToken,
+      token: cleanToken,
+      agentUsername: cleanAgent,
+      ...(label.trim() ? { label: label.trim() } : {}),
     };
-    const trimmedLabel = label.trim();
-    const trimmedAgent = agentUsername.trim().replace(/^@/, "");
-    if (trimmedLabel) input.label = trimmedLabel;
-    if (trimmedAgent) input.agentUsername = trimmedAgent;
+    setBusy("create");
+    setNote(null);
     try {
-      const created = await api.channels.create(input);
+      const connection = await api.channels.create(input);
       if (!alive.current) return;
-      setConnections((prev) => [created, ...prev]);
+      mergeConnection(connection);
+      setToken("");
       setLabel("");
       setAgentUsername("");
-      setToken("");
-      setChannel("discord");
+      setNote(
+        connection.lastError
+          ? connection.lastError.message
+          : "Token verified. Configure access below, then activate the connection.",
+      );
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error).hint);
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const retry = async (connection: ChannelConnectionDto) => {
+    const replacement = (rotateTokens[connection.id] ?? "").trim();
+    setBusy(`retry:${connection.id}`);
+    try {
+      const result = await api.channels.retry(connection.id, replacement || undefined);
+      if (!alive.current) return;
+      mergeConnection(result.connection);
+      setRotateTokens((current) => ({ ...current, [connection.id]: "" }));
+      setNote(result.ok ? "Token verified." : (result.connection.lastError?.message ?? "Validation failed."));
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
     } finally {
       if (alive.current) setBusy(null);
     }
   };
 
   const activate = async (connection: ChannelConnectionDto) => {
-    const userId = (activateIds[connection.id] ?? "").trim();
-    if (!/^\d{5,25}$/.test(userId)) {
-      setNote("Enter your numeric Discord user ID (Settings → Advanced → Developer Mode → right-click yourself → Copy User ID).");
+    const draft = drafts[connection.id] ?? initialDraft(connection);
+    const allowFrom = parseAllowFrom(draft.allowFrom);
+    if (!allowFrom) {
+      setNote("Allowlist IDs must be numeric Discord/Telegram user IDs.");
+      return;
+    }
+    if (draft.dmPolicy === "allowlist" && allowFrom.length === 0) {
+      setNote("Allowlist policy requires at least one user ID.");
       return;
     }
     setBusy(`activate:${connection.id}`);
     try {
-      const result = await api.channels.activate(connection.id, { allowFrom: [userId] });
+      const result = await api.channels.activate(connection.id, {
+        dmPolicy: draft.dmPolicy,
+        allowFrom,
+      });
       if (!alive.current) return;
-      setConnections((prev) =>
-        prev.map((item) => (item.id === connection.id ? result.connection : item)),
-      );
-      setNote(
-        `Discord runtime wired: DMs from ${userId} route to ${result.runtime.boundAgent}. The gateway needs its ${result.runtime.tokenEnvVar} env set (operator step).`,
-      );
+      mergeConnection(result.connection);
+      setNote(`${LABELS[connection.channel]} is starting for ${result.runtime.boundAgent}.`);
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error).hint);
+      if (alive.current) setNote(errorCopy(error));
     } finally {
       if (alive.current) setBusy(null);
     }
   };
 
-  const sendMock = async (connection: ChannelConnectionDto) => {
-    const message = (mockMessages[connection.id] ?? "").trim();
-    if (!message) {
-      setMockResults((prev) => ({
-        ...prev,
-        [connection.id]: "Message is required.",
-      }));
-      return;
-    }
-    setBusy(`mock:${connection.id}`);
+  const deactivate = async (connection: ChannelConnectionDto) => {
+    setBusy(`deactivate:${connection.id}`);
     try {
-      const result = await api.channels.mockMessage(connection.id, message);
-      if (!alive.current) return;
-      setMockResults((prev) => ({ ...prev, [connection.id]: result }));
-      setMockMessages((prev) => ({ ...prev, [connection.id]: "" }));
+      const result = await api.channels.deactivate(connection.id);
+      if (alive.current) mergeConnection(result.connection);
     } catch (error) {
-      if (alive.current) {
-        setMockResults((prev) => ({
-          ...prev,
-          [connection.id]: errorCopy(error).hint,
-        }));
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const loadPairing = async (connection: ChannelConnectionDto) => {
+    setBusy(`pairing:${connection.id}`);
+    try {
+      const result = await api.channels.pairing(connection.id);
+      if (alive.current) setPairings((current) => ({ ...current, [connection.id]: result.items }));
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const decidePairing = async (
+    connection: ChannelConnectionDto,
+    request: ChannelPairingRequestDto,
+    decision: "approve" | "deny",
+  ) => {
+    setBusy(`pairing:${request.id}`);
+    try {
+      const linkToMyAccount = decision === "approve" && (pairingLinks[request.id] ?? false);
+      const pairingCode = (pairingCodes[request.id] ?? "").trim();
+      await api.channels.decidePairing(
+        connection.id,
+        request.id,
+        decision,
+        linkToMyAccount ? { linkToMyAccount, pairingCode } : {},
+      );
+      setPairingLinks((current) => ({ ...current, [request.id]: false }));
+      setPairingCodes((current) => ({ ...current, [request.id]: "" }));
+      await loadPairing(connection);
+      if (decision === "approve") {
+        await load();
+        setNote(
+          linkToMyAccount
+            ? "Sender approved and verified as your Eden account. Web and channel memory now match."
+            : "Sender approved for this bot without linking an Eden account.",
+        );
       }
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
     } finally {
       if (alive.current) setBusy(null);
     }
@@ -231,23 +267,19 @@ export function ChannelsClient() {
   const remove = async (connection: ChannelConnectionDto) => {
     if (confirmingId !== connection.id) {
       setConfirmingId(connection.id);
-      if (confirmTimer.current != null) window.clearTimeout(confirmTimer.current);
-      confirmTimer.current = window.setTimeout(
-        () => setConfirmingId(null),
-        4000,
-      );
       return;
     }
-    setConfirmingId(null);
     setBusy(`delete:${connection.id}`);
     try {
       await api.channels.delete(connection.id);
-      if (!alive.current) return;
-      setConnections((prev) => prev.filter((item) => item.id !== connection.id));
+      if (alive.current) setConnections((items) => items.filter((item) => item.id !== connection.id));
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error).hint);
+      if (alive.current) setNote(errorCopy(error));
     } finally {
-      if (alive.current) setBusy(null);
+      if (alive.current) {
+        setBusy(null);
+        setConfirmingId(null);
+      }
     }
   };
 
@@ -255,87 +287,43 @@ export function ChannelsClient() {
     "w-full rounded-lg border border-edge bg-background px-3 py-2 text-sm text-foreground placeholder:text-faint focus:border-accent/60 focus:outline-none";
 
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 py-14 md:px-10">
+    <div className="mx-auto w-full max-w-6xl px-6 py-14 md:px-10">
       <header>
-        <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
-          Autonomy
-        </p>
-        <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
-          Channels
-        </h1>
-        <p className="mt-2 text-sm text-muted">
-          Connect agents to external channel endpoints.
+        <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">Autonomy</p>
+        <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">Connections</h1>
+        <p className="mt-2 max-w-2xl text-sm text-muted">
+          Give an agent its own Discord or Telegram bot. Tokens stay encrypted; only the last
+          four characters are ever shown here.
         </p>
       </header>
 
       {note ? (
-        <p
-          role="status"
-          className="mt-6 rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-xs text-rose-300"
-        >
+        <p role="status" className="mt-6 rounded-lg border border-accent/25 bg-accent/10 px-3 py-2 text-xs text-accent-soft">
           {note}
         </p>
       ) : null}
 
-      <div className="mt-10 grid gap-6 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-        <form
-          onSubmit={(event) => void create(event)}
-          className="rounded-xl border border-edge bg-surface p-4"
-        >
-          <h2 className="text-sm font-medium">New connection</h2>
+      <div className="mt-10 grid gap-6 lg:grid-cols-[minmax(0,0.72fr)_minmax(0,1.28fr)]">
+        <form onSubmit={(event) => void create(event)} className="h-fit rounded-xl border border-edge bg-surface p-4">
+          <h2 className="text-sm font-medium">Connect a bot</h2>
           <div className="mt-5 space-y-4">
-            <FormField label="Channel">
-              <select
-                value={channel}
-                onChange={(event) => setChannel(event.target.value as ChannelKind)}
-                className={inputClass}
-              >
-                {CHANNELS.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
+            <FormField label="Provider">
+              <select value={channel} onChange={(event) => setChannel(event.target.value as ChannelKind)} className={inputClass}>
+                {CHANNELS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </FormField>
-
-            <FormField label="Label">
-              <input
-                value={label}
-                onChange={(event) => setLabel(event.target.value)}
-                placeholder="Team workspace"
-                maxLength={120}
-                className={inputClass}
-              />
+            <FormField label="Agent username">
+              <input value={agentUsername} onChange={(event) => setAgentUsername(event.target.value)} placeholder="@abraham" className={inputClass} />
             </FormField>
-
-            <FormField label="Agent">
-              <input
-                value={agentUsername}
-                onChange={(event) => setAgentUsername(event.target.value)}
-                placeholder="@abraham"
-                maxLength={200}
-                className={inputClass}
-              />
+            <FormField label="Bot token">
+              <input value={token} onChange={(event) => setToken(event.target.value)} type="password" autoComplete="off" placeholder="••••••••" className={inputClass} />
             </FormField>
-
-            <FormField label="Token">
-              <input
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-                placeholder="••••••••"
-                type="password"
-                autoComplete="off"
-                className={inputClass}
-              />
+            <FormField label="Label (optional)">
+              <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Community bot" maxLength={120} className={inputClass} />
             </FormField>
           </div>
-
-          <button
-            type="submit"
-            disabled={busy === "create"}
-            className="mt-5 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {busy === "create" ? "Saving…" : "Connect"}
+          <button type="submit" disabled={busy === "create"} className="mt-5 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white hover:bg-accent/85 disabled:opacity-50">
+            {busy === "create" ? "Validating…" : "Save & validate"}
           </button>
         </form>
 
@@ -343,141 +331,118 @@ export function ChannelsClient() {
           {phase === "loading" ? (
             <SkeletonRows count={4} />
           ) : phase === "error" ? (
-            <EmptyState
-              {...errorCopy(loadError)}
-              action={
-                <button
-                  type="button"
-                  onClick={() => void load()}
-                  className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
-                >
-                  Retry
-                </button>
-              }
-            />
+            <EmptyState title="Couldn’t load connections" hint={note ?? undefined} action={<button type="button" onClick={() => void load()} className="rounded-lg border border-edge px-3 py-2 text-sm text-muted">Retry</button>} />
           ) : connections.length === 0 ? (
-            <EmptyState
-              title="No channels connected"
-              hint="Create a connection to route sandbox channel messages."
-            />
+            <EmptyState title="No connections yet" hint="Add a Discord or Telegram bot to an agent." />
           ) : (
-            <ul className="space-y-3">
+            <ul className="space-y-4">
               {connections.map((connection) => {
-                const mock = mockResults[connection.id];
-                const mockBusy = busy === `mock:${connection.id}`;
-                const deleteBusy = busy === `delete:${connection.id}`;
+                const draft = drafts[connection.id] ?? initialDraft(connection);
+                const pending = (pairings[connection.id] ?? []).filter((item) => item.status === "pending");
                 return (
-                  <li
-                    key={connection.id}
-                    className="rounded-xl border border-edge bg-surface p-4"
-                  >
+                  <li key={connection.id} className="rounded-xl border border-edge bg-surface p-4">
                     <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div className="min-w-0">
+                      <div>
                         <div className="flex flex-wrap items-center gap-2">
-                          <h3 className="text-sm font-medium">
-                            {connection.label ||
-                              CHANNEL_LABELS[connection.channel] ||
-                              connection.channel}
-                          </h3>
-                          <span
-                            className={`inline-flex items-center rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${statusTone(connection.status)}`}
-                          >
-                            {connection.status}
+                          <h3 className="text-sm font-medium">{connection.label || connection.bot?.username || LABELS[connection.channel]}</h3>
+                          <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${statusTone(connection)}`}>
+                            {connection.observedState}
                           </span>
                         </div>
                         <p className="mt-1 text-xs text-muted">
-                          {CHANNEL_LABELS[connection.channel]} ·{" "}
-                          {tokenPreview(connection)}
-                          {connection.agentId ? (
-                            <span className="text-faint">
-                              {" "}
-                              · agent {connection.agentId.slice(0, 8)}
-                            </span>
-                          ) : null}
+                          {LABELS[connection.channel]} · {tokenPreview(connection)}
+                          {connection.bot?.username ? ` · @${connection.bot.username}` : ""}
                         </p>
-                        <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">
-                          Updated {formatRelativeTime(connection.updatedAt)}
-                        </p>
+                        <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">Updated {formatRelativeTime(connection.updatedAt)}</p>
                       </div>
-                      <button
-                        type="button"
-                        disabled={deleteBusy}
-                        onClick={() => void remove(connection)}
-                        className={`rounded-lg border px-3 py-1.5 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                          confirmingId === connection.id
-                            ? "border-rose-400/50 bg-rose-400/10 text-rose-300"
-                            : "border-edge text-muted hover:border-rose-400/50 hover:text-rose-300"
-                        }`}
-                      >
-                        {confirmingId === connection.id ? "Confirm" : "Delete"}
+                      <button type="button" disabled={busy === `delete:${connection.id}`} onClick={() => void remove(connection)} className={`rounded-lg border px-3 py-1.5 text-xs ${confirmingId === connection.id ? "border-rose-400/50 bg-rose-400/10 text-rose-300" : "border-edge text-muted hover:text-rose-300"}`}>
+                        {confirmingId === connection.id ? "Confirm delete" : "Delete"}
                       </button>
                     </div>
 
-                    <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-                      <input
-                        value={mockMessages[connection.id] ?? ""}
-                        onChange={(event) =>
-                          setMockMessages((prev) => ({
-                            ...prev,
-                            [connection.id]: event.target.value,
-                          }))
-                        }
-                        placeholder="Sandbox message"
-                        maxLength={4000}
-                        className={inputClass}
-                      />
-                      <button
-                        type="button"
-                        disabled={mockBusy}
-                        onClick={() => void sendMock(connection)}
-                        className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        {mockBusy ? "Routing…" : "Test"}
-                      </button>
-                    </div>
-
-                    {connection.channel === "discord" && connection.agentId ? (
-                      <div className="mt-2 flex flex-col gap-2 sm:flex-row">
-                        <input
-                          value={activateIds[connection.id] ?? ""}
-                          onChange={(event) =>
-                            setActivateIds((prev) => ({
-                              ...prev,
-                              [connection.id]: event.target.value,
-                            }))
-                          }
-                          placeholder="Your Discord user ID (allowlist)"
-                          maxLength={25}
-                          className={inputClass}
-                        />
-                        <button
-                          type="button"
-                          disabled={busy === `activate:${connection.id}`}
-                          onClick={() => void activate(connection)}
-                          className="rounded-lg border border-accent/40 px-3.5 py-2 text-sm text-accent-soft transition-colors hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                          {busy === `activate:${connection.id}`
-                            ? "Wiring…"
-                            : connection.status === "active"
-                              ? "Re-activate"
-                              : "Activate"}
-                        </button>
+                    {connection.lastError ? (
+                      <div className="mt-4 rounded-lg border border-rose-400/25 bg-rose-400/10 p-3">
+                        <p className="text-xs text-rose-200">{connection.lastError.message}</p>
+                        <div className="mt-2 flex gap-2">
+                          <input value={rotateTokens[connection.id] ?? ""} onChange={(event) => setRotateTokens((current) => ({ ...current, [connection.id]: event.target.value }))} type="password" autoComplete="off" placeholder="New token (or retry stored)" className={inputClass} />
+                          <button type="button" onClick={() => void retry(connection)} disabled={busy === `retry:${connection.id}`} className="rounded-lg border border-rose-300/30 px-3 text-xs text-rose-200 disabled:opacity-50">Retry</button>
+                        </div>
                       </div>
                     ) : null}
 
-                    {mock ? (
-                      <p
-                        role="status"
-                        className={`mt-2 text-xs ${
-                          typeof mock === "string"
-                            ? "text-rose-300"
-                            : "text-emerald-300"
-                        }`}
-                      >
-                        {typeof mock === "string"
-                          ? mock
-                          : `Routed ${mock.messageLength} characters through ${CHANNEL_LABELS[mock.channel]}.`}
-                      </p>
+                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                      <FormField label="DM policy">
+                        <select value={draft.dmPolicy} onChange={(event) => setDrafts((current) => ({ ...current, [connection.id]: { ...draft, dmPolicy: event.target.value as ConnectionDraft["dmPolicy"] } }))} className={inputClass}>
+                          <option value="pairing">Pairing approval</option>
+                          <option value="allowlist">Allowlist only</option>
+                        </select>
+                      </FormField>
+                      <FormField label="Allowed user IDs">
+                        <input value={draft.allowFrom} onChange={(event) => setDrafts((current) => ({ ...current, [connection.id]: { ...draft, allowFrom: event.target.value } }))} placeholder="123456789, 987654321" className={inputClass} />
+                      </FormField>
+                    </div>
+
+                    {connection.channel === "discord" ? (
+                      <div className="mt-3 rounded-lg border border-edge bg-background/50 p-3">
+                        <p className="font-mono text-[10px] uppercase tracking-wider text-faint">Direct messages only</p>
+                        <p className="mt-2 text-xs text-muted">
+                          Guild and channel delivery is disabled so shared transcripts cannot access private user memory.
+                        </p>
+                      </div>
+                    ) : null}
+
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {connection.desiredState === "active" ? (
+                        <button type="button" onClick={() => void deactivate(connection)} disabled={busy === `deactivate:${connection.id}`} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">Deactivate</button>
+                      ) : (
+                        <button type="button" onClick={() => void activate(connection)} disabled={connection.observedState === "error" || busy === `activate:${connection.id}`} className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft disabled:opacity-40">{busy === `activate:${connection.id}` ? "Activating…" : "Activate"}</button>
+                      )}
+                      <button type="button" onClick={() => void loadPairing(connection)} disabled={busy === `pairing:${connection.id}`} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">
+                        Pending requests{pending.length ? ` (${pending.length})` : ""}
+                      </button>
+                    </div>
+
+                    {pairings[connection.id] ? (
+                      <div className="mt-3 border-t border-edge pt-3">
+                        {pending.length === 0 ? <p className="text-xs text-faint">No pending pairing requests.</p> : (
+                          <ul className="space-y-2">
+                            {pending.map((request) => {
+                              const linkToMyAccount = pairingLinks[request.id] ?? false;
+                              const code = pairingCodes[request.id] ?? "";
+                              return (
+                                <li key={request.id} className="rounded-lg bg-background px-3 py-2">
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div><p className="text-xs text-muted">Sender ••••{request.peerPreview ?? "unknown"}</p><p className="text-[10px] text-faint">Requested {formatRelativeTime(request.requestedAt)}</p></div>
+                                    <div className="flex gap-2">
+                                      <button type="button" disabled={busy === `pairing:${request.id}`} onClick={() => void decidePairing(connection, request, "deny")} className="text-xs text-rose-300 disabled:opacity-40">Deny</button>
+                                      <button type="button" disabled={busy === `pairing:${request.id}` || (linkToMyAccount && !code.trim())} onClick={() => void decidePairing(connection, request, "approve")} className="text-xs text-emerald-300 disabled:opacity-40">Approve</button>
+                                    </div>
+                                  </div>
+                                  <label className="mt-2 flex items-start gap-2 text-xs text-muted">
+                                    <input
+                                      type="checkbox"
+                                      checked={linkToMyAccount}
+                                      onChange={(event) => setPairingLinks((current) => ({ ...current, [request.id]: event.target.checked }))}
+                                    />
+                                    <span>This sender is me — link to my Eden account and shared web memory.</span>
+                                  </label>
+                                  {linkToMyAccount ? (
+                                    <input
+                                      value={code}
+                                      onChange={(event) => setPairingCodes((current) => ({ ...current, [request.id]: event.target.value }))}
+                                      type="password"
+                                      autoComplete="one-time-code"
+                                      placeholder="Enter the one-time code shown by the bot"
+                                      maxLength={128}
+                                      className={`${inputClass} mt-2`}
+                                    />
+                                  ) : null}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </div>
                     ) : null}
                   </li>
                 );

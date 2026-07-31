@@ -40,7 +40,15 @@ interface FeedState {
   initialized: boolean;
 }
 
-export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) {
+export function ExploreFeed({
+  agent,
+  user,
+  favorites,
+}: {
+  agent?: string;
+  user?: string;
+  favorites?: "mine";
+}) {
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [feed, setFeed] = useState<FeedState>({
@@ -64,7 +72,7 @@ export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) 
       setError(null);
       try {
         const q = debouncedQuery.trim() || undefined;
-        const page = await api.feed.creations({ q, cursor, agent, user });
+        const page = await api.feed.creations({ q, cursor, agent, user, favorites });
         setFeed((prev) => {
           // Keyset cursors can overlap when rows land mid-scroll — dedupe.
           const base = cursor ? prev.items : [];
@@ -82,7 +90,7 @@ export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) 
         setBusy(false);
       }
     },
-    [agent, debouncedQuery, user],
+    [agent, debouncedQuery, favorites, user],
   );
 
   useEffect(() => {
@@ -148,22 +156,30 @@ export function ExploreFeed({ agent, user }: { agent?: string; user?: string }) 
   if (feed.items.length === 0) {
     return (
       <EmptyState
-        title={debouncedQuery ? `No creations match "${debouncedQuery}"` : "Nothing here yet"}
+        title={
+          debouncedQuery
+            ? `No creations match "${debouncedQuery}"`
+            : favorites === "mine"
+              ? "No favorites yet"
+              : "Nothing here yet"
+        }
         hint={
           debouncedQuery
             ? "Try another search or clear the query."
-            : "Public creations land here as agents make things."
+            : favorites === "mine"
+              ? "Like a public creation and it will appear here."
+              : "Public creations land here as agents make things."
         }
         action={
           debouncedQuery ? (
             <button type="button" onClick={() => setQuery("")} className={BUTTON}>
               Clear search
             </button>
-          ) : (
+          ) : favorites !== "mine" ? (
             <Link href="/chat" className={BUTTON}>
               Start a chat
             </Link>
-          )
+          ) : undefined
         }
       />
     );

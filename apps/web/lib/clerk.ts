@@ -31,6 +31,22 @@ export function isClerkEnabled(): boolean {
   return clerkPublishableKey.length > 0;
 }
 
+export type AuthMode = "dev-impersonation" | "clerk";
+
+/**
+ * Keep every auth surface on the same mode. An explicit dev override wins
+ * even when a Clerk publishable key is present (the local E2E stack has both),
+ * otherwise Clerk is used only when it is actually configured.
+ */
+export function selectAuthMode(
+  devImpersonation = process.env.NEXT_PUBLIC_EDEN3_DEV_IMPERSONATION,
+  publishableKey = clerkPublishableKey,
+): AuthMode {
+  return devImpersonation === "1" || publishableKey.length === 0
+    ? "dev-impersonation"
+    : "clerk";
+}
+
 function clerkDomainFromPublishableKey(key: string): string {
   const encoded = key.split("_")[2];
   if (!encoded) throw new Error("Invalid Clerk publishable key");

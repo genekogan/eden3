@@ -1,4 +1,5 @@
 import { normalizeUsername, usernameError } from "./agent-utils";
+import { findPersonaBanalities } from "@eden3/shared";
 
 export interface BuilderInterview {
   idea: string;
@@ -44,12 +45,18 @@ function sentence(value: string, fallback: string): string {
   return trimmed || fallback;
 }
 
+/** Keep zero-signal boilerplate supplied in an interview out of SOUL.md. */
+function doctrineSafeSentence(value: string, fallback: string): string {
+  const candidate = sentence(value, fallback);
+  return findPersonaBanalities(candidate).length === 0 ? candidate : fallback;
+}
+
 export function buildAgentFromInterview(input: BuilderInterview): BuilderDraft {
-  const idea = sentence(input.idea, "help with creative work");
-  const audience = sentence(input.audience, "the user");
-  const tone = sentence(input.tone, "clear, practical, and warm");
-  const outputs = sentence(input.outputs, "short plans, drafts, and next actions");
-  const name = sentence(input.name ?? "", titleCase(idea) || "New Agent");
+  const idea = doctrineSafeSentence(input.idea, "help with creative work");
+  const audience = doctrineSafeSentence(input.audience, "the user");
+  const tone = doctrineSafeSentence(input.tone, "clear, practical, and warm");
+  const outputs = doctrineSafeSentence(input.outputs, "short plans, drafts, and next actions");
+  const name = doctrineSafeSentence(input.name ?? "", titleCase(idea) || "New Agent");
 
   return {
     username: usernameFrom(name),
@@ -57,13 +64,16 @@ export function buildAgentFromInterview(input: BuilderInterview): BuilderDraft {
     description: `${name} helps ${audience} ${idea}.`,
     greeting: `Tell me what you want to make, and I will help with ${outputs}.`,
     persona: [
-      `You are ${name}, an Eden3 agent built through the conversational builder.`,
-      `Primary purpose: ${idea}.`,
-      `Primary audience: ${audience}.`,
-      `Voice and tone: ${tone}.`,
-      `Expected outputs: ${outputs}.`,
-      'Default skill posture: use Eden safe-base behavior, ask concise clarifying questions, and prefer concrete next steps over vague advice.',
-      'When the user wants media, help shape prompts for Eden Studio and OpenClaw native image, video, music, and speech tools.',
+      '# Voice and stance',
+      '',
+      `- Speak in a ${tone} voice.`,
+      `- Primary purpose: ${idea}.`,
+      `- Work for ${audience}; match vocabulary and detail to what they can use.`,
+      `- Favor these deliverables: ${outputs}.`,
+      '- Lead with a specific recommendation or artifact, then explain the tradeoffs that matter.',
+      '- Ask one focused question only when the missing answer would materially change the result; otherwise begin.',
+      '- Disagree early when a weak premise would waste time, and offer a stronger alternative.',
+      '- For media work, turn the intent into vivid, production-ready image, video, music, or speech directions.',
     ].join('\n'),
   };
 }

@@ -3,6 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type {
+  AgentModel,
+  AgentRuntime,
+  ModelRuntimeDto,
   OperatorHealth,
   OperatorRecentUsageEvent,
   OperatorStatusBreakdown,
@@ -146,6 +149,76 @@ function HealthPanel({ health }: { health: OperatorHealth }) {
             </p>
           </div>
         ))}
+      </div>
+    </section>
+  );
+}
+
+function ModelRuntimePanel({
+  models,
+  updating,
+  error,
+  onChange,
+}: {
+  models: ModelRuntimeDto[];
+  updating: AgentModel | null;
+  error: string | null;
+  onChange: (model: AgentModel, agentRuntime: AgentRuntime) => void;
+}) {
+  return (
+    <section
+      aria-label="Model runtimes"
+      className="rounded-xl border border-edge bg-surface p-5"
+    >
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
+            Model runtimes
+          </p>
+          <p className="mt-1 max-w-2xl text-xs text-muted">
+            Applies to every agent using the model. Subscription turns still use
+            notional token pricing for manna, but are excluded from provider invoice
+            reconciliation.
+          </p>
+        </div>
+        {error ? <p className="text-xs text-rose-300">{error}</p> : null}
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-2">
+        {models.map((row) => {
+          // Runtime updates are read/modify/write operations on one shared
+          // OpenClaw config. Keep the whole catalog single-flight so two quick
+          // operator changes cannot race and silently lose one model's toggle.
+          const busy = updating !== null;
+          return (
+            <label
+              key={row.model}
+              className="flex min-w-0 items-center justify-between gap-4 rounded-lg border border-edge/60 bg-raised/40 p-3"
+            >
+              <span className="min-w-0">
+                <span className="block truncate text-sm text-foreground">
+                  {row.model.replace("anthropic/", "")}
+                </span>
+                <span className="mt-0.5 block font-mono text-[10px] uppercase tracking-[0.15em] text-faint">
+                  {row.agentRuntime === "claude-cli"
+                    ? "notional subscription"
+                    : "provider API"}
+                </span>
+              </span>
+              <select
+                aria-label={`${row.model} runtime`}
+                value={row.agentRuntime}
+                disabled={busy}
+                onChange={(event) =>
+                  onChange(row.model, event.target.value as AgentRuntime)
+                }
+                className="rounded-lg border border-edge bg-surface px-2.5 py-1.5 text-xs text-foreground disabled:opacity-50"
+              >
+                <option value="openclaw">Provider API</option>
+                <option value="claude-cli">Claude subscription</option>
+              </select>
+            </label>
+          );
+        })}
       </div>
     </section>
   );
@@ -322,7 +395,7 @@ function RecentActivity({ rows }: { rows: OperatorRecentUsageEvent[] }) {
                     <td className="hidden px-4 py-3 lg:table-cell">
                       <div className="truncate">{row.model ?? "unknown"}</div>
                       <div className="mt-0.5 truncate font-mono text-[11px] text-faint">
-                        {row.provider ?? "no provider"}
+                        {row.provider ?? "no provider"} · {row.pricingBasis}
                       </div>
                     </td>
                     <td className="whitespace-nowrap px-4 py-3 text-right font-mono text-xs tabular-nums text-muted">
@@ -356,6 +429,9 @@ function RecentActivity({ rows }: { rows: OperatorRecentUsageEvent[] }) {
 export function OperatorClient() {
   const [summary, setSummary] = useState<OperatorUsageSummary | null>(null);
   const [health, setHealth] = useState<OperatorHealth | null>(null);
+  const [modelRuntimes, setModelRuntimes] = useState<ModelRuntimeDto[] | null>(null);
+  const [runtimeUpdating, setRuntimeUpdating] = useState<AgentModel | null>(null);
+  const [runtimeError, setRuntimeError] = useState<string | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [error, setError] = useState<unknown>(null);
   const [days, setDays] = useState(7);
@@ -365,13 +441,15 @@ export function OperatorClient() {
     async (soft = false) => {
       if (!soft) setPhase("loading");
       try {
-        const [data, healthData] = await Promise.all([
+        const [data, healthData, runtimeData] = await Promise.all([
           api.operator.usageSummary({ days, limit: 25 }),
           api.operator.health().catch(() => null),
+          api.operator.modelRuntimes().catch(() => null),
         ]);
         if (!alive.current) return;
         setSummary(data);
         setHealth(healthData);
+        setModelRuntimes(runtimeData?.models ?? null);
         setPhase("ready");
         setError(null);
       } catch (err) {
@@ -390,6 +468,30 @@ export function OperatorClient() {
       alive.current = false;
     };
   }, [load]);
+
+  const updateModelRuntime = useCallback(
+    async (model: AgentModel, agentRuntime: AgentRuntime) => {
+      setRuntimeUpdating(model);
+      setRuntimeError(null);
+      try {
+        const updated = await api.operator.setModelRuntime({ model, agentRuntime });
+        if (!alive.current) return;
+        setModelRuntimes((rows) =>
+          rows?.map((row) =>
+            row.model === updated.model
+              ? { model: updated.model, agentRuntime: updated.agentRuntime }
+              : row,
+          ) ?? null,
+        );
+      } catch (err) {
+        if (!alive.current) return;
+        setRuntimeError(err instanceof Error ? err.message : "Runtime update failed");
+      } finally {
+        if (alive.current) setRuntimeUpdating(null);
+      }
+    },
+    [],
+  );
 
   return (
     <div className="mx-auto w-full max-w-6xl px-5 py-10 md:px-8">
@@ -463,15 +565,25 @@ export function OperatorClient() {
       ) : summary ? (
         <main className="mt-8 space-y-6">
           {health ? <HealthPanel health={health} /> : null}
+          {modelRuntimes ? (
+            <ModelRuntimePanel
+              models={modelRuntimes}
+              updating={runtimeUpdating}
+              error={runtimeError}
+              onChange={(model, agentRuntime) =>
+                void updateModelRuntime(model, agentRuntime)
+              }
+            />
+          ) : null}
           <section
             aria-label="Usage totals"
             className="grid gap-3 md:grid-cols-2 xl:grid-cols-4"
           >
             <Metric
-              label="Provider cost"
+              label="Metered cost basis"
               value={usd.format(summary.totals.costUsd)}
               sub={`${formatMannaExact(summary.totals.manna)} manna billed`}
-              hint="Raw provider cost (before markup) across all tenants in the window. Manna is what users were billed. Admin-only — never shown to users."
+              hint="Provider-API rows use observed provider cost; subscription rows use notional token pricing. Manna is what users were billed. Admin-only — never shown to users."
             />
             <Metric
               label="Metered calls"

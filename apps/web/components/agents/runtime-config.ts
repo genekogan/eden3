@@ -20,6 +20,11 @@ export const MODEL_TIER_OPTIONS = [
   },
   {
     value: AGENT_MODEL_OPTIONS[2],
+    label: "Latest",
+    detail: "claude-sonnet-4-6",
+  },
+  {
+    value: AGENT_MODEL_OPTIONS[3],
     label: "Deep",
     detail: "claude-opus-4-6",
   },

@@ -38,6 +38,11 @@ describe("settings page", () => {
     expect(html).toContain("9,000");
     expect(html).toContain("Cancellation is scheduled");
     expect(html).toContain("Manage manna");
+    expect(html).toContain("Your data");
+    expect(html).toContain("Download account data");
+    expect(html).toContain("all retained conversations");
+    expect(html).toContain("Browse favorites");
+    expect(html).toContain("/explore?favorites=mine");
   });
 
   it("renders a signed-out local state", () => {

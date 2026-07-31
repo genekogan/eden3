@@ -14,6 +14,7 @@ describe("agent runtime config options", () => {
     expect(MODEL_TIER_OPTIONS.map((option) => option.label)).toEqual([
       "Fast",
       "Balanced",
+      "Latest",
       "Deep",
     ]);
     expect(THINKING_LEVEL_OPTIONS.map((option) => option.value)).toEqual([

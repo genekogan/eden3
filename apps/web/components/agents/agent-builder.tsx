@@ -142,8 +142,8 @@ export function AgentBuilder() {
               Draft
             </p>
             <p className="mt-1 text-sm text-muted">
-              Eden will attach the default safe-base skill when this agent is
-              created.
+              Eden will attach its standard creative tools and safety defaults
+              when this agent is created.
             </p>
           </div>
           <FieldShell

@@ -545,6 +545,10 @@ export function SessionConversation({ routeId }: { routeId: string }) {
     })),
     ...state.local,
   ];
+  const readOnlyChannel = session?.readOnly === true;
+  const channelLabel = session?.platform
+    ? `${session.platform.charAt(0).toUpperCase()}${session.platform.slice(1)}`
+    : "external channel";
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
@@ -605,6 +609,11 @@ export function SessionConversation({ routeId }: { routeId: string }) {
             channelUp ? "bg-accent" : "bg-edge"
           }`}
         />
+        {readOnlyChannel ? (
+          <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-accent-soft">
+            {channelLabel} · read-only
+          </span>
+        ) : null}
       </header>
 
       {/* Transcript */}
@@ -634,7 +643,11 @@ export function SessionConversation({ routeId }: { routeId: string }) {
           {loadPhase === "ready" && items.length === 0 ? (
             <EmptyState
               title="No messages yet"
-              hint="Say something below to get this conversation going."
+              hint={
+                readOnlyChannel
+                  ? `Messages from ${channelLabel} will appear here.`
+                  : "Say something below to get this conversation going."
+              }
             />
           ) : null}
 
@@ -737,16 +750,23 @@ export function SessionConversation({ routeId }: { routeId: string }) {
       {/* Composer */}
       <div className="shrink-0 border-t border-edge bg-background px-4 pb-4 pt-3 md:px-6">
         <div className="mx-auto w-full max-w-3xl">
-          <Composer
-            onSend={send}
-            onStop={stop}
-            streaming={streaming}
-            notice={noticeNode}
-            placeholder={
-              primaryAgent ? `Message ${primaryAgent.username}…` : "Message…"
-            }
-            autoFocus
-          />
+          {readOnlyChannel ? (
+            <p className="rounded-xl border border-edge bg-surface px-4 py-3 text-center text-xs text-muted">
+              This is a read-only mirror of the {channelLabel} conversation. Reply from the
+              channel itself.
+            </p>
+          ) : (
+            <Composer
+              onSend={send}
+              onStop={stop}
+              streaming={streaming}
+              notice={noticeNode}
+              placeholder={
+                primaryAgent ? `Message ${primaryAgent.username}…` : "Message…"
+              }
+              autoFocus
+            />
+          )}
         </div>
       </div>
     </div>

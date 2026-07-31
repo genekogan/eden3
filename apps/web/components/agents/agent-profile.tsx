@@ -488,11 +488,16 @@ function AgentMemoryPanel({
   };
 
   const rebuild = async () => {
+    if (
+      !window.confirm(
+        "Force reseed from Eden history? This replaces collective and per-user seed files. Use this only when you intentionally want to discard later native/dream memory edits.",
+      )
+    ) return;
     setBusy("rebuild");
     setNote(null);
     try {
       const data = await api.agents.rebuildMemory(username);
-      setNote(data.queued ? "Rebuild queued." : "Rebuild already running.");
+      setNote(data.queued ? "Manual reseed queued." : "A memory operation is already running.");
     } catch (error) {
       setNote(describeApiFailure(error));
     } finally {
@@ -510,7 +515,7 @@ function AgentMemoryPanel({
   const rows = [
     ["Status", status?.status ?? "pending"],
     ["Messages", String(status?.messagesSampled ?? 0)],
-    ["Chars", String(status?.memoryChars ?? snapshot?.collective.chars ?? 0)],
+    ["Chars", String(snapshot?.collective.chars ?? status?.memoryChars ?? 0)],
     ["Model", status?.model ?? "pending"],
   ];
 
@@ -542,7 +547,7 @@ function AgentMemoryPanel({
           disabled={busy !== null || draft.trim() === ""}
           className={primaryButtonClass}
         >
-          {busy === "save" ? "Saving…" : "Save memory"}
+          {busy === "save" ? "Saving…" : "Save owner correction"}
         </button>
         <button
           type="button"
@@ -550,9 +555,16 @@ function AgentMemoryPanel({
           disabled={busy !== null}
           className={quietButtonClass}
         >
-          {busy === "rebuild" ? "Rebuilding…" : "Rebuild from history"}
+          {busy === "rebuild" ? "Reseeding…" : "Force reseed from history"}
         </button>
       </div>
+      {snapshot?.latestRevision ? (
+        <p className="rounded-lg border border-edge bg-surface px-3 py-2 text-xs leading-relaxed text-faint">
+          Latest provenance: <span className="text-muted">{snapshot.latestRevision.operation}</span>
+          {" · "}{new Date(snapshot.latestRevision.createdAt).toLocaleString()}
+          {" · "}<span className="font-mono">{snapshot.latestRevision.sha256.slice(0, 12)}</span>
+        </p>
+      ) : null}
       {snapshot?.userFiles.length ? (
         <section className="border-t border-edge pt-5">
           <h2 className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
@@ -560,15 +572,44 @@ function AgentMemoryPanel({
           </h2>
           <div className="mt-3 grid gap-3 md:grid-cols-2">
             {snapshot.userFiles.map((file) => (
-              <article key={file.filename} className="min-w-0 rounded-lg border border-edge bg-surface p-3">
-                <p className="break-all font-mono text-xs text-muted">{file.filename}</p>
+              <details key={file.filename} className="min-w-0 rounded-lg border border-edge bg-surface p-3">
+                <summary className="cursor-pointer break-all font-mono text-xs text-muted">
+                  {file.filename}
+                </summary>
                 <p className="mt-1 text-xs text-faint">{file.chars} chars</p>
-                {file.summary ? (
-                  <p className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-muted">
-                    {file.summary}
-                  </p>
-                ) : null}
-              </article>
+                <pre className="mt-3 max-h-[320px] overflow-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
+                  {file.content}
+                </pre>
+              </details>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {snapshot?.dreamDiary.content ? (
+        <section className="border-t border-edge pt-5">
+          <h2 className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
+            Dream Diary
+          </h2>
+          <pre className="mt-3 max-h-[360px] overflow-auto whitespace-pre-wrap rounded-lg border border-edge bg-surface p-3 text-xs leading-relaxed text-muted">
+            {snapshot.dreamDiary.content}
+          </pre>
+        </section>
+      ) : null}
+      {snapshot?.dreamReports.length ? (
+        <section className="border-t border-edge pt-5">
+          <h2 className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
+            Deep / REM Reports
+          </h2>
+          <div className="mt-3 space-y-3">
+            {snapshot.dreamReports.map((file) => (
+              <details key={file.path} className="rounded-lg border border-edge bg-surface p-3">
+                <summary className="cursor-pointer font-mono text-xs text-muted">
+                  {file.phase.toUpperCase()} · {file.filename}
+                </summary>
+                <pre className="mt-3 max-h-[320px] overflow-auto whitespace-pre-wrap text-xs leading-relaxed text-muted">
+                  {file.content}
+                </pre>
+              </details>
             ))}
           </div>
         </section>
@@ -873,6 +914,12 @@ export function AgentProfile({ username }: { username: string }) {
                   className={quietButtonClass}
                 >
                   Edit
+                </Link>
+                <Link
+                  href={`/channels?agent=${encodeURIComponent(agent.username)}`}
+                  className={quietButtonClass}
+                >
+                  Connections
                 </Link>
                 <button
                   type="button"

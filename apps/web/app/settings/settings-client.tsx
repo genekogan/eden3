@@ -47,6 +47,44 @@ function labelForTier(tier: string | null): string {
   return tier.slice(0, 1).toUpperCase() + tier.slice(1);
 }
 
+function AccountExportButton({ username }: { username: string }) {
+  const [phase, setPhase] = useState<"idle" | "downloading" | "error">("idle");
+
+  async function download(): Promise<void> {
+    setPhase("downloading");
+    try {
+      const blob = await api.account.exportBundle();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${username}-eden3-account.zip`;
+      link.click();
+      URL.revokeObjectURL(url);
+      setPhase("idle");
+    } catch {
+      setPhase("error");
+    }
+  }
+
+  return (
+    <div>
+      <button
+        type="button"
+        disabled={phase === "downloading"}
+        onClick={() => void download()}
+        className="rounded-lg border border-accent/40 px-3.5 py-2 text-sm text-accent-soft transition-colors hover:border-accent hover:text-accent disabled:cursor-wait disabled:opacity-60"
+      >
+        {phase === "downloading" ? "Preparing download…" : "Download account data"}
+      </button>
+      {phase === "error" ? (
+        <p className="mt-2 text-xs text-red-300" role="status">
+          The export could not be downloaded. Please retry.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
 export function SettingsSummary({ data }: { data: SettingsData }) {
   const user = data.user;
   const manna = data.manna;
@@ -179,6 +217,27 @@ export function SettingsSummary({ data }: { data: SettingsData }) {
           >
             View agents
           </Link>
+        </div>
+      </section>
+
+      <section className="rounded-xl border border-edge bg-surface p-6 xl:col-span-2">
+        <div className="flex flex-col justify-between gap-5 md:flex-row md:items-center">
+          <div className="max-w-2xl">
+            <h2 className="text-lg font-medium">Your data</h2>
+            <p className="mt-2 text-sm leading-6 text-muted">
+              Download a ZIP containing your profile, agents, all retained conversations,
+              creation references, collections, favorites, and manna history.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <Link
+              href="/explore?favorites=mine"
+              className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+            >
+              Browse favorites
+            </Link>
+            <AccountExportButton username={user.username} />
+          </div>
         </div>
       </section>
     </div>

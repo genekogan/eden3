@@ -278,6 +278,23 @@ describe("lib/api browser transport", () => {
     expect(init).toMatchObject({ credentials: "include" });
   });
 
+  it("downloads the authenticated account export through the same-origin API", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response("PK account export", {
+        status: 200,
+        headers: { "content-type": "application/zip" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const blob = await api.account.exportBundle();
+    expect(await blob.text()).toBe("PK account export");
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/account/export");
+    expect(init).toMatchObject({ cache: "no-store", credentials: "include" });
+  });
+
   it("normalizes the billing subscription payload without Stripe identifiers", async () => {
     vi.stubGlobal("window", {});
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>

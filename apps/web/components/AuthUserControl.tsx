@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { isClerkEnabled, loadClerk, type ClerkJs } from "@/lib/clerk";
+import { loadClerk, selectAuthMode, type ClerkJs } from "@/lib/clerk";
 import { DevUserSwitcher } from "@/components/DevUserSwitcher";
 
 export function AuthUserControl({
@@ -9,7 +9,9 @@ export function AuthUserControl({
 }: {
   variant?: "footer" | "panel";
 } = {}) {
-  if (!isClerkEnabled()) return <DevUserSwitcher variant={variant} />;
+  if (selectAuthMode() === "dev-impersonation") {
+    return <DevUserSwitcher variant={variant} />;
+  }
   return <ClerkUserControl panel={variant === "panel"} />;
 }
 
