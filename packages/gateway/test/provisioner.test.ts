@@ -127,6 +127,7 @@ function makeProvisioner(overrides: {
   cli?: OpenClawCliLike;
   fetchImpl?: typeof fetch;
   routableTimeoutMs?: number;
+  routableStabilityMs?: number;
 }): AgentProvisioner {
   const idsRef = { ids: ['openclaw/main', 'openclaw/banny'] };
   const { fetchImpl } = modelsFetch(idsRef);
@@ -137,10 +138,15 @@ function makeProvisioner(overrides: {
       fetchImpl: overrides.fetchImpl ?? fetchImpl,
     },
     cli: overrides.cli ?? new FakeCli(),
+    registrationMode: 'cli',
     dataDir,
     templatesDir: REAL_TEMPLATES_DIR,
     routableTimeoutMs: overrides.routableTimeoutMs ?? 2_000,
     routablePollIntervalMs: 10,
+    // Most unit tests only need the presence contract. The dedicated polling
+    // test below exercises the production stability window without adding a
+    // second to every provisioner test.
+    routableStabilityMs: overrides.routableStabilityMs ?? 0,
     now: () => new Date('2026-07-03T00:00:00.000Z'),
   });
 }
@@ -542,9 +548,12 @@ describe('AgentProvisioner.provisionAgent', () => {
         { status: 200 },
       );
     }) as typeof fetch;
-    const ok = await makeProvisioner({ fetchImpl }).provisionAgent(PARAMS);
+    const ok = await makeProvisioner({
+      fetchImpl,
+      routableStabilityMs: 20,
+    }).provisionAgent(PARAMS);
     expect(ok.openclawId).toBe('banny');
-    expect(polls).toBeGreaterThanOrEqual(3);
+    expect(polls).toBeGreaterThanOrEqual(5);
 
     // never routable → ProvisionError mentioning the deadline
     const neverFetch = (async () =>

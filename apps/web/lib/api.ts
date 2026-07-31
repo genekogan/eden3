@@ -2,9 +2,11 @@
  * Typed fetch client for the eden3 api (@eden3/api, Fastify on :4301) —
  * the FULL web<->api contract in one place.
  *
- * In the browser everything goes same-origin through the Next rewrite
- * (/api/* -> :4301/*, cookies flow by default); on the server (RSC/route
- * handlers) it targets the api origin directly. Wire shapes are the
+ * In the browser ordinary JSON calls go same-origin through the Next rewrite
+ * (/api/* -> :4301/*, cookies flow by default). Long-running Studio and chat
+ * streaming calls use NEXT_PUBLIC_API_ORIGIN when configured so a framework
+ * proxy timeout cannot terminate them. On the server (RSC/route handlers) the
+ * client targets the api origin directly. Wire shapes are the
  * @eden3/shared DTOs plus the envelope types in lib/types.ts.
  *
  * Streaming:
@@ -321,6 +323,32 @@ export interface SseStreamOptions extends StreamSseOptions {
 }
 
 /**
+ * Open a long-running POST SSE response through the direct API origin when
+ * one is configured. Kept as one transport seam so the generic client and the
+ * new-chat raw-response path share Clerk auth, cookies, cancellation, and the
+ * proxy-timeout bypass.
+ */
+export async function openSseResponse(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const clerkToken = await getClerkToken();
+  return fetch(`${apiBase({ direct: true })}${path}`, {
+    method: "POST",
+    cache: "no-store",
+    credentials: typeof window !== "undefined" ? "include" : undefined,
+    ...(signal ? { signal } : {}),
+    headers: {
+      accept: "text/event-stream",
+      "content-type": "application/json",
+      ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
+    },
+    body: JSON.stringify(body ?? {}),
+  });
+}
+
+/**
  * POST `body` to an SSE endpoint and iterate the typed @eden3/shared events
  * from the response body:
  *
@@ -336,18 +364,7 @@ export async function* sseStream(
   body: unknown,
   options: SseStreamOptions = {},
 ): AsyncGenerator<SessionEvent, void, undefined> {
-  const clerkToken = await getClerkToken();
-  const res = await fetch(`${apiBase()}${path}`, {
-    method: "POST",
-    cache: "no-store",
-    signal: options.signal,
-    headers: {
-      accept: "text/event-stream",
-      "content-type": "application/json",
-      ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
-    },
-    body: JSON.stringify(body ?? {}),
-  });
+  const res = await openSseResponse(path, body, options.signal);
   if (!res.ok) throw await toApiError(res, path);
   if (!res.body) {
     throw new ApiError(res.status, `${res.status} ${path}: empty stream body`);

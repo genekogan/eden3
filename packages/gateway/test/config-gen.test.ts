@@ -35,6 +35,7 @@ import {
   openclawConfigLockPath,
   openclawConfigPath,
   readOpenClawConfig,
+  registerAgentConfig,
   resolveDataDir,
   resolveSandboxAssetsDir,
   setAgentModel,
@@ -958,6 +959,65 @@ describe('model-scoped agentRuntime', () => {
     expect(
       await setModelAgentRuntime('anthropic/claude-sonnet-4-6', 'claude-cli', { dataDir }),
     ).toMatchObject({ changed: false });
+  });
+});
+
+describe('registerAgentConfig', () => {
+  it('adds one exact, idempotent agents.list entry without disturbing neighbors', async () => {
+    await seedConfig({
+      agents: {
+        defaults: { model: 'anthropic/claude-haiku-4-5' },
+        list: [{ id: 'main', name: 'Main', workspace: '/existing/main' }],
+      },
+      channels: { discord: { enabled: false } },
+    });
+    const workspace = path.join(dataDir, 'workspace-new-agent');
+
+    const first = await registerAgentConfig(
+      'new-agent',
+      'anthropic/claude-haiku-4-5',
+      workspace,
+      { dataDir },
+    );
+    const second = await registerAgentConfig(
+      'new-agent',
+      'anthropic/claude-haiku-4-5',
+      workspace,
+      { dataDir },
+    );
+
+    expect(first).toEqual({ changed: true, added: true });
+    expect(second).toEqual({ changed: false, added: false });
+    const config = await readOpenClawConfig(dataDir);
+    expect((config.agents as { defaults: unknown }).defaults).toEqual({
+      model: 'anthropic/claude-haiku-4-5',
+    });
+    expect((config.channels as { discord: unknown }).discord).toEqual({ enabled: false });
+    expect((config.agents as { list: unknown[] }).list).toEqual([
+      { id: 'main', name: 'Main', workspace: '/existing/main' },
+      {
+        id: 'new-agent',
+        name: 'new-agent',
+        workspace,
+        agentDir: '/home/node/.openclaw/agents/new-agent/agent',
+        model: 'anthropic/claude-haiku-4-5',
+      },
+    ]);
+  });
+
+  it('rejects malformed agents state and unsupported models before writing', async () => {
+    await seedConfig({ agents: { list: 'not-an-array' } });
+    await expect(
+      registerAgentConfig('new-agent', 'anthropic/claude-haiku-4-5', '/tmp/workspace', {
+        dataDir,
+      }),
+    ).rejects.toThrow('agents.list must be an array');
+
+    await seedConfig({ agents: { list: [] } });
+    await expect(
+      registerAgentConfig('new-agent', 'anthropic/not-a-model', '/tmp/workspace', { dataDir }),
+    ).rejects.toThrow();
+    expect((await readOpenClawConfig(dataDir)).agents).toEqual({ list: [] });
   });
 });
 

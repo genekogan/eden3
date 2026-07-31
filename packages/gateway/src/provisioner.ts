@@ -12,6 +12,7 @@ import {
 
 import {
   readOpenClawConfig,
+  registerAgentConfig,
   resolveDataDir,
   setAgentModel,
   withOpenClawConfigLock,
@@ -308,15 +309,24 @@ export interface ProvisionerOptions {
   gateway: GatewayClientOptions;
   /** CLI wrapper; a real `OpenClawCli` by default. */
   cli?: OpenClawCliLike;
+  /** Compatibility seam for the old CLI seeder; production uses validated config. */
+  registrationMode?: 'config' | 'cli';
   /** Host openclaw data dir; default OPENCLAW_DATA_DIR env / infra/openclaw/data. */
   dataDir?: string;
   /** Template source; default `packages/gateway/workspace-templates/`. */
   templatesDir?: string;
   /** Gateway-visible data dir. Defaults to dataDir's Docker-host-visible path. */
   containerDataDir?: string;
-  /** Routability poll deadline (default 15s per task spec). */
+  /** Routability poll deadline (default 30s; 7.1 hot reload is ~13s at fleet size). */
   routableTimeoutMs?: number;
   routablePollIntervalMs?: number;
+  /**
+   * Require the model to remain visible for this long before returning
+   * (default 1s). OpenClaw 7.1 can expose a just-written config entry from
+   * `/v1/models` one poll before its hot-reload router is ready to serve the
+   * first turn.
+   */
+  routableStabilityMs?: number;
   /** Clock override for {{PROVISIONED_AT}} (tests). */
   now?: () => Date;
 }
@@ -325,22 +335,26 @@ const DEFAULT_TEMPLATES_DIR = fileURLToPath(new URL('../workspace-templates/', i
 export class AgentProvisioner {
   private readonly gateway: GatewayClientOptions;
   private readonly cli: OpenClawCliLike;
+  private readonly registrationMode: 'config' | 'cli';
   private readonly dataDir: string;
   private readonly templatesDir: string;
   private readonly containerDataDir: string;
   private readonly routableTimeoutMs: number;
   private readonly routablePollIntervalMs: number;
+  private readonly routableStabilityMs: number;
   private readonly now: () => Date;
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: ProvisionerOptions) {
     this.gateway = options.gateway;
     this.cli = options.cli ?? new OpenClawCli();
+    this.registrationMode = options.registrationMode ?? 'config';
     this.dataDir = options.dataDir ?? resolveDataDir();
     this.templatesDir = options.templatesDir ?? DEFAULT_TEMPLATES_DIR;
     this.containerDataDir = options.containerDataDir ?? this.dataDir;
-    this.routableTimeoutMs = options.routableTimeoutMs ?? 15_000;
+    this.routableTimeoutMs = options.routableTimeoutMs ?? 30_000;
     this.routablePollIntervalMs = options.routablePollIntervalMs ?? 500;
+    this.routableStabilityMs = options.routableStabilityMs ?? 1_000;
     this.now = options.now ?? (() => new Date());
     this.fetchImpl = options.gateway.fetchImpl ?? fetch;
   }
@@ -432,24 +446,39 @@ export class AgentProvisioner {
     await fs.mkdir(workspaceDir, { recursive: true });
     await fs.mkdir(path.join(workspaceDir, 'memory', 'users'), { recursive: true });
 
-    // 2. register FIRST (idempotent). `agents add` seeds the workspace with
-    //    OpenClaw's default template files — including a generic SOUL.md and a
-    //    BOOTSTRAP.md — so it must run BEFORE we render ours (step 3), or our
-    //    persona is clobbered by the seed.
+    // 2. register FIRST (idempotent). Production writes the exact source-
+    //    verified agents.list entry through the atomic config writer, including
+    //    pinned OpenClaw schema validation before rename. This avoids starting
+    //    a second full OpenClaw CLI runtime for a five-field edit — a path that
+    //    exceeds the UI request budget on a migrated, hundreds-agent registry.
+    //    The CLI mode remains as a compatibility/test seam; because it seeds
+    //    generic workspace files, step 3 must still overwrite fresh content.
     let modelUpdated = false;
     if (existing === undefined) {
-      await withOpenClawConfigLock(this.dataDir, () =>
-        this.cli.execJson([
-          'agents',
-          'add',
+      if (this.registrationMode === 'cli') {
+        await withOpenClawConfigLock(this.dataDir, () =>
+          this.cli.execJson([
+            'agents',
+            'add',
+            params.openclawId,
+            '--non-interactive',
+            '--workspace',
+            this.containerWorkspaceDir(params.openclawId),
+            '--model',
+            params.model,
+          ]),
+        );
+      } else {
+        await registerAgentConfig(
           params.openclawId,
-          '--non-interactive',
-          '--workspace',
-          this.containerWorkspaceDir(params.openclawId),
-          '--model',
           params.model,
-        ]),
-      );
+          this.containerWorkspaceDir(params.openclawId),
+          { dataDir: this.dataDir },
+        );
+        await fs.mkdir(path.join(this.dataDir, 'agents', params.openclawId, 'agent'), {
+          recursive: true,
+        });
+      }
     } else if (existing.model !== undefined && existing.model !== params.model) {
       await setAgentModel(params.openclawId, params.model, { dataDir: this.dataDir });
       modelUpdated = true;
@@ -688,12 +717,18 @@ export class AgentProvisioner {
     return { id: found.id, ...(found.model !== undefined ? { model: found.model } : {}) };
   }
 
-  /** Poll `GET /v1/models` until `openclaw/<id>` appears (spike probe #1). */
+  /**
+   * Poll `GET /v1/models` until `openclaw/<id>` remains visible across the
+   * configured stability window. A single sighting is insufficient on
+   * OpenClaw 7.1: the endpoint can observe the new file just before the
+   * hot-reload router applies it, making an immediate first turn fail.
+   */
   private async waitRoutable(openclawId: string): Promise<void> {
     const modelId = `openclaw/${openclawId}`;
     const deadline = Date.now() + this.routableTimeoutMs;
     const baseUrl = this.gateway.baseUrl.replace(/\/+$/, '');
     let lastFailure = 'no response yet';
+    let visibleSince: number | undefined;
     for (;;) {
       try {
         const res = await this.fetchImpl(`${baseUrl}/v1/models`, {
@@ -702,12 +737,20 @@ export class AgentProvisioner {
         if (res.ok) {
           const body = modelsResponseSchema.safeParse(await res.json());
           const ids = body.success ? (body.data.data ?? []).map((m) => m.id) : [];
-          if (ids.includes(modelId)) return;
-          lastFailure = `${modelId} not in /v1/models (${ids.length} models listed)`;
+          if (ids.includes(modelId)) {
+            visibleSince ??= Date.now();
+            if (Date.now() - visibleSince >= this.routableStabilityMs) return;
+            lastFailure = `${modelId} visible but awaiting hot-reload stability`;
+          } else {
+            visibleSince = undefined;
+            lastFailure = `${modelId} not in /v1/models (${ids.length} models listed)`;
+          }
         } else {
+          visibleSince = undefined;
           lastFailure = `/v1/models responded ${res.status}`;
         }
       } catch (err) {
+        visibleSince = undefined;
         lastFailure = `/v1/models fetch failed: ${(err as Error).message}`;
       }
       if (Date.now() + this.routablePollIntervalMs > deadline) {

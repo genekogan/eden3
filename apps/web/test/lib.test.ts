@@ -222,6 +222,41 @@ describe("lib/api browser transport", () => {
     });
   });
 
+  it("sends long-running chat streams directly to the API origin", async () => {
+    process.env.NEXT_PUBLIC_API_ORIGIN = "http://127.0.0.1:4301/";
+    vi.stubGlobal("window", {});
+    const started: SessionEvent = {
+      type: "turn.started",
+      sessionId: SESSION_ID,
+      turnId: TURN_ID,
+    };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(encodeSseEvent(started), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const events: SessionEvent[] = [];
+    for await (const event of api.sessions.sendNew({
+      content: "wake up",
+      agentUsername: "dormant-agent",
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([started]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("http://127.0.0.1:4301/sessions/new/messages");
+    expect(init).toMatchObject({
+      method: "POST",
+      cache: "no-store",
+      credentials: "include",
+    });
+  });
+
   it("keeps ordinary browser API calls on the same-origin rewrite", async () => {
     process.env.NEXT_PUBLIC_API_ORIGIN = "http://127.0.0.1:4301";
     vi.stubGlobal("window", {});

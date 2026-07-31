@@ -1,6 +1,9 @@
 import { getEnv, resetEnvCache } from '@eden3/core';
 import { loadRootEnv } from '@eden3/db';
 import type { FastifyInstance } from 'fastify';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildServer } from '../src/server';
@@ -117,6 +120,23 @@ describe('http hardening', () => {
     expect(res.headers['referrer-policy']).toBe('no-referrer');
     expect(res.headers['content-security-policy']).toContain("frame-ancestors 'none'");
     expect(res.headers['permissions-policy']).toContain('camera=()');
+  });
+
+  it('allows public media to render across the API and web origins', async () => {
+    const mediaDir = await mkdtemp(path.join(tmpdir(), 'eden3-media-corp-'));
+    const restoreMediaDir = withEnv('MEDIA_DIR', mediaDir);
+    await writeFile(path.join(mediaDir, 'fixture.txt'), 'fixture', 'utf8');
+    const probe = await buildServer();
+    try {
+      const res = await probe.inject({ method: 'GET', url: '/media/fixture.txt' });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['cross-origin-resource-policy']).toBe('cross-origin');
+      expect(res.headers['x-content-type-options']).toBe('nosniff');
+    } finally {
+      await probe.close();
+      restoreMediaDir();
+      await rm(mediaDir, { recursive: true, force: true });
+    }
   });
 
   it('rejects oversized request bodies with a stable envelope', async () => {

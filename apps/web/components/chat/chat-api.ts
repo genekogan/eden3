@@ -8,10 +8,12 @@
  *   - `fetchSessionPage` — GET /api/sessions/:id with the optional `cursor`
  *     param for loading older messages (ascending pages, cursor at the top).
  *
- * Browser-only (same-origin through the Next rewrite, cookies flow).
+ * Browser-only. Reads stay on the same-origin rewrite; turn streams use the
+ * direct API origin when configured so long provisioning/model calls are not
+ * capped by the Next proxy request timeout.
  */
 
-import { ApiError, emitMannaUpdate } from "@/lib/api";
+import { ApiError, emitMannaUpdate, openSseResponse } from "@/lib/api";
 import { streamSseBody } from "@/lib/sse";
 import type {
   AccountSummary,
@@ -67,16 +69,7 @@ export async function startNewSessionStream(
   signal?: AbortSignal,
 ): Promise<NewSessionStream> {
   const path = "/sessions/new/messages";
-  const res = await fetch(`/api${path}`, {
-    method: "POST",
-    cache: "no-store",
-    ...(signal ? { signal } : {}),
-    headers: {
-      accept: "text/event-stream",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  const res = await openSseResponse(path, body, signal);
   if (!res.ok) throw await toApiError(res, path);
   if (!res.body) {
     throw new ApiError(res.status, `${res.status} ${path}: empty stream body`);

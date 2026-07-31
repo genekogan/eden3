@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { beforeAll, describe, expect, it } from 'vitest';
 
+import { readOpenClawConfig } from '../../src/config-gen';
 import { CronSync, scheduleToCron } from '../../src/cron-sync';
 import { OpenClawCli, OpenClawCliError } from '../../src/docker';
 import { AgentProvisioner, BOOTSTRAP_FILENAME, WORKSPACE_STATE_FILENAME } from '../../src/provisioner';
@@ -101,9 +102,13 @@ describe('provisioner (live gateway)', () => {
       fs.access(path.join(result.hostWorkspaceDir, BOOTSTRAP_FILENAME)),
     ).rejects.toThrow();
 
-    // registered with the CLI (canonical agents.list view)
-    const agents = await cli.execJson<{ id: string; model?: string }[]>(['agents', 'list']);
-    const entry = agents.find((a) => a.id === AGENT_ID);
+    // Registered in the validated config source of truth. Starting a second
+    // full OpenClaw CLI runtime just to list a hundreds-agent registry exceeds
+    // the CLI wrapper's one-minute budget and is unrelated to routability
+    // (the raw /v1/models assertion immediately below covers the live view).
+    const config = await readOpenClawConfig(DATA_DIR);
+    const list = (config.agents as { list?: { id: string; model?: string }[] } | undefined)?.list ?? [];
+    const entry = list.find((agent) => agent.id === AGENT_ID);
     expect(entry).toBeDefined();
     expect(entry!.model).toBe(MODEL);
   });

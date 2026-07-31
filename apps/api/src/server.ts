@@ -219,6 +219,17 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     index: false,
     list: false,
   });
+  // Creation URLs can legitimately use the API origin directly while the web
+  // app is served from localhost (or a separate production hostname). Keep
+  // the global API default `same-site`, but opt public media into embedding.
+  // `onSend` is intentionally used instead of fastify-static's raw-response
+  // callback so it wins over the earlier Fastify hardening header.
+  app.addHook('onSend', async (req, reply, payload) => {
+    if (req.url.startsWith('/media/')) {
+      reply.header('cross-origin-resource-policy', 'cross-origin');
+    }
+    return payload;
+  });
 
   // Which database this stack points at (ENV-1: the running stack may be the
   // staging mirror) — the UI labels stg vs the canonical fork so fixture data
