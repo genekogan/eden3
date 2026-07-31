@@ -5,6 +5,7 @@ import path from 'node:path';
 import { gatewaySessionKey, refund, type AuthSession } from '@eden3/core';
 import {
   db,
+  messages,
   pg,
   sessionAgents,
   sessionUsers,
@@ -13,7 +14,7 @@ import {
 } from '@eden3/db';
 import { MEMORY_DREAM_MODEL, type MemoryPromotionSummary } from '@eden3/gateway';
 import type { AgentRuntime } from '@eden3/shared';
-import { eq } from 'drizzle-orm';
+import { and, eq } from 'drizzle-orm';
 
 import type { EventsBus } from '../events-bus';
 import type { MemoryRuntimeLike, ModelRuntimeCatalogLike } from '../gateway-glue';
@@ -758,12 +759,108 @@ interface EdenMemoryDreamAgentRunnerOptions {
   distillMemory?: typeof distillAgentMemory;
   memoryStatus?: typeof agentMemoryStatus;
   refundDebit?: typeof refund;
+  loadAssistantContent?: (messageId: string, sessionId: string) => Promise<string | null>;
   now?: () => Date;
   onError?: (err: unknown, context: string) => void;
 }
 
-function emptySink(): TurnSink {
-  return { emit() {}, end() {} };
+const DREAM_ENTRY_OPEN = '<DREAM_ENTRY>';
+const DREAM_ENTRY_CLOSE = '</DREAM_ENTRY>';
+const REM_REPORT_OPEN = '<REM_REPORT>';
+const REM_REPORT_CLOSE = '</REM_REPORT>';
+const MAX_DREAM_ENTRY_CHARS = 10_000;
+const MAX_REM_REPORT_CHARS = 20_000;
+
+export interface MemoryRemResponse {
+  dreamEntry: string;
+  remReport: string;
+}
+
+function taggedSection(
+  text: string,
+  open: string,
+  close: string,
+  maxChars: number,
+): string {
+  const start = text.indexOf(open);
+  const end = start === -1 ? -1 : text.indexOf(close, start + open.length);
+  if (start === -1 || end === -1 || text.indexOf(open, start + open.length) !== -1) {
+    throw new Error('memory REM response has an invalid structured envelope');
+  }
+  const value = text.slice(start + open.length, end).trim().replaceAll('\0', '');
+  if (value.length === 0 || value.length > maxChars) {
+    throw new Error('memory REM response section is empty or exceeds its size budget');
+  }
+  return value;
+}
+
+/** Parse the tool-free response that Eden materializes into durable dream files. */
+export function parseMemoryRemResponse(text: string): MemoryRemResponse {
+  return {
+    dreamEntry: taggedSection(
+      text,
+      DREAM_ENTRY_OPEN,
+      DREAM_ENTRY_CLOSE,
+      MAX_DREAM_ENTRY_CHARS,
+    ),
+    remReport: taggedSection(
+      text,
+      REM_REPORT_OPEN,
+      REM_REPORT_CLOSE,
+      MAX_REM_REPORT_CHARS,
+    ),
+  };
+}
+
+/**
+ * Idempotently project one durable provider response into the human-readable
+ * dream files. The run marker prevents a crash between the two writes from
+ * duplicating the diary entry when recovery completes the projection.
+ */
+export async function materializeMemoryRemResponse(
+  workspacePath: string,
+  date: string,
+  runId: string,
+  text: string,
+): Promise<void> {
+  const parsed = parseMemoryRemResponse(text);
+  const marker = `<!-- eden-memory-dream:${runId} -->`;
+  const dreamsPath = path.join(workspacePath, 'DREAMS.md');
+  const remDir = path.join(workspacePath, 'memory', 'dreaming', 'rem');
+  const remPath = path.join(remDir, `${date}.md`);
+  const existingDiary = await readText(dreamsPath);
+  if (!existingDiary?.includes(marker)) {
+    const prefix = existingDiary?.trimEnd() || '# Dreams';
+    await fs.writeFile(
+      dreamsPath,
+      `${prefix}\n\n${marker}\n## REM — ${date}\n\n${parsed.dreamEntry}\n`,
+      'utf8',
+    );
+  }
+  await fs.mkdir(remDir, { recursive: true });
+  await fs.writeFile(
+    remPath,
+    `${marker}\n# REM memory report — ${date}\n\n${parsed.remReport}\n`,
+    'utf8',
+  );
+}
+
+async function loadMemoryDreamAssistantContent(
+  messageId: string,
+  sessionId: string,
+): Promise<string | null> {
+  const [message] = await db
+    .select({ content: messages.content })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.id, messageId),
+        eq(messages.sessionId, sessionId),
+        eq(messages.role, 'assistant'),
+      ),
+    )
+    .limit(1);
+  return message?.content ?? null;
 }
 
 async function readText(file: string): Promise<string | null> {
@@ -790,11 +887,17 @@ export function renderMemoryRemPrompt(date: string): string {
   return [
     'EDEN MANAGED REM MEMORY SWEEP — trusted internal maintenance turn.',
     `Date: ${date}.`,
-    'Review today\'s conversations, memory notes, and durable patterns for this agent.',
-    `Append a concise, honest dream entry to DREAMS.md and a detailed report to memory/dreaming/rem/${date}.md.`,
+    'Review the durable memory and agent context already present in this prompt.',
     'Do not copy private peer facts into MEMORY.md or into a different peer file.',
     'Per-user notes may inform private understanding, but never quote, reveal, confirm, deny, or imply one peer\'s private details to another.',
-    'Write files first. Keep the final chat reply to a terse maintenance acknowledgement.',
+    'Do not call tools, shell commands, Read, Write, Edit, memory_search, or subagents. Eden will write the files after this response.',
+    'Return exactly two non-empty Markdown fragments in this envelope, with no prose outside it:',
+    DREAM_ENTRY_OPEN,
+    'A concise, honest dream entry for the day.',
+    DREAM_ENTRY_CLOSE,
+    REM_REPORT_OPEN,
+    'A detailed REM report of durable patterns, uncertainty, and useful follow-up.',
+    REM_REPORT_CLOSE,
   ].join('\n');
 }
 
@@ -823,6 +926,7 @@ export interface MemoryDreamTerminalUsage {
   pricingBasis: MemoryDreamExecutionResult['pricingBasis'];
   sessionId: string | null;
   agentId: string | null;
+  messageId?: string | null;
 }
 
 export interface MemoryDreamDurableEvidence {
@@ -909,8 +1013,9 @@ export class PostgresMemoryDreamDurability implements MemoryDreamDurability {
       pricing_basis: MemoryDreamExecutionResult['pricingBasis'];
       session_id: string | null;
       agent_id: string | null;
+      message_id: string | null;
     }[]>`
-      select id, status, pricing_basis, session_id, agent_id
+      select id, status, pricing_basis, session_id, agent_id, message_id
       from usage_events
       where event_type = 'memory_dream' and turn_id = ${runId}
       order by created_at desc
@@ -932,6 +1037,7 @@ export class PostgresMemoryDreamDurability implements MemoryDreamDurability {
             pricingBasis: usage.pricing_basis,
             sessionId: usage.session_id,
             agentId: usage.agent_id,
+            messageId: usage.message_id,
           }
         : null,
       debitKeys: debits.map((row) => row.idempotency_key),
@@ -970,6 +1076,10 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
   private readonly distillMemory: typeof distillAgentMemory;
   private readonly memoryStatus: typeof agentMemoryStatus;
   private readonly refundDebit: typeof refund;
+  private readonly loadAssistantContent: (
+    messageId: string,
+    sessionId: string,
+  ) => Promise<string | null>;
 
   constructor(private readonly options: EdenMemoryDreamAgentRunnerOptions) {
     this.now = options.now ?? (() => new Date());
@@ -977,6 +1087,7 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
     this.distillMemory = options.distillMemory ?? distillAgentMemory;
     this.memoryStatus = options.memoryStatus ?? agentMemoryStatus;
     this.refundDebit = options.refundDebit ?? refund;
+    this.loadAssistantContent = options.loadAssistantContent ?? loadMemoryDreamAssistantContent;
   }
 
   async run(
@@ -1139,6 +1250,13 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
     // sequence. An expired owner may not revive itself or hand work off.
     await this.durability.saveCheckpoint(run, checkpoint, 'started');
     let turnErrorCode: string | null = null;
+    let remResponse = '';
+    const remSink: TurnSink = {
+      emit(event) {
+        if (event.type === 'token') remResponse += event.delta;
+      },
+      end() {},
+    };
     try {
       const outcome = await runTurn(
         {
@@ -1162,11 +1280,19 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
           user: owner,
           content: renderMemoryRemPrompt(checkpoint.date),
           source: { kind: 'memory_dream', sweepId, runId },
-          beginStream: emptySink,
+          beginStream: () => remSink,
           turnId: runId,
         },
       );
       turnErrorCode = outcome.errorCode;
+      if (outcome.errorCode === null) {
+        await materializeMemoryRemResponse(
+          candidate.workspacePath,
+          checkpoint.date,
+          runId,
+          remResponse,
+        );
+      }
     } catch (err) {
       evidence = await this.durability.inspect(runId);
       if (evidence.usage) {
@@ -1329,6 +1455,34 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
       'rem',
       `${checkpoint.date}.md`,
     );
+    const [currentDiary, currentReport] = await Promise.all([
+      readText(dreamsPath),
+      readText(remPath),
+    ]);
+    const needsProjection =
+      currentDiary === null ||
+      currentReport === null ||
+      memorySha256(currentDiary) === checkpoint.previousDreamDiarySha256 ||
+      memorySha256(currentReport) === checkpoint.previousRemReportSha256;
+    if (needsProjection) {
+      if (!usage.messageId) {
+        throw new MemoryDreamRecoveryResolvedError(
+          `memory dream run ${run.id} cannot recover its structured response`,
+        );
+      }
+      const assistantContent = await this.loadAssistantContent(usage.messageId, run.id);
+      if (assistantContent === null) {
+        throw new MemoryDreamRecoveryResolvedError(
+          `memory dream run ${run.id} has no durable structured response`,
+        );
+      }
+      await materializeMemoryRemResponse(
+        candidate.workspacePath,
+        checkpoint.date,
+        run.id,
+        assistantContent,
+      );
+    }
     const deepPath = path.join(
       candidate.workspacePath,
       'memory',

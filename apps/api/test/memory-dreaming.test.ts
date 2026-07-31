@@ -15,6 +15,8 @@ import {
   MEMORY_DREAM_CLAIM_STALE_MS,
   PostgresMemoryDreamStore,
   ensureMemoryDreamSession,
+  materializeMemoryRemResponse,
+  parseMemoryRemResponse,
   renderMemoryRemPrompt,
   selectActiveMemoryDreamAgents,
   type ActiveMemoryDreamCandidate,
@@ -389,8 +391,42 @@ describe('activity-gated memory dreaming', () => {
     const selected = selectActiveMemoryDreamAgents([row], new Date('2026-07-30T07:00:00.000Z'));
     expect(selected).toMatchObject({ active: [], skipped: [{ reason: 'already-dreamed' }] });
     const prompt = renderMemoryRemPrompt('2026-07-31');
-    expect(prompt).toContain('memory/dreaming/rem/2026-07-31.md');
     expect(prompt).toContain('never quote, reveal, confirm, deny, or imply');
+    expect(prompt).toContain('Do not call tools');
+    expect(prompt).toContain('<DREAM_ENTRY>');
+    expect(prompt).toContain('<REM_REPORT>');
+  });
+
+  it('parses and idempotently materializes one tool-free REM response', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'eden3-memory-rem-output-'));
+    const runId = randomUUID();
+    const response = [
+      '<DREAM_ENTRY>',
+      'A compact dream fragment.',
+      '</DREAM_ENTRY>',
+      '<REM_REPORT>',
+      '## Pattern\n\nA detailed durable pattern with uncertainty.',
+      '</REM_REPORT>',
+    ].join('\n');
+    try {
+      await writeFile(path.join(workspace, 'DREAMS.md'), '# Dreams\n', 'utf8');
+      expect(parseMemoryRemResponse(response)).toEqual({
+        dreamEntry: 'A compact dream fragment.',
+        remReport: '## Pattern\n\nA detailed durable pattern with uncertainty.',
+      });
+      await materializeMemoryRemResponse(workspace, '2026-07-31', runId, response);
+      await materializeMemoryRemResponse(workspace, '2026-07-31', runId, response);
+      const diary = await readFile(path.join(workspace, 'DREAMS.md'), 'utf8');
+      const report = await readFile(
+        path.join(workspace, 'memory', 'dreaming', 'rem', '2026-07-31.md'),
+        'utf8',
+      );
+      expect(diary.match(new RegExp(`eden-memory-dream:${runId}`, 'g'))).toHaveLength(1);
+      expect(diary).toContain('A compact dream fragment.');
+      expect(report).toContain('A detailed durable pattern with uncertainty.');
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
   });
 
   it('does not hide activity that arrived after a successful run captured its watermark', () => {
@@ -479,6 +515,7 @@ function makeRunner(
     }>;
     refund?: (params: { originalIdempotencyKey: string; type?: string }) => Promise<null>;
     providerCalled?: () => void;
+    assistantContent?: (messageId: string, sessionId: string) => Promise<string | null>;
   } = {},
 ): EdenMemoryDreamAgentRunner {
   return new EdenMemoryDreamAgentRunner({
@@ -500,6 +537,9 @@ function makeRunner(
     ...(overrides.distill ? { distillMemory: overrides.distill as never } : {}),
     ...(overrides.status ? { memoryStatus: overrides.status as never } : {}),
     ...(overrides.refund ? { refundDebit: overrides.refund as never } : {}),
+    ...(overrides.assistantContent
+      ? { loadAssistantContent: overrides.assistantContent }
+      : {}),
     now: () => new Date('2026-07-31T08:00:00.000Z'),
   });
 }
@@ -666,6 +706,86 @@ describe('memory dream crash safety', () => {
         checkpoint: { phase: 'provider_terminal' },
         providerStatus: 'terminal',
       });
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('reconstructs missing REM files from the durable assistant message without replay', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'eden3-memory-terminal-project-'));
+    const runId = randomUUID();
+    const messageId = randomUUID();
+    try {
+      await mkdir(path.join(workspace, 'memory', 'dreaming', 'deep'), { recursive: true });
+      await writeFile(path.join(workspace, 'MEMORY.md'), '# promoted memory\n', 'utf8');
+      await writeFile(
+        path.join(workspace, 'memory', 'dreaming', 'deep', '2026-07-31.md'),
+        `# Deep\n\n- Run: ${runId}\n`,
+        'utf8',
+      );
+      const checkpoint: MemoryDreamCheckpoint = {
+        schema: 'eden-memory-dream-v1',
+        phase: 'provider_started',
+        date: '2026-07-31',
+        previousSha256: memorySha256('# seeded memory\n'),
+        promotedSha256: memorySha256('# promoted memory\n'),
+        promotion: { ...execution.promotion, agentId: 'memory-test-agent' },
+        previousDreamDiarySha256: null,
+        previousRemReportSha256: null,
+        agentRuntime: 'claude-cli',
+      };
+      const durability = new FakeDurability({
+        checkpoint,
+        providerStatus: 'terminal',
+        usage: {
+          id: randomUUID(),
+          status: 'completed',
+          pricingBasis: 'notional-subscription',
+          sessionId: runId,
+          agentId: activeCandidate(workspace).agentAccountId,
+          messageId,
+        },
+        debitKeys: [runId],
+      });
+      let providerCalls = 0;
+      const response = [
+        '<DREAM_ENTRY>',
+        'Recovered diary fragment.',
+        '</DREAM_ENTRY>',
+        '<REM_REPORT>',
+        'Recovered detailed report.',
+        '</REM_REPORT>',
+      ].join('\n');
+      const result = await makeRunner(durability, {
+        providerCalled: () => {
+          providerCalls += 1;
+        },
+        assistantContent: async (requestedMessageId, requestedSessionId) => {
+          expect(requestedMessageId).toBe(messageId);
+          expect(requestedSessionId).toBe(runId);
+          return response;
+        },
+      }).run(activeCandidate(workspace), 'sweep-1', {
+        id: runId,
+        sweepId: 'sweep-1',
+        claimToken: randomUUID(),
+        lastActivityAt: new Date('2026-07-31T05:00:00.000Z'),
+        isRecovery: true,
+      });
+      expect(result).toMatchObject({
+        usageEventId: durability.evidence.usage?.id,
+        agentRuntime: 'claude-cli',
+      });
+      expect(providerCalls).toBe(0);
+      expect(await readFile(path.join(workspace, 'DREAMS.md'), 'utf8')).toContain(
+        'Recovered diary fragment.',
+      );
+      expect(
+        await readFile(
+          path.join(workspace, 'memory', 'dreaming', 'rem', '2026-07-31.md'),
+          'utf8',
+        ),
+      ).toContain('Recovered detailed report.');
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }
