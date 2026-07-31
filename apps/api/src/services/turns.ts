@@ -457,6 +457,18 @@ function toSharedUsage(usage: GatewayUsage | undefined): Usage | undefined {
   return out;
 }
 
+/** A successful provider turn must account for at least one real token. */
+function hasPositiveUsage(usage: GatewayUsage | undefined): boolean {
+  if (!usage) return false;
+  return [
+    usage.promptTokens,
+    usage.completionTokens,
+    usage.cachedTokens,
+    usage.cacheWriteTokens,
+    usage.totalTokens,
+  ].some((value) => typeof value === 'number' && Number.isFinite(value) && value > 0);
+}
+
 /** Insert a message row and bump the session counters in one transaction. */
 async function persistMessage(row: {
   sessionId: string;
@@ -863,6 +875,44 @@ async function runClaimedTurn(
               // recorded loudly as missing_usage; it is never a zero-cost row.
               onError(err, 'claude transcript usage capture');
             }
+          }
+          // OpenClaw 7.1 can translate a CLI spawn/auth failure into a
+          // superficially successful compat tail whose text is
+          // "Error: internal error" and whose usage fields are all zero. A
+          // real Claude CLI completion always has either an attributable
+          // transcript provider message or positive compat-tail usage. Fail
+          // closed here so an absent/expired subscription login is visible,
+          // fully refunded, and never mistaken for a provider-API success.
+          if (
+            agentRuntime === 'claude-cli' &&
+            usageCapture === undefined &&
+            !hasPositiveUsage(effectiveUsage)
+          ) {
+            const errorCode = 'subscription_runtime_unavailable';
+            const errorMessage =
+              'Claude subscription runtime failed before returning billable usage';
+            outcome.errorCode = errorCode;
+            outcome.errorMessage = errorMessage;
+            const fullyRefunded = await refundTurn();
+            await params.beforeTerminal?.();
+            await withClaimFence((dbc) =>
+              recordUsageEvent(
+                {
+                  status: 'error',
+                  usage: effectiveUsage,
+                  chargedManna: fullyRefunded ? 0 : PRICING.chatTurn,
+                  errorCode,
+                  errorMessage,
+                  finishReason: event.finishReason ?? null,
+                  emptyTurn: event.emptyTurn,
+                  usageCapture: null,
+                  usageSource: 'missing',
+                },
+                dbc ? { dbc, strict: true } : {},
+              ),
+            );
+            publish({ type: 'error', turnId, code: errorCode, message: errorMessage });
+            break;
           }
           const metering = meterChatUsage(effectiveUsage, meteringModel);
           const settleChatCharge = async (): Promise<ChatChargeSettlement> => {

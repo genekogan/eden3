@@ -805,6 +805,102 @@ describe('runTurn usage events', () => {
     });
   });
 
+  it('fails closed and refunds a Claude CLI completion with no attributable usage', async () => {
+    const fixture = await makeFixture();
+    const emitted: SessionEvent[] = [];
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield { type: 'token', delta: 'Error: internal error' };
+        yield {
+          type: 'turn.completed',
+          text: 'Error: internal error',
+          emptyTurn: false,
+          usage: {
+            promptTokens: 0,
+            completionTokens: 0,
+            cachedTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: 0,
+          },
+        };
+      },
+    };
+    let captures = 0;
+    const capture: ClaudeTranscriptUsageCaptureLike = {
+      async capture() {
+        captures += 1;
+        return undefined;
+      },
+    };
+
+    const outcome = await runTurn(makeDeps(compat, capture), {
+      session: fixture.session,
+      agent: {
+        ...fixture.agent,
+        model: 'anthropic/claude-sonnet-4-6',
+        agentRuntime: 'claude-cli',
+      },
+      user: fixture.user,
+      content: 'must fail closed',
+      beginStream: () => ({
+        emit(event) {
+          emitted.push(event);
+        },
+        end() {},
+      }),
+    });
+
+    expect(captures).toBe(1);
+    expect(outcome).toMatchObject({
+      assistantMessageId: null,
+      errorCode: 'subscription_runtime_unavailable',
+    });
+    expect(emitted).toContainEqual(
+      expect.objectContaining({ type: 'error', code: 'subscription_runtime_unavailable' }),
+    );
+    expect(emitted.some((event) => event.type === 'turn.completed')).toBe(false);
+
+    const assistantRows = await pg<{ count: string }[]>`
+      select count(*)::text as count from messages
+      where session_id = ${fixture.session.id} and role = 'assistant'
+    `;
+    expect(Number(assistantRows[0]!.count)).toBe(0);
+    const [usage] = await pg<
+      Array<{
+        status: string;
+        pricingBasis: string;
+        manna: number | null;
+        errorCode: string | null;
+        metadata: { usageSource?: string; agentConfig?: { agentRuntime?: string } } | null;
+      }>
+    >`
+      select status, pricing_basis as "pricingBasis", manna, error_code as "errorCode", metadata
+      from usage_events where turn_id = ${outcome.turnId}
+    `;
+    expect(usage).toMatchObject({
+      status: 'error',
+      pricingBasis: 'notional-subscription',
+      manna: 0,
+      errorCode: 'subscription_runtime_unavailable',
+      metadata: {
+        usageSource: 'missing',
+        agentConfig: { agentRuntime: 'claude-cli' },
+      },
+    });
+    const [net] = await pg<{ spend: string }[]>`
+      select coalesce(sum(case
+        when type like 'spend%' and amount < 0 then -amount
+        when type like 'refund%' and amount > 0 then -amount
+        else 0 end), 0)::text as spend
+      from manna_transactions
+      where manna_account_id in (
+        select id from manna_accounts where account_id = ${fixture.user.accountId}
+      )
+    `;
+    expect(Number(net!.spend)).toBe(0);
+  });
+
   it('ignores duplicate gateway completion events without double-persisting or double-charging', async () => {
     const fixture = await makeFixture();
     const compat: CompatClientLike = {
