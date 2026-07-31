@@ -14,14 +14,19 @@ const read = (relative) => fs.readFile(new URL(relative, `file://${repoRoot}/`),
 
 describe('metered self-cron infrastructure contract', () => {
   it('bakes the optional eden_cron plugin and never delegates to gateway cron', async () => {
-    const [dockerfile, plugin, manifest] = await Promise.all([
+    const [dockerfile, plugin, manifest, packageJson, packageLock] = await Promise.all([
       read('infra/openclaw/Dockerfile'),
       read('infra/openclaw/plugins/eden3-cron/index.js'),
       read('infra/openclaw/plugins/eden3-cron/openclaw.plugin.json'),
+      read('infra/openclaw/plugins/eden3-cron/package.json'),
+      read('infra/openclaw/plugins/eden3-cron/package-lock.json'),
     ]);
     expect(dockerfile).toContain(
       'plugins/eden3-cron /opt/eden3/openclaw-plugins/eden3-cron',
     );
+    expect(dockerfile).toContain('npm ci --omit=dev --ignore-scripts');
+    expect(JSON.parse(packageJson)).toMatchObject({ dependencies: { typebox: expect.any(String) } });
+    expect(JSON.parse(packageLock)).toMatchObject({ lockfileVersion: 3 });
     expect(plugin).toContain("name: 'eden_cron'");
     expect(plugin).toContain('optional: true');
     expect(plugin).toContain('toolContext.sessionKey');

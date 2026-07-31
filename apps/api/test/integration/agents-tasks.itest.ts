@@ -93,7 +93,11 @@ afterAll(async () => {
   await pg`delete from accounts where username = ${importedAgentUsername}`;
   await deleteFixturesByMarker(marker);
   await pg.end({ timeout: 5 });
-});
+// OpenClaw 7.1 config commands validate the complete migrated registry. Two
+// sequential agent deletions can legitimately exceed Vitest's 60-second hook
+// default on the canonical fleet, so give cleanup the same real-stack budget
+// as the provision/import paths it reverses.
+}, 180_000);
 
 describe('POST /agents (live gateway provisioning)', () => {
   it('provisions a routable agent with a fully rendered workspace', async () => {
