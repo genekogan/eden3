@@ -336,6 +336,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       `/channels/runtime/turns/${RUN_A}/settle`,
       '/channels/runtime/messages',
     ]);
+    expect(businessCalls[1].options).toEqual({ timeoutMs: 20_000 });
     expect(businessCalls[0].body).toMatchObject({
       connectionId: CONNECTION_A,
       runtimeAccountId: 'account-a',
@@ -900,6 +901,38 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     );
   });
 
+  it('accepts Telegram numeric sender ids while preserving exact peer identity', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    const peerId = '857837419';
+    const numericPeerId = 857837419;
+    const sessionKey = `agent:agent-a:telegram:account-a:direct:${peerId}`;
+    receiveTelegramA(bridge, {
+      event: {
+        senderId: numericPeerId,
+        from: `telegram:${peerId}`,
+        metadata: { messageId: '42', senderId: numericPeerId },
+      },
+      context: {
+        senderId: numericPeerId,
+        conversationId: peerId,
+        sessionKey,
+      },
+    });
+
+    await expect(
+      bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: numericPeerId, prompt: 'hello', messages: [] },
+        {
+          runId: RUN_A,
+          sessionKey,
+          messageProvider: 'telegram',
+          agentId: 'agent-a',
+        },
+      ),
+    ).resolves.toEqual({ outcome: 'pass' });
+    expect(calls.some((call) => call.path === '/channels/runtime/turns/reserve')).toBe(true);
+  });
+
   it('durably acknowledges the exact successful native delivery', async () => {
     const { bridge, calls } = mockBridge(telegramHostedConfig());
     receiveTelegramA(bridge);
@@ -1422,6 +1455,29 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(refundAttempts).toBe(1);
     await bridge.onGatewayStop();
     expect(refundAttempts).toBe(2);
+  });
+
+  it('retries a startup status callback after event-loop-starved gateway startup', async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const { bridge } = mockBridge(hostedConfig(), {
+        '/channels/runtime/status': async () => {
+          attempts += 1;
+          if (attempts <= 2) throw new Error('startup transport timeout');
+          return { ok: true };
+        },
+      });
+      await bridge.onGatewayStart();
+      expect(attempts).toBe(2);
+      await vi.advanceTimersByTimeAsync(
+        channelRuntimeBridgeInternals.STARTUP_STATUS_RETRY_MS,
+      );
+      expect(attempts).toBe(4);
+      await bridge.onGatewayStop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('retains an in-flight reservation beyond the 30-minute provider timeout ceiling', async () => {
