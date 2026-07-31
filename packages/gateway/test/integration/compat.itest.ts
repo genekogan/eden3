@@ -141,7 +141,7 @@ describe('OpenClawCompatClient.chatTurn (live)', () => {
     expect(completed.usage?.totalTokens).toBeGreaterThan(0);
   });
 
-  it('keeps continuity across two turns on the same sessionKey (server-side history)', async () => {
+  it('keeps continuity and reports cached usage once the same session is warm', async () => {
     const sessionKey = freshSessionKey();
     const codeword = `verdant-${randomUUID().slice(0, 8)}`;
 
@@ -165,14 +165,27 @@ describe('OpenClawCompatClient.chatTurn (live)', () => {
     );
     const completed = expectCompleted(second);
     expect(completed.text.toLowerCase()).toContain(codeword.toLowerCase());
-    expect(completed.usage?.cachedTokens ?? 0).toBeGreaterThan(0);
+
+    // A valid cold-tail transition can report no cached tokens on turn two
+    // even though continuity is intact. A third turn has the now-materialized
+    // transcript available and must prove the warm-cache metering path.
+    const third = await collect(
+      compat.chatTurn({
+        agentId: AGENT_ID,
+        sessionKey,
+        userMessage: 'Reply with exactly: warm-cache-ok',
+      }),
+    );
+    const warmCompleted = expectCompleted(third);
+    expect(warmCompleted.text.toLowerCase()).toContain('warm-cache-ok');
+    expect(warmCompleted.usage?.cachedTokens ?? 0).toBeGreaterThan(0);
 
     // Cross-check via the tools client: the transcript is addressable through
     // sessions_history with the probed args shape (scoped key + top-level
     // sessionKey context) and contains both turns.
     const history = await tools.sessionsHistory({ sessionKey, agentId: AGENT_ID, limit: 20 });
     expect(history.sessionKey).toBe(scopedSessionKey(AGENT_ID, sessionKey));
-    expect(history.messages.length).toBeGreaterThanOrEqual(4); // user,assistant × 2
+    expect(history.messages.length).toBeGreaterThanOrEqual(6); // user,assistant × 3
     const roles = new Set(history.messages.map((m) => m.role));
     expect(roles.has('user')).toBe(true);
     expect(roles.has('assistant')).toBe(true);

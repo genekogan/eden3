@@ -15,7 +15,8 @@ import {
 /**
  * Streaming chat client for the OpenClaw gateway's OpenAI-compat endpoint.
  *
- * Wire format (probed live 2026-07-02 against openclaw 2026.6.10):
+ * Wire format (originally live-probed 2026-07-02 on OpenClaw 2026.6.10;
+ * source-reverified 2026-07-31 against OpenClaw 2026.7.1):
  *
  *   POST /v1/chat/completions   {model:"openclaw/<agentId>", stream:true,
  *     stream_options:{include_usage:true}, user:<scoped key>,
@@ -57,7 +58,7 @@ export class OpenClawCompatClient {
    * reading and end the iteration (no error / no turn.completed).
    */
   async *chatTurn(params: ChatTurnParams): AsyncGenerator<GatewayTurnEvent, void, void> {
-    const { agentId, sessionKey, userMessage, signal } = params;
+    const { agentId, sessionKey, userMessage, modelOverride, signal } = params;
     if (signal?.aborted) return;
 
     // Scoped key routes the turn to the agent (see types.ts: the `model`
@@ -72,6 +73,7 @@ export class OpenClawCompatClient {
           authorization: `Bearer ${this.token}`,
           'content-type': 'application/json',
           'x-openclaw-session-key': scoped,
+          ...(modelOverride !== undefined ? { 'x-openclaw-model': modelOverride } : {}),
         },
         body: JSON.stringify({
           model: `openclaw/${agentId}`,

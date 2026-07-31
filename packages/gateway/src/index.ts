@@ -1,5 +1,6 @@
 // @eden3/gateway — typed clients + lifecycle tooling for the OpenClaw gateway:
 //   OpenClawCompatClient — streaming chat turns (/v1/chat/completions, SSE)
+//   Claude transcript    — exact claude-cli token/cache usage attribution
 //   OpenClawToolsClient  — /tools/invoke (async media tools, sessions_history)
 //   OpenClawCli          — docker exec CLI wrapper (--json parsing)
 //   AgentProvisioner     — workspace render + agents add + routability check
@@ -8,9 +9,11 @@
 //   CronSync             — eden3 trigger ↔ gateway cron reconciliation
 export * from './types';
 export * from './compat-client';
+export * from './claude-transcript';
 export * from './tools-client';
 export * from './docker';
 export * from './config-gen';
 export * from './channel-sync';
 export * from './provisioner';
 export * from './cron-sync';
+export * from './memory-cli';

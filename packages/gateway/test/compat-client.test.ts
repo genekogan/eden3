@@ -80,6 +80,7 @@ describe('OpenClawCompatClient.chatTurn', () => {
             prompt_tokens: 26367,
             completion_tokens: 7,
             total_tokens: 26413,
+            cache_write_tokens: 42,
             prompt_tokens_details: { cached_tokens: 26364 },
           }),
         ),
@@ -95,7 +96,13 @@ describe('OpenClawCompatClient.chatTurn', () => {
         type: 'turn.completed',
         text: 'pomegranate',
         emptyTurn: false,
-        usage: { promptTokens: 26367, completionTokens: 7, totalTokens: 26413, cachedTokens: 26364 },
+        usage: {
+          promptTokens: 26367,
+          completionTokens: 7,
+          totalTokens: 26413,
+          cachedTokens: 26364,
+          cacheWriteTokens: 42,
+        },
         finishReason: 'stop',
       },
     ]);
@@ -138,6 +145,22 @@ describe('OpenClawCompatClient.chatTurn', () => {
       stream_options: { include_usage: true },
       messages: [{ role: 'user', content: 'hi' }],
     });
+  });
+
+  it('sends a trusted provider/model override through the 7.1 compat header only', async () => {
+    const { fetchImpl, calls } = makeFetch(() => sseResponse([frame('[DONE]')]));
+    await collect(
+      client(fetchImpl).chatTurn({
+        ...turnParams,
+        modelOverride: 'anthropic/claude-sonnet-4-6',
+      }),
+    );
+
+    const call = calls[0]!;
+    expect((call.init.headers as Record<string, string>)['x-openclaw-model']).toBe(
+      'anthropic/claude-sonnet-4-6',
+    );
+    expect(JSON.parse(String(call.init.body)).model).toBe('openclaw/testbot');
   });
 
   it('does not re-scope an already scoped session key', async () => {

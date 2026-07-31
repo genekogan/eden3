@@ -5,7 +5,10 @@ import { z } from 'zod';
  * @eden3/gateway — types shared by the compat (streaming chat) and tools
  * (/tools/invoke) clients for the OpenClaw gateway.
  *
- * ## Agent addressing (probed live 2026-07-02, openclaw 2026.6.10)
+ * ## Agent addressing
+ *
+ * Originally live-probed 2026-07-02 on OpenClaw 2026.6.10 and
+ * source-reverified 2026-07-31 against OpenClaw 2026.7.1.
  *
  * The gateway stores every session under a GLOBAL key of the form
  * `agent:<agentId>:<key>`. Routing a request to a specific agent happens via
@@ -83,6 +86,8 @@ export function isNoResponseSentinel(text: string): boolean {
 export interface GatewayUsage extends Usage {
   /** Prompt tokens served from the provider prompt cache (metering input). */
   cachedTokens?: number;
+  /** Prompt tokens written to the provider prompt cache (metering input). */
+  cacheWriteTokens?: number;
 }
 
 export interface ChatTurnParams {
@@ -95,6 +100,13 @@ export interface ChatTurnParams {
    * sending prior turns would duplicate them (spike probe #7).
    */
   userMessage: string;
+  /**
+   * Optional canonical provider/model override. OpenClaw 2026.7.1 accepts
+   * this only through `x-openclaw-model`; the compat body model remains the
+   * agent-addressing shim (`openclaw/<agentId>`). Used by trusted Eden REM
+   * turns so normal agent model selection is not mutated.
+   */
+  modelOverride?: string;
   /**
    * Abort streaming: the upstream turn cannot be cancelled, so on abort the
    * client just stops reading and the iterator ends (no further events).
@@ -150,7 +162,13 @@ export const compatUsageSchema = z
     total_tokens: z.number().optional(),
     /** Not observed flat on this gateway, but tolerated. */
     cached_tokens: z.number().optional(),
-    prompt_tokens_details: z.object({ cached_tokens: z.number().optional() }).nullish(),
+    cache_write_tokens: z.number().optional(),
+    prompt_tokens_details: z
+      .object({
+        cached_tokens: z.number().optional(),
+        cache_write_tokens: z.number().optional(),
+      })
+      .nullish(),
   })
   .passthrough();
 export type CompatUsage = z.infer<typeof compatUsageSchema>;
@@ -189,6 +207,8 @@ export function toGatewayUsage(usage: CompatUsage): GatewayUsage {
   if (typeof usage.total_tokens === 'number') out.totalTokens = usage.total_tokens;
   const cached = usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens;
   if (typeof cached === 'number') out.cachedTokens = cached;
+  const cacheWrite = usage.prompt_tokens_details?.cache_write_tokens ?? usage.cache_write_tokens;
+  if (typeof cacheWrite === 'number') out.cacheWriteTokens = cacheWrite;
   return out;
 }
 

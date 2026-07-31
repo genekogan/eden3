@@ -21,7 +21,10 @@ import {
  * INSIDE an ok:true envelope as `details:{status:"forbidden"|"error", error}` —
  * sessionsHistory() surfaces those as {@link GatewayToolError} too.
  *
- * ## sessions_history args shape (probed live 2026-07-02, openclaw 2026.6.10)
+ * ## sessions_history args shape
+ *
+ * Originally live-probed 2026-07-02 on OpenClaw 2026.6.10 and
+ * source-reverified 2026-07-31 against OpenClaw 2026.7.1.
  *
  * Exact addressing discovered via the tool's own error messages:
  *

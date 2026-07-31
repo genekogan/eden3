@@ -11,6 +11,7 @@ import {
   PERSONA_TEMPLATE_FILES,
   ProvisionError,
   WORKSPACE_STATE_FILENAME,
+  assertWorkspacePersonaDoctrine,
   renderTemplate,
   workspaceBootstrapStatus,
   type ProvisionAgentParams,
@@ -157,10 +158,10 @@ describe('renderTemplate', () => {
 });
 
 /**
- * Truth table for the EXACT predicate the running gateway
- * (`resolveWorkspaceBootstrapStatus`, image 2026.6.10) uses per turn. If this
- * ever diverges from the bundled source, migrated agents silently regress to the
- * blank-slate ritual — so it is pinned here as a contract.
+ * Truth table for the EXACT predicate OpenClaw 2026.7.1
+ * (`resolveWorkspaceBootstrapStatus`) uses per turn. If this ever diverges from
+ * the bundled source, migrated agents silently regress to the blank-slate
+ * ritual — so it is pinned here as a contract.
  */
 describe('workspaceBootstrapStatus (mirrors OpenClaw resolveWorkspaceBootstrapStatus)', () => {
   let ws: string;
@@ -246,6 +247,20 @@ describe('AgentProvisioner.provisionAgent', () => {
     // memory dirs for the agent's own journals + per-user notes
     const usersDir = await fs.stat(path.join(result.hostWorkspaceDir, 'memory', 'users'));
     expect(usersDir.isDirectory()).toBe(true);
+    await expect(assertWorkspacePersonaDoctrine(result.hostWorkspaceDir)).resolves.toBeUndefined();
+  });
+
+  it('rejects a banal or oversized persona before registration or workspace mutation', async () => {
+    const cli = new FakeCli();
+    const provisioner = makeProvisioner({ cli });
+    await expect(
+      provisioner.provisionAgent({
+        ...PARAMS,
+        persona: `You're becoming someone. ${'x'.repeat(20_000)}`,
+      }),
+    ).rejects.toThrow(/persona doctrine.*SOUL\.md.*maximum.*zero-signal phrase/s);
+    expect(cli.calls).toEqual([]);
+    expect(await fileExists(path.join(dataDir, 'workspace-banny'))).toBe(false);
   });
 
   it('renders persona AFTER agents add — our SOUL beats the seeded default, ' +
@@ -342,6 +357,34 @@ describe('AgentProvisioner.provisionAgent', () => {
     await fs.rm(brokenTemplatesDir, { recursive: true, force: true });
   });
 
+  it('requires BOOTSTRAP.md absence even when the runtime marker alone says complete', async () => {
+    class BootstrapRaceProvisioner extends AgentProvisioner {
+      protected override async afterBootstrapSuppression(dir: string): Promise<void> {
+        await fs.writeFile(path.join(dir, BOOTSTRAP_FILENAME), '# late bootstrap\n', 'utf8');
+      }
+    }
+    const provisioner = new BootstrapRaceProvisioner({
+      gateway: {
+        baseUrl: 'http://gw.test',
+        token: 'tok',
+        fetchImpl: modelsFetch({ ids: ['openclaw/main', 'openclaw/banny'] }).fetchImpl,
+      },
+      cli: new FakeCli(),
+      dataDir,
+      templatesDir: REAL_TEMPLATES_DIR,
+      routableTimeoutMs: 2_000,
+      routablePollIntervalMs: 10,
+      now: () => new Date('2026-07-03T00:00:00.000Z'),
+    });
+
+    await expect(provisioner.provisionAgent(PARAMS)).rejects.toThrow(
+      /strict post-write readback.*bootstrap=present/s,
+    );
+    // OpenClaw's OR predicate would call this complete; Eden's stricter
+    // readback is what catches the lost redundancy.
+    expect(await workspaceBootstrapStatus(path.join(dataDir, 'workspace-banny'))).toBe('complete');
+  });
+
   it('omitted memorySeed renders as empty (never a literal placeholder)', async () => {
     const provisioner = makeProvisioner({});
     const { memorySeed: _unused, ...noSeed } = PARAMS;
@@ -401,6 +444,30 @@ describe('AgentProvisioner.provisionAgent', () => {
     expect(await fs.readFile(soulPath, 'utf8')).toBe(PARAMS.persona);
   });
 
+  it('preflights the exact skip-if-exists result before mutating an existing workspace', async () => {
+    const cli = new FakeCli();
+    const provisioner = makeProvisioner({ cli });
+    const first = await provisioner.provisionAgent(PARAMS);
+    const soulPath = path.join(first.hostWorkspaceDir, 'SOUL.md');
+    const statePath = path.join(first.hostWorkspaceDir, WORKSPACE_STATE_FILENAME);
+    const bootstrapPath = path.join(first.hostWorkspaceDir, BOOTSTRAP_FILENAME);
+    const memoryPath = path.join(first.hostWorkspaceDir, 'MEMORY.md');
+    const memoryBefore = await fs.readFile(memoryPath, 'utf8');
+
+    await fs.writeFile(soulPath, 'Remember you’re a guest.\n', 'utf8');
+    await fs.writeFile(statePath, '{"version":1}\n', 'utf8');
+    await fs.writeFile(bootstrapPath, '# stale bootstrap\n', 'utf8');
+
+    await expect(provisioner.provisionAgent(PARAMS)).rejects.toThrow(
+      /prospective workspace.*zero-signal phrase/s,
+    );
+    // Doctrine failure precedes every repair mutation: no marker rewrite,
+    // BOOTSTRAP removal, or durable-memory clobber happened.
+    expect(await fs.readFile(statePath, 'utf8')).toBe('{"version":1}\n');
+    expect(await fs.readFile(bootstrapPath, 'utf8')).toBe('# stale bootstrap\n');
+    expect(await fs.readFile(memoryPath, 'utf8')).toBe(memoryBefore);
+  });
+
   it('does not re-add an already-registered agent', async () => {
     const cli = new FakeCli();
     cli.agents = [{ id: 'banny', model: 'anthropic/claude-haiku-4-5' }];
@@ -411,7 +478,7 @@ describe('AgentProvisioner.provisionAgent', () => {
     expect(cli.calls.some((c) => c.args[1] === 'add')).toBe(false);
   });
 
-  it('falls back to reading openclaw.json when agents list fails', async () => {
+  it('uses openclaw.json when the agents-list CLI is unavailable', async () => {
     const cli = new FakeCli();
     cli.failListWith = new Error('no such command');
     await fs.writeFile(
@@ -424,6 +491,26 @@ describe('AgentProvisioner.provisionAgent', () => {
     const result = await provisioner.provisionAgent(PARAMS);
     expect(result.registration).toBe('existing');
     expect(cli.calls.some((c) => c.args[1] === 'add')).toBe(false);
+  });
+
+  it('prefers the mounted config and does not spawn agents list for a large fleet', async () => {
+    const cli = new FakeCli();
+    cli.failListWith = new Error('agents list should not run');
+    await fs.writeFile(
+      path.join(dataDir, 'openclaw.json'),
+      JSON.stringify({
+        agents: {
+          list: [
+            { id: 'main', model: 'anthropic/claude-opus-4-6' },
+            { id: 'banny', model: 'anthropic/claude-haiku-4-5' },
+          ],
+        },
+      }),
+    );
+    const provisioner = makeProvisioner({ cli });
+    const result = await provisioner.provisionAgent(PARAMS);
+    expect(result.registration).toBe('existing');
+    expect(cli.calls.some((c) => c.args[0] === 'agents' && c.args[1] === 'list')).toBe(false);
   });
 
   it('updates the model in openclaw.json when an existing registration drifts', async () => {
@@ -522,6 +609,76 @@ describe('AgentProvisioner.updateAgentPersona', () => {
         greeting: 'hi',
       }),
     ).rejects.toThrow(/provision "ghost" first/);
+  });
+
+  it('rejects a doctrine-breaking hot edit without changing SOUL.md', async () => {
+    const provisioner = makeProvisioner({});
+    const first = await provisioner.provisionAgent(PARAMS);
+    const before = await fs.readFile(path.join(first.hostWorkspaceDir, 'SOUL.md'), 'utf8');
+    await expect(
+      provisioner.updateAgentPersona({
+        openclawId: 'banny',
+        name: 'Banny',
+        username: 'banny',
+        description: 'Resident banana artist',
+        persona: 'Be genuinely helpful, not performatively helpful.',
+        greeting: 'Hello.',
+      }),
+    ).rejects.toThrow(/zero-signal phrase/);
+    expect(await fs.readFile(path.join(first.hostWorkspaceDir, 'SOUL.md'), 'utf8')).toBe(before);
+  });
+
+  it('read-back rejects a doctrine regression that lands after hot-edit preflight', async () => {
+    class CorruptingProvisioner extends AgentProvisioner {
+      corruptAfterWrite = false;
+
+      protected override async afterBootstrapSuppression(dir: string): Promise<void> {
+        if (this.corruptAfterWrite) {
+          await fs.writeFile(path.join(dir, 'SOUL.md'), 'This is sacred work.\n', 'utf8');
+        }
+      }
+    }
+
+    const cli = new FakeCli();
+    const provisioner = new CorruptingProvisioner({
+      gateway: {
+        baseUrl: 'http://gw.test',
+        token: 'tok-secret',
+        fetchImpl: modelsFetch({ ids: ['openclaw/main', 'openclaw/banny'] }).fetchImpl,
+      },
+      cli,
+      dataDir,
+      templatesDir: REAL_TEMPLATES_DIR,
+      routableTimeoutMs: 2_000,
+      routablePollIntervalMs: 10,
+      now: () => new Date('2026-07-03T00:00:00.000Z'),
+    });
+    await provisioner.provisionAgent(PARAMS);
+    const workspaceDir = path.join(dataDir, 'workspace-banny');
+    const soulBefore = await fs.readFile(path.join(workspaceDir, 'SOUL.md'), 'utf8');
+    const identityBefore = await fs.readFile(path.join(workspaceDir, 'IDENTITY.md'), 'utf8');
+    const stateBefore = await fs.readFile(
+      path.join(workspaceDir, WORKSPACE_STATE_FILENAME),
+      'utf8',
+    );
+    provisioner.corruptAfterWrite = true;
+
+    await expect(
+      provisioner.updateAgentPersona({
+        openclawId: 'banny',
+        name: 'Banny Prime',
+        username: 'banny',
+        description: 'Reformed banana, now a sculptor',
+        persona: 'Use dry humor and speak in compact visual metaphors.',
+        greeting: 'Welcome to the studio.',
+      }),
+    ).rejects.toThrow(/workspace .*persona doctrine.*zero-signal phrase/s);
+    // Failed read-back is a failed hot reload, not a partially-applied one.
+    expect(await fs.readFile(path.join(workspaceDir, 'SOUL.md'), 'utf8')).toBe(soulBefore);
+    expect(await fs.readFile(path.join(workspaceDir, 'IDENTITY.md'), 'utf8')).toBe(identityBefore);
+    expect(await fs.readFile(path.join(workspaceDir, WORKSPACE_STATE_FILENAME), 'utf8')).toBe(
+      stateBefore,
+    );
   });
 
   it('re-asserts the bootstrap-suppression marker (self-heals a wiped marker + stray BOOTSTRAP.md)', async () => {

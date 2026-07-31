@@ -25,9 +25,7 @@ const DATA_DIR =
 
 const AGENT_ID = 'itest-persona-probe';
 const MODEL = 'anthropic/claude-haiku-4-5';
-const DOCKER_COMPOSE = existsSync('/usr/local/bin/docker-compose')
-  ? '/usr/local/bin/docker-compose'
-  : 'docker-compose';
+const COMPOSE_WRAPPER = path.join(REPO_ROOT, 'scripts', 'compose.mjs');
 
 const cli = new OpenClawCli();
 const provisioner = new AgentProvisioner({
@@ -72,7 +70,10 @@ async function askMarker(): Promise<string> {
 }
 
 async function restartOpenClaw(): Promise<void> {
-  await execFileAsync(DOCKER_COMPOSE, ['-f', path.join(REPO_ROOT, 'infra/docker-compose.yml'), 'restart', 'openclaw'], {
+  // The wrapper derives the exact Compose database selector from DATABASE_URL.
+  // Raw Compose is deliberately invalid so a restart cannot silently point
+  // the credential sidecars at a different logical database than the API.
+  await execFileAsync(process.execPath, [COMPOSE_WRAPPER, 'restart', 'openclaw'], {
     cwd: REPO_ROOT,
     env: process.env,
     timeout: 60_000,
@@ -86,24 +87,17 @@ async function restartOpenClaw(): Promise<void> {
   let last = '';
   while (Date.now() < deadline) {
     try {
-      const { stdout } = await execFileAsync(
-        'docker',
-        ['inspect', '-f', '{{.State.Health.Status}}', 'eden3-openclaw'],
-        {
-          cwd: REPO_ROOT,
-          env: process.env,
-          timeout: 10_000,
-          maxBuffer: 1024 * 1024,
-        },
-      );
-      last = stdout.trim();
-      if (last === 'healthy') return;
+      const response = await fetch(`${BASE_URL}/healthz`, {
+        signal: AbortSignal.timeout(5_000),
+      });
+      last = `${response.status} ${response.statusText}`.trim();
+      if (response.ok) return;
     } catch (err) {
       last = (err as Error).message;
     }
     await new Promise((resolve) => setTimeout(resolve, 1_000));
   }
-  throw new Error(`eden3-openclaw did not become healthy after restart; last=${last}`);
+  throw new Error(`eden3-openclaw /healthz did not recover after restart; last=${last}`);
 }
 
 beforeAll(() => {

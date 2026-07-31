@@ -4,7 +4,18 @@ import { fileURLToPath } from 'node:url';
 
 import { z } from 'zod';
 
-import { readOpenClawConfig, resolveDataDir, setAgentModel } from './config-gen';
+import {
+  BOOTSTRAP_FILE_NAMES,
+  lintPersonaDoctrine,
+  type BootstrapFileName,
+} from '@eden3/shared';
+
+import {
+  readOpenClawConfig,
+  resolveDataDir,
+  setAgentModel,
+  withOpenClawConfigLock,
+} from './config-gen';
 import { OpenClawCli, type OpenClawCliLike } from './docker';
 import type { GatewayClientOptions } from './types';
 
@@ -26,14 +37,14 @@ import type { GatewayClientOptions } from './types';
  * FIRST, then overwrite ALL of our rendered persona files so ours win, then
  * write the bootstrap-suppression marker LAST.
  *
- * BOOTSTRAP SUPPRESSION (verified against the running image, 2026.6.10,
- * `workspace-*.js` `resolveWorkspaceBootstrapStatus`): the first-boot ritual is
- * skipped iff `openclaw-workspace-state.json` at the workspace ROOT carries a
- * non-empty-string `setupCompletedAt` — OR no `BOOTSTRAP.md` exists. We do
- * BOTH: write `{"version":1,"setupCompletedAt":<iso>}` last, and delete the
- * `BOOTSTRAP.md` the seeder dropped. These two are correctness invariants
- * (re-asserted on every provision, even without `force`) rather than
- * user-editable content, so they live outside the skip-if-exists file loop.
+ * BOOTSTRAP SUPPRESSION (source-reverified 2026-07-31 against OpenClaw 2026.7.1,
+ * `resolveWorkspaceBootstrapStatus`): the first-boot ritual is skipped iff
+ * `openclaw-workspace-state.json` at the workspace ROOT carries a non-empty
+ * string `setupCompletedAt` — OR no `BOOTSTRAP.md` exists. We do BOTH: write
+ * `{"version":1,"setupCompletedAt":<iso>}` last, and delete the `BOOTSTRAP.md`
+ * the seeder dropped. These two are correctness invariants (re-asserted on
+ * every provision, even without `force`) rather than user-editable content, so
+ * they live outside the skip-if-exists file loop.
  */
 
 export class ProvisionError extends Error {
@@ -108,6 +119,79 @@ function assertFullyRendered(relPath: string, rendered: string): void {
         'workspace-templates and the provisioner var map are out of sync',
     );
   }
+}
+
+type RenderedTemplate = { relPath: string; raw: string; rendered: string };
+
+function asBootstrapFileName(relPath: string): BootstrapFileName | undefined {
+  return (BOOTSTRAP_FILE_NAMES as readonly string[]).includes(relPath)
+    ? (relPath as BootstrapFileName)
+    : undefined;
+}
+
+function assertDoctrineFileSet(
+  files: Partial<Record<BootstrapFileName, string>>,
+  context: string,
+): void {
+  const issues = lintPersonaDoctrine(files);
+  if (issues.length > 0) {
+    throw new ProvisionError(
+      `${context} violates the persona doctrine: ${issues.map((issue) => issue.message).join('; ')}`,
+    );
+  }
+}
+
+function doctrineFilesFromTemplates(
+  templates: readonly RenderedTemplate[],
+): Partial<Record<BootstrapFileName, string>> {
+  const files: Partial<Record<BootstrapFileName, string>> = {};
+  for (const template of templates) {
+    const file = asBootstrapFileName(template.relPath);
+    if (file !== undefined) files[file] = template.rendered;
+  }
+  return files;
+}
+
+/** Read the exact seven-file context set that OpenClaw injects every turn. */
+export async function readWorkspaceDoctrineFiles(
+  workspaceDir: string,
+): Promise<Partial<Record<BootstrapFileName, string>>> {
+  const files: Partial<Record<BootstrapFileName, string>> = {};
+  for (const file of BOOTSTRAP_FILE_NAMES) {
+    try {
+      files[file] = await fs.readFile(path.join(workspaceDir, file), 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  }
+  return files;
+}
+
+/** Fail loudly if the actual workspace would be truncated or doctrine-drifted. */
+export async function assertWorkspacePersonaDoctrine(workspaceDir: string): Promise<void> {
+  assertDoctrineFileSet(await readWorkspaceDoctrineFiles(workspaceDir), `workspace ${workspaceDir}`);
+}
+
+interface WorkspaceFileSnapshot {
+  path: string;
+  contents: Buffer | null;
+}
+
+async function snapshotWorkspaceFile(target: string): Promise<WorkspaceFileSnapshot> {
+  try {
+    return { path: target, contents: await fs.readFile(target) };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { path: target, contents: null };
+    throw err;
+  }
+}
+
+async function restoreWorkspaceFile(snapshot: WorkspaceFileSnapshot): Promise<void> {
+  if (snapshot.contents === null) {
+    await fs.rm(snapshot.path, { force: true });
+    return;
+  }
+  await fs.writeFile(snapshot.path, snapshot.contents);
 }
 
 async function loadTemplates(dir: string): Promise<{ relPath: string; raw: string }[]> {
@@ -309,6 +393,41 @@ export class AgentProvisioner {
     };
     const workspaceDir = this.hostWorkspaceDir(params.openclawId);
 
+    // Render and validate the complete context set before any registration or
+    // file mutation. This prevents a bad user persona or template drift from
+    // leaving behind a half-provisioned agent.
+    const templates: RenderedTemplate[] = (
+      await loadTemplates(this.templatesDir)
+    )
+      .filter((template) => template.relPath !== WORKSPACE_STATE_FILENAME)
+      .map((template) => {
+        const rendered = renderTemplate(template.raw, vars);
+        assertFullyRendered(template.relPath, rendered);
+        return { ...template, rendered };
+      });
+    assertDoctrineFileSet(doctrineFilesFromTemplates(templates), 'rendered workspace templates');
+
+    // Resolve registration before mutating the workspace. For an existing
+    // registration, skip-if-exists means the effective result is a mixture of
+    // disk files and rendered templates; validate that exact prospective set
+    // before changing the model, writing a missing file, or touching bootstrap
+    // state. The final read-back below remains necessary for races and I/O
+    // failures between this preflight and the writes.
+    const existing = await this.findRegisteredAgent(params.openclawId);
+    const registration: ProvisionAgentResult['registration'] =
+      existing === undefined ? 'added' : 'existing';
+    const overwrite = force || registration === 'added';
+    if (registration === 'existing') {
+      const prospective = await readWorkspaceDoctrineFiles(workspaceDir);
+      for (const template of templates) {
+        const file = asBootstrapFileName(template.relPath);
+        if (file !== undefined && (overwrite || prospective[file] === undefined)) {
+          prospective[file] = template.rendered;
+        }
+      }
+      assertDoctrineFileSet(prospective, `prospective workspace ${workspaceDir}`);
+    }
+
     // 1. workspace + memory dirs (per-user notes live at memory/users/<username>.md)
     await fs.mkdir(workspaceDir, { recursive: true });
     await fs.mkdir(path.join(workspaceDir, 'memory', 'users'), { recursive: true });
@@ -317,21 +436,20 @@ export class AgentProvisioner {
     //    OpenClaw's default template files — including a generic SOUL.md and a
     //    BOOTSTRAP.md — so it must run BEFORE we render ours (step 3), or our
     //    persona is clobbered by the seed.
-    const existing = await this.findRegisteredAgent(params.openclawId);
-    let registration: ProvisionAgentResult['registration'] = 'existing';
     let modelUpdated = false;
     if (existing === undefined) {
-      await this.cli.execJson([
-        'agents',
-        'add',
-        params.openclawId,
-        '--non-interactive',
-        '--workspace',
-        this.containerWorkspaceDir(params.openclawId),
-        '--model',
-        params.model,
-      ]);
-      registration = 'added';
+      await withOpenClawConfigLock(this.dataDir, () =>
+        this.cli.execJson([
+          'agents',
+          'add',
+          params.openclawId,
+          '--non-interactive',
+          '--workspace',
+          this.containerWorkspaceDir(params.openclawId),
+          '--model',
+          params.model,
+        ]),
+      );
     } else if (existing.model !== undefined && existing.model !== params.model) {
       await setAgentModel(params.openclawId, params.model, { dataDir: this.dataDir });
       modelUpdated = true;
@@ -346,22 +464,16 @@ export class AgentProvisioner {
     //    `agents add` just seeded on a fresh registration. So when we added the
     //    agent THIS call, force the render over the seed; otherwise honour the
     //    caller's `force` flag (default: keep existing files).
-    const overwrite = force || registration === 'added';
-    const templates = (await loadTemplates(this.templatesDir)).filter(
-      (t) => t.relPath !== WORKSPACE_STATE_FILENAME,
-    );
     const filesWritten: string[] = [];
     const filesSkipped: string[] = [];
     for (const template of templates) {
-      const rendered = renderTemplate(template.raw, vars);
-      assertFullyRendered(template.relPath, rendered);
       const target = path.join(workspaceDir, template.relPath);
       if (!overwrite && (await fileExists(target))) {
         filesSkipped.push(template.relPath);
         continue;
       }
       await fs.mkdir(path.dirname(target), { recursive: true });
-      await fs.writeFile(target, rendered, 'utf8');
+      await fs.writeFile(target, template.rendered, 'utf8');
       filesWritten.push(template.relPath);
     }
 
@@ -385,6 +497,7 @@ export class AgentProvisioner {
     //     (incl. after a gateway restart). Re-read from disk and fail loudly
     //     rather than ship a workspace that regresses. See docs/dev/spike.md.
     await this.assertBootstrapSuppressed(workspaceDir);
+    await assertWorkspacePersonaDoctrine(workspaceDir);
 
     // 5. verify routable
     await this.waitRoutable(params.openclawId);
@@ -427,31 +540,21 @@ export class AgentProvisioner {
   }
 
   /**
-   * Test seam invoked after the bootstrap-suppression marker is written and any
-   * seeded BOOTSTRAP.md removed, but before the read-back assertion. Overridden
-   * in tests to simulate a post-removal race; a no-op in production.
+   * Test seam invoked after content + bootstrap-suppression writes, but before
+   * the disk read-back assertions. Tests use it to simulate a late seed, race,
+   * or external file corruption; it is a no-op in production.
    */
   protected async afterBootstrapSuppression(_workspaceDir: string): Promise<void> {
     // intentionally empty
   }
 
   /**
-   * Re-read the workspace from disk and assert the first-boot ritual is
-   * suppressed by the SAME predicate the running gateway uses per turn
-   * ({@link workspaceBootstrapStatus}). Throws {@link ProvisionError} otherwise
-   * so a provision that would regress on next load (or after a gateway restart)
-   * fails loudly here instead of silently shipping a blank-slate agent.
+   * Re-read both bootstrap-suppression facts from disk. OpenClaw needs only one
+   * of them, but Eden deliberately writes and verifies both so a later loss of
+   * either fact cannot silently remove the restart-safety redundancy.
    */
   private async assertBootstrapSuppressed(workspaceDir: string): Promise<void> {
-    const status = await workspaceBootstrapStatus(workspaceDir);
-    if (status !== 'complete') {
-      throw new ProvisionError(
-        `bootstrap suppression failed for ${workspaceDir}: workspace still resolves ` +
-          `to "${status}" — the agent would run the blank-slate ritual on its next ` +
-          `load. Expected a non-empty setupCompletedAt in ${WORKSPACE_STATE_FILENAME} ` +
-          `and no ${BOOTSTRAP_FILENAME}.`,
-      );
-    }
+    await assertBootstrapSuppressionInvariants(workspaceDir);
   }
 
   /**
@@ -486,7 +589,7 @@ export class AgentProvisioner {
       VOICE: params.voice ?? 'unspecified',
       THINKING_LEVEL: params.thinkingLevel ?? 'balanced',
     };
-    const filesWritten: string[] = [];
+    const renderedUpdates = new Map<BootstrapFileName, string>();
     for (const relPath of PERSONA_TEMPLATE_FILES) {
       const sourcePath = path.join(this.templatesDir, relPath);
       let raw: string;
@@ -497,38 +600,88 @@ export class AgentProvisioner {
       }
       const rendered = renderTemplate(raw, vars);
       assertFullyRendered(relPath, rendered);
-      await fs.writeFile(path.join(workspaceDir, relPath), rendered, 'utf8');
-      filesWritten.push(relPath);
+      renderedUpdates.set(relPath, rendered);
     }
-    // Re-assert the durable suppression invariant so a persona edit can never
-    // leave the workspace in a bootstrap-pending state on next load.
-    await this.writeBootstrapSuppressionMarker(workspaceDir, this.now().toISOString());
-    await fs.rm(path.join(workspaceDir, BOOTSTRAP_FILENAME), { force: true });
-    await this.assertBootstrapSuppressed(workspaceDir);
-    return { filesWritten, bootstrapSuppressed: true };
+
+    // Validate the prospective complete set before writing either hot file.
+    // This is especially important for SOUL.md, whose body is user-editable.
+    const prospective = await readWorkspaceDoctrineFiles(workspaceDir);
+    for (const [file, rendered] of renderedUpdates) prospective[file] = rendered;
+    assertDoctrineFileSet(prospective, `persona update for ${params.openclawId}`);
+
+    // A hot update spans four files/facts and therefore cannot be made as one
+    // filesystem transaction. Snapshot the exact prior bytes and restore them
+    // on ANY write/read-back failure. The API relies on this guarantee before
+    // committing the matching DB persona.
+    const snapshots = await Promise.all(
+      [
+        ...PERSONA_TEMPLATE_FILES.map((relPath) => path.join(workspaceDir, relPath)),
+        path.join(workspaceDir, WORKSPACE_STATE_FILENAME),
+        path.join(workspaceDir, BOOTSTRAP_FILENAME),
+      ].map(snapshotWorkspaceFile),
+    );
+    const filesWritten: string[] = [];
+    let mutationStarted = false;
+    try {
+      for (const relPath of PERSONA_TEMPLATE_FILES) {
+        const rendered = renderedUpdates.get(relPath);
+        if (rendered === undefined) {
+          throw new ProvisionError(`missing rendered persona template ${relPath}`);
+        }
+        mutationStarted = true;
+        await fs.writeFile(path.join(workspaceDir, relPath), rendered, 'utf8');
+        filesWritten.push(relPath);
+      }
+      // Re-assert the durable suppression invariant so a persona edit can never
+      // leave the workspace in a bootstrap-pending state on next load.
+      await this.writeBootstrapSuppressionMarker(workspaceDir, this.now().toISOString());
+      await fs.rm(path.join(workspaceDir, BOOTSTRAP_FILENAME), { force: true });
+      await this.afterBootstrapSuppression(workspaceDir);
+      await this.assertBootstrapSuppressed(workspaceDir);
+      await assertWorkspacePersonaDoctrine(workspaceDir);
+      return { filesWritten, bootstrapSuppressed: true };
+    } catch (err) {
+      if (mutationStarted) {
+        try {
+          for (const snapshot of snapshots) await restoreWorkspaceFile(snapshot);
+        } catch (rollbackErr) {
+          throw new ProvisionError(
+            `persona update failed and workspace rollback also failed for ${params.openclawId}: ` +
+              `${(err as Error).message}; rollback: ${(rollbackErr as Error).message}`,
+          );
+        }
+      }
+      throw err;
+    }
   }
 
   /**
-   * Find the agent's `agents.list` registration: `openclaw agents list --json`
-   * when the CLI is reachable, else fall back to reading openclaw.json from
-   * the host data dir (same source of truth).
+   * Find the agent's `agents.list` registration. Prefer the host-mounted
+   * openclaw.json: it is the same source of truth as `openclaw agents list`,
+   * and avoids booting a second CLI process that takes roughly a minute with
+   * the migrated 700+ agent fleet. A missing/legacy config without an
+   * `agents.list` falls back to the CLI for compatibility.
    */
   private async findRegisteredAgent(
     openclawId: string,
   ): Promise<{ id: string; model?: string } | undefined> {
     let entries: { id: string; model?: string }[];
     try {
-      const raw = await this.cli.execJson<unknown>(['agents', 'list']);
-      entries = agentsListSchema.parse(raw);
-    } catch {
       const config = await readOpenClawConfig(this.dataDir);
       const agents = config.agents;
       const list =
         typeof agents === 'object' && agents !== null && !Array.isArray(agents)
           ? (agents as Record<string, unknown>).list
           : undefined;
-      const parsed = agentsListSchema.safeParse(list ?? []);
-      entries = parsed.success ? parsed.data : [];
+      if (list !== undefined) {
+        entries = agentsListSchema.parse(list);
+      } else {
+        const raw = await this.cli.execJson<unknown>(['agents', 'list']);
+        entries = agentsListSchema.parse(raw);
+      }
+    } catch {
+      const raw = await this.cli.execJson<unknown>(['agents', 'list']);
+      entries = agentsListSchema.parse(raw);
     }
     const found = entries.find((entry) => entry.id === openclawId);
     if (found === undefined) return undefined;
@@ -582,14 +735,15 @@ function sleep(ms: number): Promise<void> {
 
 /**
  * Reimplementation of OpenClaw's `resolveWorkspaceBootstrapStatus`
- * (`dist/workspace-*.js` in image 2026.6.10) — the EXACT per-turn predicate that
- * decides whether an agent gets the blank-slate BOOTSTRAP handoff prompt or its
- * normal SOUL-based prompt. Kept here as the single durable-marker contract the
- * provisioner enforces and the tests assert against.
+ * (source-reverified against OpenClaw 2026.7.1) — the EXACT per-turn predicate
+ * that decides whether an agent gets the blank-slate BOOTSTRAP handoff prompt
+ * or its normal SOUL-based prompt. Kept here as the single durable-marker
+ * contract the provisioner enforces and the tests assert against.
  *
  * The gateway checks TWO disk facts at the workspace ROOT and NOTHING else — not
- * the state sqlite (its `workspace_setup_state` table is DDL-only in 6.10 and is
- * never read), not any in-memory flag (which is why a restart re-runs this):
+ * the state sqlite (its `workspace_setup_state` table remains DDL-only in 7.1
+ * and is never read), not any in-memory flag (which is why a restart re-runs
+ * this):
  *
  *   status = "complete"  when  openclaw-workspace-state.json has a non-empty
  *                              string `setupCompletedAt`
@@ -617,4 +771,34 @@ export async function workspaceBootstrapStatus(
   if (typeof setupCompletedAt === 'string' && setupCompletedAt.trim().length > 0) return 'complete';
   if (!(await fileExists(path.join(workspaceDir, BOOTSTRAP_FILENAME)))) return 'complete';
   return 'pending';
+}
+
+/**
+ * Eden's stricter post-write contract: the root state marker must contain a
+ * non-empty `setupCompletedAt` AND `BOOTSTRAP.md` must be absent. OpenClaw's
+ * runtime predicate is an OR, intentionally preserved by
+ * {@link workspaceBootstrapStatus}; this assertion verifies the redundant pair
+ * Eden itself promises to write.
+ */
+export async function assertBootstrapSuppressionInvariants(workspaceDir: string): Promise<void> {
+  let setupCompletedAt: unknown;
+  try {
+    const raw = await fs.readFile(path.join(workspaceDir, WORKSPACE_STATE_FILENAME), 'utf8');
+    setupCompletedAt = (JSON.parse(raw) as { setupCompletedAt?: unknown }).setupCompletedAt;
+  } catch {
+    setupCompletedAt = undefined;
+  }
+  const markerPresent =
+    typeof setupCompletedAt === 'string' && setupCompletedAt.trim().length > 0;
+  const bootstrapPresent = await fileExists(path.join(workspaceDir, BOOTSTRAP_FILENAME));
+  if (!markerPresent || bootstrapPresent) {
+    const runtimeStatus = await workspaceBootstrapStatus(workspaceDir);
+    throw new ProvisionError(
+      `bootstrap suppression failed for ${workspaceDir}: strict post-write readback ` +
+        `requires a non-empty setupCompletedAt in ${WORKSPACE_STATE_FILENAME} AND no ` +
+        `${BOOTSTRAP_FILENAME} (marker=${markerPresent ? 'present' : 'missing'}, ` +
+        `bootstrap=${bootstrapPresent ? 'present' : 'absent'}, runtime=${runtimeStatus}). ` +
+        'The agent could otherwise regress to the blank-slate ritual after one invariant is lost.',
+    );
+  }
 }

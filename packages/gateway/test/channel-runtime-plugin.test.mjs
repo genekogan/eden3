@@ -1,0 +1,1469 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  buildHostedChannelAccountMap,
+} from '../../../infra/openclaw/plugins/eden3-channel-runtime/account-map.js';
+import {
+  channelRuntimeBridgeInternals,
+  createEdenChannelRuntimeBridge,
+} from '../../../infra/openclaw/plugins/eden3-channel-runtime/bridge.js';
+import {
+  ChannelRuntimeClientError,
+  createChannelRuntimeClient,
+  validateChannelRuntimeBaseUrl,
+} from '../../../infra/openclaw/plugins/eden3-channel-runtime/runtime-client.js';
+
+const CONNECTION_A = '11111111-1111-4111-8111-111111111111';
+const CONNECTION_B = '22222222-2222-4222-8222-222222222222';
+const RUN_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const RUN_B = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const EDEN_SESSION_A = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const EDEN_SESSION_B = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+const PEER_A = '963544662646354001';
+const PEER_B = '1532630091471786166';
+const SESSION_A = 'agent:agent-a:discord:account-a:direct:963544662646354001';
+const SESSION_B = 'agent:agent-b:discord:account-b:direct:1532630091471786166';
+const TELEGRAM_SESSION_A = 'agent:agent-a:telegram:account-a:direct:963544662646354001';
+const MEMORY_A = 'memory/users/alice-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.md';
+
+function hostedConfig(overrides = {}) {
+  return {
+    agents: {
+      defaults: {
+        model: { primary: 'anthropic/claude-haiku-4-5' },
+        models: {
+          'anthropic/claude-sonnet-4-6': { agentRuntime: { id: 'claude-cli' } },
+          'anthropic/claude-haiku-4-5': { agentRuntime: { id: 'openclaw' } },
+        },
+      },
+      list: [
+        { id: 'agent-a', model: 'anthropic/claude-sonnet-4-6' },
+        { id: 'agent-b', model: 'anthropic/claude-haiku-4-5' },
+      ],
+    },
+    channels: {
+      discord: {
+        enabled: true,
+        accounts: {
+          // config.current() exposes resolved values here. The runtime mapping
+          // must not inspect either credential field.
+          'account-a': { enabled: true, groupPolicy: 'disabled', token: 'resolved-value-a' },
+          'account-b': { enabled: true, groupPolicy: 'disabled', token: 'resolved-value-b' },
+        },
+      },
+    },
+    bindings: [
+      { agentId: 'agent-a', match: { channel: 'discord', accountId: 'account-a' } },
+      { agentId: 'agent-b', match: { channel: 'discord', accountId: 'account-b' } },
+    ],
+    plugins: {
+      entries: {
+        'eden3-channel-runtime': {
+          config: {
+            accounts: [
+              {
+                channel: 'discord',
+                accountId: 'account-a',
+                connectionId: CONNECTION_A,
+                agentId: 'agent-a',
+                model: 'anthropic/claude-sonnet-4-6',
+                agentRuntime: 'claude-cli',
+              },
+              {
+                channel: 'discord',
+                accountId: 'account-b',
+                connectionId: CONNECTION_B,
+                agentId: 'agent-b',
+                model: 'anthropic/claude-haiku-4-5',
+                agentRuntime: 'openclaw',
+              },
+            ],
+          },
+        },
+      },
+    },
+    ...overrides,
+  };
+}
+
+function hostedPluginConfig(config) {
+  return config.plugins.entries['eden3-channel-runtime'].config;
+}
+
+function telegramHostedConfig() {
+  const config = hostedConfig();
+  config.channels = {
+    telegram: {
+      enabled: true,
+      accounts: {
+        'account-a': { enabled: true, groupPolicy: 'disabled', botToken: 'resolved-value-a' },
+      },
+    },
+  };
+  config.bindings = [
+    { agentId: 'agent-a', match: { channel: 'telegram', accountId: 'account-a' } },
+  ];
+  config.plugins.entries['eden3-channel-runtime'].config.accounts = [
+    {
+      channel: 'telegram',
+      accountId: 'account-a',
+      connectionId: CONNECTION_A,
+      agentId: 'agent-a',
+      model: 'anthropic/claude-sonnet-4-6',
+      agentRuntime: 'claude-cli',
+    },
+  ];
+  return config;
+}
+
+function mockBridge(config = hostedConfig(), handlers = {}) {
+  const calls = [];
+  const client = {
+    post: vi.fn(async (path, body, options) => {
+      calls.push({ path, body: structuredClone(body), options });
+      if (handlers[path]) return handlers[path](body, options);
+      if (path === '/channels/runtime/messages' && body.role === 'user') {
+        return {
+          ok: true,
+          sessionId: body.runtimeAccountId === 'account-a' ? EDEN_SESSION_A : EDEN_SESSION_B,
+          memoryContext: { linkState: 'linked', relativePath: MEMORY_A },
+        };
+      }
+      if (path === '/channels/runtime/turns/reserve') {
+        const isA = body.runtimeAccountId === 'account-a';
+        return {
+          ok: true,
+          turnId: body.turnId,
+          model: isA ? 'anthropic/claude-sonnet-4-6' : 'anthropic/claude-haiku-4-5',
+          agentRuntime: isA ? 'claude-cli' : 'openclaw',
+          pricingBasis: isA ? 'notional-subscription' : 'provider-api',
+        };
+      }
+      return { ok: true };
+    }),
+  };
+  const api = {
+    pluginConfig: hostedPluginConfig(config),
+    runtime: { config: { current: () => config } },
+  };
+  return { bridge: createEdenChannelRuntimeBridge({ api, client, now: () => 1_800_000_000_000 }), calls };
+}
+
+function receiveA(bridge, overrides = {}) {
+  bridge.onMessageReceived(
+    {
+      content: 'hello from Discord',
+      timestamp: 1_800_000_000_000,
+      messageId: '1532630091471786166',
+      senderId: PEER_A,
+      from: `discord:${PEER_A}`,
+      // Identity-looking metadata is untrusted and must have no effect.
+      metadata: {
+        messageId: '1532630091471786166',
+        connectionId: CONNECTION_B,
+        runtimeAccountId: 'account-b',
+        senderId: PEER_A,
+      },
+      ...overrides.event,
+    },
+    {
+      channelId: 'discord',
+      accountId: 'account-a',
+      conversationId: '963544662646354001',
+      sessionKey: SESSION_A,
+      messageId: '1532630091471786166',
+      senderId: PEER_A,
+      ...overrides.context,
+    },
+  );
+}
+
+function receiveTelegramA(bridge, overrides = {}) {
+  bridge.onMessageReceived(
+    {
+      content: 'hello from Telegram',
+      timestamp: 1_800_000_000_000,
+      messageId: '42',
+      senderId: PEER_A,
+      from: `telegram:${PEER_A}`,
+      metadata: { messageId: '42', senderId: PEER_A },
+      ...overrides.event,
+    },
+    {
+      channelId: 'telegram',
+      accountId: 'account-a',
+      conversationId: PEER_A,
+      sessionKey: TELEGRAM_SESSION_A,
+      messageId: '42',
+      senderId: PEER_A,
+      ...overrides.context,
+    },
+  );
+}
+
+describe('hosted channel account mapping', () => {
+  it('never reuses a connection UUID as the turn id for a legacy non-UUID run id', () => {
+    const first = channelRuntimeBridgeInternals.uuidFromParts('legacy-run-one', CONNECTION_A, 'm1');
+    const second = channelRuntimeBridgeInternals.uuidFromParts('legacy-run-two', CONNECTION_A, 'm2');
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second).toMatch(/^[0-9a-f-]{36}$/);
+    expect(first).not.toBe(CONNECTION_A);
+    expect(second).not.toBe(CONNECTION_A);
+    expect(first).not.toBe(second);
+  });
+
+  it('derives connection identity only from validated non-secret plugin config', () => {
+    const config = hostedConfig();
+    const map = buildHostedChannelAccountMap(config, hostedPluginConfig(config));
+    expect(map.resolve('discord', 'account-a')).toEqual({
+      kind: 'valid',
+      mapping: {
+        channel: 'discord',
+        runtimeAccountId: 'account-a',
+        connectionId: CONNECTION_A,
+        agentId: 'agent-a',
+        model: {
+          ref: 'anthropic/claude-sonnet-4-6',
+          provider: 'anthropic',
+          model: 'claude-sonnet-4-6',
+        },
+        agentRuntime: 'claude-cli',
+      },
+    });
+    expect(map.resolve('discord', 'account-b').mapping.agentRuntime).toBe('openclaw');
+    expect(map.resolve('telegram', 'account-a')).toEqual({ kind: 'not-hosted' });
+  });
+
+  it('never reads resolved token values and fails closed on duplicate mapped ownership', () => {
+    const config = hostedConfig();
+    config.channels.discord.accounts['account-a'] = new Proxy(
+      { enabled: true, groupPolicy: 'disabled' },
+      {
+        get(target, property, receiver) {
+          if (property === 'token' || property === 'botToken') {
+            throw new Error('credential field was read');
+          }
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    expect(
+      buildHostedChannelAccountMap(config, hostedPluginConfig(config)).resolve(
+        'discord',
+        'account-a',
+      ).kind,
+    ).toBe('valid');
+
+    const duplicate = hostedConfig();
+    duplicate.plugins.entries['eden3-channel-runtime'].config.accounts[1].connectionId =
+      CONNECTION_A;
+    const map = buildHostedChannelAccountMap(duplicate, hostedPluginConfig(duplicate));
+    expect(map.resolve('discord', 'account-a')).toEqual({ kind: 'invalid' });
+    expect(map.resolve('discord', 'account-b')).toEqual({ kind: 'invalid' });
+    expect(map.list()).toEqual([]);
+  });
+});
+
+describe('OpenClaw hosted-channel lifecycle bridge', () => {
+  it('syncs inbound, injects canonical memory, reserves before work, settles exact usage, and mirrors output', async () => {
+    const { bridge, calls } = mockBridge();
+    receiveA(bridge);
+
+    // A persisted native /model override cannot change the bound Eden model.
+    expect(
+      bridge.onBeforeModelResolve(
+        { prompt: 'normal message after /model' },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          messageProvider: 'discord',
+          modelProviderId: 'attacker-provider',
+          modelId: 'attacker-model',
+        },
+      ),
+    ).toEqual({ providerOverride: 'anthropic', modelOverride: 'claude-sonnet-4-6' });
+
+    const promptResult = await bridge.onBeforePromptBuild(
+      { prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord' },
+    );
+    expect(promptResult.prependSystemContext).toContain(`\`${MEMORY_A}\``);
+    expect(promptResult.prependSystemContext).toContain('Identity link state: linked.');
+    expect(promptResult.prependSystemContext).not.toContain(CONNECTION_A);
+    expect(promptResult.prependSystemContext).not.toContain(PEER_A);
+
+    await expect(
+      bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          messageProvider: 'discord',
+          agentId: 'agent-a',
+        },
+      ),
+    ).resolves.toEqual({ outcome: 'pass' });
+
+    // llm_output is fire-and-forget and may not have been observed yet. The
+    // final hook's aggregate usageState is sufficient to gate settlement.
+    await expect(
+      bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'assistant answer' },
+          usageState: {
+            usage: { input: 17, output: 5, cacheRead: 7, cacheWrite: 2, total: 31 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+            resolvedRef: 'claude-cli/claude-sonnet-4-6',
+          },
+        },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786166',
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    const businessCalls = calls.filter((call) => call.path !== '/channels/runtime/status');
+    expect(businessCalls.map((call) => call.path)).toEqual([
+      '/channels/runtime/messages',
+      '/channels/runtime/turns/reserve',
+      `/channels/runtime/turns/${RUN_A}/settle`,
+      '/channels/runtime/messages',
+    ]);
+    expect(businessCalls[0].body).toMatchObject({
+      connectionId: CONNECTION_A,
+      runtimeAccountId: 'account-a',
+      conversationId: '963544662646354001',
+      peerId: PEER_A,
+      role: 'user',
+      content: 'hello from Discord',
+    });
+    expect(businessCalls[1].body).toEqual({
+      turnId: RUN_A,
+      connectionId: CONNECTION_A,
+      runtimeAccountId: 'account-a',
+      sessionId: EDEN_SESSION_A,
+      externalMessageId: '1532630091471786166',
+    });
+    expect(businessCalls[2].body).toEqual({
+      usage: {
+        promptTokens: 17,
+        completionTokens: 5,
+        cachedTokens: 7,
+        cacheWriteTokens: 2,
+        totalTokens: 31,
+      },
+      provider: 'claude-cli',
+      model: 'claude-sonnet-4-6',
+      agentRuntime: 'claude-cli',
+    });
+    expect(businessCalls[3].body).toMatchObject({
+      connectionId: CONNECTION_A,
+      runtimeAccountId: 'account-a',
+      gatewaySessionKey: SESSION_A,
+      peerId: PEER_A,
+      role: 'assistant',
+      content: 'assistant answer',
+      externalMessageId: `eden-channel-assistant:${RUN_A}`,
+    });
+  });
+
+  it('keeps two bot accounts isolated and ignores caller-supplied connection metadata', async () => {
+    const { bridge, calls } = mockBridge();
+    receiveA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    bridge.onMessageReceived(
+      {
+        content: 'hello to bot B',
+        messageId: '1532630091471786167',
+        senderId: PEER_B,
+        from: `discord:${PEER_B}`,
+        metadata: {
+          messageId: '1532630091471786167',
+          connectionId: CONNECTION_A,
+          runtimeAccountId: 'account-a',
+          senderId: PEER_B,
+        },
+      },
+      {
+        channelId: 'discord',
+        accountId: 'account-b',
+        conversationId: PEER_B,
+        sessionKey: SESSION_B,
+        messageId: '1532630091471786167',
+        senderId: PEER_B,
+      },
+    );
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-b', senderId: PEER_B, prompt: 'hello', messages: [] },
+      { runId: RUN_B, sessionKey: SESSION_B, messageProvider: 'discord', agentId: 'agent-b' },
+    );
+    const userSyncs = calls.filter(
+      (call) => call.path === '/channels/runtime/messages' && call.body.role === 'user',
+    );
+    expect(userSyncs.map((call) => [call.body.runtimeAccountId, call.body.connectionId])).toEqual([
+      ['account-a', CONNECTION_A],
+      ['account-b', CONNECTION_B],
+    ]);
+    expect(
+      calls
+        .filter((call) => call.path === '/channels/runtime/turns/reserve')
+        .map((call) => [call.body.runtimeAccountId, call.body.sessionId]),
+    ).toEqual([
+      ['account-a', EDEN_SESSION_A],
+      ['account-b', EDEN_SESSION_B],
+    ]);
+  });
+
+  it('accepts the 7.1 runless message_received shape and claims concurrent session turns FIFO', async () => {
+    const { bridge, calls } = mockBridge();
+    receiveA(bridge);
+    receiveA(bridge, {
+      event: {
+        content: 'second queued message',
+        messageId: '1532630091471786168',
+        metadata: { messageId: '1532630091471786168', senderId: PEER_A },
+      },
+      context: { messageId: '1532630091471786168' },
+    });
+
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'first', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'second', messages: [] },
+      { runId: RUN_B, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+
+    expect(
+      calls
+        .filter((call) => call.path === '/channels/runtime/turns/reserve')
+        .map((call) => [call.body.turnId, call.body.externalMessageId]),
+    ).toEqual([
+      [RUN_A, '1532630091471786166'],
+      [RUN_B, '1532630091471786168'],
+    ]);
+  });
+
+  it('gives a queued turn a fresh full correlation lease when its provider run starts', async () => {
+    vi.useFakeTimers();
+    try {
+      const { bridge, calls } = mockBridge();
+      receiveA(bridge);
+      receiveA(bridge, {
+        event: {
+          content: 'second queued message',
+          messageId: '1532630091471786168',
+          metadata: { messageId: '1532630091471786168', senderId: PEER_A },
+        },
+        context: { messageId: '1532630091471786168' },
+      });
+
+      await bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'first', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      );
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000 + 30_000);
+      await bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'second', messages: [] },
+        { runId: RUN_B, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      );
+
+      // The original inbound timer would expire five minutes into this run.
+      // Advance through an entire valid provider ceiling from B's actual
+      // claim: B must remain reserved and exactly correlatable.
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000 + 30_000);
+      expect(
+        calls.some((call) => call.path === `/channels/runtime/turns/${RUN_B}/refund`),
+      ).toBe(false);
+      await expect(
+        bridge.onReplyPayloadSending(
+          {
+            kind: 'final',
+            runId: RUN_B,
+            payload: { text: 'second answer' },
+            usageState: {
+              usage: { input: 3, output: 2, total: 5 },
+              provider: 'claude-cli',
+              model: 'claude-sonnet-4-6',
+            },
+          },
+          {
+            runId: RUN_B,
+            sessionKey: SESSION_A,
+            channelId: 'discord',
+            accountId: 'account-a',
+            messageId: '1532630091471786168',
+          },
+        ),
+      ).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a protected reply whose run or inbound message identity drifts', async () => {
+    const wrongRun = mockBridge();
+    receiveA(wrongRun.bridge);
+    await wrongRun.bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await expect(
+      wrongRun.bridge.onReplyPayloadSending(
+        { kind: 'final', runId: RUN_B, payload: { text: 'must not send' } },
+        {
+          runId: RUN_B,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786166',
+        },
+      ),
+    ).resolves.toEqual({
+      cancel: true,
+      reason: 'Eden channel turn correlation unavailable',
+    });
+
+    const wrongMessage = mockBridge();
+    receiveA(wrongMessage.bridge);
+    await wrongMessage.bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await expect(
+      wrongMessage.bridge.onReplyPayloadSending(
+        { kind: 'final', runId: RUN_A, payload: { text: 'must not send' } },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786999',
+        },
+      ),
+    ).resolves.toEqual({ cancel: true, reason: 'Eden channel identity mismatch' });
+    expect(
+      wrongMessage.calls.some(
+        (call) => call.path === `/channels/runtime/turns/${RUN_A}/refund`,
+      ),
+    ).toBe(true);
+
+    const missingMessage = mockBridge();
+    receiveA(missingMessage.bridge);
+    await missingMessage.bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await expect(
+      missingMessage.bridge.onReplyPayloadSending(
+        { kind: 'final', runId: RUN_A, payload: { text: 'must not send' } },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+        },
+      ),
+    ).resolves.toEqual({ cancel: true, reason: 'Eden channel identity mismatch' });
+    expect(
+      missingMessage.calls.some(
+        (call) => call.path === `/channels/runtime/turns/${RUN_A}/refund`,
+      ),
+    ).toBe(true);
+  });
+
+  it('blocks group transcripts before memory, provider work, or outward delivery', async () => {
+    const { bridge, calls } = mockBridge();
+    const groupSession = 'agent:agent-a:discord:channel:758719600895590444';
+    bridge.onMessageReceived(
+      {
+        content: 'group message',
+        messageId: '1532630091471786199',
+        senderId: PEER_A,
+        from: 'discord:channel:758719600895590444',
+        metadata: {
+          messageId: '1532630091471786199',
+          chatType: 'channel',
+          guildId: '758719600895590441',
+          senderId: PEER_A,
+        },
+      },
+      {
+        channelId: 'discord',
+        accountId: 'account-a',
+        conversationId: '758719600895590444',
+        sessionKey: groupSession,
+        messageId: '1532630091471786199',
+        senderId: PEER_A,
+      },
+    );
+
+    await expect(
+      bridge.onBeforePromptBuild(
+        { prompt: 'group message', messages: [] },
+        { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord' },
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'group message', messages: [] },
+        { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block', category: 'policy' });
+    await expect(
+      bridge.onReplyPayloadSending(
+        { kind: 'final', runId: RUN_A, payload: { text: 'must not enter group' } },
+        {
+          runId: RUN_A,
+          sessionKey: groupSession,
+          channelId: 'discord',
+          accountId: 'account-a',
+        },
+      ),
+    ).resolves.toEqual({
+      cancel: true,
+      reason: 'Eden hosted group delivery is disabled',
+    });
+    expect(calls.some((call) => call.path === '/channels/runtime/messages')).toBe(false);
+    expect(calls.some((call) => call.path.includes('/turns/'))).toBe(false);
+  });
+
+  it('blocks malformed hosted mappings or missing inbound sync before provider work', async () => {
+    const duplicate = hostedConfig();
+    duplicate.plugins.entries['eden3-channel-runtime'].config.accounts[1].connectionId =
+      CONNECTION_A;
+    const { bridge, calls } = mockBridge(duplicate);
+    receiveA(bridge);
+    const result = await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    expect(result).toMatchObject({ outcome: 'block', category: 'policy' });
+    expect(calls.some((call) => call.path.includes('/turns/reserve'))).toBe(false);
+  });
+
+  it('rejects invalid session identity or reserve provenance and refunds a claimed turn', async () => {
+    const invalidSession = mockBridge(hostedConfig(), {
+      '/channels/runtime/messages': async () => ({
+        ok: true,
+        sessionId: 'not-a-uuid',
+        memoryContext: { linkState: 'linked', relativePath: MEMORY_A },
+      }),
+    });
+    receiveA(invalidSession.bridge);
+    await expect(
+      invalidSession.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block' });
+    expect(invalidSession.calls.some((call) => call.path.endsWith('/reserve'))).toBe(false);
+
+    const drifted = mockBridge(hostedConfig(), {
+      '/channels/runtime/turns/reserve': async (body) => ({
+        ok: true,
+        turnId: body.turnId,
+        model: 'openai/gpt-5.5',
+        agentRuntime: 'openclaw',
+        pricingBasis: 'provider-api',
+      }),
+    });
+    receiveA(drifted.bridge);
+    await expect(
+      drifted.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block' });
+    expect(drifted.calls.some((call) => call.path.endsWith(`/${RUN_A}/refund`))).toBe(true);
+    await expect(
+      drifted.bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'This channel turn could not be started.' },
+        },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786166',
+        },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it('refunds provider failures and cancels output when settlement fails', async () => {
+    const { bridge, calls } = mockBridge(hostedConfig(), {
+      [`/channels/runtime/turns/${RUN_A}/settle`]: async () => {
+        throw new Error('private upstream detail');
+      },
+    });
+    receiveA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    bridge.onLlmOutput(
+      {
+        runId: RUN_A,
+        provider: 'claude-cli',
+        model: 'claude-sonnet-4-6',
+        resolvedRef: 'claude-cli/claude-sonnet-4-6',
+        usage: { input: 1, output: 1, total: 2 },
+      },
+      { runId: RUN_A },
+    );
+    const result = await bridge.onReplyPayloadSending(
+      { kind: 'final', runId: RUN_A, payload: { text: 'must not send' } },
+      {
+        runId: RUN_A,
+        sessionKey: SESSION_A,
+        channelId: 'discord',
+        accountId: 'account-a',
+        messageId: '1532630091471786166',
+      },
+    );
+    expect(result).toEqual({ cancel: true, reason: 'Eden channel settlement failed' });
+    expect(calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/refund`)).toBe(true);
+    expect(calls.some((call) => call.body?.role === 'assistant')).toBe(false);
+    await expect(
+      bridge.onReplyPayloadSending(
+        { kind: 'final', runId: RUN_A, payload: { text: 'retry must not send' } },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786166',
+        },
+      ),
+    ).resolves.toEqual({ cancel: true, reason: 'Eden channel delivery is blocked' });
+
+    const second = mockBridge();
+    receiveA(second.bridge);
+    await second.bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await second.bridge.onAgentEnd(
+      { runId: RUN_A, success: false, messages: [], error: 'provider private detail' },
+      { runId: RUN_A, sessionKey: SESSION_A },
+    );
+    expect(
+      second.calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/refund`),
+    ).toBe(true);
+    await expect(
+      second.bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'The provider failed. Please try again.', isError: true },
+        },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786166',
+        },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it('compensates a settled turn when assistant sync fails before delivery', async () => {
+    const { bridge, calls } = mockBridge(hostedConfig(), {
+      '/channels/runtime/messages': async (body) => {
+        if (body.role === 'user') {
+          return {
+            ok: true,
+            sessionId: EDEN_SESSION_A,
+            memoryContext: { linkState: 'linked', relativePath: MEMORY_A },
+          };
+        }
+        throw new Error('database unavailable');
+      },
+    });
+    receiveA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+
+    await expect(
+      bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'must not escape without sync' },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+            resolvedRef: 'claude-cli/claude-sonnet-4-6',
+          },
+        },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786166',
+        },
+      ),
+    ).resolves.toEqual({
+      cancel: true,
+      reason: 'Eden channel assistant synchronization failed',
+    });
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/settle`),
+    ).toBe(true);
+    expect(
+      calls.some(
+        (call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`,
+      ),
+    ).toBe(true);
+  });
+
+  it('compensates the exact host-propagated Telegram run on delivery failure', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    receiveTelegramA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
+    await expect(
+      bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'assistant answer' },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+            resolvedRef: 'claude-cli/claude-sonnet-4-6',
+          },
+        },
+        {
+          runId: RUN_A,
+          sessionKey: TELEGRAM_SESSION_A,
+          channelId: 'telegram',
+          accountId: 'account-a',
+          messageId: '42',
+        },
+      ),
+    ).resolves.toBeUndefined();
+
+    // Eden's pinned host patch propagates reply_payload_sending.runId through
+    // the otherwise runless Telegram delivery path into message_sent.
+    bridge.onMessageSent(
+      {
+        to: PEER_A,
+        content: 'assistant answer',
+        runId: RUN_A,
+        success: false,
+        error: 'network timeout',
+      },
+      {
+        channelId: 'telegram',
+        accountId: 'account-a',
+        conversationId: PEER_A,
+        runId: RUN_A,
+      },
+    );
+
+    await vi.waitFor(() =>
+      expect(
+        calls.some(
+          (call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`,
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it('durably acknowledges the exact successful native delivery', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    receiveTelegramA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
+    await bridge.onReplyPayloadSending(
+      {
+        kind: 'final',
+        runId: RUN_A,
+        payload: { text: 'assistant answer' },
+        usageState: {
+          usage: { input: 3, output: 2, total: 5 },
+          provider: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+        },
+      },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        channelId: 'telegram',
+        accountId: 'account-a',
+        messageId: '42',
+      },
+    );
+
+    await bridge.onMessageSent(
+      { to: PEER_A, content: 'assistant answer', runId: RUN_A, success: true },
+      {
+        channelId: 'telegram',
+        accountId: 'account-a',
+        conversationId: PEER_A,
+        runId: RUN_A,
+      },
+    );
+
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivered`),
+    ).toBe(true);
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
+    ).toBe(false);
+  });
+
+  it('keeps retried reply approval idempotent in exact outbound correlation', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    receiveTelegramA(bridge);
+    receiveTelegramA(bridge, {
+      event: { content: 'second message', messageId: '43' },
+      context: { messageId: '43' },
+    });
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'first', messages: [] },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'second', messages: [] },
+      {
+        runId: RUN_B,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
+    const approve = (runId, messageId, text) =>
+      bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId,
+          payload: { text },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+          },
+        },
+        {
+          runId,
+          sessionKey: TELEGRAM_SESSION_A,
+          channelId: 'telegram',
+          accountId: 'account-a',
+          messageId,
+        },
+      );
+    await approve(RUN_A, '42', 'first answer');
+    await approve(RUN_A, '42', 'first answer');
+    await approve(RUN_B, '43', 'second answer');
+
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'first answer', runId: RUN_A, success: true },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_A },
+    );
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'second answer', runId: RUN_B, success: false, error: 'network timeout' },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_B },
+    );
+
+    await vi.waitFor(() =>
+      expect(
+        calls.some(
+          (call) => call.path === `/channels/runtime/turns/${RUN_B}/delivery-failed`,
+        ),
+      ).toBe(true),
+    );
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
+    ).toBe(false);
+  });
+
+  it('correlates out-of-order Telegram callbacks by exact propagated run id', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    receiveTelegramA(bridge);
+    receiveTelegramA(bridge, {
+      event: { content: 'second message', messageId: '43' },
+      context: { messageId: '43' },
+    });
+    const run = async (runId, messageId, prompt, answer) => {
+      await bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt, messages: [] },
+        {
+          runId,
+          sessionKey: TELEGRAM_SESSION_A,
+          messageProvider: 'telegram',
+          agentId: 'agent-a',
+        },
+      );
+      await bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId,
+          payload: { text: answer },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+          },
+        },
+        {
+          runId,
+          sessionKey: TELEGRAM_SESSION_A,
+          channelId: 'telegram',
+          accountId: 'account-a',
+          messageId,
+        },
+      );
+    };
+    await run(RUN_A, '42', 'first', 'first answer');
+    await run(RUN_B, '43', 'second', 'second answer');
+
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'second answer', runId: RUN_B, success: false, error: 'network timeout' },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_B },
+    );
+    await vi.waitFor(() =>
+      expect(
+        calls.some(
+          (call) => call.path === `/channels/runtime/turns/${RUN_B}/delivery-failed`,
+        ),
+      ).toBe(true),
+    );
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
+    ).toBe(false);
+
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'first answer', runId: RUN_A, success: true },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_A },
+    );
+    await Promise.resolve();
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
+    ).toBe(false);
+  });
+
+  it('does not consume a runless Telegram turn for byte-identical unrelated output', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    receiveTelegramA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
+    await bridge.onReplyPayloadSending(
+      {
+        kind: 'final',
+        runId: RUN_A,
+        payload: { text: 'assistant answer' },
+        usageState: {
+          usage: { input: 3, output: 2, total: 5 },
+          provider: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+        },
+      },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        channelId: 'telegram',
+        accountId: 'account-a',
+        messageId: '42',
+      },
+    );
+
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'assistant answer', success: true },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A },
+    );
+    await Promise.resolve();
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
+    ).toBe(false);
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivered`),
+    ).toBe(false);
+
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'assistant answer', runId: RUN_A, success: false },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_A },
+    );
+    await vi.waitFor(() =>
+      expect(
+        calls.some(
+          (call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`,
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it('fails closed when duplicate Telegram content cannot identify one turn', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    receiveTelegramA(bridge);
+    receiveTelegramA(bridge, {
+      event: { content: 'second message', messageId: '43' },
+      context: { messageId: '43' },
+    });
+    const approve = async (runId, messageId, prompt) => {
+      await bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt, messages: [] },
+        {
+          runId,
+          sessionKey: TELEGRAM_SESSION_A,
+          messageProvider: 'telegram',
+          agentId: 'agent-a',
+        },
+      );
+      await bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId,
+          payload: { text: 'same answer' },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+          },
+        },
+        {
+          runId,
+          sessionKey: TELEGRAM_SESSION_A,
+          channelId: 'telegram',
+          accountId: 'account-a',
+          messageId,
+        },
+      );
+    };
+    await approve(RUN_A, '42', 'first');
+    await approve(RUN_B, '43', 'second');
+
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'same answer', success: false },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A },
+    );
+    await Promise.resolve();
+    expect(
+      calls.some((call) => call.path.endsWith('/delivery-failed')),
+    ).toBe(false);
+  });
+
+  it('does not correlate an ambiguous Telegram delivery failure', async () => {
+    const { bridge, calls } = mockBridge(telegramHostedConfig());
+    receiveTelegramA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
+    await bridge.onReplyPayloadSending(
+      {
+        kind: 'final',
+        runId: RUN_A,
+        payload: { text: 'assistant answer' },
+        usageState: {
+          usage: { input: 3, output: 2, total: 5 },
+          provider: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+        },
+      },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        channelId: 'telegram',
+        accountId: 'account-a',
+        messageId: '42',
+      },
+    );
+
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'assistant answer', runId: RUN_A, success: false, error: 'network timeout' },
+      {
+        channelId: 'telegram',
+        accountId: 'account-a',
+        conversationId: PEER_B,
+        runId: RUN_A,
+      },
+    );
+    await Promise.resolve();
+    expect(
+      calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
+    ).toBe(false);
+
+    // The mismatched event did not consume the FIFO entry; the subsequent
+    // exact hook can still compensate the correct settled turn.
+    bridge.onMessageSent(
+      { to: PEER_A, content: 'assistant answer', runId: RUN_A, success: false, error: 'network timeout' },
+      {
+        channelId: 'telegram',
+        accountId: 'account-a',
+        conversationId: PEER_A,
+        runId: RUN_A,
+      },
+    );
+    await vi.waitFor(() =>
+      expect(
+        calls.some(
+          (call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`,
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it('keeps a wrong pre-resolved runtime visible so API rejection cancels and refunds it', async () => {
+    const { bridge, calls } = mockBridge(hostedConfig(), {
+      [`/channels/runtime/turns/${RUN_A}/settle`]: async (body) => {
+        expect(body).toMatchObject({
+          provider: 'anthropic',
+          model: 'claude-sonnet-4-6',
+          agentRuntime: 'claude-cli',
+        });
+        throw new Error('execution provenance mismatch');
+      },
+    });
+    receiveA(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    // This is the exact observable shape when OpenClaw selected its native
+    // provider harness before the hosted bridge forced the configured model.
+    bridge.onLlmOutput(
+      {
+        runId: RUN_A,
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        usage: { input: 3, output: 2, total: 5 },
+      },
+      { runId: RUN_A },
+    );
+
+    await expect(
+      bridge.onReplyPayloadSending(
+        { kind: 'final', runId: RUN_A, payload: { text: 'must not escape' } },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          channelId: 'discord',
+          accountId: 'account-a',
+          messageId: '1532630091471786166',
+        },
+      ),
+    ).resolves.toEqual({ cancel: true, reason: 'Eden channel settlement failed' });
+    expect(calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/refund`)).toBe(true);
+    expect(calls.some((call) => call.body?.role === 'assistant')).toBe(false);
+  });
+
+  it('retries failed refund and status callbacks instead of caching a transient failure', async () => {
+    let refundAttempts = 0;
+    let statusAttempts = 0;
+    const { bridge } = mockBridge(hostedConfig(), {
+      [`/channels/runtime/turns/${RUN_A}/refund`]: async () => {
+        refundAttempts += 1;
+        if (refundAttempts === 1) throw new Error('transient refund failure');
+        return { ok: true };
+      },
+      '/channels/runtime/status': async (body) => {
+        if (body.connectionId !== CONNECTION_A) return { ok: true };
+        statusAttempts += 1;
+        if (statusAttempts === 1) throw new Error('transient status failure');
+        return { ok: true };
+      },
+    });
+    receiveA(bridge);
+    await vi.waitFor(() => expect(statusAttempts).toBe(1));
+    bridge.onMessageSent(
+      { success: true },
+      { channelId: 'discord', accountId: 'account-a' },
+    );
+    await vi.waitFor(() => expect(statusAttempts).toBe(2));
+
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+    );
+    await bridge.onAgentEnd(
+      { runId: RUN_A, success: false, messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A },
+    );
+    expect(refundAttempts).toBe(1);
+    await bridge.onGatewayStop();
+    expect(refundAttempts).toBe(2);
+  });
+
+  it('retains an in-flight reservation beyond the 30-minute provider timeout ceiling', async () => {
+    vi.useFakeTimers();
+    try {
+      const { bridge, calls } = mockBridge();
+      receiveA(bridge);
+      await bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'long work', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      );
+      await vi.advanceTimersByTimeAsync(30 * 60 * 1_000 + 30_000);
+      expect(calls.some((call) => call.path.endsWith('/refund'))).toBe(false);
+      await vi.advanceTimersByTimeAsync(
+        channelRuntimeBridgeInternals.STATE_TTL_MS - (30 * 60 * 1_000 + 30_000),
+      );
+      expect(calls.some((call) => call.path.endsWith('/refund'))).toBe(true);
+      await expect(
+        bridge.onReplyPayloadSending(
+          { kind: 'final', runId: RUN_A, payload: { text: 'late output' } },
+          {
+            runId: RUN_A,
+            sessionKey: SESSION_A,
+            channelId: 'discord',
+            accountId: 'account-a',
+          },
+        ),
+      ).resolves.toEqual({
+        cancel: true,
+        reason: 'Eden channel turn correlation unavailable',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forwards native pairing code privately and reports reconnect/error lifecycle', async () => {
+    const { bridge, calls } = mockBridge();
+    await bridge.onPairingRequested(
+      { channel: 'discord', accountId: 'account-a', senderId: PEER_A, code: 'one-time-code' },
+      { channelId: 'discord', accountId: 'account-a', senderId: PEER_A },
+    );
+    await bridge.onGatewayStart();
+    bridge.onMessageSent(
+      { success: false, content: 'not inspected' },
+      { channelId: 'discord', accountId: 'account-a' },
+    );
+    await bridge.onGatewayStop();
+    expect(calls.find((call) => call.path.endsWith('/pairing')).body).toEqual({
+      connectionId: CONNECTION_A,
+      runtimeAccountId: 'account-a',
+      peerId: PEER_A,
+      code: 'one-time-code',
+    });
+    expect(calls.filter((call) => call.path.endsWith('/status')).map((call) => call.body)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ connectionId: CONNECTION_A, state: 'live' }),
+        expect.objectContaining({ connectionId: CONNECTION_A, state: 'error', errorCode: 'provider_unavailable' }),
+        expect.objectContaining({ connectionId: CONNECTION_A, state: 'stopped' }),
+      ]),
+    );
+  });
+});
+
+describe('runtime callback HTTP client', () => {
+  it('permits only the fixed local callback transport', () => {
+    expect(validateChannelRuntimeBaseUrl('http://host.docker.internal:4301')).toBe(
+      'http://host.docker.internal:4301',
+    );
+    for (const url of [
+      'https://host.docker.internal:4301',
+      'http://example.com:4301',
+      'http://user:pass@127.0.0.1:4301',
+      'http://127.0.0.1:4301/path',
+      'http://127.0.0.1:4301/?redirect=evil',
+    ]) {
+      expect(() => validateChannelRuntimeBaseUrl(url)).toThrow(ChannelRuntimeClientError);
+    }
+  });
+
+  it('uses the existing bearer without exposing it in failures or following redirects', async () => {
+    const bearer = 'test-gateway-token-do-not-log';
+    const seen = [];
+    const fetchFn = vi.fn(async (url, init) => {
+      seen.push({ url, init });
+      return new Response(JSON.stringify({ ok: false, error: { code: 'forbidden' }, detail: bearer }), {
+        status: 403,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    const client = createChannelRuntimeClient({
+      baseUrl: 'http://127.0.0.1:4301',
+      bearer,
+      fetchFn,
+    });
+    let caught;
+    try {
+      await client.post('/channels/runtime/status', { state: 'live' });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: 'forbidden', status: 403 });
+    expect(String(caught)).not.toContain(bearer);
+    expect(String(caught)).not.toContain('detail');
+    expect(seen[0].init.redirect).toBe('error');
+    expect(seen[0].init.headers.authorization).toBe(`Bearer ${bearer}`);
+  });
+
+  it('rejects missing auth, path injection, and oversized responses with narrow errors', async () => {
+    const missing = createChannelRuntimeClient({
+      baseUrl: 'http://127.0.0.1:4301',
+      bearer: '',
+      fetchFn: vi.fn(),
+    });
+    await expect(missing.post('/channels/runtime/status', {})).rejects.toMatchObject({
+      code: 'runtime_auth_unavailable',
+    });
+
+    const client = createChannelRuntimeClient({
+      baseUrl: 'http://127.0.0.1:4301',
+      bearer: 'a-valid-test-bearer',
+      fetchFn: vi.fn(async () => new Response('x'.repeat(70_000), { status: 200 })),
+    });
+    await expect(client.post('/channels/runtime/../../secrets', {})).rejects.toMatchObject({
+      code: 'invalid_runtime_path',
+    });
+    await expect(client.post('/channels/runtime/status', {})).rejects.toMatchObject({
+      code: 'runtime_response_too_large',
+    });
+  });
+});

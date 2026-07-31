@@ -1,0 +1,22 @@
+{
+  "gateway": {
+    "mode": "local",
+    "auth": { "mode": "token" }
+  },
+  "plugins": {
+    "allow": ["eden3-channel-runtime"],
+    "load": {
+      "paths": ["/opt/eden3/openclaw-plugins/eden3-channel-runtime"]
+    },
+    "entries": {
+      "eden3-channel-runtime": {
+        "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true,
+          "allowPromptInjection": true
+        },
+        "config": { "accounts": [] }
+      }
+    }
+  }
+}

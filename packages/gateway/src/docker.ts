@@ -4,7 +4,8 @@ import { execFile } from 'node:child_process';
  * Tiny wrapper around `docker exec -u node <container> openclaw <args...>` with lenient
  * `--json` output parsing.
  *
- * Two invocation modes (probed live 2026-07-03, openclaw 2026.6.10):
+ * Two invocation modes (originally live-probed 2026-07-03 on OpenClaw
+ * 2026.6.10; source-reverified 2026-07-31 against OpenClaw 2026.7.1):
  *
  *   - Config-file commands (`agents add|list|delete`, `config …`) run as plain
  *     `docker exec -u node <container> openclaw <args>` — they do not take `--token`.

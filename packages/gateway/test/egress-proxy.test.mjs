@@ -13,6 +13,8 @@ describe('eden3 egress proxy allowlist', () => {
     expect(allowlist).toEqual(DEFAULT_ALLOWLIST);
     expect(isAllowedHost('api.anthropic.com', allowlist)).toBe(true);
     expect(isAllowedHost('queue.fal.ai', allowlist)).toBe(true);
+    expect(isAllowedHost('pypi.org', allowlist)).toBe(true);
+    expect(isAllowedHost('files.pythonhosted.org', allowlist)).toBe(true);
     expect(isAllowedHost('example.com', allowlist)).toBe(false);
   });
 

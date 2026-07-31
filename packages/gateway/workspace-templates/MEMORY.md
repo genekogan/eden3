@@ -1,5 +1,11 @@
-# MEMORY — {{NAME}}
+# Durable memory
 
-<!-- Distilled long-term memory. The lines below are seeded from {{NAME}}'s Eden history; the agent appends what matters going forward. Detailed journals live in memory/. -->
+## Hard rules
+
+## Preferences
+
+## Learned constraints
 
 {{MEMORY_SEED}}
+
+## Escalation
