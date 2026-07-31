@@ -1,5 +1,11 @@
 import { DevAuthProvider } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
+import {
+  AGENT_MODEL_OPTIONS,
+  DEFAULT_AGENT_RUNTIME_BY_MODEL,
+  type AgentModel,
+  type AgentRuntime,
+} from '@eden3/shared';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
@@ -19,6 +25,7 @@ const markerSuffix = marker.slice(marker.lastIndexOf('_') + 1);
 const reconcileOffsetMs = (Number.parseInt(markerSuffix, 16) % 80_000) * 1000;
 const reconcilePeriodStart = new Date(Date.UTC(2001, 0, 1, 0, 0, 0) + reconcileOffsetMs);
 const reconcileCompletedAt = new Date(reconcilePeriodStart.getTime() + 1_000);
+const reconcileNotionalAt = new Date(reconcilePeriodStart.getTime() + 1_500);
 const reconcileErrorAt = new Date(reconcilePeriodStart.getTime() + 2_000);
 const reconcilePeriodEnd = new Date(reconcilePeriodStart.getTime() + 3_000);
 
@@ -27,6 +34,19 @@ let userId = '';
 let agentId = '';
 let viewerId = '';
 let app: FastifyInstance;
+const runtimeState = new Map<AgentModel, AgentRuntime>(
+  AGENT_MODEL_OPTIONS.map((model) => [model, DEFAULT_AGENT_RUNTIME_BY_MODEL[model]]),
+);
+const fakeModelRuntime = {
+  getCatalog: async () =>
+    AGENT_MODEL_OPTIONS.map((model) => ({ model, agentRuntime: runtimeState.get(model)! })),
+  getRuntime: async (model: string) => runtimeState.get(model as AgentModel)!,
+  setRuntime: async (model: AgentModel, agentRuntime: AgentRuntime) => {
+    const changed = runtimeState.get(model) !== agentRuntime;
+    runtimeState.set(model, agentRuntime);
+    return { changed, model, agentRuntime };
+  },
+};
 
 beforeAll(async () => {
   adminId = await insertUserAccount(`${marker}_admin`);
@@ -64,6 +84,17 @@ beforeAll(async () => {
     )`;
   await pg`
     insert into usage_events (
+      event_type, status, user_id, agent_id, provider, model, pricing_basis, table_version,
+      prompt_tokens, completion_tokens, total_tokens, cost_usd, manna, latency_ms, metadata, created_at
+    )
+    values (
+      'chat_turn', 'completed', ${userId}, ${agentId}, 'anthropic', 'claude-sonnet-4-6',
+      'notional-subscription', 'test-table', 100, 20, 120, 9.00000000, 12150, 42,
+      ${JSON.stringify({ source: 'reconcile-notional-test' })}::jsonb,
+      ${reconcileNotionalAt.toISOString()}::timestamptz
+    )`;
+  await pg`
+    insert into usage_events (
       event_type, status, user_id, agent_id, provider, model, error_code, error_message, latency_ms, created_at
     )
     values (
@@ -73,6 +104,7 @@ beforeAll(async () => {
 
   app = await buildServer({
     auth: { provider: new DevAuthProvider({ adminUsernames: [`${marker}_admin`] }) },
+    provisioning: { modelRuntime: fakeModelRuntime },
   });
   await app.ready();
 });
@@ -119,6 +151,50 @@ describe('GET /operator/health', () => {
     expect(body).toHaveProperty('egressProxy');
     expect(body).toHaveProperty('scheduler');
     expect(typeof body.scheduler.running).toBe('boolean');
+  });
+});
+
+describe('/operator/model-runtimes', () => {
+  it('requires admin access for reads and writes', async () => {
+    expect((await app.inject({ method: 'GET', url: '/operator/model-runtimes' })).statusCode).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: '/operator/model-runtimes',
+          headers: { cookie: devCookie(viewerId) },
+          payload: { model: 'anthropic/claude-sonnet-4-6', agentRuntime: 'openclaw' },
+        })
+      ).statusCode,
+    ).toBe(403);
+  });
+
+  it('lists effective runtimes and hot-toggles both directions', async () => {
+    const before = await app.inject({
+      method: 'GET',
+      url: '/operator/model-runtimes',
+      headers: { cookie: devCookie(adminId) },
+    });
+    expect(before.statusCode).toBe(200);
+    expect(before.json()).toMatchObject({
+      models: expect.arrayContaining([
+        { model: 'anthropic/claude-sonnet-4-6', agentRuntime: 'claude-cli' },
+      ]),
+    });
+
+    for (const agentRuntime of ['openclaw', 'claude-cli'] as const) {
+      const updated = await app.inject({
+        method: 'POST',
+        url: '/operator/model-runtimes',
+        headers: { cookie: devCookie(adminId) },
+        payload: { model: 'anthropic/claude-sonnet-4-6', agentRuntime },
+      });
+      expect(updated.statusCode).toBe(200);
+      expect(updated.json()).toMatchObject({
+        model: 'anthropic/claude-sonnet-4-6',
+        agentRuntime,
+      });
+    }
   });
 });
 
@@ -350,6 +426,26 @@ describe('POST /operator/usage/reconcile', () => {
       labels: ['anthropic-july-test'],
     });
     expect(body.alerts).toEqual([]);
+  });
+
+  it('excludes subscription-notional rows from provider invoice reconciliation', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/operator/usage/reconcile',
+      headers: { cookie: devCookie(adminId) },
+      payload: {
+        ...reconciliationWindow(),
+        toleranceUsd: 0,
+        tolerancePct: 0,
+        invoices: [{ provider: 'anthropic', costUsd: 1.5 }],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      status: 'pass',
+      total: { computedCostUsd: 1.5, withinTolerance: true },
+      providers: [{ provider: 'anthropic', computedCostUsd: 1.5, events: 2 }],
+    });
   });
 
   it('returns drift alerts when invoice and computed costs exceed tolerance', async () => {

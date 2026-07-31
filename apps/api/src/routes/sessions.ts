@@ -46,6 +46,8 @@ export type SessionListCursor = z.infer<typeof sessionListCursorSchema>;
 const messagesCursorSchema = z.object({
   /** created_at ISO of the OLDEST message the client already has. */
   t: z.string().datetime({ offset: true }),
+  /** Provider sequence for equal-timestamp channel messages; null for webchat. */
+  q: z.number().int().nonnegative().nullable().optional(),
   id: z.string().uuid(),
 });
 export type MessagesCursor = z.infer<typeof messagesCursorSchema>;
@@ -111,6 +113,8 @@ export function toSessionDto(
     status: row.status,
     sessionType: row.sessionType,
     platform: row.platform,
+    channelConnectionId: row.channelConnectionId,
+    readOnly: row.channelConnectionId !== null || row.sessionType === 'channel',
     agentIds: members.agentIds,
     userIds: members.userIds,
     ...(members.agents ? { agents: members.agents } : {}),
@@ -314,8 +318,9 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
       }
       const cursor = rawCursor ? decodeMessagesCursor(rawCursor) : null;
 
-      // Fetch newest-first, then reverse — the page itself ascends. Ties on
-      // created_at (migrated rows share ms precision) break on id.
+      // Fetch newest-first, then reverse. Channel providers can deliver events
+      // out of order or with equal timestamps, so source_sequence precedes the
+      // UUID fallback whenever it is available.
       const rows = await db
         .select()
         .from(messages)
@@ -323,11 +328,27 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
           and(
             eq(messages.sessionId, session.id),
             cursor
-              ? sql`(${messages.createdAt}, ${messages.id}) < (${cursor.t}::timestamptz, ${cursor.id}::uuid)`
+              ? sql`(
+                  ${messages.createdAt} < ${cursor.t}::timestamptz
+                  or (
+                    ${messages.createdAt} = ${cursor.t}::timestamptz
+                    and (
+                      coalesce(${messages.sourceSequence}, -1) < ${cursor.q ?? -1}
+                      or (
+                        coalesce(${messages.sourceSequence}, -1) = ${cursor.q ?? -1}
+                        and ${messages.id} < ${cursor.id}::uuid
+                      )
+                    )
+                  )
+                )`
               : undefined,
           ),
         )
-        .orderBy(desc(messages.createdAt), desc(messages.id))
+        .orderBy(
+          desc(messages.createdAt),
+          sql`coalesce(${messages.sourceSequence}, -1) desc`,
+          desc(messages.id),
+        )
         .limit(limit + 1);
 
       const hasMore = rows.length > limit;
@@ -335,7 +356,11 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
       const oldest = page[0];
       const nextCursor =
         hasMore && oldest
-          ? encodeCursor({ t: oldest.createdAt.toISOString(), id: oldest.id })
+          ? encodeCursor({
+              t: oldest.createdAt.toISOString(),
+              q: oldest.sourceSequence,
+              id: oldest.id,
+            })
           : null;
 
       // Embedded summaries: senders of this page + the session's agents.

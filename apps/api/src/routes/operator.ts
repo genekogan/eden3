@@ -1,5 +1,6 @@
-import { readOpenClawConfig } from '@eden3/gateway';
 import { pg } from '@eden3/db';
+import { readOpenClawConfig } from '@eden3/gateway';
+import { agentModelSchema, agentRuntimeSchema } from '@eden3/shared';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
@@ -45,6 +46,13 @@ const reconcileBody = z
     }
   });
 
+const modelRuntimeBody = z
+  .object({
+    model: agentModelSchema,
+    agentRuntime: agentRuntimeSchema,
+  })
+  .strict();
+
 interface TotalRow {
   event_count: number;
   total_cost_usd: string;
@@ -81,6 +89,7 @@ interface RecentRow {
   turn_id: string | null;
   provider: string | null;
   model: string | null;
+  pricing_basis: 'provider-api' | 'notional-subscription';
   cost_usd: string | null;
   manna: number | null;
   latency_ms: number | null;
@@ -186,7 +195,36 @@ export const operatorRoutes: FastifyPluginAsync = async (app) => {
       scheduler: app.taskScheduler
         ? { running: app.taskScheduler.running }
         : { running: false },
+      memoryDreamScheduler: app.memoryDreamScheduler
+        ? { running: app.memoryDreamScheduler.running }
+        : { running: false },
     };
+  });
+
+  app.post('/memory/sweep', { preHandler: app.requireAuth }, async (req) => {
+    if (!req.account?.isAdmin) {
+      throw new ApiError(403, 'forbidden', 'Admin access required');
+    }
+    if (!app.memoryDreamScheduler) {
+      throw new ApiError(503, 'memory_scheduler_unavailable', 'Memory scheduler requires a configured gateway');
+    }
+    return { sweep: await app.memoryDreamScheduler.tick({ force: true }) };
+  });
+
+  // ---- GET/POST /operator/model-runtimes — model-scoped hot toggle -------
+  app.get('/model-runtimes', { preHandler: app.requireAuth }, async (req) => {
+    if (!req.account?.isAdmin) {
+      throw new ApiError(403, 'forbidden', 'Admin access required');
+    }
+    return { models: await app.gatewayGlue.modelRuntime.getCatalog() };
+  });
+
+  app.post('/model-runtimes', { preHandler: app.requireAuth }, async (req) => {
+    if (!req.account?.isAdmin) {
+      throw new ApiError(403, 'forbidden', 'Admin access required');
+    }
+    const body = modelRuntimeBody.parse(req.body);
+    return app.gatewayGlue.modelRuntime.setRuntime(body.model, body.agentRuntime);
   });
 
   app.get('/usage/summary', { preHandler: app.requireAuth }, async (req) => {
@@ -263,6 +301,7 @@ export const operatorRoutes: FastifyPluginAsync = async (app) => {
              u.turn_id,
              u.provider,
              u.model,
+             u.pricing_basis,
              u.cost_usd::text as cost_usd,
              u.manna,
              u.latency_ms,
@@ -320,6 +359,7 @@ export const operatorRoutes: FastifyPluginAsync = async (app) => {
         turnId: row.turn_id,
         provider: row.provider,
         model: row.model,
+        pricingBasis: row.pricing_basis,
         costUsd: toNumber(row.cost_usd),
         manna: toNumber(row.manna),
         latencyMs: row.latency_ms,
@@ -347,6 +387,7 @@ export const operatorRoutes: FastifyPluginAsync = async (app) => {
       from usage_events
       where created_at >= ${periodStart.toISOString()}::timestamptz
         and created_at < ${periodEnd.toISOString()}::timestamptz
+        and pricing_basis = 'provider-api'
       group by coalesce(provider, 'unknown')`;
 
     const invoiceByProvider = new Map<string, { provider: string; costUsd: number; labels: string[] }>();

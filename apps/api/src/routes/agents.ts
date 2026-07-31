@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 import {
   LocalMediaStore,
   getEnv,
@@ -17,12 +19,14 @@ import {
   agentThinkingLevelSchema,
   agentToolGroupsSchema,
   feedQuerySchema,
+  type AgentModel,
 } from '@eden3/shared';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
 import { ApiError, sendError } from '../errors';
+import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
   agentDtoFromEntities,
   agentDtoFromRow,
@@ -41,12 +45,15 @@ import {
   installDefaultAgentSkills,
   replaceAgentSkills,
 } from '../services/agent-skills';
+import { reconcileAgentRuntime } from '../services/agent-runtime-sync';
 import {
   agentMemorySnapshot,
   agentMemoryStatus,
   enqueueLazyMemoryDistillation,
   saveAgentMemory,
+  shouldRetryAutomaticMemoryDistillation,
 } from '../services/memory-distillation';
+import { runMemoryRetrievalProbe } from '../services/memory-retrieval';
 
 /**
  * Agents API.
@@ -123,6 +130,14 @@ const memoryBodySchema = z.object({
   memory: z.string().trim().min(1).max(100_000),
 });
 
+const memoryReseedBodySchema = z.object({ confirm: z.literal('reseed') }).strict();
+const memorySearchProbeBodySchema = z
+  .object({
+    query: z.string().trim().min(1).max(2_000),
+    maxResults: z.number().int().min(1).max(20).default(5),
+  })
+  .strict();
+
 const skillBundleSchema = z
   .object({
     id: z.string().trim().min(1).max(200).optional(),
@@ -171,6 +186,22 @@ const ALLOWED_AVATAR_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const MAX_AVATAR_BYTES = 8 * 1024 * 1024;
 /** base64 inflates ~4/3; 12MB leaves room for the JSON envelope around 8MB. */
 const AVATAR_UPLOAD_BODY_LIMIT_BYTES = 12 * 1024 * 1024;
+
+/** Only a fully provisioned row pointing at its derived workspace is live-editable. */
+function canHotUpdateAgent(agent: Agent): agent is Agent & { openclawId: string; workspacePath: string } {
+  if (
+    agent.provisionStatus !== 'ready' ||
+    agent.openclawId === null ||
+    agent.workspacePath === null
+  ) {
+    return false;
+  }
+  const canonicalWorkspace = path.join(
+    defaultOpenclawDataDir(),
+    `workspace-${agent.openclawId}`,
+  );
+  return path.resolve(agent.workspacePath) === path.resolve(canonicalWorkspace);
+}
 
 const avatarBodySchema = z.object({
   filename: z.string().trim().min(1).max(300).optional(),
@@ -341,6 +372,19 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     lazyStore ??= new LocalMediaStore();
     return lazyStore;
   };
+  const effectiveModel = (model: string | null | undefined): AgentModel => {
+    const parsed = agentModelSchema.safeParse(model);
+    return parsed.success ? parsed.data : DEFAULT_AGENT_MODEL;
+  };
+  const runtimeForModel = (model: string | null | undefined) =>
+    app.gatewayGlue.modelRuntime.getRuntime(effectiveModel(model));
+  const runtimeCatalog = async () =>
+    new Map(
+      (await app.gatewayGlue.modelRuntime.getCatalog()).map((entry) => [
+        entry.model,
+        entry.agentRuntime,
+      ]),
+    );
 
   // ---- GET /agents — directory (public, or scope=mine for own agents) -----
   app.get('/', async (req, reply) => {
@@ -393,10 +437,14 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       limit ${limit + 1}
     `;
 
+    const runtimes = await runtimeCatalog();
     const items = rows.slice(0, limit).map((row) => ({
       // In mine scope the viewer manages every returned row, so private
       // persona text is theirs to see (mirrors the profile route's gate).
-      ...agentDtoFromRow(row, { includePersona: scope === 'mine' || row.is_persona_public }),
+      ...agentDtoFromRow(row, {
+        includePersona: scope === 'mine' || row.is_persona_public,
+        agentRuntime: runtimes.get(effectiveModel(row.model)),
+      }),
       creationCount: row.creation_count,
       sessionCount: row.session_count,
     }));
@@ -422,8 +470,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       agent.openclawId !== null &&
       agent.workspacePath !== null &&
       agent.provisionStatus === 'ready' &&
-      memory?.status !== 'done' &&
-      memory?.status !== 'running'
+      shouldRetryAutomaticMemoryDistillation(memory)
     ) {
       enqueueLazyMemoryDistillation(
         {
@@ -462,6 +509,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         includePersona: agent.isPersonaPublic || manager,
         likeCount: interaction.like_count,
         viewerHasLiked: interaction.viewer_has_liked,
+        agentRuntime: await runtimeForModel(agent.model),
       }),
       memory,
       recentCreations: creationRows.map(creationDtoFromRow),
@@ -513,15 +561,15 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         username: account.username,
         workspacePath: agent.workspacePath,
         memory: body.memory,
+        actorAccountId: req.account!.accountId,
       }),
     };
   });
 
   // ---- POST /agents/:username/repair — re-assert the runtime (owner) ------
-  // The owner-facing "restart" button: re-renders workspace templates
-  // (skip-if-exists — user files untouched), re-asserts gateway registration
-  // + model, and re-syncs skills. Fixes drifted/broken runtime state without
-  // touching the DB row or conversation history.
+  // The owner-facing "restart" button enqueues a new durable desired revision
+  // and converges it through the same per-agent runtime fence as PATCH. This
+  // prevents a stale repair snapshot from landing after a concurrent edit.
   app.post('/:username/repair', { preHandler: app.requireAuth }, async (req, reply) => {
     const { username } = usernameParamsSchema.parse(req.params);
     const resolved = await resolveAgentByUsername(username);
@@ -535,28 +583,37 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       }
       return sendError(reply, 403, 'forbidden', 'Only the owner can repair this agent');
     }
-    if (!agent.openclawId) {
+    if (!canHotUpdateAgent(agent)) {
       return sendError(reply, 409, 'agent_not_provisioned', 'This agent has no runtime yet — open its profile to provision it');
     }
     try {
-      const result = await app.gatewayGlue.provisioner.provisionAgent({
-        openclawId: agent.openclawId,
-        name: agent.name ?? account.username,
-        username: account.username,
-        description: agent.description ?? '',
-        persona: agent.persona ?? '',
-        greeting: agent.greeting ?? '',
-        voice: agent.voice ?? '',
-        thinkingLevel: agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
-        model: agent.model ?? DEFAULT_AGENT_MODEL,
+      await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${account.id}::text, 91))`,
+        );
+        await tx
+          .update(agents)
+          .set({
+            runtimeSyncVersion: sql`${agents.runtimeSyncVersion} + 1`,
+            runtimeSyncLeaseExpiresAt: null,
+            runtimeSyncError: null,
+          })
+          .where(eq(agents.accountId, account.id));
       });
-      await installDefaultAgentSkills({
-        agentId: account.id,
-        openclawId: agent.openclawId,
-        workspacePath: result.hostWorkspaceDir ?? agent.workspacePath ?? '',
+      const sync = await reconcileAgentRuntime(account.id, {
+        provisioner: app.gatewayGlue.provisioner,
+        toolSync: app.gatewayGlue.toolSync,
         skillSync: app.gatewayGlue.skillSync,
+        logger: req.log,
       });
-      return { ok: true, repaired: agent.openclawId };
+      if (sync.status === 'ineligible') {
+        return sendError(reply, 409, 'repair_unavailable', 'The agent workspace is not eligible for repair');
+      }
+      return reply.code(sync.status === 'pending' ? 202 : 200).send({
+        ok: true,
+        repaired: agent.openclawId,
+        runtimeSync: sync.status,
+      });
     } catch (err) {
       req.log.error({ err }, `repair failed for "${account.username}"`);
       return sendError(
@@ -624,6 +681,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
 
   app.post('/:username/memory/rebuild', { preHandler: app.requireAuth }, async (req, reply) => {
     const { username } = usernameParamsSchema.parse(req.params);
+    memoryReseedBodySchema.parse(req.body);
     const resolved = await resolveAgentByUsername(username);
     if (!resolved) {
       return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
@@ -646,12 +704,41 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         name: agent.name,
         persona: agent.persona,
         workspacePath: agent.workspacePath,
-        force: true,
+        mode: 'manual-reseed',
+        actorAccountId: req.account!.accountId,
       },
       (err) => req.log.warn({ err }, `memory rebuild failed for "${account.username}"`),
     );
     const memory = await agentMemoryStatus(agent.openclawId, agent.workspacePath);
     return reply.code(202).send({ queued, memory });
+  });
+
+  app.post('/:username/memory/search-probe', { preHandler: app.requireAuth }, async (req, reply) => {
+    const { username } = usernameParamsSchema.parse(req.params);
+    const body = memorySearchProbeBodySchema.parse(req.body);
+    const resolved = await resolveAgentByUsername(username);
+    if (!resolved) {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    const { account, agent } = resolved;
+    if (!canManage(req.account, account, agent)) {
+      if (!agent.public) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      return sendError(reply, 403, 'forbidden', 'Only the owner can probe this agent memory');
+    }
+    if (!agent.openclawId || agent.provisionStatus !== 'ready') {
+      return sendError(reply, 409, 'memory_unavailable', 'Agent memory is available after provisioning');
+    }
+    return {
+      probe: await runMemoryRetrievalProbe({
+        memoryRuntime: app.gatewayGlue.memoryRuntime,
+        agentAccountId: account.id,
+        openclawId: agent.openclawId,
+        query: body.query,
+        maxResults: body.maxResults,
+      }),
+    };
   });
 
   // ---- POST/DELETE /agents/:username/like — v1 social interaction --------
@@ -678,6 +765,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         includePersona: agent.isPersonaPublic || manager,
         likeCount: interaction.like_count,
         viewerHasLiked: interaction.viewer_has_liked,
+        agentRuntime: await runtimeForModel(agent.model),
       }),
     };
   });
@@ -704,6 +792,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         includePersona: agent.isPersonaPublic || manager,
         likeCount: interaction.like_count,
         viewerHasLiked: interaction.viewer_has_liked,
+        agentRuntime: await runtimeForModel(agent.model),
       }),
     };
   });
@@ -826,6 +915,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     return reply.code(201).send({
       agent: agentDtoFromEntities(created.account, updatedAgent ?? created.agent, {
         includePersona: true,
+        agentRuntime: await runtimeForModel((updatedAgent ?? created.agent).model),
       }),
     });
   });
@@ -935,6 +1025,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     return reply.code(201).send({
       agent: agentDtoFromEntities(created.account, updatedAgent ?? created.agent, {
         includePersona: true,
+        agentRuntime: await runtimeForModel((updatedAgent ?? created.agent).model),
       }),
       imported: {
         bundleVersion: body.bundle.version,
@@ -964,7 +1055,39 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       return sendError(reply, 403, 'forbidden', 'Only the owner can edit this agent');
     }
 
+    const personaChanged =
+      body.name !== undefined ||
+      body.description !== undefined ||
+      body.persona !== undefined ||
+      body.greeting !== undefined ||
+      body.voice !== undefined ||
+      body.thinkingLevel !== undefined;
+    const runtimeRelevantChanged =
+      personaChanged || body.model !== undefined || body.toolGroups !== undefined;
+
+    // Postgres is the durable authority. Commit the desired row and increment
+    // a monotonic runtime revision before touching files/config. A process
+    // death, partial provisioner restore, or gateway outage therefore leaves
+    // an explicit pending revision instead of an undetectably divergent
+    // workspace. The fenced reconciler below (and its background loop) always
+    // renders the newest committed row.
     const updatedAgent = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select pg_advisory_xact_lock(hashtextextended(${account.id}::text, 91))`,
+      );
+      const [lockedAgent] = await tx
+        .select()
+        .from(agents)
+        .where(eq(agents.accountId, account.id))
+        .limit(1);
+      if (!lockedAgent) {
+        throw new ApiError(404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      // Even a pending/provisioning/failed agent needs a durable desired
+      // revision. Once provisioning commits a canonical ready workspace, the
+      // scheduler can converge the newest DB row instead of leaving a stale
+      // initial render permanently marked 0==0.
+      const requiresRuntimeSync = runtimeRelevantChanged;
       const [row] = await tx
         .update(agents)
         .set({
@@ -983,6 +1106,13 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
           ...(body.thinkingLevel !== undefined ? { thinkingLevel: body.thinkingLevel } : {}),
           ...(body.toolGroups !== undefined ? { toolGroups: body.toolGroups } : {}),
           ...(body.public !== undefined ? { public: body.public } : {}),
+          ...(requiresRuntimeSync
+            ? {
+                runtimeSyncVersion: sql`${agents.runtimeSyncVersion} + 1`,
+                runtimeSyncLeaseExpiresAt: null,
+                runtimeSyncError: null,
+              }
+            : {}),
         })
         .where(eq(agents.accountId, account.id))
         .returning();
@@ -995,68 +1125,25 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       return { agent: row, account: freshAccount ?? account };
     });
 
-    const personaChanged =
-      body.name !== undefined ||
-      body.description !== undefined ||
-      body.persona !== undefined ||
-      body.greeting !== undefined ||
-      body.voice !== undefined;
-    const modelChanged = body.model !== undefined && body.model !== agent.model;
-    const toolGroupsChanged = body.toolGroups !== undefined;
-
-    // Hot runtime updates are best-effort: agents that were never provisioned
-    // (no workspace yet) keep their DB update and get fixed on lazy provision.
-    if (agent.openclawId !== null) {
-      if (modelChanged) {
-        try {
-          await app.gatewayGlue.provisioner.provisionAgent({
-            openclawId: agent.openclawId,
-            name: updatedAgent.agent.name ?? account.username,
-            username: account.username,
-            description: updatedAgent.agent.description ?? '',
-            persona: updatedAgent.agent.persona ?? '',
-            greeting: updatedAgent.agent.greeting ?? '',
-            voice: updatedAgent.agent.voice ?? '',
-            thinkingLevel: updatedAgent.agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
-            model: updatedAgent.agent.model ?? DEFAULT_AGENT_MODEL,
-          });
-        } catch (err) {
-          req.log.warn({ err }, `model update skipped for "${account.username}"`);
-        }
-      }
-
-      try {
-        if (toolGroupsChanged) {
-          await app.gatewayGlue.toolSync.syncAgentToolGroups({
-            openclawId: agent.openclawId,
-            toolGroups: body.toolGroups ?? DEFAULT_AGENT_TOOL_GROUPS,
-          });
-        }
-      } catch (err) {
-        req.log.warn({ err }, `tool allowlist update skipped for "${account.username}"`);
-      }
-
-      try {
-        if (personaChanged) {
-          await app.gatewayGlue.provisioner.updateAgentPersona({
-            openclawId: agent.openclawId,
-            name: updatedAgent.agent.name ?? account.username,
-            username: account.username,
-            description: updatedAgent.agent.description ?? '',
-            persona: updatedAgent.agent.persona ?? '',
-            greeting: updatedAgent.agent.greeting ?? '',
-            voice: updatedAgent.agent.voice ?? '',
-            thinkingLevel: updatedAgent.agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
-          });
-        }
-      } catch (err) {
-        req.log.warn({ err }, `persona re-render skipped for "${account.username}"`);
+    if (runtimeRelevantChanged && canHotUpdateAgent(updatedAgent.agent)) {
+      const sync = await reconcileAgentRuntime(account.id, {
+        provisioner: app.gatewayGlue.provisioner,
+        toolSync: app.gatewayGlue.toolSync,
+        skillSync: app.gatewayGlue.skillSync,
+        logger: req.log,
+      });
+      if (sync.status === 'pending') {
+        req.log.warn(
+          { accountId: account.id, version: sync.version },
+          `agent edit saved; runtime convergence pending for "${account.username}"`,
+        );
       }
     }
 
     return {
       agent: agentDtoFromEntities(updatedAgent.account, updatedAgent.agent, {
         includePersona: true,
+        agentRuntime: await runtimeForModel(updatedAgent.agent.model),
       }),
     };
   });
@@ -1121,7 +1208,10 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         .returning();
 
       return {
-        agent: agentDtoFromEntities(updatedAccount ?? account, agent, { includePersona: true }),
+        agent: agentDtoFromEntities(updatedAccount ?? account, agent, {
+          includePersona: true,
+          agentRuntime: await runtimeForModel(agent.model),
+        }),
       };
     },
   );
@@ -1148,7 +1238,10 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       .returning();
 
     return {
-      agent: agentDtoFromEntities(updatedAccount ?? account, agent, { includePersona: true }),
+      agent: agentDtoFromEntities(updatedAccount ?? account, agent, {
+        includePersona: true,
+        agentRuntime: await runtimeForModel(agent.model),
+      }),
     };
   });
 };

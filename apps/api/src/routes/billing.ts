@@ -5,6 +5,7 @@ import {
   accounts,
   billingSubscriptions,
   db,
+  mannaAccounts,
   mannaTransactions,
   mannaVouchers,
   pg,
@@ -75,6 +76,47 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+/** Source voucher id carried by ETL-imported inventory rows. */
+export function legacyVoucherExternalId(metadata: unknown): string | null {
+  const value = asRecord(metadata)?.['legacyExternalId'];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/** ETL marker for a present legacy expiry that could not be parsed safely. */
+export function legacyVoucherHasMalformedExpiration(metadata: unknown): boolean {
+  return asRecord(metadata)?.['legacyMalformedExpiresAt'] === true;
+}
+
+/** ETL marker for malformed present authorization/capacity fields. */
+export function legacyVoucherHasMalformedCriticalFields(metadata: unknown): boolean {
+  const value = asRecord(metadata)?.['legacyMalformedCriticalFields'];
+  return value === true || (Array.isArray(value) && value.length > 0);
+}
+
+/** Legacy Clerk/user ids allowed to redeem an imported voucher. */
+export function legacyVoucherAllowedUserIds(metadata: unknown): string[] {
+  const value = asRecord(metadata)?.['allowedUserIds'];
+  if (!Array.isArray(value)) return [];
+  return [
+    ...new Set(
+      value.filter((item): item is string => typeof item === 'string' && item.length > 0),
+    ),
+  ];
+}
+
+/** Empty allowlists are public; otherwise one preserved legacy identity must match. */
+export function legacyVoucherAllowsAccount(
+  metadata: unknown,
+  accountIdentifiers: readonly (string | null | undefined)[],
+): boolean {
+  const allowed = legacyVoucherAllowedUserIds(metadata);
+  if (allowed.length === 0) return true;
+  const identities = new Set(
+    accountIdentifiers.filter((value): value is string => typeof value === 'string' && value.length > 0),
+  );
+  return allowed.some((value) => identities.has(value));
 }
 
 function asString(value: unknown): string | null {
@@ -512,6 +554,15 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
         .where(eq(mannaVouchers.code, body.code))
         .limit(1);
       if (!voucher) throw new ApiError(404, 'voucher_not_found', 'Voucher code not found');
+      // Defense in depth for inventory imported before/while a reconciliation
+      // replay updates `disabled`: durable ETL markers keep malformed expiry,
+      // authorization, and capacity fields from becoming permissive defaults.
+      if (
+        legacyVoucherHasMalformedExpiration(voucher.metadata) ||
+        legacyVoucherHasMalformedCriticalFields(voucher.metadata)
+      ) {
+        throw new ApiError(400, 'voucher_disabled', 'Voucher is disabled');
+      }
 
       const idempotencyKey = `voucher:${voucher.id}:${account.accountId}`;
       // Serialize same-user redeems of the same voucher: without this, two
@@ -530,6 +581,59 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
           amount: voucher.amount,
           balance: await getBalance(account.accountId, { db: tx }),
         };
+      }
+
+      // Imported MannaVoucherRedemption docs are ledger history with no new
+      // Eden3 idempotency key. For migrated inventory only, recognize that
+      // same-account legacy fact by source voucher id or its code before
+      // consuming capacity/crediting again. This is deliberately scoped by
+      // metadata so native Eden3 vouchers retain the ordinary path above.
+      const legacyExternalId = legacyVoucherExternalId(voucher.metadata);
+      if (legacyExternalId) {
+        const [legacyRedemption] = await tx
+          .select({ id: mannaTransactions.id })
+          .from(mannaTransactions)
+          .innerJoin(mannaAccounts, eq(mannaAccounts.id, mannaTransactions.mannaAccountId))
+          .where(
+            and(
+              eq(mannaAccounts.accountId, account.accountId),
+              or(
+                eq(mannaTransactions.type, 'credit:voucher'),
+                eq(mannaTransactions.type, 'credit_voucher'),
+              ),
+              or(
+                eq(mannaTransactions.voucherExternalId, legacyExternalId),
+                sql`lower(${mannaTransactions.code}) = lower(${voucher.code})`,
+              ),
+            ),
+          )
+          .limit(1);
+        if (legacyRedemption) {
+          return {
+            alreadyApplied: true,
+            amount: voucher.amount,
+            balance: await getBalance(account.accountId, { db: tx }),
+          };
+        }
+      }
+
+      // Eden1 compared allowedUserIds with User.userId (the inherited Clerk
+      // identity), while a few manually-issued vouchers used the Mongo user
+      // id. Preserve both identity forms without exposing either in the API.
+      if (legacyVoucherAllowedUserIds(voucher.metadata).length > 0) {
+        const [legacyAccount] = await tx
+          .select({ externalId: accounts.externalId, clerkUserId: accounts.clerkUserId })
+          .from(accounts)
+          .where(eq(accounts.id, account.accountId))
+          .limit(1);
+        if (
+          !legacyVoucherAllowsAccount(voucher.metadata, [
+            legacyAccount?.externalId,
+            legacyAccount?.clerkUserId,
+          ])
+        ) {
+          throw new ApiError(403, 'voucher_not_allowed', 'This voucher is not available to this account');
+        }
       }
 
       const [updated] = await tx
@@ -557,7 +661,7 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
         amount: voucher.amount,
         type: 'credit:voucher',
         idempotencyKey,
-        voucherExternalId: voucher.id,
+        voucherExternalId: legacyExternalId ?? voucher.id,
         code: voucher.code,
         db: tx,
       });

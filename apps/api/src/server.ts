@@ -21,11 +21,23 @@ import { ensureBuiltinSkills } from './services/agent-skills';
 import { ensureDefaultEdenAssistant } from './services/default-assistant';
 import { registerHttpHardening } from './services/http-hardening';
 import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './services/history-sync';
+import { AgentRuntimeSyncScheduler } from './services/agent-runtime-sync';
 import { MediaPipeline } from './services/media-pipeline';
-import { makeScheduledTaskRunner, TaskScheduler } from './services/task-scheduler';
+import {
+  EdenMemoryDreamAgentRunner,
+  MemoryDreamOrchestrator,
+  MemoryDreamScheduler,
+  PostgresMemoryDreamStore,
+} from './services/memory-dreaming';
+import {
+  makeScheduledTaskRecoveryRunner,
+  makeScheduledTaskRunner,
+  TaskScheduler,
+} from './services/task-scheduler';
 import { TurnRegistry } from './services/turn-registry';
 import type { CompatClientLike } from './services/turns';
 import { createAttachmentSightingHandler, MediaWatcher } from './workers/media-watcher';
+import { accountRoutes } from './routes/account';
 import { agentsRoutes } from './routes/agents';
 import { authRoutes } from './routes/auth';
 import { billingRoutes, type BillingRoutesOptions } from './routes/billing';
@@ -102,6 +114,8 @@ declare module 'fastify' {
     turnLimiter: TurnConcurrencyLimiter;
     /** Eden3-side scheduled-task loop (null when the gateway is not configured). */
     taskScheduler: TaskScheduler | null;
+    /** Eden-managed, activity-gated native deep + metered REM loop. */
+    memoryDreamScheduler: MemoryDreamScheduler | null;
   }
 }
 
@@ -297,33 +311,95 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // real clients by default, fakes injectable via opts.provisioning.
   app.decorate('gatewayGlue', new GatewayGlue(opts.provisioning));
 
+  // DB-authoritative runtime/persona convergence. Route edits attempt an
+  // immediate fenced sync; this independent loop closes every process-death,
+  // gateway-outage, and partial-filesystem-restore window from the durable
+  // pending revision. It is intentionally tied to production auto-start but
+  // not to scheduled-task firing or gateway chat-client construction.
+  const agentRuntimeSyncScheduler =
+    opts.scheduler?.autoStart === true
+      ? new AgentRuntimeSyncScheduler({
+          // Keep construction lazy so a missing host gateway token preserves
+          // the documented read-only/degraded API boot. Individual retries
+          // fail durably with backoff until credentials are restored.
+          provisioner: {
+            provisionAgent: (params, options) =>
+              app.gatewayGlue.provisioner.provisionAgent(params, options),
+            updateAgentPersona: (params) =>
+              app.gatewayGlue.provisioner.updateAgentPersona(params),
+          },
+          toolSync: app.gatewayGlue.toolSync,
+          skillSync: app.gatewayGlue.skillSync,
+          logger: app.log,
+        })
+      : null;
+  app.addHook('onClose', async () => agentRuntimeSyncScheduler?.stop());
+  agentRuntimeSyncScheduler?.start();
+
   // Eden3-side scheduled-task firing. Constructed whenever a gateway is
   // wired (scheduled runs are real metered agent turns), but only STARTED
   // when the entrypoint opts in — tests drive tick() themselves. Interval 0
-  // (TASK_SCHEDULER_INTERVAL_MS) also disables start().
-  const taskScheduler =
-    gatewayClients && historySync
-      ? new TaskScheduler({
-          runTask: makeScheduledTaskRunner({
+  // (TASK_SCHEDULER_INTERVAL_MS) disables task firing but not the independent
+  // native-cron cleanup safety loop or provider-free billing recovery loop.
+  const taskScheduler = new TaskScheduler({
+    runTask:
+      gatewayClients && historySync
+        ? makeScheduledTaskRunner({
             compat: gatewayClients.compat,
             bus: app.eventsBus,
             registry: app.turnRegistry,
             historySync,
             turnLimiter: app.turnLimiter,
             onError: (err, context) => app.log.error({ err, context }, 'scheduled task side-error'),
-          }),
-          intervalMs: env.TASK_SCHEDULER_INTERVAL_MS,
-          // Legacy gateway cron jobs double-fire against this scheduler —
-          // sweep them once per boot.
-          cleanupGatewayJobs: () => app.gatewayGlue.cronSync.removeAllEden3Jobs(),
-          logger: app.log,
-        })
-      : null;
+          })
+        : async () => {
+            throw new ApiError(503, 'gateway_unavailable', 'Scheduled task runtime is unavailable');
+          },
+    // Compensation never needs the gateway. Keep this runner/timer alive in
+    // degraded mode and when normal scheduled firing is explicitly disabled.
+    recoverTask: makeScheduledTaskRecoveryRunner({
+      onError: (err, context) => app.log.error({ err, context }, 'scheduled task recovery side-error'),
+    }),
+    // A degraded API still starts the independent native-cron safety sweep,
+    // but never attempts provider turns without chat clients.
+    intervalMs: gatewayClients && historySync ? env.TASK_SCHEDULER_INTERVAL_MS : 0,
+    cleanupGatewayJobs: () => app.gatewayGlue.cronSync.removeAllEden3Jobs(),
+    logger: app.log,
+  });
   app.decorate('taskScheduler', taskScheduler);
   app.addHook('onClose', async () => {
     taskScheduler?.stop();
   });
   if (opts.scheduler?.autoStart === true) taskScheduler?.start();
+
+  const memoryDreamScheduler =
+    gatewayClients && historySync
+      ? new MemoryDreamScheduler(
+          new MemoryDreamOrchestrator(
+            new PostgresMemoryDreamStore(),
+            new EdenMemoryDreamAgentRunner({
+              compat: gatewayClients.compat,
+              bus: app.eventsBus,
+              registry: app.turnRegistry,
+              historySync,
+              memoryRuntime: app.gatewayGlue.memoryRuntime,
+              modelRuntime: app.gatewayGlue.modelRuntime,
+              onError: (err, context) =>
+                app.log.error({ err, context }, 'memory dream side-error'),
+            }),
+          ),
+          {
+            intervalMs: env.MEMORY_DREAM_SCHEDULER_INTERVAL_MS,
+            hourUtc: env.MEMORY_DREAM_HOUR_UTC,
+            onError: (err) => app.log.error({ err }, 'memory dream scheduler tick failed'),
+          },
+        )
+      : null;
+  app.decorate('memoryDreamScheduler', memoryDreamScheduler);
+  app.addHook('onClose', async () => {
+    memoryDreamScheduler?.stop();
+  });
+  if (opts.scheduler?.autoStart === true) memoryDreamScheduler?.start();
   await ensureBuiltinSkills();
   await ensureDefaultEdenAssistant({
     // The real API entrypoint starts the media watcher and talks to the live
@@ -337,6 +413,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
   await app.register(chatRoutes, { prefix: '/sessions' }); // POST /sessions/:idOrNew/messages
   await app.register(authRoutes, { prefix: '/auth' });
+  await app.register(accountRoutes, { prefix: '/account' });
   await app.register(sessionsRoutes, { prefix: '/sessions' });
   await app.register(agentsRoutes, { prefix: '/agents' });
   // Concepts share the /agents path root (/agents/:username/concepts/*).

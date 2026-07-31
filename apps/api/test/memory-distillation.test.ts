@@ -10,8 +10,10 @@ import {
   agentMemoryStatus,
   distillAgentMemory,
   MANUAL_MEMORY_MODEL,
+  MEMORY_DISTILLATION_STALE_MS,
   MEMORY_DISTILLATION_MODEL,
 } from '../src/services/memory-distillation';
+import { memoryUserFilename } from '../src/services/memory-paths';
 import {
   deleteFixturesByMarker,
   insertAgentAccount,
@@ -133,9 +135,15 @@ describe('memory distillation', () => {
       expect(memory).toContain('celadon comet mural concept');
       expect(memory).not.toContain('cobalt lighthouse should stay in my user file');
       expect(memory).not.toContain('violet observatory');
-      const ownerMemory = await readFile(path.join(workspace, 'memory', 'users', `${marker}_gene.md`), 'utf8');
+      const ownerMemory = await readFile(
+        path.join(workspace, 'memory', 'users', memoryUserFilename(`${marker}_gene`, ownerId)),
+        'utf8',
+      );
       expect(ownerMemory).toContain('cobalt lighthouse should stay in my user file');
-      const otherMemory = await readFile(path.join(workspace, 'memory', 'users', `${marker}_maya.md`), 'utf8');
+      const otherMemory = await readFile(
+        path.join(workspace, 'memory', 'users', memoryUserFilename(`${marker}_maya`, otherUserId)),
+        'utf8',
+      );
       expect(otherMemory).toContain('violet observatory');
 
       const [row] = await pg<{
@@ -158,6 +166,18 @@ describe('memory distillation', () => {
       const status = await agentMemoryStatus(`${marker}_agent`, workspace);
       expect(status).toMatchObject({ status: 'done', messagesSampled: 3 });
       expect(status?.summary).toContain('celadon comet mural concept');
+
+      await writeFile(path.join(workspace, 'MEMORY.md'), '# Native memory\n\n- dream-owned update\n');
+      const repeated = await distillAgentMemory({
+        agentAccountId: agentId,
+        openclawId: `${marker}_agent`,
+        username: `${marker}_agent`,
+        workspacePath: workspace,
+      });
+      expect(repeated.skippedReason).toBe('already_seeded');
+      expect(await readFile(path.join(workspace, 'MEMORY.md'), 'utf8')).toContain(
+        'dream-owned update',
+      );
     } finally {
       await deleteFixturesByMarker(marker);
       await rm(workspace, { recursive: true, force: true });
@@ -190,9 +210,192 @@ describe('memory distillation', () => {
       });
       const status = await agentMemoryStatus(`${marker}_agent`, workspace);
       expect(status).toMatchObject({ status: 'skipped', messagesSampled: 0, memoryChars: 0 });
+      const repeated = await distillAgentMemory({
+        agentAccountId: agentId,
+        openclawId: `${marker}_agent`,
+        username: `${marker}_agent`,
+        workspacePath: workspace,
+      });
+      expect(repeated).toMatchObject({ status: 'skipped', skippedReason: 'already_seeded' });
+      await expect(
+        distillAgentMemory({
+          agentAccountId: agentId,
+          openclawId: `${marker}_agent`,
+          username: `${marker}_agent`,
+          workspacePath: workspace,
+          mode: 'manual-reseed',
+        }),
+      ).rejects.toThrow('actorAccountId');
+
+      await insertSessionWithMessages({
+        ownerId,
+        agentId,
+        title: 'History accumulated after initial skip',
+        messages: [
+          {
+            senderId: ownerId,
+            role: 'user',
+            content: 'A private preference added after the initial empty-history seed attempt.',
+            createdAt: new Date('2026-04-02T00:00:00Z'),
+          },
+          {
+            senderId: agentId,
+            role: 'assistant',
+            content:
+              'After the initial skip, the agent accumulated a substantial copper planetarium archive with indexed constellations, restoration notes, collaboration history, and enough durable narrative context for a real collective memory seed.',
+            createdAt: new Date('2026-04-02T00:00:01Z'),
+          },
+        ],
+      });
+      await pg`
+        update distill_state set updated_at = now() - interval '7 hours'
+        where openclaw_id = ${`${marker}_agent`}
+      `;
+      const seededAfterHistory = await distillAgentMemory({
+        agentAccountId: agentId,
+        openclawId: `${marker}_agent`,
+        username: `${marker}_agent`,
+        workspacePath: workspace,
+      });
+      expect(seededAfterHistory.status).toBe('done');
+      expect(await readFile(path.join(workspace, 'MEMORY.md'), 'utf8')).toContain(
+        'copper planetarium archive',
+      );
     } finally {
       await deleteFixturesByMarker(marker);
       await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('retries error/stale automatic claims and recovers a committed seed without duplicating it', async () => {
+    const marker = makeMarker('memory_retry');
+    const workspace = await tempWorkspace(marker);
+    const staleWorkspace = await tempWorkspace(`${marker}_stale`);
+    const freshWorkspace = await tempWorkspace(`${marker}_fresh`);
+    try {
+      const ownerId = await insertUserAccount(`${marker}_user`);
+      const agentId = await insertAgentAccount(`${marker}_agent`, {
+        ownerId,
+        openclawId: `${marker}_agent`,
+        workspacePath: workspace,
+        provisionStatus: 'ready',
+      });
+      await insertSessionWithMessages({
+        ownerId,
+        agentId,
+        title: 'Retryable memory archive',
+        messages: [
+          {
+            senderId: ownerId,
+            role: 'user',
+            content: 'Keep this private retry fixture in the user-scoped note only.',
+            createdAt: new Date('2026-04-01T00:00:00Z'),
+          },
+          {
+            senderId: agentId,
+            role: 'assistant',
+            content:
+              'The retryable archive contains a long celadon observatory catalog with enough durable context to seed collective memory safely after a transient storage failure.',
+            createdAt: new Date('2026-04-01T00:00:01Z'),
+          },
+        ],
+      });
+      await pg`
+        insert into distill_state (
+          openclaw_id, agent_account_id, username, status, error, completed_at, updated_at
+        ) values (
+          ${`${marker}_agent`}, ${agentId}, ${`${marker}_agent`}, 'error',
+          'transient write failure', now(), now()
+        )
+      `;
+
+      const retried = await distillAgentMemory({
+        agentAccountId: agentId,
+        openclawId: `${marker}_agent`,
+        username: `${marker}_agent`,
+        workspacePath: workspace,
+      });
+      expect(retried.status).toBe('done');
+      const [initialRevisionCount] = await pg<{ count: string }[]>`
+        select count(*)::text as count from memory_revisions
+        where openclaw_id = ${`${marker}_agent`} and operation = 'automatic-seed'
+      `;
+      expect(initialRevisionCount?.count).toBe('1');
+
+      // Simulate the narrow crash window after file+revision commit but before
+      // the status write. Recovery must preserve subsequent native ownership
+      // and use the existing revision as its durable commit marker.
+      const nativeOwned = '# Native-owned memory\n\n- preserved after crash recovery\n';
+      await writeFile(path.join(workspace, 'MEMORY.md'), nativeOwned, 'utf8');
+      await pg`
+        update distill_state set status = 'error', error = 'status commit lost', updated_at = now()
+        where openclaw_id = ${`${marker}_agent`}
+      `;
+      const recovered = await distillAgentMemory({
+        agentAccountId: agentId,
+        openclawId: `${marker}_agent`,
+        username: `${marker}_agent`,
+        workspacePath: workspace,
+      });
+      expect(recovered.status).toBe('done');
+      expect(await readFile(path.join(workspace, 'MEMORY.md'), 'utf8')).toBe(nativeOwned);
+      const [recoveredRevisionCount] = await pg<{ count: string }[]>`
+        select count(*)::text as count from memory_revisions
+        where openclaw_id = ${`${marker}_agent`} and operation = 'automatic-seed'
+      `;
+      expect(recoveredRevisionCount?.count).toBe('1');
+
+      const staleAgentId = await insertAgentAccount(`${marker}_stale_agent`, {
+        ownerId,
+        openclawId: `${marker}_stale_agent`,
+        workspacePath: staleWorkspace,
+        provisionStatus: 'ready',
+      });
+      await pg`
+        insert into distill_state (
+          openclaw_id, agent_account_id, username, status, started_at, updated_at
+        ) values (
+          ${`${marker}_stale_agent`}, ${staleAgentId}, ${`${marker}_stale_agent`},
+          'running', now() - interval '2 hours', now() - interval '2 hours'
+        )
+      `;
+      const reclaimed = await distillAgentMemory({
+        agentAccountId: staleAgentId,
+        openclawId: `${marker}_stale_agent`,
+        username: `${marker}_stale_agent`,
+        workspacePath: staleWorkspace,
+      });
+      expect(reclaimed).toMatchObject({ status: 'skipped', skippedReason: 'too_little_history' });
+
+      const freshAgentId = await insertAgentAccount(`${marker}_fresh_agent`, {
+        ownerId,
+        openclawId: `${marker}_fresh_agent`,
+        workspacePath: freshWorkspace,
+        provisionStatus: 'ready',
+      });
+      const freshUpdatedAt = new Date(Date.now() - Math.floor(MEMORY_DISTILLATION_STALE_MS / 2));
+      await pg`
+        insert into distill_state (
+          openclaw_id, agent_account_id, username, status, started_at, updated_at
+        ) values (
+          ${`${marker}_fresh_agent`}, ${freshAgentId}, ${`${marker}_fresh_agent`},
+          'running', ${freshUpdatedAt.toISOString()}, ${freshUpdatedAt.toISOString()}
+        )
+      `;
+      const notStolen = await distillAgentMemory({
+        agentAccountId: freshAgentId,
+        openclawId: `${marker}_fresh_agent`,
+        username: `${marker}_fresh_agent`,
+        workspacePath: freshWorkspace,
+      });
+      expect(notStolen).toMatchObject({ status: 'running', skippedReason: 'already_seeded' });
+    } finally {
+      await deleteFixturesByMarker(marker);
+      await Promise.all(
+        [workspace, staleWorkspace, freshWorkspace].map((dir) =>
+          rm(dir, { recursive: true, force: true }),
+        ),
+      );
     }
   });
 
@@ -344,7 +547,7 @@ describe('memory distillation', () => {
         'utf8',
       );
       await writeFile(
-        path.join(workspace, 'memory', 'users', `${marker}_user.md`),
+        path.join(workspace, 'memory', 'users', memoryUserFilename(`${marker}_user`, ownerId)),
         `# User memory - ${marker}_user\n\n- private owner note\n`,
         'utf8',
       );
@@ -385,7 +588,9 @@ describe('memory distillation', () => {
         memory: {
           status: 'done',
           collective: { filename: 'MEMORY.md' },
-          userFiles: [expect.objectContaining({ filename: `${marker}_user.md` })],
+          userFiles: [
+            expect.objectContaining({ filename: memoryUserFilename(`${marker}_user`, ownerId) }),
+          ],
         },
       });
       expect(ownerView.json().memory.collective.content).toContain('original collective note');
@@ -418,10 +623,12 @@ describe('memory distillation', () => {
         method: 'POST',
         url: `/agents/${marker}_agent/memory/rebuild`,
         cookies: { eden3_dev_user: ownerId },
+        payload: { confirm: 'reseed' },
       });
       expect(rebuild.statusCode).toBe(202);
       expect(rebuild.json()).toMatchObject({ queued: true });
       await waitForMemoryContains(path.join(workspace, 'MEMORY.md'), 'silver atlas chamber');
+      await waitForDistillDone(`${marker}_agent`);
       const rebuilt = await agentMemoryStatus(`${marker}_agent`, workspace);
       expect(rebuilt).toMatchObject({
         status: 'done',

@@ -1,9 +1,15 @@
 import { isHex24, isUuid, resolveAccount, resolveAccountByUsername } from '@eden3/core';
 import { pg } from '@eden3/db';
-import { feedQuerySchema } from '@eden3/shared';
+import {
+  DEFAULT_AGENT_MODEL,
+  agentModelSchema,
+  feedQuerySchema,
+  type AgentModel,
+} from '@eden3/shared';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
+import { ApiError } from '../errors';
 import {
   agentDtoFromRow,
   creationDtoFromRow,
@@ -37,6 +43,8 @@ const feedCreationsQuerySchema = feedQuerySchema.extend({
   agent: z.string().trim().min(1).max(200).optional(),
   /** Filter by creator user (same reference shapes). */
   user: z.string().trim().min(1).max(200).optional(),
+  /** Filter to creations liked by the signed-in account. */
+  favorites: z.literal('mine').optional(),
 });
 
 const feedAgentsQuerySchema = z.object({
@@ -59,12 +67,20 @@ async function resolveAccountRef(ref: string): Promise<string | null> {
 }
 
 export const feedRoutes: FastifyPluginAsync = async (app) => {
+  const effectiveModel = (model: string | null | undefined): AgentModel => {
+    const parsed = agentModelSchema.safeParse(model);
+    return parsed.success ? parsed.data : DEFAULT_AGENT_MODEL;
+  };
+
   // ---- GET /feed/creations -------------------------------------------------
   app.get('/creations', async (req) => {
-    const { q, cursor, limit, agent, user } = feedCreationsQuerySchema.parse(req.query);
+    const { q, cursor, limit, agent, user, favorites } = feedCreationsQuerySchema.parse(req.query);
     const after = parseCursorParam(cursor);
     const pattern = q !== undefined && q !== '' ? `%${escapeLike(q)}%` : null;
     const viewerId = req.account?.accountId ?? null;
+    if (favorites === 'mine' && viewerId === null) {
+      throw new ApiError(401, 'unauthorized', 'Authentication required');
+    }
 
     let agentId: string | null = null;
     if (agent !== undefined) {
@@ -100,6 +116,15 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
         ${safePublicCreationFilter()}
         ${agentId !== null ? pg`and c.agent_id = ${agentId}` : pg``}
         ${userId !== null ? pg`and c.user_id = ${userId}` : pg``}
+        ${
+          favorites === 'mine'
+            ? pg`and exists (
+                select 1 from creation_likes favorite
+                where favorite.creation_id = c.id
+                  and favorite.user_id = ${viewerId!}
+              )`
+            : pg``
+        }
         ${
           pattern !== null
             ? pg`and (
@@ -170,10 +195,19 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
       order by recent.last_creation_at desc
       limit ${limit}
     `;
+    const runtimes = new Map(
+      (await app.gatewayGlue.modelRuntime.getCatalog()).map((entry) => [
+        entry.model,
+        entry.agentRuntime,
+      ]),
+    );
 
     return {
       items: rows.map((row) => ({
-        ...agentDtoFromRow(row, { includePersona: row.is_persona_public }),
+        ...agentDtoFromRow(row, {
+          includePersona: row.is_persona_public,
+          agentRuntime: runtimes.get(effectiveModel(row.model)),
+        }),
         lastCreationAt: pgToIso(row.last_creation_at),
       })),
       nextCursor: null,

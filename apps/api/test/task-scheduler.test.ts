@@ -1,8 +1,10 @@
+import { DailyCapExceededError } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import type { Trigger } from '@eden3/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { ApiError } from '../src/errors';
+import { SCHEDULED_TASK_REFUND_PENDING_PREFIX } from '../src/services/scheduled-tasks';
 import { TaskScheduler } from '../src/services/task-scheduler';
 import { deleteFixturesByMarker, insertAgentAccount, insertUserAccount, makeMarker } from './fixtures';
 
@@ -27,6 +29,10 @@ interface TriggerRow {
   next_scheduled_run: string | null;
   last_error: string | null;
   error_count: number | null;
+  pending_occurrence_id: string | null;
+  pending_occurrence_kind: string | null;
+  pending_occurrence_at: string | null;
+  pending_occurrence_claim_id: string | null;
 }
 
 async function insertTrigger(opts: {
@@ -52,9 +58,16 @@ async function insertTrigger(opts: {
 
 async function readTrigger(id: string): Promise<TriggerRow> {
   const [row] = await pg<
-    Array<Omit<TriggerRow, 'next_scheduled_run'> & { next_scheduled_run: string | Date | null }>
+    Array<
+      Omit<TriggerRow, 'next_scheduled_run' | 'pending_occurrence_at'> & {
+        next_scheduled_run: string | Date | null;
+        pending_occurrence_at: string | Date | null;
+      }
+    >
   >`
-    select status, next_scheduled_run, last_error, error_count
+    select status, next_scheduled_run, last_error, error_count,
+           pending_occurrence_id, pending_occurrence_kind, pending_occurrence_at,
+           pending_occurrence_claim_id
     from triggers where id = ${id}
   `;
   return {
@@ -62,22 +75,36 @@ async function readTrigger(id: string): Promise<TriggerRow> {
     // Normalize timestamptz to ISO regardless of the driver's parser.
     next_scheduled_run:
       row!.next_scheduled_run === null ? null : new Date(row!.next_scheduled_run).toISOString(),
+    pending_occurrence_at:
+      row!.pending_occurrence_at === null
+        ? null
+        : new Date(row!.pending_occurrence_at).toISOString(),
   };
 }
 
 function makeScheduler(opts: {
   runTask?: (trigger: Trigger) => Promise<unknown>;
+  recoverTask?: (trigger: Trigger) => Promise<unknown>;
+  recoveryIntervalMs?: number;
   now?: () => Date;
   cleanupGatewayJobs?: () => Promise<{ removed: number }>;
+  cleanupGatewayJobsRetryMs?: number;
   intervalMs?: number;
   reapStaleRunningMs?: number;
   maxConsecutiveFailures?: number;
 }): TaskScheduler {
   return new TaskScheduler({
     runTask: opts.runTask ?? (async () => {}),
+    ...(opts.recoverTask ? { recoverTask: opts.recoverTask } : {}),
+    ...(opts.recoveryIntervalMs !== undefined
+      ? { recoveryIntervalMs: opts.recoveryIntervalMs }
+      : {}),
     intervalMs: opts.intervalMs ?? 0,
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.cleanupGatewayJobs ? { cleanupGatewayJobs: opts.cleanupGatewayJobs } : {}),
+    ...(opts.cleanupGatewayJobsRetryMs !== undefined
+      ? { cleanupGatewayJobsRetryMs: opts.cleanupGatewayJobsRetryMs }
+      : {}),
     ...(opts.reapStaleRunningMs !== undefined
       ? { reapStaleRunningMs: opts.reapStaleRunningMs }
       : {}),
@@ -103,6 +130,105 @@ afterAll(async () => {
 });
 
 describe('TaskScheduler.tick', () => {
+  it('retries native cron cleanup on ticks until one success, then latches', async () => {
+    let sweeps = 0;
+    const scheduler = makeScheduler({
+      cleanupGatewayJobs: async () => {
+        sweeps += 1;
+        if (sweeps < 3) throw new Error('gateway temporarily unavailable');
+        return { removed: 4 };
+      },
+    });
+
+    await scheduler.tick();
+    expect(sweeps).toBe(1);
+    await scheduler.tick();
+    expect(sweeps).toBe(2);
+    await scheduler.tick();
+    expect(sweeps).toBe(3);
+    await scheduler.tick();
+    expect(sweeps).toBe(3);
+  });
+
+  it('does not fire due work until the legacy native-cron sweep succeeds', async () => {
+    const id = await insertTrigger({
+      schedule: { hour: '*', minute: 0, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+    });
+    let sweeps = 0;
+    const fired: string[] = [];
+    const scheduler = makeScheduler({
+      cleanupGatewayJobs: async () => {
+        sweeps += 1;
+        if (sweeps < 3) throw new Error('legacy cron state unavailable');
+        return { removed: 1 };
+      },
+      runTask: async (trigger) => {
+        fired.push(trigger.id);
+      },
+    });
+
+    expect((await scheduler.tick()).outcomes).toEqual([]);
+    expect((await scheduler.tick()).outcomes).toEqual([]);
+    expect(fired).toEqual([]);
+    expect((await scheduler.tick()).outcomes).toContainEqual({
+      triggerId: id,
+      outcome: 'fired',
+    });
+    expect(fired).toEqual([id]);
+  });
+
+  it('runs compensation before the native-cron cleanup fence', async () => {
+    const dueAt = new Date(Date.now() - 60_000);
+    const id = await insertTrigger({
+      schedule: { hour: '*', minute: 0, timezone: 'UTC' },
+      nextScheduledRun: null,
+      status: 'paused',
+    });
+    await pg`
+      update triggers
+      set pending_occurrence_id = ${crypto.randomUUID()},
+          pending_occurrence_kind = 'scheduled',
+          pending_occurrence_at = ${dueAt.toISOString()},
+          last_error = ${`${SCHEDULED_TASK_REFUND_PENDING_PREFIX} retry me`}
+      where id = ${id}
+    `;
+    const recovered: string[] = [];
+    let finishCleanup!: () => void;
+    const cleanupBlocked = new Promise<void>((resolve) => {
+      finishCleanup = resolve;
+    });
+    const scheduler = makeScheduler({
+      cleanupGatewayJobs: async () => {
+        await cleanupBlocked;
+        return { removed: 0 };
+      },
+      runTask: async () => {
+        throw new Error('normal provider runner must stay fenced');
+      },
+      recoverTask: async (trigger) => {
+        recovered.push(trigger.id);
+        await pg`
+          update triggers
+          set pending_occurrence_id = null,
+              pending_occurrence_kind = null,
+              pending_occurrence_at = null,
+              pending_occurrence_claim_id = null
+          where id = ${trigger.id}
+        `;
+      },
+    });
+
+    const ticking = scheduler.tick();
+    try {
+      // A gateway cleanup call that never returns must not hold compensation.
+      await expect.poll(() => recovered.includes(id), { timeout: 5000 }).toBe(true);
+    } finally {
+      finishCleanup();
+    }
+    expect((await ticking).outcomes).toContainEqual({ triggerId: id, outcome: 'fired' });
+  });
+
   it('fires due recurring tasks via runTask and stamps the next future run', async () => {
     const id = await insertTrigger({
       schedule: { hour: 9, minute: 30, timezone: 'UTC' },
@@ -289,6 +415,77 @@ describe('TaskScheduler.tick', () => {
     expect(new Date(row.next_scheduled_run!).getTime()).toBeGreaterThan(Date.now());
   });
 
+  it('immediately auto-pauses and clears the next run on the rolling hourly cap', async () => {
+    const id = await insertTrigger({
+      schedule: { hour: '*', minute: 30, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+    });
+    const scheduler = makeScheduler({
+      runTask: async () => {
+        throw new ApiError(
+          429,
+          'automation_hourly_budget_exceeded',
+          'Agent automation hourly manna cap reached: 80 spent in the last hour, cap is 80',
+        );
+      },
+    });
+
+    const result = await scheduler.tick();
+    expect(result.outcomes.find((row) => row.triggerId === id)?.outcome).toBe('failed');
+    const row = await readTrigger(id);
+    expect(row.status).toBe('paused');
+    expect(row.next_scheduled_run).toBeNull();
+    expect(row.error_count).toBe(1);
+    expect(row.last_error).toContain('auto-paused after automation budget refusal');
+    expect(row.last_error).toContain('cap is 80');
+  });
+
+  it('auto-pauses rather than finishes a one-time task refused by a budget cap', async () => {
+    const at = new Date(Date.now() - 30_000).toISOString();
+    const id = await insertTrigger({ schedule: { at }, nextScheduledRun: new Date(at) });
+    const scheduler = makeScheduler({
+      runTask: async () => {
+        throw new ApiError(
+          429,
+          'automation_hourly_budget_exceeded',
+          'Agent automation hourly manna cap reached: 80 spent in the last hour, cap is 80',
+        );
+      },
+    });
+
+    await scheduler.tick();
+    const row = await readTrigger(id);
+    expect(row.status).toBe('paused');
+    expect(row.next_scheduled_run).toBeNull();
+    expect(row.last_error).toContain('auto-paused after automation budget refusal');
+  });
+
+  it('immediately auto-pauses after the metering layer refuses the daily cap', async () => {
+    const id = await insertTrigger({
+      schedule: { hour: '*', minute: 35, timezone: 'UTC' },
+      nextScheduledRun: new Date(Date.now() - 60_000),
+    });
+    const scheduler = makeScheduler({
+      runTask: async () => {
+        // runScheduledTask records this pre-stream debit refusal before
+        // rethrowing it; mirror that durable effect in the injected seam.
+        await pg`
+          update triggers
+          set last_error = 'daily cap reached', error_count = 1
+          where id = ${id}
+        `;
+        throw new DailyCapExceededError(userId, 500, 1, 500);
+      },
+    });
+
+    await scheduler.tick();
+    const row = await readTrigger(id);
+    expect(row.status).toBe('paused');
+    expect(row.next_scheduled_run).toBeNull();
+    expect(row.error_count).toBe(1);
+    expect(row.last_error).toContain('daily manna cap exceeded');
+  });
+
   it('never auto-pauses when maxConsecutiveFailures is disabled (<= 0)', async () => {
     const id = await insertTrigger({
       schedule: { hour: 9, minute: 30, timezone: 'UTC' },
@@ -396,31 +593,105 @@ describe('TaskScheduler.tick', () => {
     expect(firstResult.outcomes.find((o) => o.triggerId === id)?.outcome).toBe('fired');
   });
 
-  it('reaps a task stranded in running (api crash mid-run) and re-fires it', async () => {
-    // Simulate the strand: status='running', updated_at old, next_scheduled_run
-    // still the pre-fire (past) value — exactly what a crash between the
-    // active→running claim and the next-run stamp leaves behind.
+  it('queues a stale running occurrence exactly once for compensation-only recovery', async () => {
+    let schedulerNow = new Date();
+    const dueAt = new Date(schedulerNow.getTime() - 60_000);
     const id = await insertTrigger({
       schedule: { hour: 9, minute: 30, timezone: 'UTC' },
-      nextScheduledRun: new Date(Date.now() - 60_000),
+      nextScheduledRun: dueAt,
       status: 'running',
     });
-    await pg`update triggers set updated_at = now() - interval '30 minutes' where id = ${id}`;
+    const occurrenceId = crypto.randomUUID();
+    const oldClaimId = crypto.randomUUID();
+    await pg`
+      update triggers
+      set pending_occurrence_id = ${occurrenceId},
+          pending_occurrence_kind = 'scheduled',
+          pending_occurrence_at = ${dueAt.toISOString()},
+          pending_occurrence_claim_id = ${oldClaimId},
+          updated_at = ${new Date(schedulerNow.getTime() - 30 * 60_000).toISOString()}
+      where id = ${id}
+    `;
 
-    const fired: string[] = [];
+    const recoveries: Array<{ id: string; status: string | null; error: string | null }> = [];
     const scheduler = makeScheduler({
       runTask: async (trigger) => {
-        fired.push(trigger.id);
+        recoveries.push({ id: trigger.id, status: trigger.status, error: trigger.lastError });
+        // The injected seam stands in for runScheduledTask's terminal
+        // compensation write; clear the occurrence so later ages cannot replay.
+        await pg`
+          update triggers
+          set pending_occurrence_id = null,
+              pending_occurrence_kind = null,
+              pending_occurrence_at = null,
+              pending_occurrence_claim_id = null,
+              last_error = 'stale occurrence closed without provider replay'
+          where id = ${trigger.id}
+        `;
       },
+      now: () => schedulerNow,
       reapStaleRunningMs: 15 * 60 * 1000,
     });
 
     const { outcomes } = await scheduler.tick();
-    // Reaped to active, then fired in the same tick.
-    expect(fired).toContain(id);
+    expect(recoveries).toEqual([
+      {
+        id,
+        status: 'paused',
+        error: expect.stringContaining('stale recovery pending'),
+      },
+    ]);
     expect(outcomes.find((o) => o.triggerId === id)?.outcome).toBe('fired');
     const row = await readTrigger(id);
-    expect(row.status).toBe('active');
+    expect(row.status).toBe('paused');
+    expect(row.next_scheduled_run).toBeNull();
+    expect(row.pending_occurrence_id).toBeNull();
+    expect(row.pending_occurrence_kind).toBeNull();
+    expect(row.pending_occurrence_at).toBeNull();
+    expect(row.pending_occurrence_claim_id).toBeNull();
+    expect(row.last_error).toContain('without provider replay');
+
+    // Ageing the terminal quarantine by another hour must never make it
+    // cadence-replayable.
+    schedulerNow = new Date(schedulerNow.getTime() + 60 * 60_000);
+    const later = await scheduler.tick();
+    expect(recoveries.filter((recovery) => recovery.id === id)).toHaveLength(1);
+    expect(later.outcomes.find((outcome) => outcome.triggerId === id)).toBeUndefined();
+  });
+
+  it('never replays an old owner-paused pending occurrence based on age alone', async () => {
+    const now = new Date();
+    const dueAt = new Date(now.getTime() - 60_000);
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: null,
+      status: 'paused',
+    });
+    const occurrenceId = crypto.randomUUID();
+    await pg`
+      update triggers
+      set pending_occurrence_id = ${occurrenceId},
+          pending_occurrence_kind = 'scheduled',
+          pending_occurrence_at = ${dueAt.toISOString()},
+          updated_at = ${new Date(now.getTime() - 3 * 60 * 60_000).toISOString()}
+      where id = ${id}
+    `;
+
+    let calls = 0;
+    const scheduler = makeScheduler({
+      runTask: async () => {
+        calls += 1;
+      },
+      now: () => now,
+      reapStaleRunningMs: 15 * 60 * 1000,
+    });
+
+    const result = await scheduler.tick();
+    expect(calls).toBe(0);
+    expect(result.outcomes.find((outcome) => outcome.triggerId === id)).toBeUndefined();
+    const row = await readTrigger(id);
+    expect(row.status).toBe('paused');
+    expect(row.pending_occurrence_id).toBe(occurrenceId);
   });
 
   it('does NOT reap a task that is legitimately mid-run (recently updated)', async () => {
@@ -447,10 +718,75 @@ describe('TaskScheduler.tick', () => {
 });
 
 describe('TaskScheduler.start', () => {
-  it('does not start when the interval is 0 (disabled)', () => {
+  it('does not start task firing when the interval is 0 (disabled)', () => {
     const scheduler = makeScheduler({ intervalMs: 0 });
     scheduler.start();
     expect(scheduler.running).toBe(false);
+    scheduler.stop();
+  });
+
+  it('keeps provider-free compensation running when normal firing is disabled', async () => {
+    const dueAt = new Date(Date.now() - 60_000);
+    const id = await insertTrigger({
+      schedule: { hour: '*', minute: 0, timezone: 'UTC' },
+      nextScheduledRun: null,
+      status: 'paused',
+    });
+    await pg`
+      update triggers
+      set pending_occurrence_id = ${crypto.randomUUID()},
+          pending_occurrence_kind = 'scheduled',
+          pending_occurrence_at = ${dueAt.toISOString()},
+          last_error = ${`${SCHEDULED_TASK_REFUND_PENDING_PREFIX} interval-zero retry`}
+      where id = ${id}
+    `;
+    const recovered: string[] = [];
+    const scheduler = makeScheduler({
+      intervalMs: 0,
+      recoveryIntervalMs: 5,
+      runTask: async () => {
+        throw new Error('normal provider runner must remain disabled');
+      },
+      recoverTask: async (trigger) => {
+        recovered.push(trigger.id);
+        await pg`
+          update triggers
+          set pending_occurrence_id = null,
+              pending_occurrence_kind = null,
+              pending_occurrence_at = null,
+              pending_occurrence_claim_id = null
+          where id = ${trigger.id}
+        `;
+      },
+    });
+    try {
+      scheduler.start();
+      expect(scheduler.running).toBe(false);
+      await expect.poll(() => recovered.includes(id), { timeout: 5000 }).toBe(true);
+    } finally {
+      scheduler.stop();
+    }
+  });
+
+  it('retries native cron cleanup even when task firing is disabled', async () => {
+    let sweeps = 0;
+    const scheduler = makeScheduler({
+      intervalMs: 0,
+      cleanupGatewayJobsRetryMs: 5,
+      cleanupGatewayJobs: async () => {
+        sweeps += 1;
+        if (sweeps === 1) throw new Error('gateway booting');
+        return { removed: 3 };
+      },
+    });
+    try {
+      scheduler.start();
+      scheduler.start();
+      expect(scheduler.running).toBe(false);
+      await expect.poll(() => sweeps, { timeout: 5000 }).toBe(2);
+    } finally {
+      scheduler.stop();
+    }
   });
 
   it('runs the legacy gateway-job sweep once on start', async () => {

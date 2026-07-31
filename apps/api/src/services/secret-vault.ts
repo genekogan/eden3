@@ -13,8 +13,37 @@ export interface EncryptedSecret {
 }
 
 export interface SecretVaultLike {
-  encrypt(plaintext: string): EncryptedSecret;
-  decrypt(record: Pick<ChannelConnection, 'tokenCiphertext' | 'tokenIv' | 'tokenAuthTag' | 'keyVersion'>): string;
+  encrypt(plaintext: string, context?: string): EncryptedSecret;
+  decrypt(
+    record: Pick<ChannelConnection, 'tokenCiphertext' | 'tokenIv' | 'tokenAuthTag' | 'keyVersion'>,
+    context?: string,
+  ): string;
+}
+
+function aad(parts: string[]): string {
+  if (parts.some((part) => part.length === 0 || part.includes('\0'))) {
+    throw new TypeError('invalid secret encryption context');
+  }
+  return ['eden3-secret-v2', ...parts].join('\0');
+}
+
+export function channelTokenSecretContext(params: {
+  connectionId: string;
+  accountId: string;
+  channel: string;
+}): string {
+  return aad(['channel-token', params.connectionId, params.accountId, params.channel]);
+}
+
+export function channelPeerSecretContext(connectionId: string, peerFingerprint: string): string {
+  return aad(['channel-peer', connectionId, peerFingerprint]);
+}
+
+export function channelPairingCodeSecretContext(
+  connectionId: string,
+  peerFingerprint: string,
+): string {
+  return aad(['channel-pairing-code', connectionId, peerFingerprint]);
 }
 
 function parseKey(raw: string): Buffer {
@@ -39,12 +68,19 @@ export class AesGcmSecretVault implements SecretVaultLike {
 
   constructor(opts: { key: string; keyVersion?: string }) {
     this.key = parseKey(opts.key);
-    this.keyVersion = opts.keyVersion ?? 'v1';
+    this.keyVersion = opts.keyVersion ?? 'v2';
+    if (this.keyVersion !== 'v1' && this.keyVersion !== 'v2') {
+      throw new Error(`Unsupported secret key version ${this.keyVersion}`);
+    }
   }
 
-  encrypt(plaintext: string): EncryptedSecret {
+  encrypt(plaintext: string, context?: string): EncryptedSecret {
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', this.key, iv);
+    if (this.keyVersion === 'v2') {
+      if (!context) throw new Error('Secret encryption context is required');
+      cipher.setAAD(Buffer.from(context, 'utf8'));
+    }
     const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
     const authTag = cipher.getAuthTag();
     return {
@@ -57,8 +93,11 @@ export class AesGcmSecretVault implements SecretVaultLike {
     };
   }
 
-  decrypt(record: Pick<ChannelConnection, 'tokenCiphertext' | 'tokenIv' | 'tokenAuthTag' | 'keyVersion'>): string {
-    if (record.keyVersion !== this.keyVersion) {
+  decrypt(
+    record: Pick<ChannelConnection, 'tokenCiphertext' | 'tokenIv' | 'tokenAuthTag' | 'keyVersion'>,
+    context?: string,
+  ): string {
+    if (record.keyVersion !== 'v1' && record.keyVersion !== this.keyVersion) {
       throw new Error(`Unsupported secret key version ${record.keyVersion}`);
     }
     const decipher = createDecipheriv(
@@ -66,6 +105,10 @@ export class AesGcmSecretVault implements SecretVaultLike {
       this.key,
       Buffer.from(record.tokenIv, 'base64'),
     );
+    if (record.keyVersion === 'v2') {
+      if (!context) throw new Error('Secret decryption context is required');
+      decipher.setAAD(Buffer.from(context, 'utf8'));
+    }
     decipher.setAuthTag(Buffer.from(record.tokenAuthTag, 'base64'));
     return Buffer.concat([
       decipher.update(Buffer.from(record.tokenCiphertext, 'base64')),

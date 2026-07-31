@@ -76,6 +76,42 @@ interface ResolvedTarget {
   agent: TurnAgent;
 }
 
+/** A completed chat may make a previously-too-small seed eligible. */
+async function enqueueAutomaticMemoryRetryForAgent(
+  agentAccountId: string,
+  onError: (err: unknown) => void,
+): Promise<void> {
+  const [row] = await db
+    .select({
+      openclawId: agents.openclawId,
+      workspacePath: agents.workspacePath,
+      provisionStatus: agents.provisionStatus,
+      name: agents.name,
+      persona: agents.persona,
+      username: accounts.username,
+    })
+    .from(agents)
+    .innerJoin(accounts, eq(accounts.id, agents.accountId))
+    .where(eq(agents.accountId, agentAccountId))
+    .limit(1);
+  if (
+    !row?.openclawId ||
+    !row.workspacePath ||
+    row.provisionStatus !== 'ready'
+  ) return;
+  enqueueLazyMemoryDistillation(
+    {
+      agentAccountId,
+      openclawId: row.openclawId,
+      username: row.username,
+      name: row.name,
+      persona: row.persona,
+      workspacePath: row.workspacePath,
+    },
+    onError,
+  );
+}
+
 /** Create the session row + memberships for `new` in one transaction. */
 async function ensureChattableAgent(
   resolved: NonNullable<Awaited<ReturnType<typeof resolveAgentByUsername>>>,
@@ -88,6 +124,7 @@ async function ensureChattableAgent(
       username: account.username,
       openclawId: agent.openclawId,
       model: agent.model,
+      agentRuntime: await gatewayGlue.modelRuntime.getRuntime(agent.model),
       thinkingLevel: agent.thinkingLevel,
     };
   }
@@ -157,6 +194,7 @@ async function ensureChattableAgent(
       username: account.username,
       openclawId,
       model: agent.model,
+      agentRuntime: await gatewayGlue.modelRuntime.getRuntime(agent.model),
       thinkingLevel: agent.thinkingLevel,
     };
   } catch (err) {
@@ -219,6 +257,13 @@ async function resolveExisting(
   if (!(await canAccessSession(session, account))) {
     throw new ApiError(403, 'forbidden', 'You do not have access to this session');
   }
+  if (session.channelConnectionId !== null || session.sessionType === 'channel') {
+    throw new ApiError(
+      409,
+      'channel_session_read_only',
+      'External channel conversations are read-only in Eden',
+    );
+  }
 
   const rows = await db
     .select({
@@ -268,6 +313,9 @@ async function resolveExisting(
       username: provisioned.username,
       openclawId: provisioned.openclawId!,
       model: provisioned.model,
+      agentRuntime: await gatewayGlue.modelRuntime.getRuntime(
+        provisioned.model ?? DEFAULT_AGENT_MODEL,
+      ),
       thinkingLevel: provisioned.thinkingLevel,
     },
   };
@@ -368,6 +416,11 @@ export const chatRoutes: FastifyPluginAsync = async (app) => {
             content: body.content,
             beginStream: () => openSseSink(reply, target.session.id),
           },
+        );
+        void enqueueAutomaticMemoryRetryForAgent(target.agent.accountId, (err) =>
+          req.log.warn({ err }, `memory distillation retry failed for "${target.agent.username}"`),
+        ).catch((err) =>
+          req.log.warn({ err }, `memory distillation retry lookup failed for "${target.agent.username}"`),
         );
       } catch (err) {
         // runTurn only throws BEFORE the reply is hijacked (see its contract).

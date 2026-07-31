@@ -5,6 +5,7 @@ import {
   DEFAULT_AGENT_MODEL,
   DEFAULT_AGENT_THINKING_LEVEL,
   DEFAULT_AGENT_TOOL_GROUPS,
+  defaultAgentRuntimeForModel,
   agentToolGroupsSchema,
   agentModelSchema,
   agentThinkingLevelSchema,
@@ -12,6 +13,7 @@ import {
   tryDecodeFeedCursor,
   type AccountSummary,
   type AgentDto,
+  type AgentRuntime,
   type CollectionDto,
   type CreationDto,
   type CronSchedule,
@@ -189,6 +191,8 @@ export interface AgentDtoOptions {
   includePersona: boolean;
   likeCount?: number;
   viewerHasLiked?: boolean;
+  /** Effective config-derived runtime; defaults to the static catalog value. */
+  agentRuntime?: AgentRuntime;
 }
 
 function coerceAgentModel(value: string | null | undefined): AgentDto['model'] {
@@ -207,6 +211,7 @@ function coerceToolGroups(value: unknown): AgentDto['toolGroups'] {
 }
 
 export function agentDtoFromRow(row: AgentRow, opts: AgentDtoOptions): AgentDto {
+  const model = coerceAgentModel(row.model);
   return {
     id: row.id,
     externalId: row.external_id,
@@ -216,7 +221,8 @@ export function agentDtoFromRow(row: AgentRow, opts: AgentDtoOptions): AgentDto 
     persona: opts.includePersona ? row.persona : null,
     greeting: row.greeting,
     voice: row.voice,
-    model: coerceAgentModel(row.model),
+    model,
+    agentRuntime: opts.agentRuntime ?? defaultAgentRuntimeForModel(model),
     thinkingLevel: coerceThinkingLevel(row.thinking_level),
     toolGroups: coerceToolGroups(row.tool_groups),
     userImage: row.user_image,
@@ -237,6 +243,7 @@ export function agentDtoFromEntities(
   agent: Agent,
   opts: AgentDtoOptions,
 ): AgentDto {
+  const model = coerceAgentModel(agent.model);
   return {
     id: account.id,
     externalId: account.externalId,
@@ -246,7 +253,8 @@ export function agentDtoFromEntities(
     persona: opts.includePersona ? agent.persona : null,
     greeting: agent.greeting,
     voice: agent.voice,
-    model: coerceAgentModel(agent.model),
+    model,
+    agentRuntime: opts.agentRuntime ?? defaultAgentRuntimeForModel(model),
     thinkingLevel: coerceThinkingLevel(agent.thinkingLevel),
     toolGroups: coerceToolGroups(agent.toolGroups),
     userImage: account.userImage,

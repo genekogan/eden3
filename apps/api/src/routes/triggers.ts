@@ -18,6 +18,7 @@ import { triggerDtoFromEntity } from '../route-helpers';
 import { concurrentTurnLimit, dailyMannaSpend } from '../services/chat-limits';
 import { runScheduledTask } from '../services/scheduled-tasks';
 import { nextOccurrence, TaskScheduleError } from '../services/task-schedule';
+import { agentTaskLimitError, MAX_ENABLED_TASKS_PER_AGENT } from '../services/task-limits';
 
 /**
  * Tasks API — user-scheduled prompts ("triggers"). Registered under the
@@ -266,19 +267,35 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
     }
 
-    const [row] = await db
-      .insert(triggers)
-      .values({
-        userId: viewer.accountId,
-        agentId: agentAccount.id,
-        name: body.name,
-        prompt: body.prompt,
-        schedule: body.schedule,
-        status: 'active',
-        sessionTarget: 'new',
-        nextScheduledRun,
-      })
-      .returning();
+    // Serialize enabled-task creates for this agent. The hard per-agent cap
+    // applies to owner-created and self-created jobs alike, including admins;
+    // otherwise two racing creates could both observe slot ten as free.
+    const rowId = await pg.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended(${agentAccount.id}::text, 84))`;
+      const [enabled] = await tx<{ count: number }[]>`
+        select count(*)::int as count
+        from triggers
+        where agent_id = ${agentAccount.id}
+          and deleted = false
+          and status in ('active', 'running')
+      `;
+      if ((enabled?.count ?? 0) >= MAX_ENABLED_TASKS_PER_AGENT) {
+        throw agentTaskLimitError(agentAccount.id);
+      }
+      const [inserted] = await tx<{ id: string }[]>`
+        insert into triggers (
+          user_id, agent_id, name, prompt, schedule, status,
+          session_target, next_scheduled_run
+        ) values (
+          ${viewer.accountId}, ${agentAccount.id}, ${body.name}, ${body.prompt},
+          ${JSON.stringify(body.schedule)}::jsonb, 'active', 'new', ${nextScheduledRun.toISOString()}
+        )
+        returning id
+      `;
+      if (!inserted) throw new Error('triggers insert returned no row');
+      return inserted.id;
+    });
+    const [row] = await db.select().from(triggers).where(eq(triggers.id, rowId)).limit(1);
     if (!row) throw new Error('triggers insert returned no row');
 
     const fresh = await ensureGatewayJobRemoved(app.gatewayGlue, req.log, row);
@@ -377,32 +394,86 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       return sendError(reply, 403, 'forbidden', 'Only the task owner can modify it');
     }
 
-    const nextDeleted = body.deleted === true;
-    const nextStatus = nextDeleted ? (existing.status ?? 'paused') : (body.status ?? existing.status);
-    const nextSchedule = body.schedule ?? existing.schedule ?? {};
-    // 'running' = active with a run in flight — schedule edits keep it live.
-    const enabled = !nextDeleted && (nextStatus === 'active' || nextStatus === 'running');
+    const updatedId = await pg.begin(async (tx) => {
+      // Always take the same per-agent lock as creates and bridge mutations,
+      // then re-read this row under `for update`. Computing slot usage from
+      // the pre-transaction route read lets a pause/resume race exceed ten.
+      if (existing.agentId) {
+        await tx`select pg_advisory_xact_lock(hashtextextended(${existing.agentId}::text, 84))`;
+      }
+      const [current] = await tx<{
+        id: string;
+        agent_id: string | null;
+        deleted: boolean;
+        status: string | null;
+        name: string | null;
+        prompt: string | null;
+        schedule: unknown;
+        pending_occurrence_id: string | null;
+      }[]>`
+        select id, agent_id, deleted, status, name, prompt, schedule,
+               pending_occurrence_id
+        from triggers
+        where id = ${existing.id}
+        for update
+      `;
+      if (!current || current.deleted) return null;
+      const pauseOnly =
+        body.status === 'paused' &&
+        body.name === undefined &&
+        body.prompt === undefined &&
+        body.schedule === undefined &&
+        body.deleted === undefined;
+      if (current.pending_occurrence_id && !pauseOnly) {
+        throw new ApiError(
+          409,
+          'task_refund_pending',
+          'This task has a run or charge recovery in progress; it may be paused, but retry other edits after recovery completes',
+        );
+      }
 
-    // An enabled task must have a real upcoming run; paused/deleted tasks
-    // carry none (resume recomputes, so a stale stamp can't "miss-fire").
-    const nextScheduledRun = enabled ? nextRunFromSchedule(nextSchedule, new Date()) : null;
+      const nextDeleted = body.deleted === true;
+      const nextStatus = nextDeleted
+        ? (current.status ?? 'paused')
+        : (body.status ?? current.status);
+      const nextSchedule = body.schedule ?? current.schedule ?? {};
+      // 'running' = active with a run in flight — schedule edits keep it live.
+      const enabled = !nextDeleted && (nextStatus === 'active' || nextStatus === 'running');
+      const wasEnabled = current.status === 'active' || current.status === 'running';
+      const claimsNewSlot = enabled && !wasEnabled;
+      const nextScheduledRun = enabled
+        ? nextRunFromSchedule(nextSchedule, new Date())
+        : null;
 
-    const [updated] = await db
-      .update(triggers)
-      .set({
-        ...(nextDeleted
-          ? { deleted: true, status: 'finished' }
-          : body.status !== undefined
-            ? { status: body.status }
-            : {}),
-        ...(body.name !== undefined ? { name: body.name } : {}),
-        ...(body.prompt !== undefined ? { prompt: body.prompt } : {}),
-        ...(body.schedule !== undefined ? { schedule: body.schedule } : {}),
-        nextScheduledRun,
-        updatedAt: new Date(),
-      })
-      .where(eq(triggers.id, existing.id))
-      .returning();
+      if (claimsNewSlot && current.agent_id) {
+        const [count] = await tx<{ count: number }[]>`
+          select count(*)::int as count
+          from triggers
+          where agent_id = ${current.agent_id}
+            and deleted = false
+            and status in ('active', 'running')
+        `;
+        if ((count?.count ?? 0) >= MAX_ENABLED_TASKS_PER_AGENT) {
+          throw agentTaskLimitError(current.agent_id);
+        }
+      }
+      const [changed] = await tx<{ id: string }[]>`
+        update triggers
+        set deleted = ${nextDeleted},
+            status = ${nextDeleted ? 'finished' : nextStatus},
+            name = ${body.name ?? current.name},
+            prompt = ${body.prompt ?? current.prompt},
+            schedule = ${JSON.stringify(nextSchedule)}::jsonb,
+            next_scheduled_run = ${nextScheduledRun?.toISOString() ?? null},
+            updated_at = now()
+        where id = ${existing.id}
+        returning id
+      `;
+      return changed?.id ?? null;
+    });
+    const [updated] = updatedId
+      ? await db.select().from(triggers).where(eq(triggers.id, updatedId)).limit(1)
+      : [];
     if (!updated) {
       return sendError(reply, 404, 'task_not_found', `No task "${id}"`);
     }

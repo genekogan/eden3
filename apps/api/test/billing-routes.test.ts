@@ -499,6 +499,83 @@ describe('POST /billing/vouchers/redeem', () => {
     expect(voucher?.redeemed_count).toBe(1);
   });
 
+  it('recognizes an imported per-user redemption without crediting or consuming capacity again', async () => {
+    const code = `${marker}_voucher_imported`;
+    const legacyVoucherId = `${marker}_legacy_voucher`;
+    const before = await getBalance(userId);
+    await pg`
+      insert into manna_vouchers (
+        code, amount, max_redemptions, redeemed_count, metadata
+      )
+      values (
+        ${code}, 888, 3, 1,
+        ${JSON.stringify({ legacyExternalId: legacyVoucherId, legacyAction: 'manna' })}::jsonb
+      )
+    `;
+    await pg`
+      insert into manna_transactions (
+        external_id, manna_account_id, amount, type, voucher_external_id, code
+      )
+      select
+        ${`${marker}_legacy_redemption`}, ma.id, 888, 'credit:voucher',
+        ${legacyVoucherId}, ${code}
+      from manna_accounts ma
+      where ma.account_id = ${userId}
+    `;
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/billing/vouchers/redeem',
+      headers: { cookie: devCookie(userId) },
+      payload: { code },
+    });
+
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ amount: 888, alreadyApplied: true, balance: before });
+    expect((await ledgerRows(userId)).filter((row) => row.code === code)).toHaveLength(1);
+    const [voucher] = await pg<{ redeemed_count: number }[]>`
+      select redeemed_count from manna_vouchers where code = ${code}
+    `;
+    expect(voucher?.redeemed_count).toBe(1);
+  });
+
+  it('preserves and enforces an imported legacy user allowlist', async () => {
+    const code = `${marker}_voucher_allowlisted`;
+    const legacyClerkId = `${marker}_legacy_clerk_user`;
+    await pg`update accounts set clerk_user_id = ${legacyClerkId} where id = ${userId}`;
+    await pg`
+      insert into manna_vouchers (code, amount, max_redemptions, metadata)
+      values (
+        ${code}, 222, 1,
+        ${JSON.stringify({
+          legacyExternalId: `${marker}_legacy_allowlisted_voucher`,
+          legacyAction: 'manna',
+          allowedUserIds: [legacyClerkId],
+        })}::jsonb
+      )
+    `;
+
+    const denied = await app.inject({
+      method: 'POST',
+      url: '/billing/vouchers/redeem',
+      headers: { cookie: devCookie(otherUserId) },
+      payload: { code },
+    });
+    expect(denied.statusCode).toBe(403);
+    expect((denied.json() as { error: { code: string } }).error.code).toBe(
+      'voucher_not_allowed',
+    );
+
+    const allowed = await app.inject({
+      method: 'POST',
+      url: '/billing/vouchers/redeem',
+      headers: { cookie: devCookie(userId) },
+      payload: { code },
+    });
+    expect(allowed.statusCode).toBe(200);
+    expect(allowed.json()).toMatchObject({ amount: 222, alreadyApplied: false });
+  });
+
   it('rejects expired vouchers', async () => {
     const code = `${marker}_expired`;
     await pg`
@@ -515,6 +592,70 @@ describe('POST /billing/vouchers/redeem', () => {
 
     expect(res.statusCode).toBe(400);
     expect((res.json() as { error: { code: string } }).error.code).toBe('voucher_expired');
+  });
+
+  it('refuses a malformed-expiry legacy voucher even before disabled reconciliation lands', async () => {
+    const code = `${marker}_malformed_expiry`;
+    await pg`
+      insert into manna_vouchers (code, amount, disabled, expires_at, metadata)
+      values (
+        ${code}, 321, false, null,
+        ${JSON.stringify({
+          legacyExternalId: `${marker}_legacy_malformed_expiry`,
+          legacyAction: 'manna',
+          legacyMalformedExpiresAt: true,
+        })}::jsonb
+      )
+    `;
+    const before = await getBalance(userId);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/billing/vouchers/redeem',
+      headers: { cookie: devCookie(userId) },
+      payload: { code },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('voucher_disabled');
+    expect((await getBalance(userId)).total).toBe(before.total);
+    const [voucher] = await pg<{ redeemed_count: number }[]>`
+      select redeemed_count from manna_vouchers where code = ${code}
+    `;
+    expect(voucher?.redeemed_count).toBe(0);
+    expect((await ledgerRows(userId)).filter((row) => row.code === code)).toHaveLength(0);
+  });
+
+  it('refuses a malformed-critical legacy voucher even before disabled reconciliation lands', async () => {
+    const code = `${marker}_malformed_critical`;
+    await pg`
+      insert into manna_vouchers (code, amount, disabled, metadata)
+      values (
+        ${code}, 654, false,
+        ${JSON.stringify({
+          legacyExternalId: `${marker}_legacy_malformed_critical`,
+          legacyAction: 'manna',
+          legacyMalformedCriticalFields: ['maxUses', 'allowedUserIds'],
+        })}::jsonb
+      )
+    `;
+    const before = await getBalance(userId);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/billing/vouchers/redeem',
+      headers: { cookie: devCookie(userId) },
+      payload: { code },
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('voucher_disabled');
+    expect((await getBalance(userId)).total).toBe(before.total);
+    const [voucher] = await pg<{ redeemed_count: number }[]>`
+      select redeemed_count from manna_vouchers where code = ${code}
+    `;
+    expect(voucher?.redeemed_count).toBe(0);
+    expect((await ledgerRows(userId)).filter((row) => row.code === code)).toHaveLength(0);
   });
 
   it('rejects unknown voucher codes', async () => {

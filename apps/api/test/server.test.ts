@@ -40,6 +40,35 @@ describe('GET /health', () => {
     expect(body.versions.api).toBeTruthy();
   });
 
+  it('boots degraded without a host gateway token and still runs native-cron cleanup', async () => {
+    const restoreToken = withEnv('OPENCLAW_GATEWAY_TOKEN', '');
+    let cleanupSweeps = 0;
+    const probe = await buildServer({
+      gateway: null,
+      scheduler: { autoStart: true },
+      provisioning: {
+        cronSync: {
+          async removeTrigger(triggerId) {
+            return { name: `eden3:${triggerId}`, action: 'absent' as const };
+          },
+          async removeAllEden3Jobs() {
+            cleanupSweeps += 1;
+            return { removed: 0 };
+          },
+        },
+      },
+    });
+    try {
+      expect((await probe.inject({ method: 'GET', url: '/health' })).statusCode).toBe(200);
+      await expect.poll(() => cleanupSweeps).toBe(1);
+      expect(probe.taskScheduler).not.toBeNull();
+      expect(probe.taskScheduler?.running).toBe(false);
+    } finally {
+      await probe.close();
+      restoreToken();
+    }
+  });
+
   it('logs structured request metadata without headers, cookies, or bearer secrets', async () => {
     const lines: string[] = [];
     const probe = await buildServer({

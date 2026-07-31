@@ -6,9 +6,9 @@ import { pg } from '@eden3/db';
 import {
   BOOTSTRAP_FILENAME,
   WORKSPACE_STATE_FILENAME,
+  mutateOpenClawConfig,
   readOpenClawConfig,
   renderTemplate,
-  writeOpenClawConfig,
   workspaceBootstrapStatus,
 } from '@eden3/gateway';
 
@@ -164,26 +164,27 @@ export async function syncDefaultEdenWorkspace(
 }
 
 async function ensureMainAgentUsesDefaultWorkspace(dataDir: string): Promise<void> {
-  let parsed: Record<string, unknown>;
+  // Preserve the historical best-effort behavior for a malformed/unreadable
+  // config, but never use this unlocked read as the mutation snapshot.
   try {
-    parsed = await readOpenClawConfig(dataDir);
+    await readOpenClawConfig(dataDir);
   } catch {
     return;
   }
-  const agents = parsed.agents;
-  const list =
-    typeof agents === 'object' && agents !== null && !Array.isArray(agents)
-      ? (agents as Record<string, unknown>).list
-      : undefined;
-  if (!Array.isArray(list)) return;
-  const entry = list.find(
-    (item): item is Record<string, unknown> =>
-      typeof item === 'object' && item !== null && item.id === DEFAULT_EDEN_OPENCLAW_ID,
-  );
-  if (!entry) return;
-  const workspace = path.join(dataDir, 'workspace');
-  if (entry.name === DEFAULT_EDEN_PROFILE.name && entry.workspace === workspace) return;
-  entry.name = DEFAULT_EDEN_PROFILE.name;
-  entry.workspace = workspace;
-  await writeOpenClawConfig(dataDir, parsed);
+  await mutateOpenClawConfig(dataDir, (config) => {
+    const agents = config.agents;
+    const list =
+      typeof agents === 'object' && agents !== null && !Array.isArray(agents)
+        ? (agents as Record<string, unknown>).list
+        : undefined;
+    if (!Array.isArray(list)) return;
+    const entry = list.find(
+      (item): item is Record<string, unknown> =>
+        typeof item === 'object' && item !== null && item.id === DEFAULT_EDEN_OPENCLAW_ID,
+    );
+    if (!entry) return;
+    const workspace = path.join(dataDir, 'workspace');
+    entry.name = DEFAULT_EDEN_PROFILE.name;
+    entry.workspace = workspace;
+  });
 }

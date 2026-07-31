@@ -89,7 +89,13 @@ describe('runTurn refund-guard (pre-stream failure)', () => {
     await expect(
       runTurn(makeDeps(), {
         session,
-        agent: { accountId: userId, username: 'agent', openclawId: 'testbot' },
+        agent: {
+          accountId: userId,
+          username: 'agent',
+          openclawId: 'testbot',
+          model: 'anthropic/claude-haiku-4-5',
+          agentRuntime: 'openclaw',
+        },
         user: userSession(),
         content: 'hello',
         beginStream: (): TurnSink => {

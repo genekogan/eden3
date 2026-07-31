@@ -189,6 +189,14 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
     where owner_account_id = any(${ids}::uuid[])
        or actor_account_id = any(${ids}::uuid[])
   `;
+  await pg`
+    delete from channel_turns
+    where account_id = any(${ids}::uuid[])
+       or agent_id = any(${ids}::uuid[])
+       or connection_id in (
+         select id from channel_connections
+         where account_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[]))
+  `;
   await pg`delete from channel_connections where account_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
   await pg`
     delete from messages
@@ -244,7 +252,9 @@ export interface FakeProvisioner extends ProvisionerLike {
   personaUpdates: UpdatePersonaParams[];
 }
 
-export function makeFakeProvisioner(opts: { failProvision?: boolean } = {}): FakeProvisioner {
+export function makeFakeProvisioner(
+  opts: { failProvision?: boolean; failPersonaUpdate?: boolean } = {},
+): FakeProvisioner {
   const provisions: ProvisionAgentParams[] = [];
   const personaUpdates: UpdatePersonaParams[] = [];
   return {
@@ -266,6 +276,7 @@ export function makeFakeProvisioner(opts: { failProvision?: boolean } = {}): Fak
     },
     async updateAgentPersona(params): ReturnType<ProvisionerLike['updateAgentPersona']> {
       personaUpdates.push(params);
+      if (opts.failPersonaUpdate === true) throw new Error('fake persona doctrine failure');
       return { filesWritten: ['SOUL.md', 'IDENTITY.md'], bootstrapSuppressed: true };
     },
   };

@@ -17,8 +17,10 @@ describe('session cursors', () => {
   });
 
   it('round-trips a messages cursor', () => {
-    const cursor = { t: '2026-07-03T10:00:00.000Z', id: '11111111-1111-4111-8111-111111111111' };
+    const cursor = { t: '2026-07-03T10:00:00.000Z', q: 42, id: '11111111-1111-4111-8111-111111111111' };
     expect(decodeMessagesCursor(encodeCursor(cursor))).toEqual(cursor);
+    const legacy = { t: cursor.t, id: cursor.id };
+    expect(decodeMessagesCursor(encodeCursor(legacy))).toEqual(legacy);
   });
 
   it('rejects malformed cursors with a 400 ApiError', () => {

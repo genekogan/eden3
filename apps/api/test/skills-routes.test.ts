@@ -5,15 +5,18 @@ import path from 'node:path';
 import { DevAuthProvider } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import type { FastifyInstance } from 'fastify';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { buildServer } from '../src/server';
+import { reconcileAgentRuntime } from '../src/services/agent-runtime-sync';
 import {
   deleteFixturesByMarker,
   devCookie,
   insertAgentAccount,
   insertUserAccount,
+  makeFakeProvisioner,
   makeFakeSkillSync,
+  makeFakeToolSync,
   makeMarker,
 } from './fixtures';
 
@@ -24,9 +27,13 @@ let ownerId = '';
 let strangerId = '';
 let adminId = '';
 let agentId = '';
+let dataDir = '';
 let workspaceDir = '';
 let app: FastifyInstance;
 const skillSync = makeFakeSkillSync();
+const provisioner = makeFakeProvisioner();
+const toolSync = makeFakeToolSync();
+const previousOpenClawDataDir = process.env.OPENCLAW_DATA_DIR;
 
 interface SkillDto {
   id: string;
@@ -36,7 +43,10 @@ interface SkillDto {
 }
 
 beforeAll(async () => {
-  workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), `${marker}-workspace-`));
+  dataDir = await fs.mkdtemp(path.join(os.tmpdir(), `${marker}-data-`));
+  process.env.OPENCLAW_DATA_DIR = dataDir;
+  workspaceDir = path.join(dataDir, `workspace-${marker}_agent`);
+  await fs.mkdir(workspaceDir, { recursive: true });
   ownerId = await insertUserAccount(`${marker}_owner`);
   strangerId = await insertUserAccount(`${marker}_stranger`);
   adminId = await insertUserAccount(`${marker}_admin`);
@@ -51,14 +61,16 @@ beforeAll(async () => {
   app = await buildServer({
     gateway: null,
     auth: { provider: new DevAuthProvider({ adminUsernames: [`${marker}_admin`] }) },
-    provisioning: { skillSync },
+    provisioning: { provisioner, skillSync, toolSync },
   });
   await app.ready();
 });
 
 afterAll(async () => {
   await app?.close();
-  await fs.rm(workspaceDir, { recursive: true, force: true });
+  await fs.rm(dataDir, { recursive: true, force: true });
+  if (previousOpenClawDataDir === undefined) delete process.env.OPENCLAW_DATA_DIR;
+  else process.env.OPENCLAW_DATA_DIR = previousOpenClawDataDir;
   await deleteFixturesByMarker(marker);
   await pg.end({ timeout: 5 });
 });
@@ -222,6 +234,248 @@ describe('skills routes', () => {
       where sd.slug = ${slug}
     `;
     expect(rows[0]!.count).toBe(0);
+  });
+
+  it('keeps a committed skill selection pending when projection fails, then retries it', async () => {
+    const slug = `${marker}_retry_projection`;
+    await pg`
+      insert into skill_definitions (slug, name, description, body, source, status)
+      values (
+        ${slug}, 'Retry Projection', null,
+        '# Retry Projection\n\nThis desired skill must survive a runtime outage.',
+        'curated', 'approved'
+      )
+    `;
+
+    const originalSync = skillSync.syncAgentSkills;
+    let failOnce = true;
+    skillSync.syncAgentSkills = async (params) => {
+      skillSync.calls.push(params);
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('simulated manifest write outage');
+      }
+      return { changed: true };
+    };
+    try {
+      const saved = await app.inject({
+        method: 'POST',
+        url: `/agents/${marker}_agent/skills`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { slugs: [slug] },
+      });
+      expect(saved.statusCode).toBe(202);
+      expect(saved.json()).toMatchObject({ runtimeSync: 'pending' });
+
+      const [pending] = await pg<{
+        runtime_sync_version: number;
+        runtime_synced_version: number;
+        runtime_sync_error: string | null;
+      }[]>`
+        select runtime_sync_version, runtime_synced_version, runtime_sync_error
+        from agents where account_id = ${agentId}
+      `;
+      expect(pending!.runtime_sync_version).toBeGreaterThan(pending!.runtime_synced_version);
+      expect(pending!.runtime_sync_error).toContain('retry pending');
+      const desired = await pg<{ slug: string }[]>`
+        select sd.slug
+        from agent_skills aks
+        join skill_definitions sd on sd.id = aks.skill_id
+        where aks.agent_id = ${agentId}
+      `;
+      expect(desired.map((row) => row.slug)).toEqual([slug]);
+
+      // Simulate the durable retry backoff expiring. The same DB selection is
+      // projected without another owner mutation.
+      await pg`
+        update agents set runtime_sync_lease_expires_at = null
+        where account_id = ${agentId}
+      `;
+      await expect(
+        reconcileAgentRuntime(agentId, {
+          provisioner,
+          toolSync,
+          skillSync,
+          dataDir,
+        }),
+      ).resolves.toMatchObject({ status: 'synced' });
+      const [recovered] = await pg<{
+        runtime_sync_version: number;
+        runtime_synced_version: number;
+        runtime_sync_error: string | null;
+      }[]>`
+        select runtime_sync_version, runtime_synced_version, runtime_sync_error
+        from agents where account_id = ${agentId}
+      `;
+      expect(recovered).toMatchObject({ runtime_sync_error: null });
+      expect(recovered!.runtime_synced_version).toBe(recovered!.runtime_sync_version);
+      expect(skillSync.calls.at(-1)).toEqual({
+        openclawId: `${marker}_agent`,
+        skills: [slug],
+      });
+    } finally {
+      skillSync.syncAgentSkills = originalSync;
+    }
+  });
+
+  it('keeps an admin rejection durable when its immediate runtime projection fails', async () => {
+    const slug = `${marker}_rejection_retry`;
+    await pg`
+      insert into skill_definitions (slug, name, description, body, source, status)
+      values (
+        ${slug}, 'Rejection Retry', null,
+        '# Rejection Retry\n\nThis skill will be rejected during a runtime outage.',
+        'user', 'approved'
+      )
+    `;
+    const installed = await app.inject({
+      method: 'POST',
+      url: `/agents/${marker}_agent/skills`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { slugs: [slug] },
+    });
+    expect(installed.statusCode).toBe(200);
+
+    const originalSync = skillSync.syncAgentSkills;
+    let failOnce = true;
+    skillSync.syncAgentSkills = async (params) => {
+      skillSync.calls.push(params);
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('simulated rejection projection outage');
+      }
+      return { changed: true };
+    };
+    try {
+      const rejected = await app.inject({
+        method: 'POST',
+        url: `/skills/${slug}/review`,
+        headers: { cookie: devCookie(adminId) },
+        payload: { status: 'rejected' },
+      });
+      expect(rejected.statusCode).toBe(200);
+      const [pending] = await pg<{
+        runtime_sync_version: number;
+        runtime_synced_version: number;
+        runtime_sync_error: string | null;
+      }[]>`
+        select runtime_sync_version, runtime_synced_version, runtime_sync_error
+        from agents where account_id = ${agentId}
+      `;
+      expect(pending!.runtime_sync_version).toBeGreaterThan(pending!.runtime_synced_version);
+      expect(pending!.runtime_sync_error).toContain('retry pending');
+      const [attachment] = await pg<{ count: number }[]>`
+        select count(*)::int as count
+        from agent_skills aks
+        join skill_definitions sd on sd.id = aks.skill_id
+        where aks.agent_id = ${agentId} and sd.slug = ${slug}
+      `;
+      expect(attachment!.count).toBe(0);
+
+      await pg`
+        update agents set runtime_sync_lease_expires_at = null
+        where account_id = ${agentId}
+      `;
+      await expect(
+        reconcileAgentRuntime(agentId, {
+          provisioner,
+          toolSync,
+          skillSync,
+          dataDir,
+        }),
+      ).resolves.toMatchObject({ status: 'synced' });
+      expect(skillSync.calls.at(-1)).toEqual({
+        openclawId: `${marker}_agent`,
+        skills: [],
+      });
+    } finally {
+      skillSync.syncAgentSkills = originalSync;
+    }
+  });
+
+  it('serializes concurrent skill projections so an older runtime write cannot win', async () => {
+    const firstSlug = `${marker}_concurrent_a`;
+    const winnerSlug = `${marker}_concurrent_b`;
+    await pg`
+      insert into skill_definitions (slug, name, description, body, source, status)
+      values
+        (${firstSlug}, 'Concurrent A', null, '# A\n\nOlder desired state.', 'curated', 'approved'),
+        (${winnerSlug}, 'Concurrent B', null, '# B\n\nNewest desired state.', 'curated', 'approved')
+    `;
+
+    const originalSync = skillSync.syncAgentSkills;
+    let releaseFirst!: () => void;
+    let enteredFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const firstEntered = new Promise<void>((resolve) => {
+      enteredFirst = resolve;
+    });
+    let blocked = false;
+    skillSync.syncAgentSkills = async (params) => {
+      skillSync.calls.push(params);
+      if (!blocked && params.skills.length === 1 && params.skills[0] === firstSlug) {
+        blocked = true;
+        enteredFirst();
+        await firstGate;
+      }
+      return { changed: true };
+    };
+    try {
+      const first = app.inject({
+        method: 'POST',
+        url: `/agents/${marker}_agent/skills`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { slugs: [firstSlug] },
+      });
+      await firstEntered;
+
+      const second = app.inject({
+        method: 'POST',
+        url: `/agents/${marker}_agent/skills`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { slugs: [winnerSlug] },
+      });
+      await vi.waitFor(async () => {
+        const desired = await pg<{ slug: string }[]>`
+          select sd.slug
+          from agent_skills aks
+          join skill_definitions sd on sd.id = aks.skill_id
+          where aks.agent_id = ${agentId}
+        `;
+        expect(desired.map((row) => row.slug)).toEqual([winnerSlug]);
+      });
+      // The second request has committed its DB revision, but its runtime
+      // projection cannot pass the first claimant's session advisory lock.
+      expect(skillSync.calls.at(-1)).toEqual({
+        openclawId: `${marker}_agent`,
+        skills: [firstSlug],
+      });
+
+      releaseFirst();
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      expect(firstResult.statusCode).toBe(200);
+      expect(secondResult.statusCode).toBe(200);
+      expect(skillSync.calls.at(-1)).toEqual({
+        openclawId: `${marker}_agent`,
+        skills: [winnerSlug],
+      });
+      const [runtime] = await pg<{
+        runtime_sync_version: number;
+        runtime_synced_version: number;
+      }[]>`
+        select runtime_sync_version, runtime_synced_version
+        from agents where account_id = ${agentId}
+      `;
+      expect(runtime!.runtime_synced_version).toBe(runtime!.runtime_sync_version);
+      const toolsFile = await fs.readFile(path.join(workspaceDir, 'TOOLS.md'), 'utf8');
+      expect(toolsFile).toContain(`Concurrent B (${winnerSlug})`);
+      expect(toolsFile).not.toContain(`Concurrent A (${firstSlug})`);
+    } finally {
+      releaseFirst();
+      skillSync.syncAgentSkills = originalSync;
+    }
   });
 
   it('blocks non-owners from changing an agent skill allowlist', async () => {

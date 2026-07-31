@@ -1,24 +1,50 @@
 import { randomUUID } from 'node:crypto';
 
-import type { AuthSession, CostProvider } from '@eden3/core';
+import type { AuthSession, CostProvider, DbHandle } from '@eden3/core';
 import {
+  DailyCapExceededError,
+  InsufficientMannaError,
   PRICING,
+  RollingSpendCapExceededError,
   costFromLlmUsage,
-  credit,
   debit,
   getEnv,
   mannaForEstimate,
   refund,
 } from '@eden3/core';
-import { DEFAULT_AGENT_MODEL, DEFAULT_AGENT_THINKING_LEVEL } from '@eden3/shared';
+import {
+  DEFAULT_AGENT_THINKING_LEVEL,
+  type AgentRuntime,
+  type SessionEvent,
+  type Usage,
+} from '@eden3/shared';
 import { accounts, db, messages, sessions, usageEvents, type Session } from '@eden3/db';
-import type { ChatTurnParams, GatewayTurnEvent, GatewayUsage } from '@eden3/gateway';
-import type { SessionEvent, Usage } from '@eden3/shared';
+import {
+  ClaudeTranscriptUsageCapture,
+  type ChatTurnParams,
+  type ClaudeTranscriptUsageCaptureLike,
+  type ClaudeTranscriptUsageResult,
+  type GatewayTurnEvent,
+  type GatewayUsage,
+} from '@eden3/gateway';
 import { desc, eq, sql } from 'drizzle-orm';
 
 import type { EventsBus } from '../events-bus';
+import { ApiError } from '../errors';
+import { defaultOpenclawDataDir } from '../gateway-glue';
 import { HistorySync, PRIMER_HEADER } from './history-sync';
+import { memoryUserRelativePath } from './memory-paths';
+import {
+  AUTOMATION_BUDGET_SCOPE,
+  AUTOMATION_HOURLY_BUDGET_ERROR,
+  automationLedgerKey,
+  automationRollingCap,
+} from './automation-budget';
 import type { TurnRegistry } from './turn-registry';
+import {
+  PostgresSubscriptionTurnClaims,
+  type SubscriptionTurnClaimsLike,
+} from './subscription-turn-claims';
 
 /**
  * Chat turn pipeline (POST /sessions/:idOrNew/messages body → SSE stream).
@@ -35,8 +61,10 @@ import type { TurnRegistry } from './turn-registry';
  *   5. stream the gateway turn, re-emitting every event on the per-session
  *      events bus AND onto the POST response body (both carry the same
  *      @eden3/shared SessionEvent frames).
- *   6. persist the assistant message (usage → eden_message_data jsonb),
- *      bump counters, emit turn.completed.
+ *   6. transactionally settle the actual token cost, then persist the
+ *      assistant message (usage → eden_message_data jsonb), bump counters,
+ *      and emit turn.completed. A rejected settlement is fully refunded and
+ *      surfaces as an error without persisting an under-billed assistant.
  *   7. on gateway error: refund the debit, emit error + manna.updated.
  *   8. fire-and-forget trailing history-sync (async media / late messages).
  *
@@ -56,11 +84,27 @@ export interface TurnSink {
   end(): void;
 }
 
+/**
+ * A durable caller-owned generation was superseded while a turn was live.
+ * runTurn recognizes this error at provider terminal and suppresses every
+ * settlement/message/usage finalization, leaving only idempotent refunds.
+ */
+export class TurnClaimLostError extends ApiError {
+  constructor(message: string) {
+    super(409, 'task_not_active', message);
+    this.name = 'TurnClaimLostError';
+  }
+}
+
 export interface RunTurnDeps {
   compat: CompatClientLike;
   bus: EventsBus;
   registry: TurnRegistry;
   historySync: HistorySync;
+  /** Optional override for claude-cli transcript enrichment/fallback. */
+  claudeUsageCapture?: ClaudeTranscriptUsageCaptureLike;
+  /** Optional override for the cross-process same-session Claude turn lease. */
+  subscriptionTurnClaims?: SubscriptionTurnClaimsLike;
   /** Error sink for non-fatal background failures (default: swallow). */
   onError?: (err: unknown, context: string) => void;
 }
@@ -71,8 +115,12 @@ export interface TurnAgent {
   username: string;
   /** OpenClaw agent id the gateway routes by. */
   openclawId: string;
-  /** Provider/model ref when known, e.g. "anthropic/claude-haiku-4-5". */
-  model?: string;
+  /** Authoritative provider/model ref, e.g. "anthropic/claude-haiku-4-5". */
+  model: string;
+  /** Per-turn trusted compat override; does not mutate the agent's normal model. */
+  gatewayModelOverride?: string;
+  /** Effective model-scoped runtime, snapshotted before the turn starts. */
+  agentRuntime: AgentRuntime;
   /** User-facing reasoning control persisted on the agent. */
   thinkingLevel?: string;
 }
@@ -85,17 +133,52 @@ export interface RunTurnParams {
   /** The user's message exactly as typed (persisted verbatim). */
   content: string;
   /** Optional product surface that initiated this turn. */
-  source?: {
-    kind: 'scheduled_task';
-    triggerId: string;
-    triggerExternalId?: string | null;
-  };
+  source?:
+    | {
+        kind: 'scheduled_task';
+        triggerId: string;
+        triggerExternalId?: string | null;
+        occurrenceId?: string;
+        occurrenceAt?: string | null;
+      }
+    | {
+        kind: 'memory_dream';
+        sweepId: string;
+        runId: string;
+      }
+    | {
+        kind: 'heartbeat';
+        heartbeatId: string;
+      };
   /**
    * Called once the turn is funded and persisted — the route hijacks the
    * reply and returns the SSE sink. Everything failing before this point
    * surfaces as a normal JSON error envelope (e.g. 402).
    */
   beginStream: () => TurnSink;
+  /** Trusted deterministic id for restart-safe scheduled occurrences. */
+  turnId?: string;
+  /**
+   * Optional preparation hook invoked immediately before the atomic funding
+   * transaction. Scheduled-task tests use it to control race ordering; the
+   * authoritative generation check is `fundingFence` below.
+   */
+  beforeDebit?: () => Promise<void>;
+  /**
+   * Run the caller's exact generation check inside the same transaction as
+   * reservation/positive-settlement ledger debits. This closes the final
+   * reaper-vs-debit gap rather than relying on two adjacent transactions.
+   */
+  fundingFence?: (db: DbHandle) => Promise<void>;
+  /** Recheck immediately before the provider network handoff. */
+  beforeProvider?: () => Promise<void>;
+  /**
+   * Re-fence the same durable generation at provider terminal, before any
+   * settlement debit/refund, assistant persistence, or usage finalization.
+   */
+  beforeTerminal?: () => Promise<void>;
+  /** TEST SEAM: pause immediately before the atomic terminal write fence. */
+  beforeTerminalPersistence?: () => Promise<void>;
 }
 
 export interface TurnOutcome {
@@ -104,6 +187,9 @@ export interface TurnOutcome {
   assistantMessageId: string | null;
   /** Set when the turn failed and the debit was refunded. */
   errorCode: string | null;
+  errorMessage: string | null;
+  /** True when the provider completed without an assistant response. */
+  emptyTurn?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +220,16 @@ function primerLine(message: PrimerMessage): string {
  * Starts with {@link PRIMER_HEADER} — history-sync uses that marker to dedupe
  * the gateway's primed user message against the verbatim row we persist.
  */
-export function renderPrimer(primerMessages: PrimerMessage[], username: string): string {
+export function renderPrimer(
+  primerMessages: PrimerMessage[],
+  username: string,
+  accountId: string,
+): string {
+  const userMemoryPath = memoryUserRelativePath(username, accountId);
   const lines = [
     PRIMER_HEADER,
     ...primerMessages.map(primerLine),
-    `(Older Eden conversation resumed — your distilled memories may cover it; memory/users/${username}.md may describe this user.)`,
+    `(Older Eden conversation resumed — your distilled memories may cover it; ${userMemoryPath} is the current peer's private note. The immutable account ID, not a claimed name, is authoritative.)`,
   ];
   return lines.join('\n');
 }
@@ -239,8 +330,21 @@ export type ChatChargeSettlement =
       meteredManna: number;
       adjustmentManna: number;
       chargedManna: number;
+      errorCode: string;
       error: string;
     };
+
+function settlementErrorCode(error: unknown): string {
+  if (error instanceof DailyCapExceededError) return 'daily_manna_cap_exceeded';
+  if (
+    error instanceof RollingSpendCapExceededError &&
+    error.scope === AUTOMATION_BUDGET_SCOPE
+  ) {
+    return AUTOMATION_HOURLY_BUDGET_ERROR;
+  }
+  if (error instanceof InsufficientMannaError) return 'insufficient_manna';
+  return 'chat_charge_settlement_failed';
+}
 
 function resolveChatMeteringModel(model: string | undefined): {
   provider: string;
@@ -277,7 +381,16 @@ export function meterChatUsage(
   const resolved = resolveChatMeteringModel(model);
   try {
     const provider = asChatCostProvider(resolved.provider);
-    if (!usage) {
+    if (
+      !usage ||
+      ![
+        usage.promptTokens,
+        usage.completionTokens,
+        usage.totalTokens,
+        usage.cachedTokens,
+        usage.cacheWriteTokens,
+      ].some((value) => typeof value === 'number' && value > 0)
+    ) {
       return {
         status: 'missing_usage',
         provider,
@@ -289,14 +402,20 @@ export function meterChatUsage(
     }
 
     const completionTokens = usage.completionTokens ?? 0;
-    const promptTokens =
-      usage.promptTokens ?? (usage.totalTokens !== undefined ? Math.max(0, usage.totalTokens - completionTokens) : 0);
+    const derivedPromptTokens =
+      usage.totalTokens === undefined
+        ? 0
+        : Math.max(0, usage.totalTokens - completionTokens - (usage.cacheWriteTokens ?? 0));
+    // Some compat tails carry explicit prompt=0 alongside a meaningful total.
+    // Never let that lossy field suppress the recoverable prompt quantity.
+    const promptTokens = Math.max(usage.promptTokens ?? 0, derivedPromptTokens);
     const estimate = costFromLlmUsage({
       provider,
       model: resolved.model,
       promptTokens,
       completionTokens,
       cachedTokens: usage.cachedTokens ?? 0,
+      cacheWriteTokens: usage.cacheWriteTokens ?? 0,
     });
     return {
       status: 'metered',
@@ -346,9 +465,9 @@ async function persistMessage(row: {
   content: string;
   name?: string | null;
   edenMessageData?: unknown;
-}): Promise<{ id: string; createdAt: Date }> {
-  return await db.transaction(async (tx) => {
-    const [inserted] = await tx
+}, dbc?: DbHandle): Promise<{ id: string; createdAt: Date }> {
+  const persist = async (handle: DbHandle): Promise<{ id: string; createdAt: Date }> => {
+    const [inserted] = await handle
       .insert(messages)
       .values({
         sessionId: row.sessionId,
@@ -360,7 +479,7 @@ async function persistMessage(row: {
       })
       .returning({ id: messages.id, createdAt: messages.createdAt });
     if (!inserted) throw new Error('message insert returned no row');
-    await tx
+    await handle
       .update(sessions)
       .set({
         messageCount: sql`${sessions.messageCount} + 1`,
@@ -369,7 +488,8 @@ async function persistMessage(row: {
       })
       .where(eq(sessions.id, row.sessionId));
     return inserted;
-  });
+  };
+  return dbc ? await persist(dbc) : await db.transaction(persist);
 }
 
 /**
@@ -378,29 +498,99 @@ async function persistMessage(row: {
  * reported as an SSE `error` event and the debit is refunded.
  */
 export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise<TurnOutcome> {
+  const sessionKey = params.session.gatewaySessionKey;
+  if (!sessionKey) throw new Error(`session ${params.session.id} has no gateway session key`);
+  const turnId = params.turnId ?? randomUUID();
+  if (params.agent.agentRuntime !== 'claude-cli') {
+    return await runClaimedTurn(deps, params, turnId);
+  }
+
+  // Claude transcript attribution is a timestamp window over one provider
+  // session. Reject, before debit or message persistence, when another API
+  // process owns this gateway session. A heartbeat keeps legitimate long
+  // turns live; a crashed owner becomes reclaimable after lease expiry.
+  const onError = deps.onError ?? (() => {});
+  const claims = deps.subscriptionTurnClaims ?? new PostgresSubscriptionTurnClaims();
+  const lease = await claims.acquire({ sessionKey, turnId, onError });
+  if (lease === null) {
+    throw new ApiError(
+      409,
+      'session_turn_in_progress',
+      'Another subscription-backed turn is already running in this session',
+    );
+  }
+  try {
+    return await runClaimedTurn(deps, params, turnId);
+  } finally {
+    try {
+      await lease.release();
+    } catch (err) {
+      onError(err, 'subscription turn lease release');
+    }
+  }
+}
+
+async function runClaimedTurn(
+  deps: RunTurnDeps,
+  params: RunTurnParams,
+  turnId: string,
+): Promise<TurnOutcome> {
   const { session, agent, user, content } = params;
   const onError = deps.onError ?? (() => {});
   const sessionKey = session.gatewaySessionKey;
   if (!sessionKey) throw new Error(`session ${session.id} has no gateway session key`);
 
-  const turnId = randomUUID();
   const turnStartedAtMs = Date.now();
+  // Freeze runtime provenance before any async funding/gateway work. A hot
+  // operator toggle during this turn affects the next turn, never settlement
+  // of the one already in flight.
+  const agentRuntime = agent.agentRuntime;
+  const pricingBasis =
+    agentRuntime === 'claude-cli' ? 'notional-subscription' : 'provider-api';
+  const isMemoryDream = params.source?.kind === 'memory_dream';
+  const isAutomation =
+    params.source?.kind === 'scheduled_task' || params.source?.kind === 'heartbeat';
+  const usageEventType = isMemoryDream ? 'memory_dream' : 'chat_turn';
+  const spendType = isMemoryDream ? 'spend:memory-dream' : 'spend:chat';
+  const refundType = isMemoryDream ? 'refund:memory-dream' : 'refund:chat';
+  const meteringModel = agent.gatewayModelOverride ?? agent.model;
   const taskExternalId =
     params.source?.kind === 'scheduled_task' && params.source.triggerExternalId
       ? params.source.triggerExternalId
       : undefined;
+  const ledgerTurnKey = isAutomation
+    ? automationLedgerKey(agent.accountId, turnId)
+    : turnId;
+  const ledgerSettlementKey = isAutomation
+    ? automationLedgerKey(agent.accountId, turnId, 'settle')
+    : `${turnId}:settle`;
+  const dailyCap = { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER };
+  const withClaimFence = async <T>(
+    operation: (dbc?: DbHandle) => Promise<T>,
+  ): Promise<T> => {
+    if (!params.fundingFence) return await operation();
+    return await db.transaction(async (tx) => {
+      await params.fundingFence!(tx);
+      return await operation(tx);
+    });
+  };
 
   // 1. Debit — idempotencyKey is the turn uuid; a 402 must precede streaming.
   // The dailyCap makes the reservation itself enforce Q7's per-day ceiling
   // race-free (the route-level pre-check is just a fast friendly 429).
-  const debited = await debit({
-    accountId: user.accountId,
-    amount: PRICING.chatTurn,
-    type: 'spend:chat',
-    idempotencyKey: turnId,
-    dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
-    ...(taskExternalId ? { taskExternalId } : {}),
-  });
+  await params.beforeDebit?.();
+  const debited = await withClaimFence((dbc) =>
+    debit({
+      accountId: user.accountId,
+      amount: PRICING.chatTurn,
+      type: spendType,
+      idempotencyKey: ledgerTurnKey,
+      dailyCap,
+      ...(isAutomation ? { rollingCap: automationRollingCap(agent.accountId) } : {}),
+      ...(taskExternalId ? { taskExternalId } : {}),
+      ...(dbc ? { db: dbc } : {}),
+    }),
+  );
 
   // A bare refund for the PRE-STREAM window (no SSE sink exists yet, so we
   // cannot publish manna.updated). Any throw between the debit and
@@ -409,7 +599,7 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
   // throws only before the reply is hijacked).
   const refundBeforeStream = async (err: unknown): Promise<never> => {
     try {
-      await refund({ originalIdempotencyKey: turnId, type: 'refund:chat' });
+      await refund({ originalIdempotencyKey: ledgerTurnKey, type: refundType });
     } catch (refundErr) {
       onError(refundErr, 'manna refund (pre-stream)');
     }
@@ -431,7 +621,7 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
       let gatewayMessage = content;
       if (prime) {
         const primerMessages = await loadPrimerMessages(session.id);
-        gatewayMessage = `${renderPrimer(primerMessages, user.username)}\n\n${content}`;
+        gatewayMessage = `${renderPrimer(primerMessages, user.username, user.accountId)}\n\n${content}`;
       }
 
       // 3. Persist the user message VERBATIM (the primer exists only gateway-
@@ -464,6 +654,8 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
     userMessageId: userMessage.id,
     assistantMessageId: null,
     errorCode: null,
+    errorMessage: null,
+    emptyTurn: false,
   };
 
   const publish = (event: SessionEvent): void => {
@@ -479,37 +671,53 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
     }
   };
 
-  const refundTurn = async (): Promise<void> => {
-    try {
-      const refunded = await refund({ originalIdempotencyKey: turnId, type: 'refund:chat' });
-      if (refunded) {
-        publish({ type: 'manna.updated', accountId: user.accountId, balance: refunded.balance.total });
+  const refundTurn = async (): Promise<boolean> => {
+    let complete = true;
+    for (const [key, type] of [
+      [ledgerSettlementKey, `${refundType}:settle`],
+      [ledgerTurnKey, refundType],
+    ] as const) {
+      try {
+        const refunded = await refund({ originalIdempotencyKey: key, type });
+        if (refunded) {
+          publish({
+            type: 'manna.updated',
+            accountId: user.accountId,
+            balance: refunded.balance.total,
+          });
+        }
+      } catch (err) {
+        complete = false;
+        onError(err, 'manna refund');
       }
-    } catch (err) {
-      onError(err, 'manna refund');
     }
+    return complete;
   };
 
   let usageEventRecorded = false;
+  let chargeSettlement: ChatChargeSettlement | undefined;
   const recordUsageEvent = async (record: {
     status: 'completed' | 'missing_usage' | 'unmetered' | 'error';
     usage?: GatewayUsage;
     metering?: ChatTurnMetering;
     settlement?: ChatChargeSettlement;
+    /** Actual ledger charge after any terminal refund. */
+    chargedManna?: number;
     messageId?: string | null;
     errorCode?: string | null;
     errorMessage?: string | null;
     finishReason?: string | null;
     emptyTurn?: boolean;
-  }): Promise<void> => {
+    usageCapture?: ClaudeTranscriptUsageResult | null;
+    usageSource?: 'compat-tail' | 'claude-transcript' | 'missing';
+  }, options: { dbc?: DbHandle; strict?: boolean } = {}): Promise<void> => {
     if (usageEventRecorded) return;
-    usageEventRecorded = true;
     try {
-      const metering = record.metering ?? meterChatUsage(record.usage, agent.model);
+      const metering = record.metering ?? meterChatUsage(record.usage, meteringModel);
       // Paired with the usage_events_turn_unique partial index: a retried or
       // crashed-and-replayed pipeline cannot double-record this turn.
-      await db.insert(usageEvents).values({
-        eventType: 'chat_turn',
+      await (options.dbc ?? db).insert(usageEvents).values({
+        eventType: usageEventType,
         status: record.status,
         userId: user.accountId,
         agentId: agent.accountId,
@@ -518,29 +726,49 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
         turnId,
         provider: metering.provider,
         model: metering.model,
+        pricingBasis,
         tableVersion: metering.status === 'metered' ? metering.tableVersion : null,
         promptTokens: record.usage?.promptTokens ?? null,
         completionTokens: record.usage?.completionTokens ?? null,
         cachedTokens: record.usage?.cachedTokens ?? null,
+        cacheWriteTokens: record.usage?.cacheWriteTokens ?? null,
         totalTokens: record.usage?.totalTokens ?? null,
         costUsd: costUsdToNumeric(metering.costUsd),
-        manna: metering.manna,
+        // Usage is an actual-billing surface. Metering retains the notional
+        // model cost in metadata; this column follows what settlement really
+        // charged after cap failures/refunds.
+        manna: record.chargedManna ?? record.settlement?.chargedManna ?? metering.manna,
         latencyMs: Date.now() - turnStartedAtMs,
         errorCode: record.errorCode ?? null,
         errorMessage: record.errorMessage ?? null,
         metadata: {
           metering,
           agentConfig: {
-            model: agent.model ?? DEFAULT_AGENT_MODEL,
+            model: meteringModel,
+            agentRuntime,
+            pricingBasis,
             thinkingLevel: agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
           },
+          usageSource: record.usageSource ?? (record.usage ? 'compat-tail' : 'missing'),
+          claudeTranscript:
+            record.usageCapture === undefined || record.usageCapture === null
+              ? null
+              : {
+                  claudeSessionId: record.usageCapture.claudeSessionId,
+                  providerMessageIds: record.usageCapture.providerMessageIds,
+                  models: record.usageCapture.models,
+                },
           settlement: record.settlement ?? null,
           finishReason: record.finishReason ?? null,
           emptyTurn: record.emptyTurn ?? null,
+          userMessageId: userMessage.id,
           source: params.source ?? null,
         },
       }).onConflictDoNothing();
+      usageEventRecorded = true;
     } catch (err) {
+      if (options.strict === true) throw err;
+      usageEventRecorded = true;
       onError(err, 'usage event insert');
     }
   };
@@ -552,11 +780,20 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
     let primedMarked = !prime;
     let completed = false;
     let terminalEvent: 'completed' | 'error' | null = null;
+    // Transcript capture must begin at the provider handoff, not at the
+    // earlier debit/primer work. Otherwise a just-finished queued turn in the
+    // same Claude session could fall inside this turn's metering window.
+    const usageWindowStartedAtMs = Date.now();
 
+    await params.beforeProvider?.();
     for await (const event of deps.compat.chatTurn({
       agentId: agent.openclawId,
       sessionKey,
       userMessage: gatewayMessage,
+      // Eden's DB configuration is authoritative on every request. OpenClaw
+      // persists `/model` session overrides; omitting this header could execute
+      // one model/runtime while billing the DB-selected model.
+      modelOverride: meteringModel,
     })) {
       switch (event.type) {
         case 'turn.started': {
@@ -597,8 +834,37 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
             break;
           }
           terminalEvent = 'completed';
+          await params.beforeTerminal?.();
           completed = true;
-          const metering = meterChatUsage(event.usage, agent.model);
+          outcome.emptyTurn = event.emptyTurn;
+          let effectiveUsage = event.usage;
+          let usageCapture: ClaudeTranscriptUsageResult | undefined;
+          let usageSource: 'compat-tail' | 'claude-transcript' | 'missing' = event.usage
+            ? 'compat-tail'
+            : 'missing';
+          if (agentRuntime === 'claude-cli') {
+            try {
+              const capture =
+                deps.claudeUsageCapture ??
+                new ClaudeTranscriptUsageCapture({ dataDir: defaultOpenclawDataDir() });
+              usageCapture = await capture.capture({
+                agentId: agent.openclawId,
+                sessionKey,
+                startedAtMs: usageWindowStartedAtMs,
+              });
+              if (usageCapture) {
+                // Transcript usage is authoritative when present: the compat
+                // tail intentionally omits cache-write tokens in OpenClaw 7.1.
+                effectiveUsage = usageCapture.usage;
+                usageSource = 'claude-transcript';
+              }
+            } catch (err) {
+              // Tail usage remains a proven primary fallback. Missing both is
+              // recorded loudly as missing_usage; it is never a zero-cost row.
+              onError(err, 'claude transcript usage capture');
+            }
+          }
+          const metering = meterChatUsage(effectiveUsage, meteringModel);
           const settleChatCharge = async (): Promise<ChatChargeSettlement> => {
             if (metering.status !== 'metered') {
               return {
@@ -626,13 +892,20 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
 
             try {
               if (adjustmentManna > 0) {
-                const adjusted = await debit({
-                  accountId: user.accountId,
-                  amount: adjustmentManna,
-                  type: 'spend:chat:settle',
-                  idempotencyKey: `${turnId}:settle`,
-                  ...(taskExternalId ? { taskExternalId } : {}),
-                });
+                const adjusted = await withClaimFence((dbc) =>
+                  debit({
+                    accountId: user.accountId,
+                    amount: adjustmentManna,
+                    type: isMemoryDream ? 'spend:memory-dream:settle' : 'spend:chat:settle',
+                    idempotencyKey: ledgerSettlementKey,
+                    dailyCap,
+                    ...(isAutomation
+                      ? { rollingCap: automationRollingCap(agent.accountId) }
+                      : {}),
+                    ...(taskExternalId ? { taskExternalId } : {}),
+                    ...(dbc ? { db: dbc } : {}),
+                  }),
+                );
                 publish({
                   type: 'manna.updated',
                   accountId: user.accountId,
@@ -650,13 +923,18 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
                 };
               }
 
-              const adjusted = await credit({
-                accountId: user.accountId,
-                amount: Math.abs(adjustmentManna),
-                type: 'refund:chat:settle',
-                idempotencyKey: `${turnId}:settle:refund`,
-                ...(taskExternalId ? { taskExternalId } : {}),
-              });
+              // Manna prices are integer-ceiled, so reserve=1 can only adjust
+              // downward to zero. Use the linked, idempotent full refund: a
+              // free turn must release both daily and rolling headroom at the
+              // original debit timestamp.
+              const adjusted = await withClaimFence((dbc) =>
+                refund({
+                  originalIdempotencyKey: ledgerTurnKey,
+                  type: isMemoryDream ? 'refund:memory-dream:settle' : 'refund:chat:settle',
+                  ...(dbc ? { db: dbc } : {}),
+                }),
+              );
+              if (!adjusted) throw new Error('chat reserve disappeared before settlement refund');
               publish({
                 type: 'manna.updated',
                 accountId: user.accountId,
@@ -673,6 +951,7 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
                 alreadyApplied: adjusted.alreadyApplied,
               };
             } catch (err) {
+              if (err instanceof TurnClaimLostError) throw err;
               onError(err, 'chat charge settlement');
               return {
                 status: 'failed',
@@ -680,6 +959,7 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
                 meteredManna,
                 adjustmentManna,
                 chargedManna: PRICING.chatTurn,
+                errorCode: settlementErrorCode(err),
                 error: err instanceof Error ? err.message : String(err),
               };
             }
@@ -692,55 +972,118 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
           const messageData = {
             kind: 'chat_turn',
             turnId,
-            usage: event.usage ?? null,
+            usage: effectiveUsage ?? null,
             metering: meteringWithAccounts,
             agentConfig: {
-              model: agent.model ?? DEFAULT_AGENT_MODEL,
+              model: meteringModel,
+              agentRuntime,
+              pricingBasis,
               thinkingLevel: agent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
             },
+            usageSource,
+            claudeTranscript: usageCapture
+              ? {
+                  claudeSessionId: usageCapture.claudeSessionId,
+                  providerMessageIds: usageCapture.providerMessageIds,
+                  models: usageCapture.models,
+                }
+              : null,
             settlement: null as ChatChargeSettlement | null,
             emptyTurn: event.emptyTurn,
             finishReason: event.finishReason ?? null,
             source: params.source ?? null,
           };
-          const assistant = await persistMessage({
-            sessionId: session.id,
-            senderId: agent.accountId,
-            role: 'assistant',
-            content: event.text,
-            name: agent.username,
-            edenMessageData: messageData,
+          // Usage capture can involve filesystem I/O. Re-fence after it so a
+          // process suspended during capture cannot finalize on a generation
+          // that recovery has since superseded.
+          await params.beforeTerminal?.();
+          const settlement = await settleChatCharge();
+          chargeSettlement = settlement;
+          if (settlement.status === 'failed') {
+            // The provider completed, but exact settlement could not fit the
+            // account/automation caps (or the remaining balance). Fail closed:
+            // expose no zero/under-billed success and refund every debit that
+            // landed for this turn. The ledger cap itself was never crossed.
+            const fullyRefunded = await refundTurn();
+            await params.beforeTerminal?.();
+            const failedSettlement = {
+              ...settlement,
+              chargedManna: fullyRefunded ? 0 : settlement.chargedManna,
+            };
+            chargeSettlement = failedSettlement;
+            outcome.errorCode = settlement.errorCode;
+            outcome.errorMessage = settlement.error;
+            await withClaimFence((dbc) =>
+              recordUsageEvent(
+                {
+                  status: 'error',
+                  usage: effectiveUsage,
+                  metering,
+                  settlement: failedSettlement,
+                  errorCode: settlement.errorCode,
+                  errorMessage: settlement.error,
+                  finishReason: event.finishReason ?? null,
+                  emptyTurn: event.emptyTurn,
+                  usageCapture: usageCapture ?? null,
+                  usageSource,
+                },
+                dbc ? { dbc, strict: true } : {},
+              ),
+            );
+            publish({
+              type: 'error',
+              turnId,
+              code: settlement.errorCode,
+              message: settlement.error,
+            });
+            break;
+          }
+          await params.beforeTerminal?.();
+          await params.beforeTerminalPersistence?.();
+          // For durable callers, the final generation renewal, assistant row,
+          // and terminal usage checkpoint share one transaction. Even a
+          // process suspended for the full lease immediately before this write
+          // cannot resume after recovery and persist a zombie completion.
+          const assistant = await withClaimFence(async (dbc) => {
+            const inserted = await persistMessage(
+              {
+                sessionId: session.id,
+                senderId: agent.accountId,
+                role: 'assistant',
+                content: event.text,
+                name: agent.username,
+                edenMessageData: { ...messageData, settlement },
+              },
+              dbc,
+            );
+            await recordUsageEvent(
+              {
+                status:
+                  metering.status === 'metered'
+                    ? 'completed'
+                    : metering.status === 'missing_usage'
+                      ? 'missing_usage'
+                      : 'unmetered',
+                usage: effectiveUsage,
+                metering,
+                settlement,
+                messageId: inserted.id,
+                finishReason: event.finishReason ?? null,
+                emptyTurn: event.emptyTurn,
+                usageCapture: usageCapture ?? null,
+                usageSource,
+              },
+              dbc ? { dbc, strict: true } : {},
+            );
+            return inserted;
           });
           outcome.assistantMessageId = assistant.id;
-          const settlement = await settleChatCharge();
-          try {
-            await db
-              .update(messages)
-              .set({ edenMessageData: { ...messageData, settlement } })
-              .where(eq(messages.id, assistant.id));
-          } catch (err) {
-            onError(err, 'chat settlement metadata update');
-          }
-          await recordUsageEvent({
-            status:
-              metering.status === 'metered'
-                ? 'completed'
-                : metering.status === 'missing_usage'
-                  ? 'missing_usage'
-                  : 'unmetered',
-            usage: event.usage,
-            metering,
-            settlement,
-            messageId: assistant.id,
-            finishReason: event.finishReason ?? null,
-            emptyTurn: event.emptyTurn,
-          });
           if (event.emptyTurn) {
             // Agent said nothing — typically an async media tool is running
             // (spike: compat filler suppressed upstream). Signal the UI.
             publish({ type: 'media.pending', sessionId: session.id, tool: 'unknown' });
           }
-          const sharedUsage = toSharedUsage(event.usage);
+          const sharedUsage = toSharedUsage(effectiveUsage);
           publish({
             type: 'turn.completed',
             turnId,
@@ -758,13 +1101,22 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
             break;
           }
           terminalEvent = 'error';
+          await params.beforeTerminal?.();
           outcome.errorCode = event.code;
-          await refundTurn();
-          await recordUsageEvent({
-            status: 'error',
-            errorCode: event.code,
-            errorMessage: event.message,
-          });
+          outcome.errorMessage = event.message;
+          const fullyRefunded = await refundTurn();
+          await params.beforeTerminal?.();
+          await withClaimFence((dbc) =>
+            recordUsageEvent(
+              {
+                status: 'error',
+                chargedManna: fullyRefunded ? 0 : PRICING.chatTurn,
+                errorCode: event.code,
+                errorMessage: event.message,
+              },
+              dbc ? { dbc, strict: true } : {},
+            ),
+          );
           publish({ type: 'error', turnId, code: event.code, message: event.message });
           break;
         }
@@ -773,13 +1125,22 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
 
     if (!completed && outcome.errorCode === null) {
       // Stream ended without a terminal event (should not happen) — refund.
+      await params.beforeTerminal?.();
       outcome.errorCode = 'gateway_stream_error';
-      await refundTurn();
-      await recordUsageEvent({
-        status: 'error',
-        errorCode: 'gateway_stream_error',
-        errorMessage: 'gateway stream ended without completing the turn',
-      });
+      outcome.errorMessage = 'gateway stream ended without completing the turn';
+      const fullyRefunded = await refundTurn();
+      await params.beforeTerminal?.();
+      await withClaimFence((dbc) =>
+        recordUsageEvent(
+          {
+            status: 'error',
+            chargedManna: fullyRefunded ? 0 : PRICING.chatTurn,
+            errorCode: 'gateway_stream_error',
+            errorMessage: 'gateway stream ended without completing the turn',
+          },
+          dbc ? { dbc, strict: true } : {},
+        ),
+      );
       publish({
         type: 'error',
         turnId,
@@ -787,21 +1148,58 @@ export async function runTurn(deps: RunTurnDeps, params: RunTurnParams): Promise
         message: 'gateway stream ended without completing the turn',
       });
     }
-  } catch (err) {
-    outcome.errorCode = 'internal_error';
-    onError(err, 'turn pipeline');
-    await refundTurn();
-    await recordUsageEvent({
-      status: 'error',
-      errorCode: 'internal_error',
-      errorMessage: err instanceof Error ? err.message : 'turn pipeline failed',
-    });
-    publish({
-      type: 'error',
-      turnId,
-      code: 'internal_error',
-      message: err instanceof Error ? err.message : 'turn pipeline failed',
-    });
+  } catch (caught) {
+    let err = caught;
+    // An internal failure may itself occur after provider handoff but before
+    // terminal persistence. Re-check the caller generation before writing an
+    // error usage row; a stale claimant must not finalize anything after its
+    // recovery owner has taken over.
+    if (!(err instanceof TurnClaimLostError) && params.beforeTerminal) {
+      try {
+        await params.beforeTerminal();
+      } catch (fenceError) {
+        err = fenceError;
+      }
+    }
+    if (err instanceof TurnClaimLostError) {
+      outcome.errorCode = err.code;
+      outcome.errorMessage = err.message;
+      onError(err, 'durable turn claim lost');
+      // The recovery owner may already have reversed either key. Both calls
+      // are idempotent; deliberately do not persist a late usage/error row.
+      await refundTurn();
+      publish({ type: 'error', turnId, code: err.code, message: err.message });
+    } else {
+      outcome.errorCode = 'internal_error';
+      outcome.errorMessage = err instanceof Error ? err.message : 'turn pipeline failed';
+      onError(err, 'turn pipeline');
+      const fullyRefunded = await refundTurn();
+      if (chargeSettlement) {
+        chargeSettlement = {
+          ...chargeSettlement,
+          chargedManna: fullyRefunded ? 0 : chargeSettlement.chargedManna,
+        };
+      }
+      await withClaimFence((dbc) =>
+        recordUsageEvent(
+          {
+            status: 'error',
+            settlement: chargeSettlement,
+            chargedManna:
+              chargeSettlement?.chargedManna ?? (fullyRefunded ? 0 : PRICING.chatTurn),
+            errorCode: 'internal_error',
+            errorMessage: err instanceof Error ? err.message : 'turn pipeline failed',
+          },
+          dbc ? { dbc, strict: true } : {},
+        ),
+      );
+      publish({
+        type: 'error',
+        turnId,
+        code: 'internal_error',
+        message: err instanceof Error ? err.message : 'turn pipeline failed',
+      });
+    }
   } finally {
     try {
       sink.end();

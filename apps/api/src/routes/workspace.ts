@@ -1,5 +1,11 @@
 import { resolveAgentByUsername } from '@eden3/core';
 import { pg, type Account, type Agent } from '@eden3/db';
+import { readWorkspaceDoctrineFiles } from '@eden3/gateway';
+import {
+  BOOTSTRAP_FILE_NAMES,
+  lintPersonaDoctrine,
+  type BootstrapFileName,
+} from '@eden3/shared';
 import { ZipArchive } from 'archiver';
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import path from 'node:path';
@@ -56,6 +62,12 @@ const saveBodySchema = z.object({
  * exact round-trip (see packages/gateway/workspace-templates/SOUL.md).
  */
 const SOUL_WORKSPACE_FILE = 'SOUL.md';
+
+function doctrineFileName(filePath: string): BootstrapFileName | undefined {
+  return (BOOTSTRAP_FILE_NAMES as readonly string[]).includes(filePath)
+    ? (filePath as BootstrapFileName)
+    : undefined;
+}
 
 async function resolveManagedWorkspace(
   req: FastifyRequest,
@@ -150,6 +162,21 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const { account, root } = await resolveManagedWorkspace(req, username);
+    const doctrineFile = doctrineFileName(body.path);
+    if (doctrineFile !== undefined) {
+      const prospective = await readWorkspaceDoctrineFiles(root);
+      prospective[doctrineFile] = body.content;
+      const issues = lintPersonaDoctrine(prospective);
+      if (issues.length > 0) {
+        throw new ApiError(
+          422,
+          'persona_doctrine_violation',
+          `The edit would violate the agent persona contract: ${issues
+            .map((issue) => issue.message)
+            .join('; ')}`,
+        );
+      }
+    }
     const result = await writeWorkspaceFile({
       root,
       path: body.path,

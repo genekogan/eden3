@@ -1,14 +1,20 @@
 import { randomUUID } from 'node:crypto';
 
 import type { AuthSession } from '@eden3/core';
-import { credit, gatewaySessionKey } from '@eden3/core';
+import { credit, gatewaySessionKey, resetEnvCache } from '@eden3/core';
 import { db, pg, sessions, type Session } from '@eden3/db';
-import { NO_RESPONSE_SENTINEL, type GatewayTurnEvent } from '@eden3/gateway';
-import type { SessionEvent } from '@eden3/shared';
+import {
+  NO_RESPONSE_SENTINEL,
+  type ClaudeTranscriptUsageCaptureLike,
+  type GatewayTurnEvent,
+} from '@eden3/gateway';
+import type { AgentRuntime, SessionEvent } from '@eden3/shared';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { EventsBus } from '../src/events-bus';
 import { HistorySync } from '../src/services/history-sync';
+import { automationMannaSpendLastHour } from '../src/services/automation-budget';
+import type { SubscriptionTurnClaimsLike } from '../src/services/subscription-turn-claims';
 import { TurnRegistry } from '../src/services/turn-registry';
 import { runTurn, type CompatClientLike, type TurnSink } from '../src/services/turns';
 
@@ -16,11 +22,24 @@ const marker = `turnusage_${randomUUID().slice(0, 8)}`;
 
 interface Fixture {
   user: AuthSession;
-  agent: { accountId: string; username: string; openclawId: string; model?: string; thinkingLevel?: string };
+  agent: {
+    accountId: string;
+    username: string;
+    openclawId: string;
+    model: string;
+    agentRuntime: AgentRuntime;
+    thinkingLevel?: string;
+  };
   session: Session;
 }
 
-function makeDeps(compat: CompatClientLike) {
+function makeDeps(
+  compat: CompatClientLike,
+  claudeUsageCapture?: ClaudeTranscriptUsageCaptureLike,
+  subscriptionTurnClaims: SubscriptionTurnClaimsLike = {
+    acquire: async () => ({ release: async () => {} }),
+  },
+) {
   return {
     compat,
     bus: new EventsBus(),
@@ -35,6 +54,8 @@ function makeDeps(compat: CompatClientLike) {
         }),
       },
     }),
+    subscriptionTurnClaims,
+    ...(claudeUsageCapture ? { claudeUsageCapture } : {}),
   };
 }
 
@@ -85,6 +106,8 @@ async function makeFixture(): Promise<Fixture> {
       accountId: agentAccount.id,
       username: agentAccount.username,
       openclawId: `${marker}_agent_${suffix}`,
+      model: 'anthropic/claude-haiku-4-5',
+      agentRuntime: 'openclaw',
     },
     session,
   };
@@ -113,6 +136,185 @@ afterAll(async () => {
 }, 30_000);
 
 describe('runTurn usage events', () => {
+  it('fails and fully refunds an actual token charge that exceeds the post-reserve daily cap', async () => {
+    const fixture = await makeFixture();
+    const previous = process.env.DAILY_MANNA_SPEND_CAP_PER_USER;
+    process.env.DAILY_MANNA_SPEND_CAP_PER_USER = '2';
+    resetEnvCache();
+    const emitted: SessionEvent[] = [];
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield {
+          type: 'turn.completed',
+          text: 'must not become an under-billed success',
+          emptyTurn: false,
+          usage: { promptTokens: 40_000, completionTokens: 0, totalTokens: 40_000 },
+        };
+      },
+    };
+    try {
+      const outcome = await runTurn(makeDeps(compat), {
+        session: fixture.session,
+        agent: fixture.agent,
+        user: fixture.user,
+        content: 'daily cap edge',
+        source: {
+          kind: 'scheduled_task',
+          triggerId: randomUUID(),
+        },
+        beginStream: () => ({
+          emit(event) {
+            emitted.push(event);
+          },
+          end() {},
+        }),
+      });
+
+      expect(outcome).toMatchObject({
+        assistantMessageId: null,
+        errorCode: 'daily_manna_cap_exceeded',
+      });
+      expect(emitted).toContainEqual(
+        expect.objectContaining({ type: 'error', code: 'daily_manna_cap_exceeded' }),
+      );
+      const [usage] = await pg<{
+        status: string;
+        manna: number | null;
+        metadata: { settlement?: { chargedManna?: number; meteredManna?: number } } | null;
+      }[]>`
+        select status, manna, metadata from usage_events where turn_id = ${outcome.turnId}
+      `;
+      expect(usage).toMatchObject({
+        status: 'error',
+        manna: 0,
+        metadata: { settlement: { chargedManna: 0 } },
+      });
+      expect(usage!.metadata?.settlement?.meteredManna).toBeGreaterThan(2);
+      const [net] = await pg<{ spend: string }[]>`
+        select coalesce(sum(case
+          when type like 'spend%' and amount < 0 then -amount
+          when type like 'refund%' and amount > 0 then -amount
+          else 0 end), 0)::text as spend
+        from manna_transactions
+        where manna_account_id in (
+          select id from manna_accounts where account_id = ${fixture.user.accountId}
+        )
+      `;
+      expect(Number(net!.spend)).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env.DAILY_MANNA_SPEND_CAP_PER_USER;
+      else process.env.DAILY_MANNA_SPEND_CAP_PER_USER = previous;
+      resetEnvCache();
+    }
+  });
+
+  it('serializes concurrent actual-cost settlements under the strict agent-hour cap', async () => {
+    const fixture = await makeFixture();
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield {
+          type: 'turn.completed',
+          text: 'bounded automation output',
+          emptyTurn: false,
+          // Haiku input pricing makes this 54 manna: each fits alone, but two
+          // concurrent settlements cannot both fit the 80-manna rolling cap.
+          usage: { promptTokens: 40_000, completionTokens: 0, totalTokens: 40_000 },
+        };
+      },
+    };
+    const run = () =>
+      runTurn(makeDeps(compat), {
+        session: fixture.session,
+        agent: fixture.agent,
+        user: fixture.user,
+        content: 'concurrent automation',
+        source: { kind: 'scheduled_task' as const, triggerId: randomUUID() },
+        beginStream: sink,
+      });
+
+    const outcomes = await Promise.all([run(), run()]);
+    expect(outcomes.map((outcome) => outcome.errorCode).sort()).toEqual([
+      null,
+      'automation_hourly_budget_exceeded',
+    ].sort());
+    expect(await automationMannaSpendLastHour(fixture.agent.accountId)).toBe(54);
+    const rows = await pg<{ status: string; manna: number | null }[]>`
+      select status, manna from usage_events
+      where turn_id in (${outcomes[0]!.turnId}, ${outcomes[1]!.turnId})
+      order by status, manna
+    `;
+    expect(rows).toEqual([
+      { status: 'completed', manna: 54 },
+      { status: 'error', manna: 0 },
+    ]);
+    expect(outcomes.filter((outcome) => outcome.assistantMessageId !== null)).toHaveLength(1);
+  });
+
+  it.each([
+    ['openclaw', 'provider-api'],
+    ['claude-cli', 'notional-subscription'],
+  ] as const)(
+    'records a memory_dream usage row and dedicated ledger types under %s',
+    async (agentRuntime, expectedBasis) => {
+      const fixture = await makeFixture();
+      const compatCalls: Array<{ modelOverride?: string }> = [];
+      const compat: CompatClientLike = {
+        async *chatTurn(params): AsyncGenerator<GatewayTurnEvent, void, void> {
+          compatCalls.push(params);
+          yield { type: 'turn.started' };
+          yield {
+            type: 'turn.completed',
+            text: 'REM complete',
+            emptyTurn: false,
+            usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 },
+          };
+        },
+      };
+      const outcome = await runTurn(
+        makeDeps(compat, { capture: async () => undefined }),
+        {
+          session: fixture.session,
+          agent: {
+            ...fixture.agent,
+            model: 'anthropic/claude-sonnet-4-6',
+            gatewayModelOverride: 'anthropic/claude-sonnet-4-6',
+            agentRuntime,
+          },
+          user: fixture.user,
+          content: 'internal REM sweep',
+          source: { kind: 'memory_dream', sweepId: randomUUID(), runId: randomUUID() },
+          beginStream: sink,
+        },
+      );
+
+      expect(compatCalls).toEqual([
+        expect.objectContaining({ modelOverride: 'anthropic/claude-sonnet-4-6' }),
+      ]);
+      const [usage] = await pg<{
+        event_type: string;
+        model: string | null;
+        pricing_basis: string;
+        metadata: { source?: { kind?: string } } | null;
+      }[]>`
+        select event_type, model, pricing_basis, metadata
+        from usage_events where turn_id = ${outcome.turnId}
+      `;
+      expect(usage).toMatchObject({
+        event_type: 'memory_dream',
+        model: 'claude-sonnet-4-6',
+        pricing_basis: expectedBasis,
+        metadata: { source: { kind: 'memory_dream' } },
+      });
+      const ledger = await pg<{ type: string }[]>`
+        select type from manna_transactions
+        where idempotency_key = ${outcome.turnId}
+      `;
+      expect(ledger).toEqual([{ type: 'spend:memory-dream' }]);
+    },
+  );
+
   it('records completed chat usage, cost, manna, and attribution in Postgres', async () => {
     const fixture = await makeFixture();
     const compat: CompatClientLike = {
@@ -151,6 +353,7 @@ describe('runTurn usage events', () => {
         message_id: string | null;
         provider: string | null;
         model: string | null;
+        pricing_basis: string;
         prompt_tokens: number | null;
         completion_tokens: number | null;
         total_tokens: number | null;
@@ -161,7 +364,7 @@ describe('runTurn usage events', () => {
       }>
     >`
       select event_type, status, user_id, agent_id, session_id, message_id,
-             provider, model, prompt_tokens, completion_tokens, total_tokens,
+             provider, model, pricing_basis, prompt_tokens, completion_tokens, total_tokens,
              cost_usd, manna, latency_ms, metadata
       from usage_events
       where turn_id = ${outcome.turnId}`;
@@ -176,6 +379,7 @@ describe('runTurn usage events', () => {
       message_id: outcome.assistantMessageId,
       provider: 'anthropic',
       model: 'claude-haiku-4-5',
+      pricing_basis: 'provider-api',
       prompt_tokens: 1_000_000,
       completion_tokens: 100_000,
       total_tokens: 1_100_000,
@@ -290,7 +494,14 @@ describe('runTurn usage events', () => {
         model: string | null;
         cost_usd: string | null;
         manna: number | null;
-        metadata: { agentConfig?: { model?: string; thinkingLevel?: string } } | null;
+        metadata: {
+          agentConfig?: {
+            model?: string;
+            agentRuntime?: AgentRuntime;
+            pricingBasis?: string;
+            thinkingLevel?: string;
+          };
+        } | null;
       }[]
     >`
       select model, cost_usd, manna, metadata
@@ -305,6 +516,8 @@ describe('runTurn usage events', () => {
     });
     expect(row?.metadata?.agentConfig).toEqual({
       model: 'anthropic/claude-sonnet-4-5',
+      agentRuntime: 'openclaw',
+      pricingBasis: 'provider-api',
       thinkingLevel: 'deep',
     });
   });
@@ -366,6 +579,230 @@ describe('runTurn usage events', () => {
     );
     expect(cacheLine).toMatchObject({ quantity: 0.9 });
     expect(cacheLine!.costUsd).toBeCloseTo(0.09, 10);
+  });
+
+  it('uses deduped Claude transcript usage and snapshots notional subscription pricing', async () => {
+    const fixture = await makeFixture();
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield {
+          type: 'turn.completed',
+          text: 'subscription answer',
+          emptyTurn: false,
+          finishReason: 'stop',
+          // Deliberately incomplete: transcript capture must replace this tail.
+          usage: { promptTokens: 2, completionTokens: 1, totalTokens: 3 },
+        };
+      },
+    };
+    const captureCalls: Array<{ agentId: string; sessionKey: string; startedAtMs: number }> = [];
+    const capture: ClaudeTranscriptUsageCaptureLike = {
+      async capture(params) {
+        captureCalls.push(params);
+        return {
+          claudeSessionId: 'claude-session-test-1234',
+          providerMessageIds: ['msg_1', 'msg_2'],
+          models: ['claude-sonnet-4-6'],
+          usage: {
+            promptTokens: 1_000_000,
+            cachedTokens: 900_000,
+            cacheWriteTokens: 200_000,
+            completionTokens: 10_000,
+            totalTokens: 1_210_000,
+          },
+        };
+      },
+    };
+
+    const outcome = await runTurn(makeDeps(compat, capture), {
+      session: fixture.session,
+      agent: {
+        ...fixture.agent,
+        model: 'anthropic/claude-sonnet-4-6',
+        agentRuntime: 'claude-cli',
+      },
+      user: fixture.user,
+      content: 'use my subscription',
+      beginStream: sink,
+    });
+
+    expect(captureCalls).toHaveLength(1);
+    expect(captureCalls[0]).toMatchObject({
+      agentId: fixture.agent.openclawId,
+      sessionKey: fixture.session.gatewaySessionKey,
+    });
+    expect(captureCalls[0]!.startedAtMs).toBeGreaterThan(0);
+    const [row] = await pg<
+      Array<{
+        pricingBasis: string;
+        promptTokens: number | null;
+        cachedTokens: number | null;
+        cacheWriteTokens: number | null;
+        completionTokens: number | null;
+        costUsd: string | null;
+        manna: number | null;
+        metadata: {
+          usageSource?: string;
+          agentConfig?: { agentRuntime?: string; pricingBasis?: string };
+          claudeTranscript?: {
+            claudeSessionId?: string;
+            providerMessageIds?: string[];
+          };
+        } | null;
+      }>
+    >`
+      select pricing_basis as "pricingBasis",
+             prompt_tokens as "promptTokens",
+             cached_tokens as "cachedTokens",
+             cache_write_tokens as "cacheWriteTokens",
+             completion_tokens as "completionTokens",
+             cost_usd as "costUsd", manna, metadata
+      from usage_events
+      where turn_id = ${outcome.turnId}
+    `;
+
+    expect(row).toMatchObject({
+      pricingBasis: 'notional-subscription',
+      promptTokens: 1_000_000,
+      cachedTokens: 900_000,
+      cacheWriteTokens: 200_000,
+      completionTokens: 10_000,
+      costUsd: '1.47000000',
+      manna: 1985,
+    });
+    expect(row?.metadata).toMatchObject({
+      usageSource: 'claude-transcript',
+      agentConfig: {
+        agentRuntime: 'claude-cli',
+        pricingBasis: 'notional-subscription',
+      },
+      claudeTranscript: {
+        claudeSessionId: 'claude-session-test-1234',
+        providerMessageIds: ['msg_1', 'msg_2'],
+      },
+    });
+  });
+
+  it('rejects a concurrent same-session Claude turn before debit or transcript capture', async () => {
+    const fixture = await makeFixture();
+    let enterGateway!: () => void;
+    const gatewayEntered = new Promise<void>((resolve) => {
+      enterGateway = resolve;
+    });
+    let finishGateway!: () => void;
+    const mayFinish = new Promise<void>((resolve) => {
+      finishGateway = resolve;
+    });
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        enterGateway();
+        await mayFinish;
+        yield { type: 'turn.started' };
+        yield {
+          type: 'turn.completed',
+          text: 'serialized answer',
+          emptyTurn: false,
+          usage: { promptTokens: 10, completionTokens: 1, totalTokens: 11 },
+        };
+      },
+    };
+    let owner: string | null = null;
+    const claims: SubscriptionTurnClaimsLike = {
+      async acquire({ turnId }) {
+        if (owner !== null) return null;
+        owner = turnId;
+        return {
+          release: async () => {
+            if (owner === turnId) owner = null;
+          },
+        };
+      },
+    };
+    let captures = 0;
+    const capture: ClaudeTranscriptUsageCaptureLike = {
+      async capture() {
+        captures += 1;
+        return undefined;
+      },
+    };
+    const turnParams = {
+      session: fixture.session,
+      agent: {
+        ...fixture.agent,
+        model: 'anthropic/claude-sonnet-4-6',
+        agentRuntime: 'claude-cli' as const,
+      },
+      user: fixture.user,
+      content: 'only once',
+      beginStream: sink,
+    };
+
+    const first = runTurn(makeDeps(compat, capture, claims), turnParams);
+    await gatewayEntered;
+    await expect(
+      runTurn(makeDeps(compat, capture, claims), turnParams),
+    ).rejects.toMatchObject({ statusCode: 409, code: 'session_turn_in_progress' });
+    expect(captures).toBe(0);
+
+    finishGateway();
+    const outcome = await first;
+    expect(outcome.errorCode).toBeNull();
+    expect(captures).toBe(1);
+    expect(owner).toBeNull();
+    const [messageCounts] = await pg<{ users: string; assistants: string }[]>`
+      select
+        count(*) filter (where role = 'user')::text as users,
+        count(*) filter (where role = 'assistant')::text as assistants
+      from messages where session_id = ${fixture.session.id}
+    `;
+    expect(messageCounts).toMatchObject({ users: '1', assistants: '1' });
+    const [spendCount] = await pg<{ count: string }[]>`
+      select count(*)::text as count
+      from manna_transactions
+      where manna_account_id in (
+        select id from manna_accounts where account_id = ${fixture.user.accountId}
+      ) and type = 'spend:chat'
+    `;
+    expect(Number(spendCount!.count)).toBe(1);
+  });
+
+  it('keeps compat-tail usage as the notional fallback when no transcript row is available', async () => {
+    const fixture = await makeFixture();
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield {
+          type: 'turn.completed',
+          text: 'tail answer',
+          emptyTurn: false,
+          usage: { promptTokens: 100, completionTokens: 10, totalTokens: 110 },
+        };
+      },
+    };
+    const capture: ClaudeTranscriptUsageCaptureLike = { capture: async () => undefined };
+    const outcome = await runTurn(makeDeps(compat, capture), {
+      session: fixture.session,
+      agent: {
+        ...fixture.agent,
+        model: 'anthropic/claude-sonnet-4-6',
+        agentRuntime: 'claude-cli',
+      },
+      user: fixture.user,
+      content: 'fallback to tail',
+      beginStream: sink,
+    });
+    const [row] = await pg<
+      Array<{ pricingBasis: string; promptTokens: number | null; metadata: { usageSource?: string } | null }>
+    >`
+      select pricing_basis as "pricingBasis", prompt_tokens as "promptTokens", metadata
+      from usage_events where turn_id = ${outcome.turnId}
+    `;
+    expect(row).toMatchObject({
+      pricingBasis: 'notional-subscription',
+      promptTokens: 100,
+      metadata: { usageSource: 'compat-tail' },
+    });
   });
 
   it('ignores duplicate gateway completion events without double-persisting or double-charging', async () => {
@@ -529,7 +966,11 @@ describe('runTurn usage events', () => {
       },
       {
         session: fixture.session,
-        agent: fixture.agent,
+        agent: {
+          ...fixture.agent,
+          model: 'anthropic/claude-sonnet-4-6',
+          agentRuntime: 'claude-cli',
+        },
         user: fixture.user,
         content: 'hello',
         beginStream: sink,
@@ -547,12 +988,16 @@ describe('runTurn usage events', () => {
       where session_id = ${fixture.session.id} and role = 'assistant'
     `;
     expect(Number(assistantRows[0]!.count)).toBe(0);
-    const usageRows = await pg<{ status: string; count: string }[]>`
-      select min(status) as status, count(*)::text as count
+    const usageRows = await pg<{ status: string; pricing_basis: string; count: string }[]>`
+      select min(status) as status, min(pricing_basis) as pricing_basis, count(*)::text as count
       from usage_events
       where turn_id = ${outcome.turnId}
     `;
-    expect(usageRows[0]).toMatchObject({ status: 'error', count: '1' });
+    expect(usageRows[0]).toMatchObject({
+      status: 'error',
+      pricing_basis: 'notional-subscription',
+      count: '1',
+    });
     const ledger = await pg<{ type: string; amount: string }[]>`
       select type, amount
       from manna_transactions

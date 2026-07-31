@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import { loadRootEnv, pg } from '@eden3/db';
-import { CronSync, OpenClawCli } from '@eden3/gateway';
+import { CronSync, OpenClawCli, withOpenClawConfigLock } from '@eden3/gateway';
 import type { AgentDto, TriggerDto } from '@eden3/shared';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -70,8 +70,10 @@ afterAll(async () => {
   if (legacyTriggerId !== '') {
     await cronSync.removeTrigger(legacyTriggerId).catch(() => {});
   }
-  await cli.execJson(['agents', 'delete', agentUsername, '--force']).catch(() => {});
-  await cli.execJson(['agents', 'delete', importedAgentUsername, '--force']).catch(() => {});
+  await withOpenClawConfigLock(DATA_DIR, async () => {
+    await cli.execJson(['agents', 'delete', agentUsername, '--force']).catch(() => {});
+    await cli.execJson(['agents', 'delete', importedAgentUsername, '--force']).catch(() => {});
+  }).catch(() => {});
   await fs
     .rm(path.join(DATA_DIR, `workspace-${agentUsername}`), { recursive: true, force: true })
     .catch(() => {});

@@ -5,14 +5,22 @@ import { getEnv } from '@eden3/core';
 import {
   AgentProvisioner,
   CronSync,
+  OpenClawCli,
+  OpenClawMemoryCli,
+  getModelAgentRuntime,
+  getModelRuntimeCatalog,
   setAgentSkills,
   setAgentToolGroups,
+  setModelAgentRuntime,
   type ProvisionAgentParams,
   type ProvisionAgentResult,
+  type MemoryPromotionSummary,
+  type MemorySearchResult,
   type SyncTriggerResult,
   type UpdatePersonaParams,
   type UpdatePersonaResult,
 } from '@eden3/gateway';
+import type { AgentModel, AgentRuntime, ModelRuntimeDto } from '@eden3/shared';
 
 import { ApiError } from './errors';
 
@@ -66,6 +74,21 @@ export interface ToolSyncLike {
   syncAgentToolGroups(params: ToolSyncParams): Promise<{ changed: boolean }>;
 }
 
+/** Canonical OpenClaw model-scoped runtime catalog seam. */
+export interface ModelRuntimeCatalogLike {
+  getCatalog(): Promise<ModelRuntimeDto[]>;
+  getRuntime(model: string): Promise<AgentRuntime>;
+  setRuntime(
+    model: AgentModel,
+    agentRuntime: AgentRuntime,
+  ): Promise<{ changed: boolean; model: AgentModel; agentRuntime: AgentRuntime }>;
+}
+
+export interface MemoryRuntimeLike {
+  promoteAgent(agentId: string): Promise<MemoryPromotionSummary>;
+  searchAgent(agentId: string, query: string, maxResults?: number): Promise<MemorySearchResult>;
+}
+
 export interface GatewayGlueOptions {
   /** Override the provisioner (tests). Default: real AgentProvisioner, lazy. */
   provisioner?: ProvisionerLike;
@@ -75,6 +98,10 @@ export interface GatewayGlueOptions {
   skillSync?: SkillSyncLike;
   /** Override tool-group sync (tests). Default: openclaw.json allowlist writer. */
   toolSync?: ToolSyncLike;
+  /** Override model-runtime config reads/writes (tests). */
+  modelRuntime?: ModelRuntimeCatalogLike;
+  /** Per-agent native memory promotion/search seam (tests inject a fake). */
+  memoryRuntime?: MemoryRuntimeLike;
 }
 
 export class GatewayGlue {
@@ -82,14 +109,19 @@ export class GatewayGlue {
   private readonly cronSyncOverride: CronSyncLike | undefined;
   private readonly skillSyncOverride: SkillSyncLike | undefined;
   private readonly toolSyncOverride: ToolSyncLike | undefined;
+  private readonly modelRuntimeOverride: ModelRuntimeCatalogLike | undefined;
+  private readonly memoryRuntimeOverride: MemoryRuntimeLike | undefined;
   private lazyProvisioner: ProvisionerLike | undefined;
   private lazyCronSync: CronSyncLike | undefined;
+  private lazyMemoryRuntime: MemoryRuntimeLike | undefined;
 
   constructor(options: GatewayGlueOptions = {}) {
     this.provisionerOverride = options.provisioner;
     this.cronSyncOverride = options.cronSync;
     this.skillSyncOverride = options.skillSync;
     this.toolSyncOverride = options.toolSync;
+    this.modelRuntimeOverride = options.modelRuntime;
+    this.memoryRuntimeOverride = options.memoryRuntime;
   }
 
   /** Throws ApiError 503 when the gateway token is not configured. */
@@ -123,6 +155,24 @@ export class GatewayGlue {
           setAgentToolGroups(openclawId, toolGroups, { dataDir: defaultOpenclawDataDir() }),
       }
     );
+  }
+
+  get modelRuntime(): ModelRuntimeCatalogLike {
+    const dataDir = defaultOpenclawDataDir();
+    return (
+      this.modelRuntimeOverride ?? {
+        getCatalog: async () => getModelRuntimeCatalog({ dataDir }),
+        getRuntime: async (model) => getModelAgentRuntime(model, { dataDir }),
+        setRuntime: async (model, agentRuntime) =>
+          setModelAgentRuntime(model, agentRuntime, { dataDir }),
+      }
+    );
+  }
+
+  get memoryRuntime(): MemoryRuntimeLike {
+    if (this.memoryRuntimeOverride) return this.memoryRuntimeOverride;
+    this.lazyMemoryRuntime ??= new OpenClawMemoryCli(new OpenClawCli());
+    return this.lazyMemoryRuntime;
   }
 }
 

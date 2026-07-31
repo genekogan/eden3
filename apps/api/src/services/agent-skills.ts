@@ -223,6 +223,25 @@ export async function skillRowsBySlugs(slugs: string[]): Promise<SkillDefinition
   `;
 }
 
+function assertInstallableSkills(
+  requested: string[],
+  rows: SkillDefinitionRow[],
+): void {
+  const found = new Set(rows.map((row) => row.slug));
+  const missing = requested.filter((slug) => !found.has(slug));
+  if (missing.length > 0) {
+    throw new SkillInstallError(404, 'skill_not_found', `Unknown skill(s): ${missing.join(', ')}`);
+  }
+  const notApproved = rows.filter((row) => row.status !== 'approved').map((row) => row.slug);
+  if (notApproved.length > 0) {
+    throw new SkillInstallError(
+      409,
+      'skill_not_approved',
+      `Skill(s) are not approved: ${notApproved.join(', ')}`,
+    );
+  }
+}
+
 export async function approvedSkillsForAgent(agentId: string): Promise<string[]> {
   const rows = await pg<{ slug: string }[]>`
     select sd.slug
@@ -248,6 +267,85 @@ export async function attachedSkillRows(agentId: string): Promise<AgentSkillRow[
   `;
 }
 
+/**
+ * Commit the DB-authoritative skill selection and enqueue one durable runtime
+ * revision. No filesystem or OpenClaw mutation is allowed here: those effects
+ * belong to the per-agent reconciler's session advisory lock.
+ *
+ * `FOR SHARE` on every selected definition closes the moderation race. An
+ * admin rejection either lands first (and this request observes `rejected`) or
+ * waits for this transaction, then sees and removes the newly attached row.
+ */
+export async function commitAgentSkillSelection(params: {
+  agentId: string;
+  slugs: string[];
+}): Promise<AgentSkillRow[]> {
+  const requested = normalizedUniqueSlugs(params.slugs);
+  await pg.begin(async (sql) => {
+    const rows =
+      requested.length === 0
+        ? []
+        : await sql<SkillDefinitionRow[]>`
+            select ${skillColumns()}
+            from skill_definitions
+            where slug = any(${requested}::text[])
+            order by slug asc
+            for share
+          `;
+    assertInstallableSkills(requested, rows);
+
+    // Definition-row locks precede the agent lock, matching admin rejection's
+    // row-update -> agent-lock order and avoiding a moderation/owner deadlock.
+    // Keep this seed aligned with PATCH /agents and POST /agents/.../repair.
+    await sql`select pg_advisory_xact_lock(hashtextextended(${params.agentId}::text, 91))`;
+
+    await sql`delete from agent_skills where agent_id = ${params.agentId}`;
+    for (const skill of rows) {
+      await sql`
+        insert into agent_skills (agent_id, skill_id, enabled)
+        values (${params.agentId}, ${skill.id}, true)
+      `;
+    }
+    const [updated] = await sql<{ account_id: string }[]>`
+      update agents
+      set runtime_sync_version = runtime_sync_version + 1,
+          runtime_sync_lease_expires_at = null,
+          runtime_sync_error = null
+      where account_id = ${params.agentId}
+      returning account_id
+    `;
+    if (!updated) throw new Error('agent skill runtime revision target unavailable');
+  });
+  return attachedSkillRows(params.agentId);
+}
+
+/**
+ * Project the current DB-authoritative approved skills into one ready runtime.
+ * The caller must hold the agent runtime session advisory lock. This function
+ * deliberately never changes `agent_skills`, so an older claimant cannot
+ * overwrite a newer owner/admin selection while finishing its projection.
+ */
+export async function projectApprovedAgentSkills(params: {
+  agentId: string;
+  openclawId: string;
+  workspacePath: string;
+  skillSync: SkillSyncLike;
+}): Promise<{ skills: AgentSkillRow[]; openclaw: { changed: boolean } }> {
+  // The runtime scheduler starts before route registration finishes. Reassert
+  // curated/retired definitions here so an immediate boot recovery cannot
+  // briefly re-project a retired skill before server bootstrap cleans it up.
+  await ensureBuiltinSkills();
+  const skills = (await attachedSkillRows(params.agentId)).filter(
+    (row) => row.enabled && row.status === 'approved',
+  );
+  await writeSkillFiles(params.workspacePath, skills);
+  const openclaw = await params.skillSync.syncAgentSkills({
+    openclawId: params.openclawId,
+    skills: skills.map((skill) => skill.slug),
+  });
+  return { skills, openclaw };
+}
+
 export async function replaceAgentSkills(params: {
   agentId: string;
   openclawId: string;
@@ -256,31 +354,34 @@ export async function replaceAgentSkills(params: {
   skillSync: SkillSyncLike;
 }): Promise<{ skills: AgentSkillRow[]; openclaw: { changed: boolean } }> {
   const requested = normalizedUniqueSlugs(params.slugs);
-  const rows = await skillRowsBySlugs(requested);
-  const found = new Set(rows.map((row) => row.slug));
-  const missing = requested.filter((slug) => !found.has(slug));
-  if (missing.length > 0) {
-    throw new SkillInstallError(404, 'skill_not_found', `Unknown skill(s): ${missing.join(', ')}`);
-  }
-  const notApproved = rows.filter((row) => row.status !== 'approved').map((row) => row.slug);
-  if (notApproved.length > 0) {
-    throw new SkillInstallError(
-      409,
-      'skill_not_approved',
-      `Skill(s) are not approved: ${notApproved.join(', ')}`,
-    );
-  }
-
-  await writeSkillFiles(params.workspacePath, rows);
-  await pg.begin(async (sql) => {
+  const rows = (await pg.begin(async (sql) => {
+    // Initial provisioning/import is the sole remaining direct projection
+    // path. Lock definitions through the attachment commit so moderation
+    // either wins first (and validation refuses) or observes the new link and
+    // enqueues a correcting runtime revision.
+    const selected =
+      requested.length === 0
+        ? []
+        : await sql<SkillDefinitionRow[]>`
+            select ${skillColumns()}
+            from skill_definitions
+            where slug = any(${requested}::text[])
+            order by slug asc
+            for share
+          `;
+    assertInstallableSkills(requested, selected);
     await sql`delete from agent_skills where agent_id = ${params.agentId}`;
-    for (const skill of rows) {
+    for (const skill of selected) {
       await sql`
         insert into agent_skills (agent_id, skill_id, enabled)
         values (${params.agentId}, ${skill.id}, true)
       `;
     }
-  });
+    return selected;
+  })) as SkillDefinitionRow[];
+  // If projection now fails, provisioning remains non-ready while the DB
+  // selection survives. Lazy provisioning can retry it without losing intent.
+  await writeSkillFiles(params.workspacePath, rows);
   const openclaw = await params.skillSync.syncAgentSkills({
     openclawId: params.openclawId,
     skills: requested,

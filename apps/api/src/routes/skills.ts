@@ -6,13 +6,13 @@ import { z } from 'zod';
 import { ApiError, sendError } from '../errors';
 import { isUniqueViolation, pgToIso } from '../route-helpers';
 import {
-  approvedSkillsForAgent,
   attachedSkillRows,
-  replaceAgentSkills,
+  commitAgentSkillSelection,
   skillColumns,
   SkillInstallError,
   type SkillDefinitionRow,
 } from '../services/agent-skills';
+import { reconcileAgentRuntime } from '../services/agent-runtime-sync';
 
 const skillSlugSchema = z
   .string()
@@ -71,6 +71,28 @@ function canManage(viewer: AuthSession | null, account: Account, agent: Agent): 
 }
 
 export const skillsRoutes: FastifyPluginAsync = async (app) => {
+  const reconcileSkillRuntime = (accountId: string, logger: typeof app.log) =>
+    reconcileAgentRuntime(accountId, {
+      // Preserve degraded boot: constructing the real provisioner may require
+      // credentials, so resolve each seam only inside the reconciler's caught
+      // runtime mutation block.
+      provisioner: {
+        provisionAgent: (params, options) =>
+          app.gatewayGlue.provisioner.provisionAgent(params, options),
+        updateAgentPersona: (params) =>
+          app.gatewayGlue.provisioner.updateAgentPersona(params),
+      },
+      toolSync: {
+        syncAgentToolGroups: (params) =>
+          app.gatewayGlue.toolSync.syncAgentToolGroups(params),
+      },
+      skillSync: {
+        syncAgentSkills: (params) =>
+          app.gatewayGlue.skillSync.syncAgentSkills(params),
+      },
+      logger,
+    });
+
   app.get('/skills', async (req) => {
     const viewer = req.account;
     const rows = await pg<SkillDefinitionRow[]>`
@@ -118,33 +140,82 @@ export const skillsRoutes: FastifyPluginAsync = async (app) => {
     const { slug } = skillParamsSchema.parse(req.params);
     const body = reviewBodySchema.parse(req.body);
 
-    const [row] = await pg<SkillDefinitionRow[]>`
-      update skill_definitions
-      set status = ${body.status},
-          reviewer_id = ${account.accountId},
-          reviewed_at = now(),
-          updated_at = now()
-      where slug = ${slug}
-      returning ${skillColumns()}
-    `;
-    if (!row) return sendError(reply, 404, 'skill_not_found', `No skill "${slug}"`);
+    const reviewed = await pg.begin(async (sql) => {
+      // Updating the definition takes an exclusive row lock. Owner attachment
+      // commits take FOR SHARE on the same row, so rejection cannot miss a
+      // just-attached skill and leave its runtime allowlist enabled.
+      const [row] = await sql<SkillDefinitionRow[]>`
+        update skill_definitions
+        set status = ${body.status},
+            reviewer_id = ${account.accountId},
+            reviewed_at = now(),
+            updated_at = now()
+        where slug = ${slug}
+        returning ${skillColumns()}
+      `;
+      if (!row) return null;
+      if (body.status !== 'rejected') {
+        return {
+          row,
+          affectedAgentIds: [] as string[],
+          immediateAgentIds: [] as string[],
+        };
+      }
 
-    if (body.status === 'rejected') {
-      const affected = await pg<{ agent_id: string; openclaw_id: string | null }[]>`
-        select aks.agent_id, g.openclaw_id
+      const affected = await sql<{
+        agent_id: string;
+        provision_status: string;
+        openclaw_id: string | null;
+        workspace_path: string | null;
+      }[]>`
+        select distinct aks.agent_id, g.provision_status, g.openclaw_id, g.workspace_path
         from agent_skills aks
         join agents g on g.account_id = aks.agent_id
         where aks.skill_id = ${row.id}
+        order by aks.agent_id
       `;
-      await pg`delete from agent_skills where skill_id = ${row.id}`;
-      for (const agent of affected) {
-        if (!agent.openclaw_id) continue;
-        const skills = await approvedSkillsForAgent(agent.agent_id);
-        await app.gatewayGlue.skillSync.syncAgentSkills({ openclawId: agent.openclaw_id, skills });
+      const affectedAgentIds = affected.map((agent) => agent.agent_id);
+      const immediateAgentIds = affected
+        .filter(
+          (agent) =>
+            agent.provision_status === 'ready' &&
+            agent.openclaw_id !== null &&
+            agent.workspace_path !== null,
+        )
+        .map((agent) => agent.agent_id);
+      // Consistent UUID order avoids deadlocks when admins reject different
+      // skills that overlap the same agent fleet.
+      for (const agentId of affectedAgentIds) {
+        await sql`select pg_advisory_xact_lock(hashtextextended(${agentId}::text, 91))`;
+      }
+      await sql`delete from agent_skills where skill_id = ${row.id}`;
+      if (affectedAgentIds.length > 0) {
+        await sql`
+          update agents
+          set runtime_sync_version = runtime_sync_version + 1,
+              runtime_sync_lease_expires_at = null,
+              runtime_sync_error = null
+          where account_id = any(${affectedAgentIds}::uuid[])
+        `;
+      }
+      return { row, affectedAgentIds, immediateAgentIds };
+    });
+    if (!reviewed) return sendError(reply, 404, 'skill_not_found', `No skill "${slug}"`);
+
+    // Desired state is already durable. Immediate convergence shortens the UI
+    // delay; any crash/outage stays scheduler-visible via the bumped revision.
+    for (const agentId of reviewed.immediateAgentIds) {
+      try {
+        await reconcileSkillRuntime(agentId, req.log);
+      } catch (err) {
+        req.log.warn(
+          { err, accountId: agentId },
+          'skill rejection saved; agent runtime convergence deferred',
+        );
       }
     }
 
-    return { skill: skillDto(row) };
+    return { skill: skillDto(reviewed.row) };
   });
 
   app.get('/agents/:username/skills', async (req, reply) => {
@@ -208,18 +279,16 @@ export const skillsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     try {
-      const result = await replaceAgentSkills({
+      const skills = await commitAgentSkillSelection({
         agentId: account.id,
-        openclawId: agent.openclawId,
-        workspacePath: agent.workspacePath,
         slugs: body.slugs,
-        skillSync: app.gatewayGlue.skillSync,
       });
-      return {
+      const sync = await reconcileSkillRuntime(account.id, req.log);
+      return reply.code(sync.status === 'pending' || sync.status === 'ineligible' ? 202 : 200).send({
         agent: { id: account.id, username: account.username, openclawId: agent.openclawId },
-        skills: result.skills.map((row) => ({ ...skillDto(row), enabled: row.enabled })),
-        openclaw: result.openclaw,
-      };
+        skills: skills.map((row) => ({ ...skillDto(row), enabled: row.enabled })),
+        runtimeSync: sync.status,
+      });
     } catch (err) {
       if (err instanceof SkillInstallError) {
         return sendError(reply, err.statusCode, err.code, err.message);
