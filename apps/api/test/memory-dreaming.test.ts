@@ -10,6 +10,7 @@ import { describe, expect, it } from 'vitest';
 import {
   EdenMemoryDreamAgentRunner,
   MemoryDreamRecoveryPendingError,
+  MemoryDreamSkippedError,
   MemoryDreamOrchestrator,
   MemoryDreamScheduler,
   MEMORY_DREAM_CLAIM_STALE_MS,
@@ -58,6 +59,7 @@ class FakeStore implements MemoryDreamStore {
   started: string[] = [];
   completed: CompleteMemoryDreamRunParams[] = [];
   failed: string[] = [];
+  skipped: string[] = [];
   failureStatuses: Array<string | undefined> = [];
   reconciledSweeps: string[] = [];
   finished = false;
@@ -106,6 +108,11 @@ class FakeStore implements MemoryDreamStore {
   async failRun(params: { runId: string; status?: 'error' | 'recovery_pending' }): Promise<boolean> {
     this.failed.push(params.runId);
     this.failureStatuses.push(params.status);
+    return true;
+  }
+
+  async skipRun(params: { runId: string }): Promise<boolean> {
+    this.skipped.push(params.runId);
     return true;
   }
 
@@ -319,6 +326,27 @@ describe('activity-gated memory dreaming', () => {
     }).run('memory-dream:2026-07-31', new Date('2026-07-30T07:00:00.000Z'));
     expect(result).toMatchObject({ claimed: true, succeeded: 0, failed: 1 });
     expect(store.failureStatuses).toEqual(['recovery_pending']);
+  });
+
+  it('durably skips an active agent whose seed has too little history without failing the sweep', async () => {
+    const store = new FakeStore([candidate(1, true)]);
+    const result = await new MemoryDreamOrchestrator(store, {
+      async run() {
+        throw new MemoryDreamSkippedError(
+          'seed-too-little-history',
+          'not enough transcript history',
+        );
+      },
+    }).run('memory-dream:2026-07-31', new Date('2026-07-30T07:00:00.000Z'));
+
+    expect(result).toMatchObject({
+      claimed: true,
+      succeeded: 0,
+      failed: 0,
+      skipped: [{ reason: 'seed-too-little-history' }],
+    });
+    expect(store.skipped).toEqual(['run-agent-1']);
+    expect(store.failed).toEqual([]);
   });
 
   it('retries a same-sweep recovery-pending run after its activity ages outside the window', async () => {
@@ -616,15 +644,18 @@ describe('memory dream crash safety', () => {
             providerCalls += 1;
           },
         });
-        await expect(
-          runner.run(activeCandidate(workspace), 'sweep-1', {
+        const promise = runner.run(activeCandidate(workspace), 'sweep-1', {
             id: randomUUID(),
             sweepId: 'sweep-1',
             claimToken: randomUUID(),
             lastActivityAt: new Date('2026-07-31T05:00:00.000Z'),
             isRecovery: false,
-          }),
-        ).rejects.toThrow('not durably done');
+          });
+        if (seedStatus === 'skipped') {
+          await expect(promise).rejects.toThrow(MemoryDreamSkippedError);
+        } else {
+          await expect(promise).rejects.toThrow('not durably done');
+        }
         expect(promotions).toBe(0);
         expect(providerCalls).toBe(0);
         expect(await readFile(path.join(workspace, 'MEMORY.md'), 'utf8')).toBe(nativeOwned);

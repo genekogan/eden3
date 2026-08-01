@@ -36,6 +36,7 @@ import { MAX_PROVIDER_TURN_MS } from './subscription-turn-claims';
 export type MemoryDreamSkipReason =
   | 'inactive'
   | 'already-dreamed'
+  | 'seed-too-little-history'
   | 'missing-owner'
   | 'missing-workspace'
   | 'not-ready';
@@ -167,6 +168,13 @@ export interface MemoryDreamStore {
     durationMs: number;
     status?: 'error' | 'recovery_pending';
   }): Promise<boolean>;
+  skipRun(params: {
+    runId: string;
+    claimToken: string;
+    candidate: RunnableMemoryDreamCandidate;
+    reason: MemoryDreamSkipReason;
+    durationMs: number;
+  }): Promise<boolean>;
   /** Re-aggregate a prior abandoned sweep after cross-sweep recovery. */
   reconcileAbandonedSweep(sweepId: string): Promise<boolean>;
   finishSweep(params: {
@@ -208,6 +216,17 @@ class MemoryDreamRecoveryResolvedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'MemoryDreamRecoveryResolvedError';
+  }
+}
+
+/** A currently active agent is intentionally deferred without failing its sweep. */
+export class MemoryDreamSkippedError extends Error {
+  constructor(
+    readonly reason: MemoryDreamSkipReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'MemoryDreamSkippedError';
   }
 }
 
@@ -258,6 +277,7 @@ export class MemoryDreamOrchestrator {
 
     let succeeded = 0;
     let failed = 0;
+    const skipped = [...selected.skipped];
     const sweepHeartbeat = setInterval(() => {
       void this.store.heartbeatSweep(sweepClaim).catch(() => {});
     }, MEMORY_DREAM_HEARTBEAT_MS);
@@ -284,21 +304,40 @@ export class MemoryDreamOrchestrator {
             recoveryResolved = terminalCommitted;
             if (terminalCommitted) succeeded += 1;
           } catch (err) {
-            const status =
-              err instanceof MemoryDreamRecoveryPendingError
-                ? 'recovery_pending'
-                : runClaim.isRecovery && !(err instanceof MemoryDreamRecoveryResolvedError)
+            if (err instanceof MemoryDreamSkippedError) {
+              terminalCommitted = await this.store.skipRun({
+                runId: runClaim.id,
+                claimToken: runClaim.claimToken,
+                candidate,
+                reason: err.reason,
+                durationMs: Math.max(0, this.now().getTime() - runStarted),
+              });
+              recoveryResolved = terminalCommitted;
+              if (terminalCommitted) {
+                skipped.push({
+                  agentAccountId: candidate.agentAccountId,
+                  openclawId: candidate.openclawId,
+                  reason: err.reason,
+                  lastActivityAt: candidate.lastActivityAt.toISOString(),
+                });
+              }
+            } else {
+              const status =
+                err instanceof MemoryDreamRecoveryPendingError
                   ? 'recovery_pending'
-                  : 'error';
-            terminalCommitted = await this.store.failRun({
-              runId: runClaim.id,
-              claimToken: runClaim.claimToken,
-              error: (err instanceof Error ? err.message : String(err)).slice(0, 2_000),
-              durationMs: Math.max(0, this.now().getTime() - runStarted),
-              status,
-            });
-            recoveryResolved = terminalCommitted && status === 'error';
-            if (terminalCommitted) failed += 1;
+                  : runClaim.isRecovery && !(err instanceof MemoryDreamRecoveryResolvedError)
+                    ? 'recovery_pending'
+                    : 'error';
+              terminalCommitted = await this.store.failRun({
+                runId: runClaim.id,
+                claimToken: runClaim.claimToken,
+                error: (err instanceof Error ? err.message : String(err)).slice(0, 2_000),
+                durationMs: Math.max(0, this.now().getTime() - runStarted),
+                status,
+              });
+              recoveryResolved = terminalCommitted && status === 'error';
+              if (terminalCommitted) failed += 1;
+            }
           } finally {
             clearInterval(runHeartbeat);
           }
@@ -336,7 +375,7 @@ export class MemoryDreamOrchestrator {
       sweepId: sweepClaim.id,
       eligible: candidates.length,
       active: selected.active.length,
-      skipped: selected.skipped,
+      skipped,
       succeeded,
       failed,
     };
@@ -667,6 +706,43 @@ export class PostgresMemoryDreamStore implements MemoryDreamStore {
         and status = 'running'
         and lease_expires_at > now()
       returning id
+    `;
+    return rows.length > 0;
+  }
+
+  async skipRun(params: {
+    runId: string;
+    claimToken: string;
+    candidate: RunnableMemoryDreamCandidate;
+    reason: MemoryDreamSkipReason;
+    durationMs: number;
+  }): Promise<boolean> {
+    const rows = await this.client<{ id: string }[]>`
+      with skipped_run as (
+        update memory_dream_runs set
+          status = 'skipped',
+          error = null,
+          provenance = ${pg.json(JSON.stringify({ skipReason: params.reason }))},
+          claim_token = null,
+          lease_expires_at = null,
+          completed_at = now(),
+          duration_ms = ${params.durationMs}
+        where id = ${params.runId} and claim_token = ${params.claimToken}
+          and status = 'running'
+          and lease_expires_at > now()
+        returning id, sweep_id
+      )
+      update memory_dream_sweeps set
+        skipped_count = skipped_count + 1,
+        skipped_agents = skipped_agents || jsonb_build_array(jsonb_build_object(
+          'agentAccountId', ${params.candidate.agentAccountId},
+          'openclawId', ${params.candidate.openclawId},
+          'reason', ${params.reason},
+          'lastActivityAt', ${params.candidate.lastActivityAt.toISOString()}
+        ))
+      from skipped_run
+      where memory_dream_sweeps.id = skipped_run.sweep_id
+      returning memory_dream_sweeps.id
     `;
     return rows.length > 0;
   }
@@ -1143,6 +1219,16 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
         candidate.workspacePath,
       );
       const seededMemory = await readText(memoryPath);
+      if (
+        seed.status === 'skipped' &&
+        seed.skippedReason === 'too_little_history' &&
+        durableSeed?.status === 'skipped'
+      ) {
+        throw new MemoryDreamSkippedError(
+          'seed-too-little-history',
+          'memory seed deferred because the agent has too little transcript history',
+        );
+      }
       if (seed.status !== 'done' || durableSeed?.status !== 'done' || seededMemory === null) {
         throw new Error(
           `memory seed prerequisite is not durably done (result=${seed.status}, durable=${durableSeed?.status ?? 'missing'})`,
