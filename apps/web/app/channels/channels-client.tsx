@@ -189,6 +189,17 @@ export function ChannelsClient() {
     return counts;
   }, [connections]);
 
+  /** Connected agents first so they aren't buried in large agent rosters. */
+  const sortedAgents = useMemo(
+    () =>
+      [...agents].sort((a, b) => {
+        const connected = (connectionCounts.get(b.id) ?? 0) - (connectionCounts.get(a.id) ?? 0);
+        if (connected !== 0) return connected;
+        return agentLabel(a).localeCompare(agentLabel(b), undefined, { sensitivity: "base" });
+      }),
+    [agents, connectionCounts],
+  );
+
   const selectAgent = (agentId: string) => {
     setSelectedAgentId(agentId);
     setNote(null);
@@ -490,7 +501,7 @@ export function ChannelsClient() {
               onChange={(event) => selectAgent(event.target.value)}
               className={inputClass}
             >
-              {agents.map((agent) => {
+              {sortedAgents.map((agent) => {
                 const count = connectionCounts.get(agent.id) ?? 0;
                 return (
                   <option key={agent.id} value={agent.id}>
