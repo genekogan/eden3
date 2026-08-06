@@ -1,12 +1,11 @@
 "use client";
 
 /**
- * /agents — the directory. Defaults to the viewer's own agents (private ones
- * included — operator ruling 2026-07-09) with a toggle to browse all public
- * agents. Debounced search over GET /api/agents?q&scope, cursor "load more",
- * create entry point top-right. Resilient to the api being mid-build
- * (501/404/offline -> quiet dashed card, retryable); an anonymous viewer is
- * dropped to the public directory automatically.
+ * /agents — YOUR agents (the cockpit is single-user: no public directory,
+ * no cross-user browsing — that returns later as a separate app). Debounced
+ * search over GET /api/agents?q&scope=mine, cursor "load more", create entry
+ * points top-right. Resilient to the api being mid-build (501/404/offline ->
+ * quiet dashed card, retryable).
  */
 
 import Link from "next/link";
@@ -66,11 +65,9 @@ function CardSkeleton() {
 }
 
 type DirectoryState = "loading" | "ready" | "error";
-type DirectoryScope = "mine" | "public";
 
 export function AgentsDirectory() {
   const [query, setQuery] = useState("");
-  const [scope, setScope] = useState<DirectoryScope>("mine");
   const [items, setItems] = useState<AgentDto[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [state, setState] = useState<DirectoryState>("loading");
@@ -81,24 +78,24 @@ export function AgentsDirectory() {
   const [reloadKey, setReloadKey] = useState(0);
   const seq = useRef(0);
 
-  // Page 1 — debounced on query, re-armed by "Try again" or a scope switch.
+  // Page 1 — debounced on query, re-armed by "Try again".
   useEffect(() => {
     setState("loading");
     setMoreError(null);
     const timer = window.setTimeout(async () => {
       const id = ++seq.current;
       try {
-        const page = await api.agents.list({ q: query.trim() || undefined, scope });
+        const page = await api.agents.list({ q: query.trim() || undefined, scope: "mine" });
         if (seq.current !== id) return;
         setItems(page.items);
         setCursor(page.nextCursor);
         setState("ready");
       } catch (error) {
         if (seq.current !== id) return;
-        // "Mine" needs a signed-in viewer; anonymous sessions get the public
-        // directory instead of a sign-in wall.
-        if (scope === "mine" && error instanceof ApiError && error.status === 401) {
-          setScope("public");
+        if (error instanceof ApiError && error.status === 401) {
+          setErrorText("Sign in to see your agents.");
+          setEndpointMissing(false);
+          setState("error");
           return;
         }
         setEndpointMissing(isEndpointMissing(error));
@@ -107,7 +104,7 @@ export function AgentsDirectory() {
       }
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [query, scope, reloadKey]);
+  }, [query, reloadKey]);
 
   const loadMore = useCallback(async () => {
     if (!cursor || loadingMore) return;
@@ -116,7 +113,7 @@ export function AgentsDirectory() {
     try {
       const page = await api.agents.list({
         q: query.trim() || undefined,
-        scope,
+        scope: "mine",
         cursor,
       });
       setItems((prev) => dedupeById([...prev, ...page.items]));
@@ -126,7 +123,7 @@ export function AgentsDirectory() {
     } finally {
       setLoadingMore(false);
     }
-  }, [cursor, loadingMore, query, scope]);
+  }, [cursor, loadingMore, query]);
 
   const trimmedQuery = query.trim();
 
@@ -135,10 +132,10 @@ export function AgentsDirectory() {
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-light tracking-tight md:text-4xl">
-            Agents
+            Your agents
           </h1>
           <p className="mt-2 text-sm text-muted">
-            Chat with creative agents — or make your own.
+            Pick an agent to work with — or make a new one.
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -163,32 +160,6 @@ export function AgentsDirectory() {
       </div>
 
       <div className="mt-8 flex flex-wrap items-center gap-3">
-        <div
-          role="group"
-          aria-label="Directory scope"
-          className="flex shrink-0 overflow-hidden rounded-lg border border-edge"
-        >
-          {(
-            [
-              ["mine", "My agents"],
-              ["public", "All agents"],
-            ] as const
-          ).map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              aria-pressed={scope === value}
-              onClick={() => setScope(value)}
-              className={`px-3 py-2 text-sm transition-colors ${
-                scope === value
-                  ? "bg-accent/15 text-accent-soft"
-                  : "bg-raised text-muted hover:text-foreground"
-              }`}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
         <div className="relative w-full max-w-sm">
           <span className="pointer-events-none absolute inset-y-0 left-3 flex items-center text-faint">
             <SearchIcon />
@@ -196,7 +167,7 @@ export function AgentsDirectory() {
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={scope === "mine" ? "Search your agents…" : "Search agents…"}
+            placeholder="Search your agents…"
             aria-label="Search agents"
             className="w-full rounded-lg border border-edge bg-raised py-2 pl-9 pr-3 text-sm text-foreground placeholder:text-faint transition-colors focus:border-accent/60 focus:outline-none"
           />
@@ -234,48 +205,23 @@ export function AgentsDirectory() {
           title={
             trimmedQuery
               ? `No agents match “${trimmedQuery}”`
-              : scope === "mine"
-                ? "You don't have an agent yet"
-                : "No agents yet"
+              : "You don't have an agent yet"
           }
           hint={
             trimmedQuery
-              ? scope === "mine"
-                ? "Try a different name — or browse all public agents."
-                : "Try a different name or handle."
-              : scope === "mine"
-                ? "Adopt one: start from a template, or let the builder interview you and shape it with you."
-                : "Be the first — create an agent and give it a persona."
+              ? "Try a different name or handle."
+              : "Adopt one: start from a template, or let the builder interview you and shape it with you."
           }
           action={
-            trimmedQuery ? undefined : scope === "mine" ? (
-              <span className="flex flex-col items-center gap-3">
-                <span className="flex flex-wrap justify-center gap-2">
-                  <Link href="/agents/new" className={primaryButtonClass}>
-                    Create agent
-                  </Link>
-                  <Link href="/agents/builder" className={quietButtonClass}>
-                    Try the builder
-                  </Link>
-                  <button
-                    type="button"
-                    onClick={() => setScope("public")}
-                    className={quietButtonClass}
-                  >
-                    Browse all agents
-                  </button>
-                </span>
-                <Link
-                  href="/chat?agent=eden"
-                  className="text-xs text-accent-soft transition-colors hover:text-accent"
-                >
-                  Not sure where to start? Say hi to Eden, the built-in guide →
+            trimmedQuery ? undefined : (
+              <span className="flex flex-wrap justify-center gap-2">
+                <Link href="/agents/new" className={primaryButtonClass}>
+                  Create agent
+                </Link>
+                <Link href="/agents/builder" className={quietButtonClass}>
+                  Try the builder
                 </Link>
               </span>
-            ) : (
-              <Link href="/agents/new" className={quietButtonClass}>
-                Create agent
-              </Link>
             )
           }
         />

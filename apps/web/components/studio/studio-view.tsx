@@ -62,9 +62,9 @@ type QuoteState =
 
 const IDLE: Phase = { kind: "idle", notice: null };
 
-export function StudioView() {
+export function StudioView({ initialTool }: { initialTool?: string } = {}) {
   const [toolsState, setToolsState] = useState<ToolsState>({ status: "loading" });
-  const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [selectedName, setSelectedName] = useState<string | null>(initialTool ?? null);
   const [prompt, setPrompt] = useState("");
   const [duration, setDuration] = useState("");
   // "" = the tool's default model tier; a key from tool.models otherwise.

@@ -1,20 +1,11 @@
-import type { Metadata } from "next";
-import { AgentProfile } from "@/components/agents/agent-profile";
+import { redirect } from "next/navigation";
 
-interface Params {
+/** /agents/[username] → the agent's chats (its home surface). */
+export default async function AgentIndexPage({
+  params,
+}: {
   params: Promise<{ username: string }>;
-}
-
-export async function generateMetadata({ params }: Params): Promise<Metadata> {
+}) {
   const { username } = await params;
-  const decoded = decodeURIComponent(username);
-  return {
-    title: `@${decoded}`,
-    description: `Chat with @${decoded} and browse its creations on Eden3.`,
-  };
-}
-
-export default async function AgentProfilePage({ params }: Params) {
-  const { username } = await params;
-  return <AgentProfile username={decodeURIComponent(username)} />;
+  redirect(`/agents/${username}/chats`);
 }

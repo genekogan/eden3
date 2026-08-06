@@ -49,13 +49,32 @@ function RailSkeleton() {
   );
 }
 
-export function SessionRail({ className }: { className?: string }) {
+function isChannelSession(session: SessionDto): boolean {
+  return session.sessionType === "channel" || session.channelConnectionId !== null;
+}
+
+type ChannelFilter = "all" | "direct" | "channels";
+
+export function SessionRail({
+  className,
+  agent,
+  basePath = "/sessions",
+  newChatHref = "/chat",
+}: {
+  className?: string;
+  /** Filter to one agent's sessions (username) — the agent-scoped chats rail. */
+  agent?: string;
+  /** Session permalink prefix (e.g. /agents/verdelis/chats). */
+  basePath?: string;
+  newChatHref?: string;
+}) {
   const pathname = usePathname();
   const [sessions, setSessions] = useState<SessionDto[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [note, setNote] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [channelFilter, setChannelFilter] = useState<ChannelFilter>("all");
   const alive = useRef(true);
 
   useEffect(() => {
@@ -67,7 +86,7 @@ export function SessionRail({ className }: { className?: string }) {
 
   const load = useCallback(async () => {
     try {
-      const { items, nextCursor } = await api.sessions.list();
+      const { items, nextCursor } = await api.sessions.list(agent ? { agent } : {});
       if (!alive.current) return;
       setSessions(items);
       setCursor(nextCursor);
@@ -84,7 +103,7 @@ export function SessionRail({ className }: { className?: string }) {
             : "Couldn't reach the API.",
       );
     }
-  }, []);
+  }, [agent]);
 
   // Initial load + refresh on navigation (new sessions appear immediately).
   useEffect(() => {
@@ -110,7 +129,9 @@ export function SessionRail({ className }: { className?: string }) {
     if (!cursor || loadingMore) return;
     setLoadingMore(true);
     try {
-      const { items, nextCursor } = await api.sessions.list({ cursor });
+      const { items, nextCursor } = await api.sessions.list(
+        agent ? { cursor, agent } : { cursor },
+      );
       if (!alive.current) return;
       setSessions((prev) => {
         const seen = new Set(prev.map((s) => s.id));
@@ -122,12 +143,20 @@ export function SessionRail({ className }: { className?: string }) {
     } finally {
       if (alive.current) setLoadingMore(false);
     }
-  }, [cursor, loadingMore]);
+  }, [cursor, loadingMore, agent]);
 
   const isActive = (session: SessionDto): boolean =>
-    pathname === `/sessions/${session.id}` ||
+    pathname === `${basePath}/${session.id}` ||
     (session.externalId !== null &&
-      pathname === `/sessions/${session.externalId}`);
+      pathname === `${basePath}/${session.externalId}`);
+
+  const hasChannelSessions = sessions.some(isChannelSession);
+  const visibleSessions =
+    channelFilter === "all"
+      ? sessions
+      : sessions.filter((session) =>
+          channelFilter === "channels" ? isChannelSession(session) : !isChannelSession(session),
+        );
 
   return (
     <aside className={`h-full min-h-0 flex-col ${className ?? ""}`}>
@@ -136,7 +165,7 @@ export function SessionRail({ className }: { className?: string }) {
           Conversations
         </h2>
         <Link
-          href="/chat"
+          href={newChatHref}
           title="New chat"
           aria-label="New chat"
           className="flex size-7 items-center justify-center rounded-lg text-accent-soft transition-colors hover:bg-accent/10"
@@ -144,6 +173,38 @@ export function SessionRail({ className }: { className?: string }) {
           <NewChatIcon />
         </Link>
       </div>
+
+      {/* External-channel mirrors (Discord/Telegram) mix in like OpenClaw; the
+          filter lets you isolate intentional web sessions or channel traffic. */}
+      {hasChannelSessions ? (
+        <div
+          role="group"
+          aria-label="Conversation source filter"
+          className="mx-4 mb-1 flex shrink-0 gap-1"
+        >
+          {(
+            [
+              ["all", "All"],
+              ["direct", "Direct"],
+              ["channels", "Channels"],
+            ] as const
+          ).map(([value, label]) => (
+            <button
+              key={value}
+              type="button"
+              aria-pressed={channelFilter === value}
+              onClick={() => setChannelFilter(value)}
+              className={`rounded-md px-2 py-0.5 text-[11px] transition-colors ${
+                channelFilter === value
+                  ? "bg-accent/15 text-accent-soft"
+                  : "text-faint hover:text-foreground"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       <nav
         className="min-h-0 flex-1 overflow-y-auto px-2 pb-4 pt-1"
@@ -165,26 +226,34 @@ export function SessionRail({ className }: { className?: string }) {
               Try again
             </button>
           </div>
-        ) : sessions.length === 0 ? (
+        ) : visibleSessions.length === 0 ? (
           <div className="mx-2 mt-2 rounded-xl border border-dashed border-edge px-3 py-5 text-center">
-            <p className="text-xs text-muted">No conversations yet</p>
-            <Link
-              href="/chat"
-              className="mt-3 inline-block rounded-md border border-accent/40 px-2.5 py-1 text-[11px] text-accent-soft transition-colors hover:border-accent/70 hover:bg-accent/10"
-            >
-              Start one
-            </Link>
+            <p className="text-xs text-muted">
+              {sessions.length === 0
+                ? "No conversations yet"
+                : channelFilter === "channels"
+                  ? "No channel conversations"
+                  : "No direct conversations"}
+            </p>
+            {sessions.length === 0 ? (
+              <Link
+                href={newChatHref}
+                className="mt-3 inline-block rounded-md border border-accent/40 px-2.5 py-1 text-[11px] text-accent-soft transition-colors hover:border-accent/70 hover:bg-accent/10"
+              >
+                Start one
+              </Link>
+            ) : null}
           </div>
         ) : (
           <ul className="space-y-0.5">
-            {sessions.map((session) => {
+            {visibleSessions.map((session) => {
               const active = isActive(session);
               const agents = sessionAgents(session);
               const when = session.lastMessageAt ?? session.updatedAt;
               return (
                 <li key={session.id}>
                   <Link
-                    href={`/sessions/${session.id}`}
+                    href={`${basePath}/${session.id}`}
                     aria-current={active ? "page" : undefined}
                     className={`relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 transition-colors ${
                       active
@@ -208,6 +277,9 @@ export function SessionRail({ className }: { className?: string }) {
                         {sessionTitle(session)}
                       </span>
                       <span className="mt-0.5 block truncate text-[11px] text-faint">
+                        {isChannelSession(session) && session.platform
+                          ? `${session.platform} · `
+                          : ""}
                         {formatRelativeTime(when)}
                         {session.messageCount > 0
                           ? ` · ${session.messageCount} messages`

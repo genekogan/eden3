@@ -98,7 +98,14 @@ function TranscriptSkeleton() {
   );
 }
 
-export function SessionConversation({ routeId }: { routeId: string }) {
+export function SessionConversation({
+  routeId,
+  backHref = "/sessions",
+}: {
+  routeId: string;
+  /** Mobile back-arrow target (the surrounding conversations list). */
+  backHref?: string;
+}) {
   const [state, dispatch] = useReducer(
     conversationReducer,
     initialConversationState,
@@ -555,7 +562,7 @@ export function SessionConversation({ routeId }: { routeId: string }) {
       {/* Header */}
       <header className="flex h-14 shrink-0 items-center gap-3 border-b border-edge px-4 md:px-6">
         <Link
-          href="/sessions"
+          href={backHref}
           aria-label="All conversations"
           className="-ml-1 flex size-8 items-center justify-center rounded-lg text-muted transition-colors hover:bg-white/[0.04] hover:text-foreground md:hidden"
         >
