@@ -1,30 +1,32 @@
 @import "tailwindcss";
 
 /*
- * Eden3 palette — near-black, soft white, one violet. The media is the hero:
- * chrome stays quiet, violet is rationed (wordmark digit, active-nav bar,
- * primary actions, the manna glyph).
+ * Eden3 palette — near-black with a barely-perceptible green cast, soft
+ * white, one green. The media is the hero: chrome stays quiet, green is
+ * rationed (wordmark digit, active-nav bar, primary actions, the manna
+ * glyph). `accent-soft` means "the accent variant safe for text on this
+ * theme's background" — lighter in dark mode, darker in light mode.
  *
- *   background  page base            #0a0a0b
- *   surface     sidebar / panels     #101012
- *   raised      cards, inputs       #17171a
- *   edge        hairline borders    #232329
- *   foreground  primary text        #f4f4f5
- *   muted       secondary text      #9a9aa6
- *   faint       tertiary/labels     #5d5d69
- *   accent      violet              #7c5cff
- *   accent-soft lighter violet      #a18fff
+ *   background  page base            #0a0b0a
+ *   surface     sidebar / panels     #101211
+ *   raised      cards, inputs       #171a18
+ *   edge        hairline borders    #232925
+ *   foreground  primary text        #f2f4f2
+ *   muted       secondary text      #9aa39c
+ *   faint       tertiary/labels     #5d675f
+ *   accent      green               #4ade80
+ *   accent-soft lighter mint        #86efac
  */
 @theme {
-  --color-background: #0a0a0b;
-  --color-surface: #101012;
-  --color-raised: #17171a;
-  --color-edge: #232329;
-  --color-foreground: #f4f4f5;
-  --color-muted: #9a9aa6;
-  --color-faint: #5d5d69;
-  --color-accent: #7c5cff;
-  --color-accent-soft: #a18fff;
+  --color-background: #0a0b0a;
+  --color-surface: #101211;
+  --color-raised: #171a18;
+  --color-edge: #232925;
+  --color-foreground: #f2f4f2;
+  --color-muted: #9aa39c;
+  --color-faint: #5d675f;
+  --color-accent: #4ade80;
+  --color-accent-soft: #86efac;
 
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica,
     Arial, sans-serif;

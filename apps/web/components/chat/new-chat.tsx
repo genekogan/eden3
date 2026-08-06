@@ -184,7 +184,14 @@ function TypingDots() {
   );
 }
 
-function NewSessionComposer({ username }: { username: string }) {
+function NewSessionComposer({
+  username,
+  sessionHref = (id) => `/sessions/${encodeURIComponent(id)}`,
+}: {
+  username: string;
+  /** Where the streaming handoff lands once the session id is known. */
+  sessionHref?: (id: string) => string;
+}) {
   const router = useRouter();
   const [agent, setAgent] = useState<AgentDto | null>(null);
   const [recent, setRecent] = useState<CreationDto[]>([]);
@@ -247,7 +254,7 @@ function NewSessionComposer({ username }: { username: string }) {
       try {
         const sessionId = await ready;
         pendingPumpRef.current = null;
-        router.replace(`/sessions/${encodeURIComponent(sessionId)}`);
+        router.replace(sessionHref(sessionId));
       } catch (error) {
         pendingPumpRef.current = null;
         setStarting(false);
@@ -260,7 +267,7 @@ function NewSessionComposer({ username }: { username: string }) {
         });
       }
     },
-    [agent, router],
+    [agent, router, sessionHref],
   );
 
   const stop = useCallback(() => {
@@ -438,7 +445,25 @@ function NewSessionComposer({ username }: { username: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Entry — /chat?agent=<username>
+// Entry — /agents/[username]/chats (the agent-scoped composer)
+// ---------------------------------------------------------------------------
+
+export function AgentChatComposer({ username }: { username: string }) {
+  return (
+    <div className="h-full">
+      <NewSessionComposer
+        key={username}
+        username={username}
+        sessionHref={(id) =>
+          `/agents/${encodeURIComponent(username)}/chats/${encodeURIComponent(id)}`
+        }
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Legacy entry — /chat?agent=<username> (route now redirects; kept for P4 cleanup)
 // ---------------------------------------------------------------------------
 
 export function NewChatScreen() {

@@ -14,7 +14,7 @@ import { sessionCountOf } from "@/components/agents/agent-utils";
 import type { AgentDto } from "@/lib/types";
 
 export function chatHref(username: string): string {
-  return `/chat?agent=${encodeURIComponent(username)}`;
+  return `/agents/${encodeURIComponent(username)}/chats/new`;
 }
 
 export function agentHref(username: string, sub?: string): string {

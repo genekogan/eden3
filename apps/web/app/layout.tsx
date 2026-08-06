@@ -1,6 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
-import { Sidebar } from "@/components/Sidebar";
+import { AppShell } from "@/components/shell/app-shell";
 import { DevUserGate } from "@/components/DevUserGate";
 import { ErrorBoundary } from "@/components/error-boundary";
 import "./globals.css";
@@ -12,21 +12,18 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
-  themeColor: "#0a0a0b",
+  themeColor: "#0a0b0a",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
       <body className="bg-background font-sans text-foreground antialiased">
-        <div className="flex min-h-dvh">
-          <Sidebar />
-          <main className="relative min-w-0 flex-1 pt-14 sm:pt-0">
-            <ErrorBoundary>
-              <DevUserGate>{children}</DevUserGate>
-            </ErrorBoundary>
-          </main>
-        </div>
+        <AppShell>
+          <ErrorBoundary>
+            <DevUserGate>{children}</DevUserGate>
+          </ErrorBoundary>
+        </AppShell>
       </body>
     </html>
   );
