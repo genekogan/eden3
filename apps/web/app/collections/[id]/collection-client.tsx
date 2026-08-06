@@ -187,11 +187,6 @@ export function CollectionClient({ id }: { id: string }) {
               <h1 className="text-3xl font-light tracking-tight md:text-4xl">
                 {collection.name ?? "Untitled collection"}
               </h1>
-              {!collection.public ? (
-                <span className="rounded-full border border-edge bg-white/[0.04] px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-faint">
-                  private
-                </span>
-              ) : null}
             </div>
             {collection.description ? (
               <p className="mt-3 max-w-2xl text-sm leading-relaxed text-muted">

@@ -62,7 +62,14 @@ type QuoteState =
 
 const IDLE: Phase = { kind: "idle", notice: null };
 
-export function StudioView({ initialTool }: { initialTool?: string } = {}) {
+export function StudioView({
+  initialTool,
+  hidePicker = false,
+}: {
+  initialTool?: string;
+  /** Sidebar-driven mode: the tool list lives in the shell, not in-page. */
+  hidePicker?: boolean;
+} = {}) {
   const [toolsState, setToolsState] = useState<ToolsState>({ status: "loading" });
   const [selectedName, setSelectedName] = useState<string | null>(initialTool ?? null);
   const [prompt, setPrompt] = useState("");
@@ -269,12 +276,14 @@ export function StudioView({ initialTool }: { initialTool?: string } = {}) {
         </p>
       ) : null}
 
-      <ToolPicker
-        tools={tools}
-        selectedName={selected?.name ?? null}
-        onSelect={selectTool}
-        disabled={phase.kind === "generating"}
-      />
+      {hidePicker ? null : (
+        <ToolPicker
+          tools={tools}
+          selectedName={selected?.name ?? null}
+          onSelect={selectTool}
+          disabled={phase.kind === "generating"}
+        />
+      )}
 
       <div className="mt-4">
         {phase.kind === "generating" && selected ? (
