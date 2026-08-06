@@ -540,9 +540,13 @@ export const api = {
   },
 
   agents: {
-    /** GET /api/agents?q&cursor&scope — scope "mine" lists the viewer's own agents (incl. private) */
+    /**
+     * GET /api/agents?q&cursor&scope — the cockpit only ever lists the
+     * viewer's own agents (scope "mine"; the public directory is out of
+     * scope for this app — cross-user browsing returns as a separate app).
+     */
     async list(
-      params: { q?: string; cursor?: string; scope?: "public" | "mine" } = {},
+      params: { q?: string; cursor?: string; scope?: "mine" } = {},
     ): Promise<Paginated<AgentDto>> {
       return toPaginated<AgentDto>(
         await get<unknown>(`/agents${qs(params)}`),
@@ -670,23 +674,11 @@ export const api = {
       );
     },
 
-    /** POST /api/agents/:username/like */
-    async like(username: string): Promise<AgentDto> {
-      return unwrap<AgentDto>(await post<unknown>(`/agents/${enc(username)}/like`), "agent");
-    },
-
-    /** DELETE /api/agents/:username/like */
-    async unlike(username: string): Promise<AgentDto> {
-      return unwrap<AgentDto>(
-        await apiFetch<unknown>(`/agents/${enc(username)}/like`, { method: "DELETE" }),
-        "agent",
-      );
-    },
   },
 
   feed: {
     /**
-     * GET /api/feed/creations?cursor&agent&user&favorites -> {creations[], nextCursor}.
+     * GET /api/feed/creations?cursor&agent&user -> {creations[], nextCursor}.
      * `user: "me"` = the signed-in viewer's own creations incl. non-public rows.
      */
     async creations(
@@ -695,7 +687,6 @@ export const api = {
         cursor?: string;
         agent?: string;
         user?: string;
-        favorites?: "mine";
       } = {},
     ): Promise<Paginated<CreationDto>> {
       return toPaginated<CreationDto>(
@@ -714,18 +705,6 @@ export const api = {
       );
     },
 
-    /** POST /api/creations/:id/like */
-    async like(id: string): Promise<CreationDto> {
-      return unwrap<CreationDto>(await post<unknown>(`/creations/${enc(id)}/like`), "creation");
-    },
-
-    /** DELETE /api/creations/:id/like */
-    async unlike(id: string): Promise<CreationDto> {
-      return unwrap<CreationDto>(
-        await apiFetch<unknown>(`/creations/${enc(id)}/like`, { method: "DELETE" }),
-        "creation",
-      );
-    },
   },
 
   collections: {

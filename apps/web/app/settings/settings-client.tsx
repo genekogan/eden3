@@ -230,12 +230,6 @@ export function SettingsSummary({ data }: { data: SettingsData }) {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
-            <Link
-              href="/explore?favorites=mine"
-              className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
-            >
-              Browse favorites
-            </Link>
             <AccountExportButton username={user.username} />
           </div>
         </div>

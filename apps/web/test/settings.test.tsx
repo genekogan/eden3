@@ -41,8 +41,9 @@ describe("settings page", () => {
     expect(html).toContain("Your data");
     expect(html).toContain("Download account data");
     expect(html).toContain("all retained conversations");
-    expect(html).toContain("Browse favorites");
-    expect(html).toContain("/explore?favorites=mine");
+    // Cross-user surfaces are purged from the cockpit — no favorites link.
+    expect(html).not.toContain("Browse favorites");
+    expect(html).not.toContain("/explore");
   });
 
   it("renders a signed-out local state", () => {
