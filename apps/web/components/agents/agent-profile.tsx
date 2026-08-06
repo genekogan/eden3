@@ -304,7 +304,7 @@ function InstalledSkill({ skill }: { skill: AgentSkillDto }) {
   );
 }
 
-function AgentSkillsPanel({
+export function AgentSkillsPanel({
   username,
   canManage,
 }: {
@@ -433,7 +433,7 @@ function AgentSkillsPanel({
 // Memory tab
 // ---------------------------------------------------------------------------
 
-function AgentMemoryPanel({
+export function AgentMemoryPanel({
   username,
   seed,
   canManage,

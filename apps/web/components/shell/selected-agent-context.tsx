@@ -21,7 +21,7 @@ import {
   type ReactNode,
 } from "react";
 import { api } from "@/lib/api";
-import type { AgentDto } from "@/lib/types";
+import type { AgentDto, DevUser } from "@/lib/types";
 import { setLastAgent } from "@/lib/last-agent";
 
 /** /agents/<username>/… — excluding the static /agents/new + /agents/builder. */
@@ -41,6 +41,10 @@ interface SelectedAgentState {
   username: string | null;
   agent: AgentDto | null;
   phase: SelectedAgentPhase;
+  /** The signed-in (or impersonated) viewer; null until loaded / signed out. */
+  viewer: DevUser | null;
+  /** Viewer owns the selected agent, or is an admin. False until both load. */
+  canManage: boolean;
   refresh: () => void;
 }
 
@@ -54,6 +58,8 @@ const SelectedAgentContext = createContext<SelectedAgentState>({
   username: null,
   agent: null,
   phase: "idle",
+  viewer: null,
+  canManage: false,
   refresh: () => {},
 });
 
@@ -79,6 +85,23 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const [myAgents, setMyAgents] = useState<AgentDto[] | null>(null);
   const [myAgentsPhase, setMyAgentsPhase] = useState<"loading" | "ready" | "error">("loading");
   const [myAgentsNonce, setMyAgentsNonce] = useState(0);
+  const [viewer, setViewer] = useState<DevUser | null>(null);
+
+  // ---- viewer (dev-impersonated or Clerk-backed) --------------------------
+  useEffect(() => {
+    let cancelled = false;
+    void api.dev
+      .me()
+      .then((user) => {
+        if (!cancelled) setViewer(user);
+      })
+      .catch(() => {
+        if (!cancelled) setViewer(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [myAgentsNonce]);
 
   // ---- selected agent (URL-driven) ----------------------------------------
   useEffect(() => {
@@ -151,9 +174,14 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     setMyAgentsNonce((n) => n + 1);
   }, []);
 
+  const canManage =
+    viewer !== null &&
+    agent !== null &&
+    ((agent.ownerId !== null && agent.ownerId === viewer.id) || Boolean(viewer.isAdmin));
+
   const selected = useMemo<SelectedAgentState>(
-    () => ({ username, agent, phase, refresh: refreshAgent }),
-    [username, agent, phase, refreshAgent],
+    () => ({ username, agent, phase, viewer, canManage, refresh: refreshAgent }),
+    [username, agent, phase, viewer, canManage, refreshAgent],
   );
   const mine = useMemo<MyAgentsState>(
     () => ({ agents: myAgents, phase: myAgentsPhase, refresh: refreshMyAgents }),
