@@ -174,7 +174,7 @@ export function NewTaskModal({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="rounded-md p-1 text-faint transition-colors hover:bg-white/[0.05] hover:text-foreground"
+            className="rounded-md p-1 text-faint transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
           >
             <svg
               viewBox="0 0 24 24"
@@ -312,7 +312,7 @@ export function NewTaskModal({
           </fieldset>
 
           {error ? (
-            <p className="rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-xs text-rose-300">
+            <p className="rounded-lg border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger-soft">
               {error}
             </p>
           ) : null}

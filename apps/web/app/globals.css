@@ -28,10 +28,45 @@
   --color-accent: #4ade80;
   --color-accent-soft: #86efac;
 
+  /* Semantic status colors. Success aliases the accent — one green family
+   * (an on-brand ready-dot is a feature, not a clash). `-soft` follows the
+   * accent-soft rule: the text-safe variant for the theme's background. */
+  --color-success: var(--color-accent);
+  --color-success-soft: var(--color-accent-soft);
+  --color-warning: #fbbf24;
+  --color-warning-soft: #fde68a;
+  --color-danger: #fb7185;
+  --color-danger-soft: #fda4af;
+
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica,
     Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
     "Liberation Mono", monospace;
+}
+
+/*
+ * Light theme — a plain CSS-variable override (Tailwind v4 utilities compile
+ * to var(--color-*), so every class re-resolves; opacity modifiers use
+ * color-mix and re-resolve too). html[data-theme] is stamped pre-paint by the
+ * inline script in app/layout.tsx; components/theme-provider.tsx keeps it in
+ * sync with the user's choice (system / light / dark).
+ */
+[data-theme="light"] {
+  --color-background: #f5f7f5;
+  --color-surface: #fcfdfc;
+  --color-raised: #ffffff;
+  --color-edge: #dde3de;
+  --color-foreground: #151915;
+  --color-muted: #556058;
+  --color-faint: #8a948d;
+  --color-accent: #16a34a;
+  --color-accent-soft: #15803d; /* text-safe: darker in light mode */
+  --color-success: var(--color-accent);
+  --color-success-soft: var(--color-accent-soft);
+  --color-warning: #b45309;
+  --color-warning-soft: #92400e;
+  --color-danger: #e11d48;
+  --color-danger-soft: #be123c;
 }
 
 @layer base {
@@ -39,6 +74,10 @@
     color-scheme: dark;
     -webkit-text-size-adjust: 100%;
     text-size-adjust: 100%;
+  }
+
+  html[data-theme="light"] {
+    color-scheme: light;
   }
 
   body {

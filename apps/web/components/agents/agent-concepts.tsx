@@ -306,7 +306,7 @@ function ConceptDetail({
                       aria-label="Remove image"
                       disabled={busy !== null}
                       onClick={() => void removeImage(image.id)}
-                      className="rounded border border-rose-400/30 px-1.5 text-xs text-rose-300 transition-colors hover:border-rose-400/60 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="rounded border border-danger/30 px-1.5 text-xs text-danger-soft transition-colors hover:border-danger/60 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       ×
                     </button>
@@ -412,8 +412,8 @@ function ConceptDetail({
               disabled={busy !== null}
               className={`rounded-md border px-3.5 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
                 confirmDelete
-                  ? "border-rose-400/60 bg-rose-400/10 text-rose-200"
-                  : "border-edge text-muted hover:border-rose-400/50 hover:text-rose-200"
+                  ? "border-danger/60 bg-danger/10 text-danger-soft"
+                  : "border-edge text-muted hover:border-danger/50 hover:text-danger-soft"
               }`}
             >
               {busy === "delete"
@@ -685,7 +685,7 @@ export function AgentConceptsPanel({
             Cancel
           </button>
         </div>
-        {createError ? <p className="text-xs text-rose-300">{createError}</p> : null}
+        {createError ? <p className="text-xs text-danger-soft">{createError}</p> : null}
       </form>
     ) : null;
 

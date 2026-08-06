@@ -2,10 +2,8 @@
 
 /**
  * Bottom-left user area: the signed-in user's identity + manna, with a
- * popover for user-level surfaces (settings, manna, usage, operator). Agent
+ * popover for user-level surfaces (account, manna, usage, operator). Agent
  * things never live here — this is the USER's corner of the shell.
- *
- * (Routes still point at the legacy pages until the /account section lands.)
  */
 
 import Link from "next/link";
@@ -16,11 +14,11 @@ import type { AuthMeResponse } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { AuthUserControl } from "@/components/AuthUserControl";
 import { MannaBadge } from "@/components/manna-badge";
+import { ThemeToggle } from "@/components/theme-provider";
 
 const LINKS: Array<{ href: string; label: string; adminOnly?: boolean }> = [
-  { href: "/settings", label: "Account settings" },
-  { href: "/manna", label: "Manna" },
-  { href: "/usage", label: "Usage" },
+  { href: "/account", label: "Account settings" },
+  { href: "/account/manna", label: "Manna" },
   { href: "/operator", label: "Operator", adminOnly: true },
 ];
 
@@ -81,7 +79,10 @@ export function UserArea({ collapsed = false }: { collapsed?: boolean }) {
               </li>
             ))}
           </ul>
-          <div className="mt-1 border-t border-edge pt-1">
+          <div className="border-t border-edge px-2 py-2">
+            <ThemeToggle />
+          </div>
+          <div className="border-t border-edge pt-1">
             {/* Clerk user button / dev impersonation switcher */}
             <AuthUserControl variant="panel" />
           </div>

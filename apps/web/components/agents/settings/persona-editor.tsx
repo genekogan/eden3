@@ -172,7 +172,7 @@ export function PersonaEditor({ username }: { username: string }) {
       />
 
       {conflict ? (
-        <div className="rounded-lg border border-amber-400/25 bg-amber-400/5 px-4 py-3 text-xs text-amber-300">
+        <div className="rounded-lg border border-warning/25 bg-warning/5 px-4 py-3 text-xs text-warning-soft">
           <p>
             The agent (or another editor) changed SOUL.md while you were editing.
             {conflict.currentMtime
@@ -191,14 +191,14 @@ export function PersonaEditor({ username }: { username: string }) {
       ) : null}
 
       {doctrineError ? (
-        <div className="rounded-lg border border-red-400/25 bg-red-400/5 px-4 py-3 text-xs text-red-400">
+        <div className="rounded-lg border border-danger/25 bg-danger/5 px-4 py-3 text-xs text-danger">
           <p className="font-medium">The save would violate the persona doctrine:</p>
           <p className="mt-1 leading-relaxed">{doctrineError}</p>
         </div>
       ) : null}
 
       {actionError ? (
-        <p className="rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
+        <p className="rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs text-danger">
           {actionError}
         </p>
       ) : null}

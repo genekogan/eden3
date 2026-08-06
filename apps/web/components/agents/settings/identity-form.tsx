@@ -124,7 +124,7 @@ export function IdentityForm({ username }: { username: string }) {
         <div className="min-w-0 flex-1">
           <p className="text-sm text-foreground">Avatar</p>
           <p className="text-xs text-faint">PNG, JPEG, or WEBP.</p>
-          {avatarNote ? <p className="mt-1 text-xs text-rose-300">{avatarNote}</p> : null}
+          {avatarNote ? <p className="mt-1 text-xs text-danger-soft">{avatarNote}</p> : null}
         </div>
         <input
           ref={avatarInput}
@@ -195,7 +195,7 @@ export function IdentityForm({ username }: { username: string }) {
       />
 
       {saveError ? (
-        <p className="rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
+        <p className="rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs text-danger">
           {saveError}
         </p>
       ) : null}

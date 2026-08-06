@@ -160,7 +160,7 @@ export function CollectionsClient() {
         >
           {createBusy ? "Creating…" : "Create"}
         </button>
-        {createError ? <p className="text-xs text-rose-300">{createError}</p> : null}
+        {createError ? <p className="text-xs text-danger-soft">{createError}</p> : null}
       </form>
 
       <div className="mt-10">

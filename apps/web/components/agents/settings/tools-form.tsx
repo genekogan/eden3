@@ -176,7 +176,7 @@ export function ToolsForm({ username }: { username: string }) {
       </details>
 
       {saveError ? (
-        <p className="rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
+        <p className="rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs text-danger">
           {saveError}
         </p>
       ) : null}

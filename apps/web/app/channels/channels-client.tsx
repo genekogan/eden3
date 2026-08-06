@@ -45,15 +45,15 @@ function tokenPreview(connection: ChannelConnectionDto): string {
 
 function statusTone(connection: ChannelConnectionDto): string {
   if (connection.observedState === "live") {
-    return "border-emerald-400/25 bg-emerald-400/10 text-emerald-300";
+    return "border-success/25 bg-success/10 text-success-soft";
   }
   if (connection.observedState === "error") {
-    return "border-rose-400/25 bg-rose-400/10 text-rose-300";
+    return "border-danger/25 bg-danger/10 text-danger-soft";
   }
   if (connection.observedState === "starting") {
-    return "border-amber-400/25 bg-amber-400/10 text-amber-200";
+    return "border-warning/25 bg-warning/10 text-warning-soft";
   }
-  return "border-edge bg-white/[0.04] text-muted";
+  return "border-edge bg-foreground/[0.04] text-muted";
 }
 
 function initialDraft(connection: ChannelConnectionDto): ConnectionDraft {
@@ -403,17 +403,17 @@ export function ChannelsClient({
             </p>
             <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">Updated {formatRelativeTime(connection.updatedAt)}</p>
           </div>
-          <button type="button" disabled={busy === `delete:${connection.id}`} onClick={() => void remove(connection)} className={`rounded-lg border px-3 py-1.5 text-xs ${confirmingId === connection.id ? "border-rose-400/50 bg-rose-400/10 text-rose-300" : "border-edge text-muted hover:text-rose-300"}`}>
+          <button type="button" disabled={busy === `delete:${connection.id}`} onClick={() => void remove(connection)} className={`rounded-lg border px-3 py-1.5 text-xs ${confirmingId === connection.id ? "border-danger/50 bg-danger/10 text-danger-soft" : "border-edge text-muted hover:text-danger-soft"}`}>
             {confirmingId === connection.id ? "Confirm delete" : "Delete"}
           </button>
         </div>
 
         {connection.lastError ? (
-          <div className="mt-4 rounded-lg border border-rose-400/25 bg-rose-400/10 p-3">
-            <p className="text-xs text-rose-200">{connection.lastError.message}</p>
+          <div className="mt-4 rounded-lg border border-danger/25 bg-danger/10 p-3">
+            <p className="text-xs text-danger-soft">{connection.lastError.message}</p>
             <div className="mt-2 flex gap-2">
               <input value={rotateTokens[connection.id] ?? ""} onChange={(event) => setRotateTokens((current) => ({ ...current, [connection.id]: event.target.value }))} type="password" autoComplete="off" placeholder="New token (or retry stored)" className={inputClass} />
-              <button type="button" onClick={() => void retry(connection)} disabled={busy === `retry:${connection.id}`} className="rounded-lg border border-rose-300/30 px-3 text-xs text-rose-200 disabled:opacity-50">Retry</button>
+              <button type="button" onClick={() => void retry(connection)} disabled={busy === `retry:${connection.id}`} className="rounded-lg border border-danger-soft/30 px-3 text-xs text-danger-soft disabled:opacity-50">Retry</button>
             </div>
           </div>
         ) : null}
@@ -462,8 +462,8 @@ export function ChannelsClient({
                       <div className="flex items-start justify-between gap-3">
                         <div><p className="text-xs text-muted">Sender ••••{request.peerPreview ?? "unknown"}</p><p className="text-[10px] text-faint">Requested {formatRelativeTime(request.requestedAt)}</p></div>
                         <div className="flex gap-2">
-                          <button type="button" disabled={busy === `pairing:${request.id}`} onClick={() => void decidePairing(connection, request, "deny")} className="text-xs text-rose-300 disabled:opacity-40">Deny</button>
-                          <button type="button" disabled={busy === `pairing:${request.id}` || (linkToMyAccount && !code.trim())} onClick={() => void decidePairing(connection, request, "approve")} className="text-xs text-emerald-300 disabled:opacity-40">Approve</button>
+                          <button type="button" disabled={busy === `pairing:${request.id}`} onClick={() => void decidePairing(connection, request, "deny")} className="text-xs text-danger-soft disabled:opacity-40">Deny</button>
+                          <button type="button" disabled={busy === `pairing:${request.id}` || (linkToMyAccount && !code.trim())} onClick={() => void decidePairing(connection, request, "approve")} className="text-xs text-success-soft disabled:opacity-40">Approve</button>
                         </div>
                       </div>
                       <label className="mt-2 flex items-start gap-2 text-xs text-muted">

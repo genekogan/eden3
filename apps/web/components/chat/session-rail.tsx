@@ -257,8 +257,8 @@ export function SessionRail({
                     aria-current={active ? "page" : undefined}
                     className={`relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 transition-colors ${
                       active
-                        ? "bg-white/[0.06] text-foreground"
-                        : "text-muted hover:bg-white/[0.03] hover:text-foreground"
+                        ? "bg-foreground/[0.06] text-foreground"
+                        : "text-muted hover:bg-foreground/[0.03] hover:text-foreground"
                     }`}
                   >
                     {active ? (

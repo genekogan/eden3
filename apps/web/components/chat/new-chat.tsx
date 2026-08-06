@@ -195,14 +195,14 @@ function NewSessionComposer({
             setNotice(null);
             void send(content);
           }}
-          className="rounded-md border border-amber-400/30 px-2 py-0.5 transition-colors hover:border-amber-300/60 hover:text-amber-100"
+          className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"
         >
           Retry
         </button>
       ) : null}
       {notice.manna ? (
         <Link
-          href="/manna"
+          href="/account/manna"
           className="text-accent-soft underline decoration-accent/40 underline-offset-2 hover:decoration-accent"
         >
           Get manna →

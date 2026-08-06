@@ -77,7 +77,7 @@ function AccountExportButton({ username }: { username: string }) {
         {phase === "downloading" ? "Preparing download…" : "Download account data"}
       </button>
       {phase === "error" ? (
-        <p className="mt-2 text-xs text-red-300" role="status">
+        <p className="mt-2 text-xs text-danger-soft" role="status">
           The export could not be downloaded. Please retry.
         </p>
       ) : null}
@@ -116,7 +116,7 @@ export function SettingsSummary({ data }: { data: SettingsData }) {
               className="size-14 rounded-full border border-edge object-cover"
             />
           ) : (
-            <div className="grid size-14 place-items-center rounded-full border border-edge bg-white/[0.04] font-mono text-lg uppercase text-accent-soft">
+            <div className="grid size-14 place-items-center rounded-full border border-edge bg-foreground/[0.04] font-mono text-lg uppercase text-accent-soft">
               {user.username.slice(0, 1)}
             </div>
           )}
@@ -193,7 +193,7 @@ export function SettingsSummary({ data }: { data: SettingsData }) {
                 </dd>
               </div>
               {subscription.cancelAtPeriodEnd ? (
-                <div className="rounded-lg border border-amber-300/25 bg-amber-300/10 px-3 py-2 text-xs text-amber-200">
+                <div className="rounded-lg border border-warning-soft/25 bg-warning-soft/10 px-3 py-2 text-xs text-warning-soft">
                   Cancellation is scheduled at period end.
                 </div>
               ) : null}
@@ -206,7 +206,7 @@ export function SettingsSummary({ data }: { data: SettingsData }) {
         </div>
         <div className="mt-6 flex flex-wrap gap-3">
           <Link
-            href="/manna"
+            href="/account/manna"
             className="rounded-lg border border-accent/40 px-3.5 py-2 text-sm text-accent-soft transition-colors hover:border-accent hover:text-accent"
           >
             Manage manna
@@ -276,11 +276,11 @@ export function SettingsClient() {
 
       {phase === "loading" ? (
         <section className="mt-10 rounded-xl border border-edge bg-surface p-6">
-          <div className="h-4 w-28 rounded bg-white/[0.08]" />
-          <div className="mt-5 h-8 w-56 rounded bg-white/[0.08]" />
+          <div className="h-4 w-28 rounded bg-foreground/[0.08]" />
+          <div className="mt-5 h-8 w-56 rounded bg-foreground/[0.08]" />
           <div className="mt-8 space-y-3">
-            <div className="h-4 w-full max-w-md rounded bg-white/[0.06]" />
-            <div className="h-4 w-full max-w-sm rounded bg-white/[0.06]" />
+            <div className="h-4 w-full max-w-md rounded bg-foreground/[0.06]" />
+            <div className="h-4 w-full max-w-sm rounded bg-foreground/[0.06]" />
           </div>
         </section>
       ) : phase === "error" ? (

@@ -51,7 +51,7 @@ export function ProvisionBadge({
     <span
       className={`inline-flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.15em] ${
         failed
-          ? "border-red-400/30 bg-red-400/10 text-red-400"
+          ? "border-danger/30 bg-danger/10 text-danger"
           : "border-accent/30 bg-accent/10 text-accent-soft"
       } ${className ?? ""}`}
     >

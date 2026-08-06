@@ -89,19 +89,19 @@ function errorCopy(error: unknown): { title: string; hint: string } {
 
 const STATUS_TONES: Record<string, { chip: string; dot: string }> = {
   active: {
-    chip: "border-emerald-400/25 bg-emerald-400/10 text-emerald-300",
-    dot: "bg-emerald-400",
+    chip: "border-success/25 bg-success/10 text-success-soft",
+    dot: "bg-success",
   },
   running: {
     chip: "border-accent/40 bg-accent/10 text-accent-soft",
     dot: "animate-pulse bg-accent",
   },
   paused: {
-    chip: "border-edge bg-white/[0.04] text-muted",
+    chip: "border-edge bg-foreground/[0.04] text-muted",
     dot: "bg-faint",
   },
   finished: {
-    chip: "border-edge bg-white/[0.03] text-faint",
+    chip: "border-edge bg-foreground/[0.03] text-faint",
     dot: "bg-faint/60",
   },
 };
@@ -182,7 +182,7 @@ function EditTaskModal({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="rounded-md p-1 text-faint transition-colors hover:bg-white/[0.05] hover:text-foreground"
+            className="rounded-md p-1 text-faint transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
           >
             <svg
               viewBox="0 0 24 24"
@@ -237,7 +237,7 @@ function EditTaskModal({
           </fieldset>
 
           {error ? (
-            <p className="rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-xs text-rose-300">
+            <p className="rounded-lg border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger-soft">
               {error}
             </p>
           ) : null}
@@ -461,8 +461,8 @@ export function TasksClient({
           role="status"
           className={`mt-6 rounded-lg border px-3 py-2 text-xs ${
             note.kind === "success"
-              ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"
-              : "border-rose-400/25 bg-rose-400/10 text-rose-300"
+              ? "border-success/25 bg-success/10 text-success-soft"
+              : "border-danger/25 bg-danger/10 text-danger-soft"
           }`}
         >
           {note.text}
@@ -560,7 +560,7 @@ export function TasksClient({
                       ) : null}
                       {task.lastError ? (
                         <p
-                          className="mt-1.5 line-clamp-2 text-xs text-rose-300"
+                          className="mt-1.5 line-clamp-2 text-xs text-danger-soft"
                           title={task.lastError}
                         >
                           {task.lastError}
@@ -604,8 +604,8 @@ export function TasksClient({
                         onClick={() => void remove(task)}
                         className={`rounded-lg border px-3 py-1.5 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                           confirmingId === task.id
-                            ? "border-rose-400/50 bg-rose-400/10 text-rose-300"
-                            : "border-edge text-muted hover:border-rose-400/50 hover:text-rose-300"
+                            ? "border-danger/50 bg-danger/10 text-danger-soft"
+                            : "border-edge text-muted hover:border-danger/50 hover:text-danger-soft"
                         }`}
                       >
                         {confirmingId === task.id ? "Confirm" : "Delete"}

@@ -71,9 +71,9 @@ function typeTone(type: string): string {
     return "border-accent/40 bg-accent/10 text-accent-soft";
   }
   if (t.includes("credit") || t.includes("grant") || t.includes("topup")) {
-    return "border-emerald-400/25 bg-emerald-400/10 text-emerald-300";
+    return "border-success/25 bg-success/10 text-success-soft";
   }
-  return "border-edge bg-white/[0.04] text-muted";
+  return "border-edge bg-foreground/[0.04] text-muted";
 }
 
 function shortId(id: string): string {
@@ -83,9 +83,9 @@ function shortId(id: string): string {
 function TransactionRow({ tx }: { tx: MannaTransactionDto }) {
   const positive = tx.amount > 0;
   const amountTone = positive
-    ? "text-emerald-300"
+    ? "text-success-soft"
     : tx.amount < 0
-      ? "text-rose-300"
+      ? "text-danger-soft"
       : "text-muted";
   return (
     <li className="flex flex-wrap items-center gap-x-4 gap-y-1.5 px-4 py-3 sm:px-5">
@@ -383,10 +383,10 @@ export function MannaClient() {
                 </button>
               </form>
               {billingNote ? (
-                <p className="mt-2 text-xs text-emerald-300">{billingNote}</p>
+                <p className="mt-2 text-xs text-success-soft">{billingNote}</p>
               ) : null}
               {billingError ? (
-                <p className="mt-2 text-xs text-rose-300">{billingError}</p>
+                <p className="mt-2 text-xs text-danger-soft">{billingError}</p>
               ) : null}
             </div>
           </div>

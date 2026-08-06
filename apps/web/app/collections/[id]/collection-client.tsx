@@ -232,8 +232,8 @@ export function CollectionClient({ id }: { id: string }) {
                 </button>
               </form>
             ) : null}
-            {mutationNote ? <p className="mt-2 text-xs text-emerald-300">{mutationNote}</p> : null}
-            {mutationError ? <p className="mt-2 text-xs text-rose-300">{mutationError}</p> : null}
+            {mutationNote ? <p className="mt-2 text-xs text-success-soft">{mutationNote}</p> : null}
+            {mutationError ? <p className="mt-2 text-xs text-danger-soft">{mutationError}</p> : null}
           </header>
 
           <div className="mt-10">
@@ -260,7 +260,7 @@ export function CollectionClient({ id }: { id: string }) {
                         type="button"
                         disabled={mutationBusy}
                         onClick={() => void removeCreation(creation.id)}
-                        className="absolute right-2 top-2 rounded-md border border-edge bg-background/90 px-2 py-1 text-[11px] text-muted opacity-0 shadow-lg shadow-black/30 transition-opacity hover:border-rose-300/50 hover:text-rose-200 disabled:cursor-not-allowed disabled:opacity-40 group-hover:opacity-100"
+                        className="absolute right-2 top-2 rounded-md border border-edge bg-background/90 px-2 py-1 text-[11px] text-muted opacity-0 shadow-lg shadow-black/30 transition-opacity hover:border-danger-soft/50 hover:text-danger-soft disabled:cursor-not-allowed disabled:opacity-40 group-hover:opacity-100"
                       >
                         Remove
                       </button>
