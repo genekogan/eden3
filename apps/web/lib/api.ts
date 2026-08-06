@@ -494,8 +494,10 @@ export const api = {
   },
 
   sessions: {
-    /** GET /api/sessions?cursor */
-    async list(params: { cursor?: string } = {}): Promise<Paginated<SessionDto>> {
+    /** GET /api/sessions?cursor&agent — agent filters to that agent's sessions. */
+    async list(
+      params: { cursor?: string; agent?: string } = {},
+    ): Promise<Paginated<SessionDto>> {
       return toPaginated<SessionDto>(
         await get<unknown>(`/sessions${qs(params)}`),
         "sessions",
@@ -683,7 +685,10 @@ export const api = {
   },
 
   feed: {
-    /** GET /api/feed/creations?cursor&agent&user&favorites -> {creations[], nextCursor} */
+    /**
+     * GET /api/feed/creations?cursor&agent&user&favorites -> {creations[], nextCursor}.
+     * `user: "me"` = the signed-in viewer's own creations incl. non-public rows.
+     */
     async creations(
       params: {
         q?: string;
@@ -1002,8 +1007,11 @@ export const api = {
     /**
      * GET /api/usage/summary — the signed-in viewer's OWN balance, spend, and
      * recent activity. Never admin-gated and never carries provider cost_usd.
+     * `agent` filters spend + recent to one agent (balance stays global).
      */
-    async summary(params: { limit?: number } = {}): Promise<UserUsageSummary> {
+    async summary(
+      params: { limit?: number; agent?: string } = {},
+    ): Promise<UserUsageSummary> {
       return get<UserUsageSummary>(`/usage/summary${qs(params)}`);
     },
   },
@@ -1039,10 +1047,10 @@ export const api = {
   },
 
   tasks: {
-    /** GET /api/tasks — scheduled prompts (triggers) for the current user. */
-    async list(): Promise<Paginated<TriggerDto>> {
+    /** GET /api/tasks?agent — scheduled prompts (triggers) for the current user. */
+    async list(params: { agent?: string } = {}): Promise<Paginated<TriggerDto>> {
       return toPaginated<TriggerDto>(
-        await get<unknown>("/tasks"),
+        await get<unknown>(`/tasks${qs(params)}`),
         "tasks",
         "triggers",
       );
