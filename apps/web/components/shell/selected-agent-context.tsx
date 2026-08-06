@@ -22,7 +22,7 @@ import {
 } from "react";
 import { api } from "@/lib/api";
 import type { AgentDto, DevUser } from "@/lib/types";
-import { setLastAgent } from "@/lib/last-agent";
+import { clearLastAgent, getLastAgent, setLastAgent } from "@/lib/last-agent";
 
 /** /agents/<username>/… — excluding the static /agents/new + /agents/builder. */
 const NON_AGENT_SEGMENTS = new Set(["new", "builder"]);
@@ -74,7 +74,22 @@ const agentCache = new Map<string, AgentDto>();
 
 export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const username = agentUsernameFromPathname(pathname);
+  const urlUsername = agentUsernameFromPathname(pathname);
+
+  // Off agent-scoped routes (/agents, /studio, /account, …) the selection
+  // falls back to the REMEMBERED agent, so the sidebar keeps its selection
+  // across reloads and domain hops. Read post-hydration (localStorage) to
+  // keep SSR markup stable.
+  const [fallbackUsername, setFallbackUsername] = useState<string | null>(null);
+  useEffect(() => {
+    if (urlUsername) {
+      setFallbackUsername(null);
+      return;
+    }
+    setFallbackUsername(getLastAgent());
+  }, [urlUsername, pathname]);
+
+  const username = urlUsername ?? fallbackUsername;
 
   const [agent, setAgent] = useState<AgentDto | null>(
     username ? (agentCache.get(username) ?? null) : null,
@@ -135,6 +150,13 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
           err && typeof err === "object" && "status" in err
             ? Number((err as { status: unknown }).status)
             : null;
+        if (status === 404 && !urlUsername) {
+          // The remembered agent is gone (deleted/renamed) — forget it so it
+          // stops resurrecting on every page, and fall back to no selection.
+          clearLastAgent();
+          setFallbackUsername(null);
+          return;
+        }
         if (!agentCache.has(username)) {
           setPhase(status === 404 ? "missing" : "error");
         }
@@ -143,7 +165,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [username, agentNonce]);
+  }, [username, urlUsername, agentNonce]);
 
   // ---- my agents (once per session, refreshable) --------------------------
   useEffect(() => {
