@@ -26,7 +26,7 @@ export function EnvChip({ className }: { className?: string }) {
   return (
     <span
       title={`Stack database: ${database}`}
-      className={`rounded-full border border-amber-400/25 bg-amber-400/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-amber-300/90 ${className ?? ""}`}
+      className={`rounded-full border border-warning/25 bg-warning/10 px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.2em] text-warning-soft/90 ${className ?? ""}`}
     >
       {label}
     </span>

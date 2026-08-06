@@ -60,14 +60,14 @@ const MD_CLASS = [
   "[&_li]:mt-1 [&_li]:marker:text-faint",
   // Inline + block code.
   "[&_code]:font-mono [&_code]:text-[0.875em]",
-  "[&_:not(pre)>code]:rounded-md [&_:not(pre)>code]:bg-white/[0.07] [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5",
+  "[&_:not(pre)>code]:rounded-md [&_:not(pre)>code]:bg-foreground/[0.07] [&_:not(pre)>code]:px-1.5 [&_:not(pre)>code]:py-0.5",
   "[&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:border [&_pre]:border-edge [&_pre]:bg-black/40 [&_pre]:p-3.5 [&_pre]:text-[13px] [&_pre]:leading-relaxed",
   // Quotes, rules.
   "[&_blockquote]:border-l-2 [&_blockquote]:border-accent/40 [&_blockquote]:pl-3.5 [&_blockquote]:text-muted",
   "[&_hr]:border-edge",
   // Tables (GFM) — scroll inside their own box.
   "[&_table]:block [&_table]:max-w-full [&_table]:overflow-x-auto [&_table]:text-sm",
-  "[&_th]:border [&_th]:border-edge [&_th]:bg-white/[0.04] [&_th]:px-2.5 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-medium",
+  "[&_th]:border [&_th]:border-edge [&_th]:bg-foreground/[0.04] [&_th]:px-2.5 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-medium",
   "[&_td]:border [&_td]:border-edge [&_td]:px-2.5 [&_td]:py-1.5 [&_td]:align-top",
   "[&_strong]:font-semibold",
 ].join(" ");

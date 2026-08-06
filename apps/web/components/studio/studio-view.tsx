@@ -410,7 +410,7 @@ export function StudioView({
                   <span>
                     Not enough manna for this tool.{" "}
                     <Link
-                      href="/manna"
+                      href="/account/manna"
                       className="text-accent-soft transition-colors hover:text-accent"
                     >
                       Top up &rarr;
@@ -454,7 +454,7 @@ function ErrorPanel({
 }) {
   return (
     <div className="rounded-xl border border-edge bg-surface p-6">
-      <p className="text-sm font-medium text-rose-300">{failure.title}</p>
+      <p className="text-sm font-medium text-danger-soft">{failure.title}</p>
       {failure.detail ? (
         <p className="mt-1.5 text-sm leading-relaxed text-muted">
           {failure.detail}
@@ -482,7 +482,7 @@ function ErrorPanel({
         </button>
         {failure.insufficient ? (
           <Link
-            href="/manna"
+            href="/account/manna"
             className="ml-auto text-xs text-accent-soft transition-colors hover:text-accent"
           >
             Top up manna &rarr;

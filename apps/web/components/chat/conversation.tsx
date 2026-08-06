@@ -480,14 +480,14 @@ export function SessionConversation({
             setNotice(null);
             send(content);
           }}
-          className="rounded-md border border-amber-400/30 px-2 py-0.5 transition-colors hover:border-amber-300/60 hover:text-amber-100"
+          className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"
         >
           Retry
         </button>
       ) : null}
       {notice.manna ? (
         <Link
-          href="/manna"
+          href="/account/manna"
           className="text-accent-soft underline decoration-accent/40 underline-offset-2 hover:decoration-accent"
         >
           Get manna →
@@ -497,7 +497,7 @@ export function SessionConversation({
         type="button"
         onClick={() => setNotice(null)}
         aria-label="Dismiss"
-        className="ml-auto px-1 text-amber-200/60 transition-colors hover:text-amber-100"
+        className="ml-auto px-1 text-warning-soft/60 transition-colors hover:text-warning-soft"
       >
         ✕
       </button>
@@ -564,7 +564,7 @@ export function SessionConversation({
         <Link
           href={backHref}
           aria-label="All conversations"
-          className="-ml-1 flex size-8 items-center justify-center rounded-lg text-muted transition-colors hover:bg-white/[0.04] hover:text-foreground md:hidden"
+          className="-ml-1 flex size-8 items-center justify-center rounded-lg text-muted transition-colors hover:bg-foreground/[0.04] hover:text-foreground md:hidden"
         >
           <svg
             viewBox="0 0 24 24"

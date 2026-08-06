@@ -262,12 +262,12 @@ function AboutSection({
 
 function skillBadgeClass(status: string): string {
   if (status === "approved") {
-    return "border-emerald-400/25 bg-emerald-400/10 text-emerald-300";
+    return "border-success/25 bg-success/10 text-success-soft";
   }
   if (status === "rejected") {
-    return "border-rose-400/25 bg-rose-400/10 text-rose-300";
+    return "border-danger/25 bg-danger/10 text-danger-soft";
   }
-  return "border-amber-400/25 bg-amber-400/10 text-amber-300";
+  return "border-warning/25 bg-warning/10 text-warning-soft";
 }
 
 function InstalledSkill({ skill }: { skill: AgentSkillDto }) {
@@ -922,7 +922,7 @@ export function AgentProfile({ username }: { username: string }) {
             </details>
           ) : null}
           {exportError ? (
-            <p className="mt-3 rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
+            <p className="mt-3 rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs text-danger">
               {exportError}
             </p>
           ) : null}
@@ -942,7 +942,7 @@ export function AgentProfile({ username }: { username: string }) {
           Setting up this agent's runtime — chat unlocks the moment it's ready.
         </div>
       ) : failed ? (
-        <div className="mt-8 rounded-xl border border-red-400/25 bg-red-400/5 px-4 py-3 text-sm text-muted">
+        <div className="mt-8 rounded-xl border border-danger/25 bg-danger/5 px-4 py-3 text-sm text-muted">
           Provisioning failed. The agent's profile and persona are saved — try
           again later or contact an admin.
         </div>
@@ -964,7 +964,7 @@ export function AgentProfile({ username }: { username: string }) {
             className={`min-w-0 rounded-lg border-b-2 px-1 py-2 text-xs capitalize transition-colors sm:-mb-px sm:rounded-none sm:pb-2.5 sm:pt-0 sm:text-sm ${
               tab === key
                 ? "border-accent bg-accent/10 text-foreground sm:bg-transparent"
-                : "border-transparent text-muted hover:bg-white/[0.03] hover:text-foreground sm:hover:bg-transparent"
+                : "border-transparent text-muted hover:bg-foreground/[0.03] hover:text-foreground sm:hover:bg-transparent"
             }`}
           >
             {key}

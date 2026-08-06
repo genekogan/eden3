@@ -1,7 +1,7 @@
 import React from "react";
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
-import { SettingsSummary } from "../app/settings/settings-client";
+import { SettingsSummary } from "../app/account/account-client";
 
 describe("settings page", () => {
   it("renders account identity and manna state", () => {

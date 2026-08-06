@@ -3,6 +3,7 @@ import { MannaClient } from "./manna-client";
 
 export const metadata: Metadata = { title: "Manna" };
 
-export default function MannaPage() {
+/** /account/manna — balance, ledger, top-ups (user-level). */
+export default function AccountMannaPage() {
   return <MannaClient />;
 }

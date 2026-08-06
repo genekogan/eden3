@@ -27,12 +27,12 @@ function errorCopy(error: unknown): { title: string; hint: string } {
 
 function statusClass(status: SkillStatus): string {
   if (status === "approved") {
-    return "border-emerald-400/25 bg-emerald-400/10 text-emerald-300";
+    return "border-success/25 bg-success/10 text-success-soft";
   }
   if (status === "rejected") {
-    return "border-rose-400/25 bg-rose-400/10 text-rose-300";
+    return "border-danger/25 bg-danger/10 text-danger-soft";
   }
-  return "border-amber-400/25 bg-amber-400/10 text-amber-300";
+  return "border-warning/25 bg-warning/10 text-warning-soft";
 }
 
 function Field({
@@ -85,7 +85,7 @@ function SkillRow({
               type="button"
               disabled={busy}
               onClick={() => onReview(skill, "approved")}
-              className="rounded-lg border border-emerald-400/30 px-3 py-1.5 text-xs text-emerald-300 hover:bg-emerald-400/10 disabled:opacity-50"
+              className="rounded-lg border border-success/30 px-3 py-1.5 text-xs text-success-soft hover:bg-success/10 disabled:opacity-50"
             >
               Approve
             </button>
@@ -93,7 +93,7 @@ function SkillRow({
               type="button"
               disabled={busy}
               onClick={() => onReview(skill, "rejected")}
-              className="rounded-lg border border-rose-400/30 px-3 py-1.5 text-xs text-rose-300 hover:bg-rose-400/10 disabled:opacity-50"
+              className="rounded-lg border border-danger/30 px-3 py-1.5 text-xs text-danger-soft hover:bg-danger/10 disabled:opacity-50"
             >
               Reject
             </button>

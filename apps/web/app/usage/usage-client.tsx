@@ -79,13 +79,13 @@ function ActivityRow({ event }: { event: UsageActivityEvent }) {
       <span
         aria-hidden
         className={`size-1.5 shrink-0 rounded-full ${
-          errored ? "bg-rose-400" : "bg-emerald-400"
+          errored ? "bg-danger" : "bg-success"
         }`}
       />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm text-foreground">{friendlyAction(event)}</p>
         {errored ? (
-          <p className="mt-0.5 text-xs text-rose-300/90">
+          <p className="mt-0.5 text-xs text-danger-soft/90">
             {manna > 0 ? "failed" : "failed — refunded"}
           </p>
         ) : event.model ? (
@@ -298,7 +298,7 @@ export function UsageClient({
             <p className="mt-4 border-t border-edge pt-4 text-xs text-faint">
               Manna is Eden&apos;s usage credit — 1,000 manna ≈ $1. Every chat
               turn and generation spends a little.{" "}
-              <a href="/manna" className="text-accent-soft hover:underline">
+              <a href="/account/manna" className="text-accent-soft hover:underline">
                 Top up or manage billing
               </a>
               .
