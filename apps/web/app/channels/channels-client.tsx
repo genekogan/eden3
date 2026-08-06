@@ -83,7 +83,15 @@ function FormField({ label, children }: { label: string; children: React.ReactNo
   );
 }
 
-export function ChannelsClient() {
+export function ChannelsClient({
+  fixedAgent,
+}: {
+  /**
+   * Pin the view to one agent (username) — used by the agent-scoped Gateway
+   * page. Hides the agent picker and the standalone-page header.
+   */
+  fixedAgent?: string;
+} = {}) {
   const [agents, setAgents] = useState<AgentDto[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [connections, setConnections] = useState<ChannelConnectionDto[]>([]);
@@ -135,6 +143,12 @@ export function ChannelsClient() {
       setConnections(channelList.items);
       setDrafts(Object.fromEntries(channelList.items.map((item) => [item.id, initialDraft(item)])));
       setSelectedAgentId((current) => {
+        if (fixedAgent) {
+          const pinned = mine.find(
+            (agent) => agent.username.toLowerCase() === fixedAgent.toLowerCase(),
+          );
+          return pinned?.id ?? null;
+        }
         if (current && mine.some((agent) => agent.id === current)) return current;
         const requested = new URLSearchParams(window.location.search)
           .get("agent")
@@ -154,7 +168,7 @@ export function ChannelsClient() {
       setNote(errorCopy(error));
       setPhase("error");
     }
-  }, []);
+  }, [fixedAgent]);
 
   useEffect(() => {
     alive.current = true;
@@ -483,17 +497,19 @@ export function ChannelsClient() {
   };
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-6 py-14 md:px-10">
-      <header>
-        <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">Autonomy</p>
-        <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">Connections</h1>
-        <p className="mt-2 max-w-2xl text-sm text-muted">
-          Give an agent its own Discord or Telegram bot. Tokens stay encrypted; only the last
-          four characters are ever shown here.
-        </p>
-      </header>
+    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-6xl px-6 py-14 md:px-10"}>
+      {fixedAgent ? null : (
+        <header>
+          <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">Autonomy</p>
+          <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">Connections</h1>
+          <p className="mt-2 max-w-2xl text-sm text-muted">
+            Give an agent its own Discord or Telegram bot. Tokens stay encrypted; only the last
+            four characters are ever shown here.
+          </p>
+        </header>
+      )}
 
-      {phase === "ready" && agents.length > 0 ? (
+      {phase === "ready" && agents.length > 0 && !fixedAgent ? (
         <div className="mt-8 max-w-sm">
           <FormField label="Agent">
             <select
@@ -568,7 +584,7 @@ export function ChannelsClient() {
               <ul className="space-y-4">{agentConnections.map(renderConnection)}</ul>
             )}
 
-            {unassignedConnections.length > 0 ? (
+            {unassignedConnections.length > 0 && !fixedAgent ? (
               <div className="mt-8">
                 <p className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">
                   Not linked to any of your agents

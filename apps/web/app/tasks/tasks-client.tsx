@@ -270,7 +270,16 @@ function EditTaskModal({
 
 type Phase = "loading" | "ready" | "error";
 
-export function TasksClient() {
+export function TasksClient({
+  fixedAgent,
+}: {
+  /**
+   * Pin to one agent (the agent-scoped Schedule page): server-filters the
+   * list, preselects the agent in the New-task modal, and drops the
+   * standalone-page header.
+   */
+  fixedAgent?: AgentDto | null;
+} = {}) {
   const [tasks, setTasks] = useState<TriggerDto[]>([]);
   const [agents, setAgents] = useState<Map<string, AgentRef>>(new Map());
   const [phase, setPhase] = useState<Phase>("loading");
@@ -288,11 +297,19 @@ export function TasksClient() {
   const load = useCallback(async (soft = false) => {
     if (!soft) setPhase("loading");
     try {
-      const { items } = await api.tasks.list();
+      const { items } = await api.tasks.list(
+        fixedAgent ? { agent: fixedAgent.username } : {},
+      );
       if (!alive.current) return;
       setTasks(items);
       setPhase("ready");
       setLoadError(null);
+
+      if (fixedAgent) {
+        // Single known agent — no identity resolution needed.
+        setAgents(new Map(items.map((task) => [task.agentId ?? "", fixedAgent])));
+        return;
+      }
 
       // Resolve agent identities: embedded summaries first, then pages of
       // GET /api/agents until every referenced agentId is covered (capped).
@@ -328,7 +345,7 @@ export function TasksClient() {
         setPhase("error");
       }
     }
-  }, []);
+  }, [fixedAgent]);
 
   useEffect(() => {
     alive.current = true;
@@ -419,21 +436,25 @@ export function TasksClient() {
   );
 
   return (
-    <div className="mx-auto w-full max-w-4xl px-6 py-14 md:px-10">
-      <header className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
-            Automation
-          </p>
-          <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
-            Tasks
-          </h1>
-          <p className="mt-2 text-sm text-muted">
-            Prompts your agents run on a schedule.
-          </p>
-        </div>
-        {newTaskButton}
-      </header>
+    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-4xl px-6 py-14 md:px-10"}>
+      {fixedAgent ? (
+        <div className="flex justify-end">{newTaskButton}</div>
+      ) : (
+        <header className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
+              Automation
+            </p>
+            <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
+              Tasks
+            </h1>
+            <p className="mt-2 text-sm text-muted">
+              Prompts your agents run on a schedule.
+            </p>
+          </div>
+          {newTaskButton}
+        </header>
+      )}
 
       {note ? (
         <p
@@ -600,6 +621,7 @@ export function TasksClient() {
 
       <NewTaskModal
         open={modalOpen}
+        initialAgent={fixedAgent ?? null}
         onClose={() => setModalOpen(false)}
         onCreated={(created, agent) => {
           if (created) {
