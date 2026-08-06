@@ -1,15 +1,11 @@
-import type { Metadata } from "next";
-import { SectionPlaceholder } from "@/components/shell/section-placeholder";
+import { redirect } from "next/navigation";
 
-export const metadata: Metadata = { title: "Agent Settings" };
-
-export default function AgentSettingsPage() {
-  return (
-    <SectionPlaceholder
-      title="Settings"
-      description="This agent's identity, persona, tools, skills, and memory — organized hierarchically."
-      legacyHref="/agents/{username}/edit"
-      legacyLabel="Open the legacy edit form"
-    />
-  );
+/** /agents/[username]/settings → Identity (the first section). */
+export default async function AgentSettingsIndexPage({
+  params,
+}: {
+  params: Promise<{ username: string }>;
+}) {
+  const { username } = await params;
+  redirect(`/agents/${username}/settings/identity`);
 }
