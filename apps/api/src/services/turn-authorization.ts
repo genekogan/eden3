@@ -89,7 +89,10 @@ export async function markTurnUsableOutput(
     `);
     const [updated] = await tx
       .update(turnProviderRuns)
-      .set({ usableOutputAt: new Date() })
+      // Database time shares the same clock as provider_started_at. An app
+      // timestamp sampled before this transaction acquires its locks can be
+      // microscopically earlier and violate the output-after-start invariant.
+      .set({ usableOutputAt: sql`now()` })
       .where(
         and(
           eq(turnProviderRuns.turnId, turnId),
