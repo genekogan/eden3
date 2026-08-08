@@ -1,6 +1,3 @@
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-
 import { getEnv } from '@eden3/core';
 import {
   AgentProvisioner,
@@ -10,6 +7,7 @@ import {
   OpenClawToolsClient,
   getModelAgentRuntime,
   getModelRuntimeCatalog,
+  resolveDataDir,
   setAgentSkills,
   setAgentToolGroups,
   setModelAgentRuntime,
@@ -177,18 +175,12 @@ export class GatewayGlue {
   }
 }
 
-/** apps/api/src -> repo root (three levels up). */
-const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url));
-
 /**
- * Host-side OpenClaw data dir. The gateway package's own default resolves
- * relative to CWD (wrong under `pnpm --filter @eden3/api dev` / vitest), so
- * the api anchors the fallback at the repo root instead.
+ * Host-side OpenClaw data dir. The gateway resolver keeps explicit overrides
+ * authoritative and maps linked worktrees to the main checkout bind source.
  */
 export function defaultOpenclawDataDir(env: NodeJS.ProcessEnv = process.env): string {
-  const fromEnv = env.OPENCLAW_DATA_DIR;
-  if (fromEnv !== undefined && fromEnv !== '') return path.resolve(fromEnv);
-  return path.join(REPO_ROOT, 'infra', 'openclaw', 'data');
+  return resolveDataDir(env);
 }
 
 function buildDefaultProvisioner(): AgentProvisioner {

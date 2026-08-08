@@ -105,10 +105,31 @@ async function waitForReadyWorkers(syncDir: string, count: number): Promise<void
 }
 
 describe('resolveDataDir', () => {
-  it('prefers OPENCLAW_DATA_DIR and falls back to infra/openclaw/data', () => {
-    expect(resolveDataDir({ OPENCLAW_DATA_DIR: '/x/y' })).toBe(path.resolve('/x/y'));
-    expect(resolveDataDir({})).toBe(path.resolve('infra', 'openclaw', 'data'));
-    expect(resolveDataDir({ OPENCLAW_DATA_DIR: '' })).toBe(path.resolve('infra', 'openclaw', 'data'));
+  it('prefers OPENCLAW_DATA_DIR and anchors the fallback to a main checkout', async () => {
+    const mainCheckout = path.join(dataDir, 'main');
+    await fs.mkdir(path.join(mainCheckout, '.git'), { recursive: true });
+
+    expect(resolveDataDir({ OPENCLAW_DATA_DIR: '/x/y' }, mainCheckout)).toBe(path.resolve('/x/y'));
+    expect(resolveDataDir({}, mainCheckout)).toBe(
+      path.join(mainCheckout, 'infra', 'openclaw', 'data'),
+    );
+    expect(resolveDataDir({ OPENCLAW_DATA_DIR: '' }, mainCheckout)).toBe(
+      path.join(mainCheckout, 'infra', 'openclaw', 'data'),
+    );
+  });
+
+  it('maps a linked worktree fallback to the main checkout bind source', async () => {
+    const mainCheckout = path.join(dataDir, 'main');
+    const worktreeCheckout = path.join(dataDir, 'worktrees', 'lane');
+    const worktreeGitDir = path.join(mainCheckout, '.git', 'worktrees', 'lane');
+    await fs.mkdir(worktreeGitDir, { recursive: true });
+    await fs.mkdir(worktreeCheckout, { recursive: true });
+    await fs.writeFile(path.join(worktreeCheckout, '.git'), `gitdir: ${worktreeGitDir}\n`);
+    await fs.writeFile(path.join(worktreeGitDir, 'commondir'), '../..\n');
+
+    expect(resolveDataDir({}, worktreeCheckout)).toBe(
+      path.join(mainCheckout, 'infra', 'openclaw', 'data'),
+    );
   });
 });
 
