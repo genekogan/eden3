@@ -173,6 +173,54 @@ export const sessions = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// session_share_links — opaque-token, non-discoverable session sharing.
+// Snapshot identity/payload are immutable; public lookup is always by
+// token_hash with revoked_at IS NULL, never by a sequential public identifier.
+// ---------------------------------------------------------------------------
+export const sessionShareLinks = pgTable(
+  'session_share_links',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    sessionId: uuid('session_id')
+      .notNull()
+      .references(() => sessions.id, { onDelete: 'cascade' }),
+    createdBy: uuid('created_by')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'restrict' }),
+    tokenHash: text('token_hash').notNull(),
+    mode: text('mode', { enum: ['snapshot', 'live'] }).notNull(),
+    title: text('title'),
+    /** Opaque message UUID captured by the snapshot service; deliberately no FK. */
+    snapshotBoundaryMessageId: uuid('snapshot_boundary_message_id'),
+    snapshotPayload: jsonb('snapshot_payload').$type<Record<string, unknown>>().notNull(),
+    revokedAt: timestamptz('revoked_at'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('session_share_links_token_uq').on(t.tokenHash),
+    index('session_share_links_session_created_idx').on(t.sessionId, t.createdAt.desc()),
+    check(
+      'session_share_links_token_hash_check',
+      sql`${t.tokenHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check('session_share_links_mode_check', sql`${t.mode} in ('snapshot', 'live')`),
+    check(
+      'session_share_links_title_check',
+      sql`${t.title} is null or char_length(${t.title}) between 1 and 200`,
+    ),
+    check(
+      'session_share_links_snapshot_payload_check',
+      sql`jsonb_typeof(${t.snapshotPayload}) = 'object'`,
+    ),
+    check(
+      'session_share_links_revoked_at_check',
+      sql`${t.revokedAt} is null or ${t.revokedAt} >= ${t.createdAt}`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // session_agents / session_users — m2m membership.
 // ---------------------------------------------------------------------------
 export const sessionAgents = pgTable(
@@ -1672,6 +1720,8 @@ export type Agent = typeof agents.$inferSelect;
 export type NewAgent = typeof agents.$inferInsert;
 export type Session = typeof sessions.$inferSelect;
 export type NewSession = typeof sessions.$inferInsert;
+export type SessionShareLink = typeof sessionShareLinks.$inferSelect;
+export type NewSessionShareLink = typeof sessionShareLinks.$inferInsert;
 export type SessionAgent = typeof sessionAgents.$inferSelect;
 export type SessionUser = typeof sessionUsers.$inferSelect;
 export type Message = typeof messages.$inferSelect;
