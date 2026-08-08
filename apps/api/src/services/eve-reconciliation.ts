@@ -540,7 +540,15 @@ export async function reconcileEveCollision(
 
   try {
     await options.afterPhase1CommitBeforeBootstrap?.();
-    const bootstrap = await ensureEveAssistant({ syncWorkspace: false });
+    const bootstrap = await ensureEveAssistant({
+      syncWorkspace: false,
+      existingIdentityPrecondition: {
+        accountId: phase1.before.platform.accountId,
+        username: phase1.before.platform.username,
+        accountStableHash: phase1.before.fingerprints.platformAccountStableHash,
+        agentHash: phase1.before.fingerprints.platformAgentHash,
+      },
+    });
     if (
       bootstrap.accountId !== input.expectedPlatformAccountId ||
       bootstrap.openclawId !== input.expectedPlatformOpenclawId
