@@ -124,7 +124,15 @@ describe('ChannelSessionSync', () => {
       conversationScope: 'direct',
       readOnly: true,
     });
-    expect(JSON.stringify(input)).not.toContain('1234567890');
+    expect(input.authorization).toMatchObject({
+      peerId: '1234567890',
+      conversationId: 'discord-channel-555',
+      conversationScope: undefined,
+      guildId: undefined,
+    });
+    expect(JSON.stringify({ event: input.event, metadata: input.safeChannelMetadata })).not.toContain(
+      '1234567890',
+    );
   });
 
   it('isolates the same peer between bot connections', () => {

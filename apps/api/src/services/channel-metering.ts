@@ -262,7 +262,43 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     input: ReserveChannelTurnInput,
     reservedManna: number,
   ): Promise<ChannelTurnRecord> {
+    const currentRuntime = await this.runtimeForModel(connection.model);
+    if (currentRuntime !== connection.agentRuntime) {
+      throw new Error('channel connection unavailable');
+    }
     return pg.begin(async (tx) => {
+      const currentRows = await tx<BillableRow[]>`
+        select c.id as connection_id, c.runtime_account_id, c.account_id,
+               c.agent_id, c.channel, a.model
+        from channel_connections c
+        join agents a on a.account_id = c.agent_id
+        where c.id = ${connection.connectionId}
+          and c.desired_state = 'active'
+          and c.runtime_account_id is not null
+          and c.agent_id is not null
+          and c.channel in ('discord', 'telegram')
+          and (
+            ${input.sessionId ?? null}::uuid is null
+            or exists (
+              select 1 from sessions s
+              where s.id = ${input.sessionId ?? null}::uuid
+                and s.channel_connection_id = c.id
+            )
+          )
+        for update of c
+      `;
+      const current = currentRows[0];
+      if (
+        !current ||
+        current.connection_id !== connection.connectionId ||
+        current.runtime_account_id !== connection.runtimeAccountId ||
+        current.account_id !== connection.accountId ||
+        current.agent_id !== connection.agentId ||
+        current.channel !== connection.channel ||
+        current.model !== connection.model
+      ) {
+        throw new Error('channel connection unavailable');
+      }
       await tx`
         insert into channel_turns (
           turn_id, connection_id, account_id, agent_id, session_id,
@@ -406,6 +442,29 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   async authorize(turn: ChannelTurnRecord): Promise<ChannelAuthorizationResult> {
     const route = modelIdentity(turn.model);
     return db.transaction(async (tx) => {
+      const liveRows = (await tx.execute(sql`
+        select c.id as connection_id, c.runtime_account_id, c.account_id,
+               c.agent_id, c.channel, a.model
+        from channel_connections c
+        join agents a on a.account_id = c.agent_id
+        where c.id = ${turn.connectionId}
+          and c.desired_state = 'active'
+          and c.runtime_account_id = ${turn.runtimeAccountId}
+          and c.account_id = ${turn.accountId}
+          and c.agent_id = ${turn.agentId}
+          and c.channel = ${turn.channel}
+          and a.model = ${turn.model}
+          and (
+            ${turn.sessionId}::uuid is null
+            or exists (
+              select 1 from sessions s
+              where s.id = ${turn.sessionId}::uuid
+                and s.channel_connection_id = c.id
+            )
+          )
+        for update of c
+      `)) as unknown as BillableRow[];
+      if (!liveRows[0]) throw new Error('channel connection unavailable');
       const debited = await debit({
         accountId: turn.accountId,
         amount: turn.reservedManna,
