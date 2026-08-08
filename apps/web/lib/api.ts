@@ -933,7 +933,6 @@ export const api = {
     cancelManagedTelegram(intentId: string): Promise<{ ok?: true }> {
       return post<{ ok?: true }>(
         `/channels/telegram/managed-bots/onboarding/${enc(intentId)}/cancel`,
-        {},
       );
     },
 

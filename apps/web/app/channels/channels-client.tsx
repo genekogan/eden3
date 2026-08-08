@@ -205,7 +205,15 @@ export function ChannelsClient() {
       inFlight = true;
       void api.channels.managedTelegramStatus(intentId).then(
         (status) => {
-          if (!disposed && alive.current) setTelegramOnboarding(status);
+          if (disposed || !alive.current) return;
+          if (status.connection) {
+            mergeConnection(status.connection);
+            setTelegramOnboarding(null);
+            setTelegramOwnerBindingUrl(null);
+            setNote("Telegram bot attached. Configure access below, then activate the connection.");
+            return;
+          }
+          setTelegramOnboarding(status);
         },
         (error) => {
           if (!disposed && alive.current) setNote(errorCopy(error));
@@ -219,7 +227,7 @@ export function ChannelsClient() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [telegramOnboarding?.intent.id, telegramOnboarding?.intent.state, telegramStep]);
+  }, [mergeConnection, telegramOnboarding?.intent.id, telegramOnboarding?.intent.state, telegramStep]);
 
   const selectedAgent = useMemo(
     () => agents.find((agent) => agent.id === selectedAgentId) ?? null,
@@ -379,6 +387,12 @@ export function ChannelsClient() {
     } finally {
       if (alive.current) setBusy(null);
     }
+  };
+
+  const resetManagedTelegram = () => {
+    setTelegramOnboarding(null);
+    setTelegramOwnerBindingUrl(null);
+    setNote("Start a new Telegram onboarding when you’re ready.");
   };
 
   const connectX = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -827,10 +841,13 @@ export function ChannelsClient() {
                       <a href={managedBotLink} target="_blank" rel="noreferrer" className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft">Open Managed Bots</a>
                     ) : null}
                     {telegramStep === "attach" ? (
-                      <button type="button" onClick={() => void attachManagedTelegram()} disabled={busy === "telegram:attach" || !selectedAgent} className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft disabled:opacity-50">{busy === "telegram:attach" ? "Attaching…" : "Attach to agent"}</button>
+                      <button type="button" onClick={() => void attachManagedTelegram()} disabled={busy?.startsWith("telegram:") || !selectedAgent} className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft disabled:opacity-50">{busy === "telegram:attach" ? "Attaching…" : "Attach to agent"}</button>
                     ) : null}
-                    {telegramOnboarding && telegramStep !== "terminal" ? (
-                      <button type="button" onClick={() => void cancelManagedTelegram()} disabled={busy === "telegram:cancel"} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">Cancel</button>
+                    {telegramOnboarding && telegramStep !== "terminal" && telegramStep !== "complete" ? (
+                      <button type="button" onClick={() => void cancelManagedTelegram()} disabled={busy?.startsWith("telegram:")} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">Cancel</button>
+                    ) : null}
+                    {telegramOnboarding && (telegramStep === "terminal" || telegramStep === "complete") ? (
+                      <button type="button" onClick={resetManagedTelegram} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted">Start over</button>
                     ) : null}
                   </div>
                 </div>
