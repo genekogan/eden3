@@ -390,6 +390,7 @@ export interface MultipartCompleteInput {
 export interface MultipartAbortInput {
   key: string;
   uploadId: string;
+  signal?: AbortSignal;
 }
 
 /** Backends expose immutable whole-object operations and resumable multipart primitives. */
@@ -757,6 +758,7 @@ export class R2ObjectBackend implements ObjectBackend {
     body?: Buffer,
     extraHeaders: Readonly<Record<string, string>> = {},
     expected: readonly number[] = [200],
+    signal?: AbortSignal,
   ): Promise<Response> {
     const now = this.now();
     const { amzDate, dateStamp } = this.dateParts(now);
@@ -792,7 +794,12 @@ export class R2ObjectBackend implements ObjectBackend {
     headers.authorization = `AWS4-HMAC-SHA256 Credential=${this.accessKeyId}/${scope}, SignedHeaders=${signedNames.join(';')}, Signature=${signature}`;
     const url = new URL(pathname, this.endpoint);
     url.search = canonicalQuery(query);
-    const response = await this.fetchImpl(url, { method, headers, ...(body ? { body } : {}) });
+    const response = await this.fetchImpl(url, {
+      method,
+      headers,
+      ...(body ? { body } : {}),
+      ...(signal ? { signal } : {}),
+    });
     if (!expected.includes(response.status)) {
       throw new Error(`R2 ${method} failed with status ${response.status}`);
     }
@@ -1023,7 +1030,18 @@ export class R2ObjectBackend implements ObjectBackend {
   }
 
   async abortMultipart(input: MultipartAbortInput): Promise<void> {
-    await this.request('DELETE', input.key, [['uploadId', input.uploadId]], undefined, {}, [204]);
+    // Abort is intentionally idempotent for crash recovery: after provider
+    // success but before our durable success write, the next lease repeats the
+    // DELETE and R2 reports the already-absent multipart upload as 404.
+    await this.request(
+      'DELETE',
+      input.key,
+      [['uploadId', input.uploadId]],
+      undefined,
+      {},
+      [204, 404],
+      input.signal,
+    );
   }
 }
 

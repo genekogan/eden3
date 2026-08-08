@@ -13,6 +13,8 @@ import {
 import { MediaObjectResolver } from './media-object-repository';
 import { PostgresMediaObjectRepository } from './media-object-postgres-repository';
 import { ObjectBackendUploadAdapter } from './upload-object-backend';
+import { PostgresUploadMultipartCleanupStore } from './upload-multipart-cleanup-postgres';
+import { UploadMultipartCleanupWorker } from './upload-multipart-cleanup';
 import { PostgresUploadPolicyEventStore } from './upload-policy-events-postgres';
 import { UploadPolicyEventWorker } from './upload-policy-events';
 import { PostgresUploadRepository } from './upload-postgres-repository';
@@ -22,12 +24,14 @@ const SHA256 = /^[a-f0-9]{64}$/;
 
 export interface StorageRuntimeLogger {
   warn(context: Record<string, unknown>, message: string): void;
+  error(context: Record<string, unknown>, message: string): void;
 }
 
 export interface StorageRuntime {
   uploadService: UploadService;
   mediaResolver: MediaObjectResolver;
   policyEventWorker: UploadPolicyEventWorker;
+  multipartCleanupWorker: UploadMultipartCleanupWorker;
   backend: ObjectBackend;
   objectRoot: string | null;
   cacheRoot: string;
@@ -212,9 +216,22 @@ export async function createStorageRuntime(options: CreateStorageRuntimeOptions)
     },
   });
   const denied = blockedHashes(env.UPLOAD_POLICY_BLOCKED_SHA256);
+  const uploadBackend = new ObjectBackendUploadAdapter(backend);
+  const multipartCleanupWorker = new UploadMultipartCleanupWorker({
+    store: new PostgresUploadMultipartCleanupStore(),
+    backend: uploadBackend,
+    onError: (error, context) => {
+      options.logger.error(
+        { err: error, ...context },
+        context.terminal
+          ? 'multipart upload cleanup exhausted retries'
+          : 'multipart upload cleanup attempt failed',
+      );
+    },
+  });
   const uploadService = new UploadService({
     repository: new PostgresUploadRepository(),
-    backend: new ObjectBackendUploadAdapter(backend),
+    backend: uploadBackend,
     capabilityKey,
     backingStore: backend instanceof R2ObjectBackend ? 'r2' : 'local',
     policyScanner: async ({ sha256 }) => ({
@@ -227,6 +244,7 @@ export async function createStorageRuntime(options: CreateStorageRuntimeOptions)
     uploadService,
     mediaResolver: new MediaObjectResolver(new PostgresMediaObjectRepository(), objectService),
     policyEventWorker,
+    multipartCleanupWorker,
     backend,
     objectRoot: backend instanceof LocalObjectBackend ? objectRoot : null,
     cacheRoot,
@@ -236,5 +254,11 @@ export async function createStorageRuntime(options: CreateStorageRuntimeOptions)
 export function storagePolicyIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
   const interval = integer(env.UPLOAD_POLICY_INTERVAL_MS, 30_000, 'UPLOAD_POLICY_INTERVAL_MS');
   if (interval === 0) throw new Error('UPLOAD_POLICY_INTERVAL_MS must be a positive integer');
+  return interval;
+}
+
+export function storageCleanupIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+  const interval = integer(env.UPLOAD_CLEANUP_INTERVAL_MS, 60_000, 'UPLOAD_CLEANUP_INTERVAL_MS');
+  if (interval === 0) throw new Error('UPLOAD_CLEANUP_INTERVAL_MS must be a positive integer');
   return interval;
 }

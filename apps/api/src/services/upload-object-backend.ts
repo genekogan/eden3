@@ -95,7 +95,15 @@ export class ObjectBackendUploadAdapter implements MultipartUploadBackend {
     return this.backend.listParts({ key: input.key, uploadId: input.backendUploadId });
   }
 
-  async abortMultipart(input: { key: string; backendUploadId: string }): Promise<void> {
-    await this.backend.abortMultipart({ key: input.key, uploadId: input.backendUploadId });
+  async abortMultipart(input: {
+    key: string;
+    backendUploadId: string;
+    signal?: AbortSignal;
+  }): Promise<void> {
+    await this.backend.abortMultipart({
+      key: input.key,
+      uploadId: input.backendUploadId,
+      signal: input.signal,
+    });
   }
 }
