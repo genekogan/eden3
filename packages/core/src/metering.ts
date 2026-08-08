@@ -45,6 +45,16 @@ export interface CostTableEntry {
   estimated?: boolean;
 }
 
+/** UTC calendar date used to select an effective-dated pricing row. */
+export type EffectiveDateInput = Date | string;
+
+export interface CostTableSelectionOptions {
+  /** Defaults to today's UTC calendar date. Strings must be exact YYYY-MM-DD. */
+  asOf?: EffectiveDateInput;
+  /** Explicit registry for deterministic validation/testing; production uses COST_TABLE. */
+  table?: readonly CostTableEntry[];
+}
+
 export interface CostLineItem extends CostTableEntry {
   quantity: number;
   costUsd: number;
@@ -318,22 +328,123 @@ function normalizeModel(provider: CostProvider, model: string): string {
   return trimmed.startsWith(prefix) ? trimmed.slice(prefix.length) : trimmed;
 }
 
+type MeteringErrorFactory = (message: string) => Error;
+
+function strictUtcCalendarDay(
+  value: unknown,
+  label: string,
+  error: MeteringErrorFactory,
+): string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw error(`${label} must be an exact UTC YYYY-MM-DD date, got ${JSON.stringify(value)}`);
+  }
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== value) {
+    throw error(`${label} is not a real UTC calendar date, got ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+function effectiveDay(
+  value: EffectiveDateInput | undefined,
+  label: string,
+  error: MeteringErrorFactory,
+): string {
+  if (value instanceof Date) {
+    if (!Number.isFinite(value.getTime())) throw error(`${label} must be a valid date`);
+    return value.toISOString().slice(0, 10);
+  }
+  if (value === undefined) return new Date().toISOString().slice(0, 10);
+  return strictUtcCalendarDay(value, label, error);
+}
+
+function assertUnambiguousEffectiveRows<T extends { effectiveDate: string }>(
+  table: readonly T[],
+  identity: (entry: T) => string,
+  registryName: string,
+  error: MeteringErrorFactory,
+): void {
+  const seen = new Set<string>();
+  for (const entry of table) {
+    // Registry rows are configuration truth, not optional queries: unlike an
+    // omitted asOf, a missing/non-string effectiveDate must never default.
+    const date = strictUtcCalendarDay(
+      entry.effectiveDate,
+      `${registryName} effectiveDate`,
+      error,
+    );
+    const version = `${identity(entry)}\u0000${date}`;
+    if (seen.has(version)) {
+      throw error(
+        `${registryName} has ambiguous overlapping rows for ${identity(entry)} at ${date}`,
+      );
+    }
+    seen.add(version);
+  }
+}
+
+function latestEligible<T extends { effectiveDate: string }>(
+  entries: readonly T[],
+  asOf: string,
+): T | undefined {
+  let selected: T | undefined;
+  for (const entry of entries) {
+    if (entry.effectiveDate > asOf) continue;
+    if (!selected || entry.effectiveDate > selected.effectiveDate) selected = entry;
+  }
+  return selected;
+}
+
 function assertFiniteNonnegative(name: string, value: number): void {
   if (!Number.isFinite(value) || value < 0) {
     throw new RangeError(`${name} must be a finite nonnegative number, got ${String(value)}`);
   }
 }
 
-function findRate(provider: CostProvider, model: string, unit: CostUnit): CostTableEntry {
-  const normalized = normalizeModel(provider, model);
-  const entry = COST_TABLE.find(
+/**
+ * Resolve one cost rate deterministically. Exact model history takes
+ * precedence over the wildcard fallback; within that history the latest row
+ * effective on or before `asOf` wins regardless of registry order.
+ */
+export function selectCostTableEntry(
+  route: { provider: CostProvider; model: string; unit: CostUnit },
+  options: CostTableSelectionOptions = {},
+): CostTableEntry {
+  const table = options.table ?? COST_TABLE;
+  const error = (message: string) => new CostTableError(message);
+  const asOf = effectiveDay(options.asOf, 'cost-table asOf', error);
+  assertUnambiguousEffectiveRows(
+    table,
     (item) =>
-      item.provider === provider &&
-      item.unit === unit &&
-      (item.model === normalized || item.model === model || item.model === '*'),
+      `${item.provider}/${item.model === '*' ? '*' : normalizeModel(item.provider, item.model)}/${item.unit}`,
+    'cost table',
+    error,
+  );
+
+  const normalized = normalizeModel(route.provider, route.model);
+  const eligibleExact = table.filter(
+    (item) =>
+      item.provider === route.provider &&
+      item.unit === route.unit &&
+      item.model !== '*' &&
+      normalizeModel(item.provider, item.model) === normalized &&
+      item.effectiveDate <= asOf,
+  );
+  const eligibleWildcard = table.filter(
+    (item) =>
+      item.provider === route.provider &&
+      item.unit === route.unit &&
+      item.model === '*' &&
+      item.effectiveDate <= asOf,
+  );
+  const entry = latestEligible(
+    eligibleExact.length > 0 ? eligibleExact : eligibleWildcard,
+    asOf,
   );
   if (!entry) {
-    throw new CostTableError(`no cost table entry for ${provider}/${normalized} unit ${unit}`);
+    throw new CostTableError(
+      `no cost table entry for ${route.provider}/${normalized} unit ${route.unit} effective on or before ${asOf}`,
+    );
   }
   return entry;
 }
@@ -354,15 +465,27 @@ export interface CostFromParamsInput {
   provider: CostProvider;
   model: string;
   units: Partial<Record<CostUnit, number>>;
+  /** Defaults to today's UTC date; supply this to reproduce a historical quote. */
+  asOf?: EffectiveDateInput;
 }
 
 export function costFromParams(input: CostFromParamsInput): CostEstimate {
+  // Freeze one UTC pricing day for the whole quote. A request crossing UTC
+  // midnight must never mix rows from two effective-date versions.
+  const asOf = effectiveDay(
+    input.asOf,
+    'cost-table asOf',
+    (message) => new CostTableError(message),
+  );
   const lines: CostLineItem[] = [];
   for (const [unit, rawQuantity] of Object.entries(input.units) as [CostUnit, number | undefined][]) {
     if (rawQuantity === undefined) continue;
     assertFiniteNonnegative(unit, rawQuantity);
     if (rawQuantity === 0) continue;
-    const entry = findRate(input.provider, input.model, unit);
+    const entry = selectCostTableEntry(
+      { provider: input.provider, model: input.model, unit },
+      { asOf },
+    );
     lines.push({
       ...entry,
       quantity: rawQuantity,
@@ -384,6 +507,8 @@ export interface LlmUsageCostInput {
   cachedTokens?: number;
   /** Prompt tokens written to cache, if the provider reports them. */
   cacheWriteTokens?: number;
+  /** Defaults to today's UTC date; supply this to reproduce historical metering. */
+  asOf?: EffectiveDateInput;
 }
 
 export function costFromLlmUsage(input: LlmUsageCostInput): CostEstimate {
@@ -404,6 +529,7 @@ export function costFromLlmUsage(input: LlmUsageCostInput): CostEstimate {
       cache_write_1m_tokens: cacheWriteTokens / 1_000_000,
       output_1m_tokens: input.completionTokens / 1_000_000,
     },
+    ...(input.asOf === undefined ? {} : { asOf: input.asOf }),
   });
 }
 
@@ -467,6 +593,13 @@ export interface TurnCeilingEntry {
   maxOutputTokens: number;
   effectiveDate: string;
   source: string;
+}
+
+export interface TurnCeilingSelectionOptions {
+  /** Defaults to today's UTC calendar date. Strings must be exact YYYY-MM-DD. */
+  asOf?: EffectiveDateInput;
+  /** Explicit registry for deterministic validation/testing; production uses TURN_CEILINGS. */
+  table?: readonly TurnCeilingEntry[];
 }
 
 /**
@@ -536,6 +669,55 @@ export interface TurnAuthorizationCeiling {
 }
 
 /**
+ * Resolve one effective-dated turn ceiling with the same deterministic rule
+ * as provider prices: exact model before wildcard, then latest eligible date.
+ */
+export function selectTurnCeilingEntry(
+  route: { provider: string; model: string },
+  options: TurnCeilingSelectionOptions = {},
+): TurnCeilingEntry {
+  const table = options.table ?? TURN_CEILINGS;
+  const error = (message: string) => new TurnCeilingError(message);
+  const asOf = effectiveDay(options.asOf, 'turn-ceiling asOf', error);
+  assertUnambiguousEffectiveRows(
+    table,
+    (item) =>
+      `${item.provider}/${item.model === '*' ? '*' : normalizeModel(item.provider, item.model)}`,
+    'turn ceiling table',
+    error,
+  );
+
+  const provider = route.provider as CostProvider;
+  const normalized = normalizeModel(provider, route.model);
+  const eligibleExact = table.filter(
+    (item) =>
+      item.provider === provider &&
+      item.model !== '*' &&
+      normalizeModel(item.provider, item.model) === normalized &&
+      item.effectiveDate <= asOf,
+  );
+  const eligibleWildcard = table.filter(
+    (item) =>
+      item.provider === provider && item.model === '*' && item.effectiveDate <= asOf,
+  );
+  const entry = latestEligible(
+    eligibleExact.length > 0 ? eligibleExact : eligibleWildcard,
+    asOf,
+  );
+  if (!entry) {
+    throw new TurnCeilingError(
+      `no turn-authorization ceiling for ${route.provider}/${normalized} effective on or before ${asOf} (table ${TURN_CEILING_TABLE_VERSION})`,
+    );
+  }
+  return entry;
+}
+
+export interface TurnAuthorizationOptions extends MannaConversionOptions {
+  /** Defaults to today's UTC date; supply this to reproduce historical authorization. */
+  asOf?: EffectiveDateInput;
+}
+
+/**
  * The economic authorization for one LLM turn on `provider/model`.
  * FAIL-CLOSED: a model without a ceiling entry cannot start a metered turn —
  * throws {@link TurnCeilingError} (the metering doctrine: never zero, never a
@@ -543,19 +725,13 @@ export interface TurnAuthorizationCeiling {
  */
 export function turnAuthorizedMax(
   route: { provider: string; model: string },
-  options: MannaConversionOptions = {},
+  options: TurnAuthorizationOptions = {},
 ): TurnAuthorizationCeiling {
   const provider = route.provider as CostProvider;
   const normalized = normalizeModel(provider, route.model);
-  const entry = TURN_CEILINGS.find(
-    (item) =>
-      item.provider === provider && (item.model === normalized || item.model === route.model),
-  );
-  if (!entry) {
-    throw new TurnCeilingError(
-      `no turn-authorization ceiling for ${route.provider}/${normalized} (table ${TURN_CEILING_TABLE_VERSION})`,
-    );
-  }
+  const entry = selectTurnCeilingEntry(route, {
+    ...(options.asOf === undefined ? {} : { asOf: options.asOf }),
+  });
   return {
     manna: mannaFromUsd(entry.maxTurnUsd, options),
     usd: entry.maxTurnUsd,
