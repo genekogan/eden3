@@ -1,8 +1,6 @@
-import type { Metadata } from "next";
-import { UsageClient } from "./usage-client";
+import { redirectToAgentSub } from "@/lib/last-agent-server";
 
-export const metadata: Metadata = { title: "Usage" };
-
-export default function UsagePage() {
-  return <UsageClient />;
+/** Legacy /usage — now the agent-scoped Log. */
+export default async function LegacyUsagePage() {
+  await redirectToAgentSub("log");
 }

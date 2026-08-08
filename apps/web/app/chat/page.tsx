@@ -1,19 +1,14 @@
-import type { Metadata } from "next";
-import { Suspense } from "react";
-import { NewChatScreen } from "@/components/chat/new-chat";
-
-export const metadata: Metadata = { title: "New Chat" };
+import { redirectToAgentSub } from "@/lib/last-agent-server";
 
 /**
- * /chat[?agent=<username>] — pick an agent (no param) or compose the first
- * message to one. The first send POSTs /api/sessions/new/messages and hands
- * the live stream to /sessions/[id]. Client-side surface; Suspense wraps the
- * useSearchParams() bailout.
+ * Legacy /chat[?agent=<username>] — chats are agent-scoped now. An explicit
+ * ?agent= wins; otherwise the remembered agent; otherwise the selector.
  */
-export default function ChatPage() {
-  return (
-    <Suspense fallback={null}>
-      <NewChatScreen />
-    </Suspense>
-  );
+export default async function LegacyChatPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ agent?: string }>;
+}) {
+  const { agent } = await searchParams;
+  await redirectToAgentSub("chats", agent);
 }

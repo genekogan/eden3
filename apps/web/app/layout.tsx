@@ -1,9 +1,10 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
-import { Sidebar } from "@/components/Sidebar";
+import { AppShell } from "@/components/shell/app-shell";
 import { DevUserGate } from "@/components/DevUserGate";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { ServiceWorkerRegistration } from "@/components/pwa/service-worker-registration";
+import { ThemeProvider } from "@/components/theme-provider";
 import "./globals.css";
 import "./pwa.css";
 
@@ -28,21 +29,33 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   viewportFit: "cover",
-  themeColor: "#0a0a0b",
+  themeColor: [
+    { media: "(prefers-color-scheme: dark)", color: "#0a0b0a" },
+    { media: "(prefers-color-scheme: light)", color: "#f5f7f5" },
+  ],
 };
+
+/**
+ * FOUC guard: stamp html[data-theme] before first paint from the stored
+ * preference (localStorage "eden3.theme"), falling back to the OS scheme.
+ * components/theme-provider.tsx owns the state after hydration.
+ */
+const THEME_INIT = `(function(){try{var t=localStorage.getItem("eden3.theme");if(t!=="light"&&t!=="dark")t=matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";document.documentElement.dataset.theme=t}catch(e){document.documentElement.dataset.theme="dark"}})()`;
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT }} />
+      </head>
       <body className="bg-background font-sans text-foreground antialiased">
-        <div className="pwa-safe-area-shell flex min-h-dvh">
-          <Sidebar />
-          <main className="relative min-w-0 flex-1 pt-14 sm:pt-0">
+        <ThemeProvider>
+          <AppShell>
             <ErrorBoundary>
               <DevUserGate>{children}</DevUserGate>
             </ErrorBoundary>
-          </main>
-        </div>
+          </AppShell>
+        </ThemeProvider>
         <ServiceWorkerRegistration />
       </body>
     </html>

@@ -147,7 +147,7 @@ export function Composer({
             className={`flex size-8 shrink-0 items-center justify-center rounded-full transition-all ${
               canSend
                 ? "bg-accent text-white hover:bg-accent-soft"
-                : "bg-white/[0.06] text-faint"
+                : "bg-foreground/[0.06] text-faint"
             }`}
           >
             <SendIcon />
@@ -173,7 +173,7 @@ export function ComposerNotice({
     <div
       className={`flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border px-3.5 py-2 text-xs ${
         tone === "warn"
-          ? "border-amber-400/25 bg-amber-400/[0.06] text-amber-200/90"
+          ? "border-warning/25 bg-warning/[0.06] text-warning-soft/90"
           : "border-edge bg-surface text-muted"
       }`}
     >

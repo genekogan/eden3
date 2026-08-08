@@ -90,14 +90,14 @@ export const AGENT_TEMPLATES = [
 ] as const;
 
 function UsernameNote({ state }: { state: UsernameState }) {
-  if (state.error) return <p className="text-red-400">{state.error}</p>;
+  if (state.error) return <p className="text-danger">{state.error}</p>;
   switch (state.availability) {
     case "checking":
       return <p className="text-faint">Checking @{state.checked}…</p>;
     case "available":
-      return <p className="text-emerald-400/90">@{state.checked} is available</p>;
+      return <p className="text-success/90">@{state.checked} is available</p>;
     case "taken":
-      return <p className="text-red-400">@{state.checked} is taken</p>;
+      return <p className="text-danger">@{state.checked} is taken</p>;
     case "unknown":
       return (
         <p className="text-faint">
@@ -633,7 +633,7 @@ export function AgentCreateForm() {
         </details>
 
         {formError ? (
-          <p className="rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
+          <p className="rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs text-danger">
             {formError}
           </p>
         ) : null}

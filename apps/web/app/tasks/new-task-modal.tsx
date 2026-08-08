@@ -47,11 +47,14 @@ export function NewTaskModal({
   open,
   onClose,
   onCreated,
+  initialAgent = null,
 }: {
   open: boolean;
   onClose: () => void;
   /** Fired after a successful POST with the created trigger + chosen agent. */
   onCreated: (created: TriggerDto | null, agent: AgentDto) => void;
+  /** Preselected agent (the agent-scoped Schedule page pins its own). */
+  initialAgent?: AgentDto | null;
 }) {
   const [agentQuery, setAgentQuery] = useState("");
   const [agentResults, setAgentResults] = useState<AgentDto[]>([]);
@@ -63,19 +66,19 @@ export function NewTaskModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Fresh form every time the modal opens.
+  // Fresh form every time the modal opens (preselecting the pinned agent).
   useEffect(() => {
     if (!open) return;
     setAgentQuery("");
     setAgentResults([]);
     setAgentNote(null);
-    setAgent(null);
+    setAgent(initialAgent);
     setName("");
     setPrompt("");
     setForm(defaultScheduleForm());
     setSubmitting(false);
     setError(null);
-  }, [open]);
+  }, [open, initialAgent]);
 
   // Escape closes; lock body scroll while open.
   useEffect(() => {
@@ -171,7 +174,7 @@ export function NewTaskModal({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="rounded-md p-1 text-faint transition-colors hover:bg-white/[0.05] hover:text-foreground"
+            className="rounded-md p-1 text-faint transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
           >
             <svg
               viewBox="0 0 24 24"
@@ -309,7 +312,7 @@ export function NewTaskModal({
           </fieldset>
 
           {error ? (
-            <p className="rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-xs text-rose-300">
+            <p className="rounded-lg border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger-soft">
               {error}
             </p>
           ) : null}

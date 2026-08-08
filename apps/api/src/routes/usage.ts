@@ -1,4 +1,10 @@
-import { numericToNumber } from '@eden3/core';
+import {
+  isHex24,
+  isUuid,
+  numericToNumber,
+  resolveAccount,
+  resolveAccountByUsername,
+} from '@eden3/core';
 import { db, mannaAccounts, pg } from '@eden3/db';
 import type { FastifyPluginAsync } from 'fastify';
 import { eq } from 'drizzle-orm';
@@ -20,7 +26,19 @@ import { z } from 'zod';
 
 const summaryQuery = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(25),
+  /**
+   * Filter spend windows + recent events to one agent (username, uuid, or
+   * legacy 24-hex id). `balance` stays account-global — manna is user-level.
+   */
+  agent: z.string().trim().min(1).max(200).optional(),
 });
+
+/** Resolve an agent reference to an accounts.id, or null when unknown. */
+async function resolveAgentRef(ref: string): Promise<string | null> {
+  if (isUuid(ref)) return ref.toLowerCase();
+  if (isHex24(ref)) return (await resolveAccount(ref))?.id ?? null;
+  return (await resolveAccountByUsername(ref))?.id ?? null;
+}
 
 interface SpendRow {
   week_manna: string;
@@ -54,7 +72,14 @@ export const usageRoutes: FastifyPluginAsync = async (app) => {
     const accountId = req.account?.accountId;
     if (accountId === undefined) return null; // unreachable — requireAuth replied 401
 
-    const { limit } = summaryQuery.parse(req.query);
+    const { limit, agent } = summaryQuery.parse(req.query);
+
+    let agentId: string | null = null;
+    let unknownAgent = false;
+    if (agent !== undefined) {
+      agentId = await resolveAgentRef(agent);
+      if (agentId === null) unknownAgent = true;
+    }
 
     const [balanceRow] = await db
       .select()
@@ -63,8 +88,13 @@ export const usageRoutes: FastifyPluginAsync = async (app) => {
       .limit(1);
 
     // Spend windows: last 7 days (week) and last 30 days (month), scoped to the
-    // viewer. Only the metered `manna` column is summed — never cost_usd.
-    const [spend] = await pg<SpendRow[]>`
+    // viewer (optionally to one agent). Only the metered `manna` column is
+    // summed — never cost_usd. An unknown agent ref yields empty usage (the
+    // account balance is still returned — it is not agent-scoped).
+    const agentFilter = agentId !== null ? pg`and agent_id = ${agentId}::uuid` : pg``;
+    const [spend] = unknownAgent
+      ? [undefined]
+      : await pg<SpendRow[]>`
       select
         coalesce(sum(manna) filter (where created_at >= now() - interval '7 days'), 0)::bigint::text as week_manna,
         count(*) filter (where created_at >= now() - interval '7 days')::int as week_events,
@@ -72,9 +102,12 @@ export const usageRoutes: FastifyPluginAsync = async (app) => {
         count(*)::int as month_events
       from usage_events
       where user_id = ${accountId}::uuid
-        and created_at >= now() - interval '30 days'`;
+        and created_at >= now() - interval '30 days'
+        ${agentFilter}`;
 
-    const recent = await pg<RecentRow[]>`
+    const recent = unknownAgent
+      ? []
+      : await pg<RecentRow[]>`
       select u.id,
              u.event_type,
              u.status,
@@ -90,6 +123,7 @@ export const usageRoutes: FastifyPluginAsync = async (app) => {
       from usage_events u
       left join accounts agent_account on agent_account.id = u.agent_id
       where u.user_id = ${accountId}::uuid
+        ${agentId !== null ? pg`and u.agent_id = ${agentId}::uuid` : pg``}
       order by u.created_at desc, u.id desc
       limit ${limit}`;
 

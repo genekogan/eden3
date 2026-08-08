@@ -60,7 +60,6 @@ export function CollectionsClient() {
   const [collections, setCollections] = useState<CollectionDto[]>([]);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [name, setName] = useState("");
-  const [isPublic, setIsPublic] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const alive = useRef(true);
@@ -111,14 +110,15 @@ export function CollectionsClient() {
     setCreateBusy(true);
     setCreateError(null);
     try {
+      // Cockpit collections are private — the public flag is a platform-era
+      // concept, out of scope here.
       const collection = await api.collections.create({
         name: trimmed,
-        public: isPublic,
+        public: false,
       });
       loadSeq.current += 1; // invalidate any list fetch that predates the create
       setCollections((prev) => [collection, ...prev]);
       setName("");
-      setIsPublic(false);
       setPhase("ready");
       void load({ background: true }); // pull the server list that includes it
     } catch (error) {
@@ -153,15 +153,6 @@ export function CollectionsClient() {
           aria-label="Collection name"
           className="min-w-0 flex-1 rounded-lg border border-edge bg-background px-3 py-2 text-sm placeholder:text-faint focus:border-accent/60 focus:outline-none"
         />
-        <label className="inline-flex items-center gap-2 text-sm text-muted">
-          <input
-            type="checkbox"
-            checked={isPublic}
-            onChange={(event) => setIsPublic(event.target.checked)}
-            className="size-4"
-          />
-          Public
-        </label>
         <button
           type="submit"
           disabled={createBusy || name.trim().length === 0}
@@ -169,7 +160,7 @@ export function CollectionsClient() {
         >
           {createBusy ? "Creating…" : "Create"}
         </button>
-        {createError ? <p className="text-xs text-rose-300">{createError}</p> : null}
+        {createError ? <p className="text-xs text-danger-soft">{createError}</p> : null}
       </form>
 
       <div className="mt-10">
@@ -214,11 +205,6 @@ export function CollectionsClient() {
                     <h2 className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
                       {collection.name ?? "Untitled collection"}
                     </h2>
-                    {!collection.public ? (
-                      <span className="shrink-0 rounded-full border border-edge bg-white/[0.04] px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-faint">
-                        private
-                      </span>
-                    ) : null}
                   </div>
                   <p className="mt-1 text-xs text-faint">
                     {typeof collection.creationCount === "number"

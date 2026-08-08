@@ -1,19 +1,17 @@
 "use client";
 
 /**
- * /chat — start a conversation.
- *
- * Without ?agent= it's an agent picker (GET /api/agents?q). With
- * ?agent=<username> it shows the agent hero (avatar, description, greeting,
- * a strip of recent creations) over a composer. The first send POSTs
- * /api/sessions/new/messages, learns the session id from the first
- * turn.started event (falling back to the x-session-id header), parks the
- * still-streaming response in the stream-handoff module, and
- * router.replace()s to /sessions/<id> — the reply keeps streaming there.
+ * The agent-scoped new-chat composer (/agents/[username]/chats[/new]):
+ * agent hero (avatar, description, greeting, recent creations) over a
+ * composer. The first send POSTs /api/sessions/new/messages, learns the
+ * session id from the first turn.started event (falling back to the
+ * x-session-id header), parks the still-streaming response in the
+ * stream-handoff module, and router.replace()s to the session permalink —
+ * the reply keeps streaming there.
  */
 
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { AgentDto, CreationDto } from "@/lib/types";
@@ -38,135 +36,6 @@ interface SendNotice {
 }
 
 // ---------------------------------------------------------------------------
-// Agent picker (no ?agent= param)
-// ---------------------------------------------------------------------------
-
-function AgentPicker() {
-  const router = useRouter();
-  const [query, setQuery] = useState("");
-  const [agents, setAgents] = useState<AgentDto[]>([]);
-  const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
-  const [error, setError] = useState<string | null>(null);
-  const [reloadNonce, setReloadNonce] = useState(0);
-
-  useEffect(() => {
-    let cancelled = false;
-    const timer = window.setTimeout(async () => {
-      try {
-        const { items } = await api.agents.list(query ? { q: query } : {});
-        if (cancelled) return;
-        setAgents(items);
-        setPhase("ready");
-      } catch (err) {
-        if (cancelled) return;
-        setError(describeSendError(err));
-        setPhase("error");
-      }
-    }, query ? 250 : 0);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [query, reloadNonce]);
-
-  return (
-    <div className="mx-auto w-full max-w-3xl px-6 py-14 md:px-10">
-      <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
-        New chat
-      </p>
-      <h1 className="mt-3 text-3xl font-light tracking-tight md:text-4xl">
-        Start a conversation
-      </h1>
-      <p className="mt-2 text-sm text-muted">
-        Pick an agent to chat with — it replies in its own voice and can create
-        images, video, and sound mid-conversation.
-      </p>
-
-      <input
-        value={query}
-        onChange={(event) => setQuery(event.target.value)}
-        placeholder="Search agents…"
-        aria-label="Search agents"
-        className="mt-8 w-full rounded-xl border border-edge bg-raised px-4 py-2.5 text-sm placeholder:text-faint focus:border-accent/60 focus:outline-none"
-      />
-
-      <div className="mt-6">
-        {phase === "loading" ? (
-          <div className="grid gap-3 sm:grid-cols-2">
-            {Array.from({ length: 6 }, (_, i) => (
-              <div
-                key={i}
-                className="flex items-center gap-3 rounded-xl border border-edge/60 p-4"
-              >
-                <Skeleton className="size-10 rounded-full" />
-                <div className="flex-1 space-y-2">
-                  <Skeleton className="h-3.5 w-1/3" />
-                  <Skeleton className="h-3 w-2/3" />
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : phase === "error" ? (
-          <EmptyState
-            title="Couldn't load agents"
-            hint={error ?? undefined}
-            action={
-              <button
-                type="button"
-                onClick={() => {
-                  setPhase("loading");
-                  setError(null);
-                  setReloadNonce((n) => n + 1);
-                }}
-                className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
-              >
-                Try again
-              </button>
-            }
-          />
-        ) : agents.length === 0 ? (
-          <EmptyState
-            title={query ? `No agents match “${query}”` : "No agents yet"}
-            hint="Agents appear here once the directory has members."
-          />
-        ) : (
-          <ul className="grid gap-3 sm:grid-cols-2">
-            {agents.map((agent) => (
-              <li key={agent.id}>
-                <button
-                  type="button"
-                  onClick={() =>
-                    router.push(
-                      `/chat?agent=${encodeURIComponent(agent.username)}`,
-                    )
-                  }
-                  className="flex w-full items-start gap-3 rounded-xl border border-edge bg-surface p-4 text-left transition-colors hover:border-accent/50 hover:bg-accent/[0.04]"
-                >
-                  <AgentAvatar account={agent} size={40} />
-                  <span className="min-w-0 flex-1">
-                    <span className="block truncate text-sm font-medium text-foreground">
-                      {agent.name ?? agent.username}
-                    </span>
-                    <span className="block truncate font-mono text-[11px] text-faint">
-                      @{agent.username}
-                    </span>
-                    {agent.description ? (
-                      <span className="mt-1.5 line-clamp-2 block text-xs leading-relaxed text-muted">
-                        {agent.description}
-                      </span>
-                    ) : null}
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Composer mode (?agent=<username>)
 // ---------------------------------------------------------------------------
 
@@ -184,7 +53,14 @@ function TypingDots() {
   );
 }
 
-function NewSessionComposer({ username }: { username: string }) {
+function NewSessionComposer({
+  username,
+  sessionHref = (id) => `/sessions/${encodeURIComponent(id)}`,
+}: {
+  username: string;
+  /** Where the streaming handoff lands once the session id is known. */
+  sessionHref?: (id: string) => string;
+}) {
   const router = useRouter();
   const [agent, setAgent] = useState<AgentDto | null>(null);
   const [recent, setRecent] = useState<CreationDto[]>([]);
@@ -247,7 +123,7 @@ function NewSessionComposer({ username }: { username: string }) {
       try {
         const sessionId = await ready;
         pendingPumpRef.current = null;
-        router.replace(`/sessions/${encodeURIComponent(sessionId)}`);
+        router.replace(sessionHref(sessionId));
       } catch (error) {
         pendingPumpRef.current = null;
         setStarting(false);
@@ -260,7 +136,7 @@ function NewSessionComposer({ username }: { username: string }) {
         });
       }
     },
-    [agent, router],
+    [agent, router, sessionHref],
   );
 
   const stop = useCallback(() => {
@@ -275,7 +151,7 @@ function NewSessionComposer({ username }: { username: string }) {
           hint="It may have been renamed or made private."
           action={
             <Link
-              href="/chat"
+              href="/agents"
               className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
             >
               Pick another agent
@@ -319,14 +195,14 @@ function NewSessionComposer({ username }: { username: string }) {
             setNotice(null);
             void send(content);
           }}
-          className="rounded-md border border-amber-400/30 px-2 py-0.5 transition-colors hover:border-amber-300/60 hover:text-amber-100"
+          className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"
         >
           Retry
         </button>
       ) : null}
       {notice.manna ? (
         <Link
-          href="/manna"
+          href="/account/manna"
           className="text-accent-soft underline decoration-accent/40 underline-offset-2 hover:decoration-accent"
         >
           Get manna →
@@ -438,23 +314,19 @@ function NewSessionComposer({ username }: { username: string }) {
 }
 
 // ---------------------------------------------------------------------------
-// Entry — /chat?agent=<username>
+// Entry — /agents/[username]/chats (the agent-scoped composer)
 // ---------------------------------------------------------------------------
 
-export function NewChatScreen() {
-  const searchParams = useSearchParams();
-  const agentParam = searchParams.get("agent");
-
-  if (!agentParam) {
-    return (
-      <div className="h-dvh overflow-y-auto">
-        <AgentPicker />
-      </div>
-    );
-  }
+export function AgentChatComposer({ username }: { username: string }) {
   return (
-    <div className="h-dvh">
-      <NewSessionComposer key={agentParam} username={agentParam} />
+    <div className="h-full">
+      <NewSessionComposer
+        key={username}
+        username={username}
+        sessionHref={(id) =>
+          `/agents/${encodeURIComponent(username)}/chats/${encodeURIComponent(id)}`
+        }
+      />
     </div>
   );
 }

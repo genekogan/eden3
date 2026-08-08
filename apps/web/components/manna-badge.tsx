@@ -81,13 +81,13 @@ export function MannaBadge({ className }: { className?: string }) {
 
   return (
     <Link
-      href="/manna"
+      href="/account/manna"
       title={title}
       className={`flex items-center gap-1.5 rounded-full border border-edge bg-raised px-2.5 py-1 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground ${className ?? ""}`}
     >
       <MannaGlyph />
       {status === "loading" ? (
-        <span className="inline-block h-3 w-8 animate-pulse rounded bg-white/[0.08]" />
+        <span className="inline-block h-3 w-8 animate-pulse rounded bg-foreground/[0.08]" />
       ) : (
         <span className="tabular-nums">
           {status === "ready" ? formatManna(balance) : "—"}

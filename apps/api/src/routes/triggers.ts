@@ -222,15 +222,27 @@ async function scheduledTaskQuotaError(account: { accountId: string; isAdmin: bo
   return null;
 }
 
+const listTasksQuerySchema = z.object({
+  /** Filter to one agent's tasks (username). */
+  agent: z.string().trim().min(1).max(200).optional(),
+});
+
 export const triggersRoutes: FastifyPluginAsync = async (app) => {
   // ---- GET /tasks — the signed-in user's triggers --------------------------
   app.get('/', { preHandler: app.requireAuth }, async (req) => {
     const viewer = req.account;
     if (!viewer) return null; // unreachable — requireAuth replied 401
+    const { agent } = listTasksQuerySchema.parse(req.query);
+    const conditions = [eq(triggers.userId, viewer.accountId), eq(triggers.deleted, false)];
+    if (agent !== undefined) {
+      const resolved = await resolveAgentByUsername(agent);
+      if (!resolved) return { items: [], nextCursor: null };
+      conditions.push(eq(triggers.agentId, resolved.account.id));
+    }
     const rows = await db
       .select()
       .from(triggers)
-      .where(and(eq(triggers.userId, viewer.accountId), eq(triggers.deleted, false)))
+      .where(and(...conditions))
       .orderBy(desc(triggers.createdAt), desc(triggers.id))
       .limit(200);
     const sessions = await lastRunSessionIds(
