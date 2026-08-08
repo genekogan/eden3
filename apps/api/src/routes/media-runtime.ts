@@ -2,9 +2,6 @@ import { getEnv } from '@eden3/core';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-// Integration prerequisite: Task3 auth-admission commit fa8469d exports the
-// opaque guard-bound route helper. This lane stays auth-plugin read-only.
-// @ts-ignore -- resolved when fa8469d is integrated before this slice.
 import { serviceAuthenticatedCallback } from '../auth-plugin';
 import { ApiError } from '../errors';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
