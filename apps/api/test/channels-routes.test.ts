@@ -1,18 +1,26 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
-import { DevAuthProvider } from '@eden3/core';
+import { credit, DevAuthProvider, getBalance } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
+import { hostedChannelSecretRef } from '@eden3/gateway';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { buildServer } from '../src/server';
 import type { ReserveChannelTurnInput } from '../src/services/channel-metering';
+import {
+  ChannelDeliveryTerminalCompensatedError,
+  ChannelTurnMeteringService,
+  PostgresChannelTurnStore,
+  channelTurnLedgerKey,
+} from '../src/services/channel-metering';
 import type { ChannelProviderClientLike } from '../src/services/channel-provider';
 import {
   AesGcmSecretVault,
   channelTokenSecretContext,
 } from '../src/services/secret-vault';
 import { PostgresChannelCredentialCustody } from '../src/services/postgres-channel-connector-custody';
+import { PostgresTelegramManagedBotCustody } from '../src/services/postgres-telegram-managed-bot-custody';
 import { XByoConnectorService, type XUserClientLike } from '../src/services/x-byo-connector';
 import type { TelegramManagedBotApiClientLike } from '../src/services/telegram-managed-bots';
 import {
@@ -655,6 +663,35 @@ describe('Telegram Managed Bots onboarding', () => {
     expect(persisted[0]?.token_preview).toBeNull();
     expect(JSON.stringify(persisted[0]?.metadata)).not.toContain('42424242');
 
+    const managedAuditsBeforeAdmin = await pg<{ count: number }[]>`
+      select count(*)::int as count from secret_access_audit_events
+      where secret_id = ${connectionId}
+    `;
+    for (const request of [
+      { method: 'POST', url: `/channels/connections/${connectionId}/retry`, payload: {} },
+      { method: 'GET', url: `/channels/connections/${connectionId}/destinations` },
+      { method: 'POST', url: `/channels/connections/${connectionId}/activate`, payload: {} },
+      { method: 'POST', url: `/channels/connections/${connectionId}/deactivate`, payload: {} },
+      { method: 'DELETE', url: `/channels/connections/${connectionId}` },
+    ] as const) {
+      const response = await app.inject({
+        method: request.method,
+        url: request.url,
+        headers: { cookie: devCookie(adminId) },
+        ...('payload' in request ? { payload: request.payload } : {}),
+      });
+      expect(response.statusCode).toBe(404);
+    }
+    const managedAuditsAfterAdmin = await pg<{ count: number }[]>`
+      select count(*)::int as count from secret_access_audit_events
+      where secret_id = ${connectionId}
+    `;
+    expect(managedAuditsAfterAdmin[0]?.count).toBe(managedAuditsBeforeAdmin[0]?.count);
+    const stillStored = await pg<{ desired_state: string; agent_id: string | null }[]>`
+      select desired_state, agent_id from channel_connections where id = ${connectionId}
+    `;
+    expect(stillStored[0]).toEqual({ desired_state: 'inactive', agent_id: null });
+
     const adminAttach = await app.inject({
       method: 'POST',
       url: `/channels/telegram/managed-bots/onboarding/${created.intent.id}/attach`,
@@ -691,6 +728,52 @@ describe('Telegram Managed Bots onboarding', () => {
       headers: { cookie: devCookie(strangerId) },
     });
     expect(crossAccount.statusCode).toBe(404);
+  });
+
+  it('rolls back the managed credential and intent when custody mints a wrong-scope capability', async () => {
+    const intentId = randomUUID();
+    await pg`
+      insert into channel_onboarding_intents (
+        id, account_id, channel, intent_secret_hash, state, expires_at
+      ) values (
+        ${intentId}, ${ownerId}, 'telegram',
+        ${createHash('sha256').update(`intent-${intentId}`).digest('hex')},
+        'pending_owner', now() + interval '15 minutes'
+      )
+    `;
+    await pg`
+      update channel_onboarding_intents
+      set provider_owner_id_hash = ${createHash('sha256').update(`owner-${intentId}`).digest('hex')},
+          state = 'awaiting_bot'
+      where id = ${intentId}
+    `;
+    await pg`update channel_onboarding_intents set state = 'exchanging' where id = ${intentId}`;
+    const capKey = randomBytes(32);
+    const custody = new PostgresTelegramManagedBotCustody(
+      { id: intentId, accountId: ownerId },
+      vault,
+      capKey,
+      (scope, key) => hostedChannelSecretRef({ ...scope, runtimeAccountId: `${scope.runtimeAccountId}-wrong` }, key),
+    );
+    const token = `765432109:${randomBytes(24).toString('base64url')}`;
+    await expect(
+      custody.storeManagedBotToken({
+        ownerAccountId: ownerId,
+        channel: 'telegram',
+        plaintextToken: token,
+        owner: { id: '42424243', username: 'scope_owner', displayName: 'Scope Owner' },
+        bot: { id: '52525253', username: 'scopefixturebot', displayName: 'Scope Fixture' },
+      }),
+    ).rejects.toThrow('invalid secret scope');
+    const intents = await pg<{ state: string; connection_id: string | null }[]>`
+      select state, connection_id from channel_onboarding_intents where id = ${intentId}
+    `;
+    expect(intents[0]).toEqual({ state: 'exchanging', connection_id: null });
+    const orphan = await pg<{ count: number }[]>`
+      select count(*)::int as count from channel_connections
+      where channel = 'telegram' and token_sha256 = ${createHash('sha256').update(token).digest('hex')}
+    `;
+    expect(orphan[0]?.count).toBe(0);
   });
 });
 
@@ -847,6 +930,37 @@ describe('named-account lifecycle', () => {
       desired_state: 'active',
       observed_state: 'stopped',
       status: 'reconnecting',
+    });
+
+    const lostAck = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/status',
+      headers: { authorization: `Bearer ${runtimeToken}` },
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        state: 'error',
+        errorCode: 'delivery_ack_lost',
+      },
+    });
+    expect(lostAck.statusCode).toBe(200);
+    const loud = await pg<
+      Array<{
+        desired_state: string;
+        observed_state: string;
+        status: string;
+        last_error_code: string | null;
+      }>
+    >`
+      select desired_state, observed_state, status, last_error_code
+      from channel_connections
+      where id = ${connection.id}
+    `;
+    expect(loud[0]).toEqual({
+      desired_state: 'active',
+      observed_state: 'error',
+      status: 'error',
+      last_error_code: 'delivery_ack_lost',
     });
   });
 });
@@ -1031,6 +1145,59 @@ describe('pairing claim and verified identity linkage', () => {
     expect(JSON.stringify(rows[0]?.request_metadata)).not.toContain('_decisionNonce');
     expect(JSON.stringify(rows[0]?.request_metadata)).not.toContain('pairingCode');
   });
+
+  it('serializes approvals behind an existing connection-scoped decision marker', async () => {
+    const connection = await activePairingConnection('pairing_serialization');
+    const peerId = '77448866';
+    const paired = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/pairing',
+      headers: { authorization: `Bearer ${runtimeToken}` },
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        peerId,
+        code: 'EDEN-4422',
+      },
+    });
+    expect(paired.statusCode).toBe(200);
+    const requestId = (paired.json() as { requestId: string }).requestId;
+    const activeMarker = { requestId: randomUUID(), nonce: randomUUID() };
+    await pg`
+      update channel_connections
+      set metadata = metadata || ${pg.json(JSON.stringify({ _pairingDecision: activeMarker }))}
+      where id = ${connection.id}
+    `;
+
+    const before = await pg<Array<{ connection_metadata: unknown; request_status: string }>>`
+      select c.metadata as connection_metadata, p.status as request_status
+      from channel_pairing_requests p
+      join channel_connections c on c.id = p.connection_id
+      where p.id = ${requestId}
+    `;
+    const callsBefore = ensureCalls.length;
+    const denied = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/pairing/${requestId}/approve`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: {},
+    });
+    expect(denied.statusCode).toBe(409);
+    expect(denied.json()).toMatchObject({
+      error: { code: 'channel_pairing_decision_in_progress' },
+    });
+    expect(ensureCalls).toHaveLength(callsBefore);
+
+    const after = await pg<Array<{ connection_metadata: unknown; request_status: string }>>`
+      select c.metadata as connection_metadata, p.status as request_status
+      from channel_pairing_requests p
+      join channel_connections c on c.id = p.connection_id
+      where p.id = ${requestId}
+    `;
+    expect(after).toEqual(before);
+    expect(after[0]?.request_status).toBe('pending');
+    expect(JSON.stringify(after[0]?.connection_metadata)).not.toContain(peerId);
+  });
 });
 
 describe('private runtime callbacks', () => {
@@ -1060,6 +1227,7 @@ describe('private runtime callbacks', () => {
     expect(accepted.statusCode).toBe(200);
     expect(sessionSync.syncMessage).toHaveBeenCalledWith({
       ...body,
+      conversationScope: 'direct',
       createdAt: new Date(body.createdAt),
     });
   });
@@ -1110,5 +1278,106 @@ describe('private runtime callbacks', () => {
     });
     expect(refunded.statusCode).toBe(200);
     expect(turnMetering.refund).toHaveBeenCalledWith(turnId);
+  });
+});
+
+describe('channel money crash boundaries against Postgres', () => {
+  it('keeps settled authorization terminal while compensation and delivered rescue serialize exactly', async () => {
+    const connection = await createConnection({
+      token: `valid_${marker}_money_crash_boundary`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    await credit({
+      accountId: ownerId,
+      amount: 1_000,
+      type: 'credit:test:channel-crash',
+      idempotencyKey: `channel-crash-credit:${marker}`,
+    });
+    const store = new PostgresChannelTurnStore(async () => 'openclaw');
+    const metering = new ChannelTurnMeteringService(store);
+    const execution = {
+      provider: 'anthropic',
+      model: 'claude-haiku-4-5',
+      agentRuntime: 'openclaw' as const,
+    };
+    const settle = async (turnId: string) => {
+      await metering.reserve({
+        turnId,
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+      });
+      return metering.settle(
+        turnId,
+        { promptTokens: 10, completionTokens: 2, totalTokens: 12 },
+        execution,
+      );
+    };
+
+    const compensatedTurn = randomUUID();
+    const balanceBeforeCompensation = (await getBalance(ownerId)).total;
+    const charged = await settle(compensatedTurn);
+    expect((await getBalance(ownerId)).total).toBe(balanceBeforeCompensation - charged.chargedManna);
+    await metering.refundDeliveryFailure(compensatedTurn);
+    await metering.refundDeliveryFailure(compensatedTurn);
+    expect((await getBalance(ownerId)).total).toBe(balanceBeforeCompensation);
+    const compensated = await pg<Array<{
+      channel_status: string;
+      error_code: string | null;
+      authorization_state: string;
+      charged_manna: string;
+      usage_status: string;
+      usage_manna: string;
+      reversal_count: number;
+    }>>`
+      select ct.status as channel_status, ct.error_code,
+             ta.state as authorization_state, ta.charged_manna,
+             ue.status as usage_status, ue.manna,
+             (
+               select count(*)::int from manna_transactions mt
+               where mt.idempotency_key = ${`refund:${channelTurnLedgerKey(compensatedTurn)}`}
+             ) as reversal_count
+      from channel_turns ct
+      join turn_authorizations ta on ta.turn_id = ct.turn_id
+      join usage_events ue on ue.turn_id = ct.turn_id and ue.event_type = 'channel_chat'
+      where ct.turn_id = ${compensatedTurn}
+    `;
+    expect(compensated[0]).toMatchObject({
+      channel_status: 'refunded',
+      error_code: 'channel_delivery_failed',
+      authorization_state: 'settled',
+      usage_status: 'error',
+      reversal_count: 1,
+    });
+    expect(Number(compensated[0]!.usage_manna)).toBe(0);
+
+    const rescuedTurn = randomUUID();
+    await settle(rescuedTurn);
+    const claimed = await store.claimRefund(rescuedTurn, false, true);
+    expect(claimed).toMatchObject({ claimed: true, errorCode: 'channel_delivery_compensation_pending' });
+    await store.markRefundFailed(rescuedTurn, 'channel_delivery_failed_refund_failed');
+    await store.markDelivered(rescuedTurn);
+    const rescued = await pg<{ status: string; reversal_count: number }[]>`
+      select ct.status,
+             (
+               select count(*)::int from manna_transactions mt
+               where mt.idempotency_key = ${`refund:${channelTurnLedgerKey(rescuedTurn)}`}
+             ) as reversal_count
+      from channel_turns ct where ct.turn_id = ${rescuedTurn}
+    `;
+    expect(rescued[0]).toEqual({ status: 'delivered', reversal_count: 0 });
+
+    const compensationWonTurn = randomUUID();
+    await settle(compensationWonTurn);
+    await metering.refundDeliveryFailure(compensationWonTurn);
+    await expect(store.markDelivered(compensationWonTurn)).rejects.toBeInstanceOf(
+      ChannelDeliveryTerminalCompensatedError,
+    );
   });
 });

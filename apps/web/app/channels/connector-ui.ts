@@ -44,6 +44,7 @@ export function telegramManagedStep(state: string): TelegramManagedStep {
       return 'complete';
     case 'cancelled':
     case 'expired':
+    case 'failed':
       return 'terminal';
     default:
       return 'bind_owner';

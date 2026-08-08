@@ -23,6 +23,7 @@ import { ApiError, sendError } from '../errors';
 import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
   ChannelTurnMeteringService,
+  ChannelDeliveryTerminalCompensatedError,
   ChannelExecutionMismatchError,
   type ChannelTurnUsage,
 } from '../services/channel-metering';
@@ -220,7 +221,13 @@ const runtimeStatusSchema = z.object({
   runtimeAccountId: z.string().min(1).max(128),
   state: z.enum(['live', 'stopped', 'error']),
   errorCode: z
-    .enum(['invalid_token', 'provider_unavailable', 'gateway_disconnected', 'configuration_error'])
+    .enum([
+      'invalid_token',
+      'provider_unavailable',
+      'gateway_disconnected',
+      'delivery_ack_lost',
+      'configuration_error',
+    ])
     .optional(),
 });
 
@@ -329,6 +336,7 @@ const SAFE_RUNTIME_ERRORS: Record<string, string> = {
   invalid_token: 'The provider rejected this bot token.',
   provider_unavailable: 'The channel provider is temporarily unavailable.',
   gateway_disconnected: 'The channel runtime disconnected.',
+  delivery_ack_lost: 'A native delivery acknowledgement arrived after compensation.',
   configuration_error: 'The channel runtime could not apply this connection.',
 };
 
@@ -761,7 +769,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       if (!resolved) {
         return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
       }
-      if (!account.isAdmin && resolved.agent.ownerId !== account.accountId) {
+      if (resolved.agent.ownerId !== account.accountId) {
         return sendError(reply, 403, 'forbidden', 'Only the owner can attach this agent');
       }
       agentId = resolved.account.id;
@@ -1108,7 +1116,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       if (!resolved) {
         return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
       }
-      if (!account.isAdmin && resolved.agent.ownerId !== account.accountId) {
+      if (resolved.agent.ownerId !== account.accountId) {
         return sendError(reply, 403, 'forbidden', 'Only the owner can attach this agent');
       }
       agentId = resolved.account.id;
@@ -1211,7 +1219,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = retryBodySchema.parse(req.body ?? {});
-    const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
+    const row = await getOwnedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
 
     let token: string;
@@ -1395,7 +1403,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.get('/connections/:id/destinations', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
-    const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
+    const row = await getOwnedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     await audit({
       actorAccountId: account.accountId,
@@ -1423,7 +1431,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = activationBodySchema.parse(req.body ?? {});
-    const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
+    const row = await getOwnedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     if (row.channel === 'discord' && body.telegramGroups.length > 0) {
       return sendError(reply, 400, 'invalid_channel_group_config', 'Telegram groups cannot be attached to Discord');
@@ -1595,7 +1603,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.post('/connections/:id/deactivate', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
-    const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
+    const row = await getOwnedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     // Revoke resolver eligibility first. Even if the config write fails, the
     // retained SecretRef can no longer retrieve plaintext for this account.
@@ -1644,7 +1652,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.delete('/connections/:id', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
-    const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
+    const row = await getOwnedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     // Deletion is fail-closed from the first durable write: any retained
     // SecretRef becomes unresolvable while refunds and exact-account cleanup
@@ -1748,7 +1756,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       const account = req.account!;
       const { id, requestId } = pairingParamsSchema.parse(req.params);
       const body = approvePairingBodySchema.parse(req.body ?? {});
-      const connection = await getOwnedConnection(id, account.accountId, account.isAdmin);
+      const connection = await getOwnedConnection(id, account.accountId, false);
       if (!connection) {
         return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
       }
@@ -1878,8 +1886,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         const connections = await tx<ChannelConnectionRow[]>`
           select ${CONNECTION_COLUMNS}
           from channel_connections
-          where id = ${connection.id}
-            ${account.isAdmin ? tx`` : tx`and account_id = ${account.accountId}`}
+          where id = ${connection.id} and account_id = ${account.accountId}
           for update
         `;
         const currentConnection = connections[0];
@@ -1894,6 +1901,14 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         }
         if (currentConnection.agent_id !== connection.agent_id) {
           throw new ApiError(409, 'channel_connection_changed', 'Connection changed; retry approval');
+        }
+        const activeDecision = pairingDecisionMarker(currentConnection.metadata);
+        if (activeDecision) {
+          throw new ApiError(
+            409,
+            'channel_pairing_decision_in_progress',
+            'Another pairing approval is still being applied; retry after it completes',
+          );
         }
         const requests = await tx<
           Array<{
@@ -2232,7 +2247,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     async (req, reply) => {
       const account = req.account!;
       const { id, requestId } = pairingParamsSchema.parse(req.params);
-      const connection = await getOwnedConnection(id, account.accountId, account.isAdmin);
+      const connection = await getOwnedConnection(id, account.accountId, false);
       if (!connection) {
         return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
       }
@@ -2489,7 +2504,18 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
 
   app.post('/runtime/turns/:turnId/delivered', { preHandler: requireRuntime }, async (req) => {
     const { turnId } = turnParamsSchema.parse(req.params);
-    await turnMetering.markDelivered(turnId);
+    try {
+      await turnMetering.markDelivered(turnId);
+    } catch (error) {
+      if (error instanceof ChannelDeliveryTerminalCompensatedError) {
+        throw new ApiError(
+          409,
+          error.code,
+          'Channel turn was already terminal-compensated before delivery acknowledgement',
+        );
+      }
+      throw error;
+    }
     return { ok: true, turnId };
   });
 

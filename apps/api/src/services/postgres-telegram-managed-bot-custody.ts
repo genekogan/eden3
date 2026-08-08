@@ -1,8 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { getEnv } from '@eden3/core';
 import { pg } from '@eden3/db';
-import { deriveCapabilityKey, hostedChannelSecretRef } from '@eden3/gateway';
+import { deriveCapabilityKey, hostedChannelSecretRef, parseSecretId } from '@eden3/gateway';
 
 import type {
   TelegramManagedBotCustodyInput,
@@ -31,6 +31,7 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
     private readonly intent: { id: string; accountId: string },
     private readonly vault: SecretVaultLike = defaultSecretVault(),
     private readonly capKey: Buffer = capabilityKey(),
+    private readonly mintSecretRef: typeof hostedChannelSecretRef = hostedChannelSecretRef,
   ) {}
 
   async storeManagedBotToken(
@@ -49,7 +50,7 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
         channel: 'telegram',
       }),
     );
-    await pg.begin(async (tx) => {
+    return pg.begin(async (tx) => {
       for (const lockKey of [
         `channel-credential-token:telegram:${encrypted.tokenSha256}`,
         `channel-credential-bot:telegram:${input.bot.id}`,
@@ -113,12 +114,7 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
           }))}
         )
       `;
-    });
-
-    return {
-      connectionId,
-      runtimeAccountId,
-      secretRef: hostedChannelSecretRef(
+      const secretRef = this.mintSecretRef(
         {
           connectionId,
           accountId: input.ownerAccountId,
@@ -126,8 +122,35 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
           runtimeAccountId,
         },
         this.capKey,
-      ),
-      state: 'stored_inactive',
-    };
+      );
+      const canonicalSecretRef = hostedChannelSecretRef(
+        {
+          connectionId,
+          accountId: input.ownerAccountId,
+          channel: 'telegram',
+          runtimeAccountId,
+        },
+        this.capKey,
+      );
+      const parsed = parseSecretId(secretRef.id);
+      const presented = Buffer.from(secretRef.id, 'utf8');
+      const expected = Buffer.from(canonicalSecretRef.id, 'utf8');
+      if (
+        secretRef.source !== 'exec' ||
+        secretRef.provider !== 'eden-channel-vault' ||
+        parsed.kind !== 'capability' ||
+        parsed.connectionId.toLowerCase() !== connectionId.toLowerCase() ||
+        presented.length !== expected.length ||
+        !timingSafeEqual(presented, expected)
+      ) {
+        throw new Error('managed-bot custody minted an invalid secret scope');
+      }
+      return {
+        connectionId,
+        runtimeAccountId,
+        secretRef,
+        state: 'stored_inactive' as const,
+      };
+    });
   }
 }
