@@ -6,6 +6,7 @@ import {
   ChannelExecutionMismatchError,
   REAPABLE_CHANNEL_TURN_STATUSES,
   ChannelTurnMeteringService,
+  assertChannelReservationReplay,
   assertChannelExecutionMatches,
   isBillableChannelTurnProvenance,
   meterChannelUsage,
@@ -122,6 +123,27 @@ describe('ChannelTurnMeteringService economic authorization', () => {
     ).rejects.toMatchObject({ name: 'TurnCeilingError' });
     expect(persistence.claimTurn).not.toHaveBeenCalled();
     expect(persistence.authorize).not.toHaveBeenCalled();
+  });
+
+  it('rejects a pre-kernel flat debit or missing authorization on reservation replay', () => {
+    const valid = {
+      recordedAmount: '-61.0000',
+      recordedType: 'spend:chat:channel',
+      reservedManna: 61,
+      payerMatches: true,
+      wasRefunded: false,
+      hasLiveAuthorization: true,
+    };
+    expect(() => assertChannelReservationReplay(valid)).not.toThrow();
+    expect(() =>
+      assertChannelReservationReplay({ ...valid, recordedAmount: '-1.0000' }),
+    ).toThrow('replay conflict');
+    expect(() =>
+      assertChannelReservationReplay({ ...valid, hasLiveAuthorization: false }),
+    ).toThrow('replay conflict');
+    expect(() =>
+      assertChannelReservationReplay({ ...valid, wasRefunded: true }),
+    ).toThrow('replay conflict');
   });
 
   it('FG-ECON-CHANNEL-02 never charges above authorized-max and records the clamped settlement', async () => {

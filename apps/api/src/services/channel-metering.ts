@@ -387,6 +387,40 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
         dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
         db: tx,
       });
+      if (debited.alreadyApplied) {
+        const replayChecks = (await tx.execute(sql`
+          select
+            exists (
+              select 1 from manna_accounts
+              where id = ${debited.transaction.mannaAccountId}
+                and account_id = ${turn.accountId}
+            ) as payer_matches,
+            exists (
+              select 1 from manna_transactions
+              where refunds_transaction_id = ${debited.transaction.id}
+                and amount > 0
+            ) as was_refunded,
+            exists (
+              select 1 from turn_authorizations
+              where turn_id = ${turn.turnId}
+                and reservation_tx_id = ${debited.transaction.id}
+                and state = 'reserved'
+            ) as has_live_authorization
+        `)) as unknown as Array<{
+          payer_matches: boolean;
+          was_refunded: boolean;
+          has_live_authorization: boolean;
+        }>;
+        const replay = replayChecks[0];
+        assertChannelReservationReplay({
+          recordedAmount: debited.transaction.amount,
+          recordedType: debited.transaction.type,
+          reservedManna: turn.reservedManna,
+          payerMatches: replay?.payer_matches === true,
+          wasRefunded: replay?.was_refunded === true,
+          hasLiveAuthorization: replay?.has_live_authorization === true,
+        });
+      }
       const authorization = turnAuthorizedMax(route);
       const row = await insertTurnAuthorization(tx, {
         turnId: turn.turnId,
@@ -598,6 +632,26 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
 
 export function channelTurnLedgerKey(turnId: string): string {
   return `channel:${turnId}`;
+}
+
+export function assertChannelReservationReplay(input: {
+  recordedAmount: string | null;
+  recordedType: string | null;
+  reservedManna: number;
+  payerMatches: boolean;
+  wasRefunded: boolean;
+  hasLiveAuthorization: boolean;
+}): void {
+  if (
+    input.recordedAmount === null ||
+    -numericToNumber(input.recordedAmount) !== input.reservedManna ||
+    input.recordedType !== 'spend:chat:channel' ||
+    !input.payerMatches ||
+    input.wasRefunded ||
+    !input.hasLiveAuthorization
+  ) {
+    throw new Error('channel turn reservation replay conflict');
+  }
 }
 
 export class ChannelExecutionMismatchError extends Error {
