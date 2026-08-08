@@ -20,6 +20,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { registerAuth } from '../src/auth-plugin';
 import { ApiError, errorEnvelope } from '../src/errors';
 import { MediaPipeline } from '../src/services/media-pipeline';
+import { compensateStudioGeneration } from '../src/services/studio-reservations';
 import { feedRoutes } from '../src/routes/feed';
 import {
   studioRoutes,
@@ -652,6 +653,7 @@ describe('POST /studio/generate', () => {
     reversalError = new Error('ledger unavailable');
     nextClaim = claimUnused;
     const before = await getBalance(richUserId);
+    let refundPendingTurnId: string | null = null;
     try {
       const res = await app.inject({
         method: 'POST',
@@ -667,21 +669,32 @@ describe('POST /studio/generate', () => {
       expect(error.message).not.toContain('ledger unavailable');
       expect((await getBalance(richUserId)).total).toBe(before.total - imageQuote.manna);
 
-      const [usage] = await pg<Array<{ status: string; manna: number; errorCode: string }>>`
-        select status, manna, error_code as "errorCode"
+      const [usage] = await pg<Array<{ turnId: string; status: string; manna: number; errorCode: string }>>`
+        select turn_id as "turnId", status, manna, error_code as "errorCode"
         from usage_events
         where user_id = ${richUserId}
           and event_type = 'studio_generation'
           and error_code = 'refund_pending'
         order by created_at desc limit 1`;
       expect(usage).toEqual({
+        turnId: expect.any(String),
         status: 'refund_pending',
         manna: imageQuote.manna,
         errorCode: 'refund_pending',
       });
+      refundPendingTurnId = usage?.turnId ?? null;
     } finally {
       invokeError = null;
       reversalError = null;
+      if (refundPendingTurnId) {
+        expect(
+          await compensateStudioGeneration({
+            turnId: refundPendingTurnId,
+            errorCode: 'provider_error',
+            errorMessage: 'provider exploded',
+          }),
+        ).toBe('refunded');
+      }
     }
   });
 
