@@ -27,33 +27,27 @@ import {
  *
  * Gateway media paths carry NO agent/session identity (spike probe #4: the
  * filename uuid is unrelated to the task id; the directory only names the
- * tool, e.g. `tool-image-generation`). Correlation is therefore heuristic,
- * in strict priority order:
+ * tool, e.g. `tool-image-generation`). Chat correlation therefore fails
+ * closed until an exact transcript sighting arrives, in strict priority order:
  *
  *   1. **Claims** (studio flow): a caller that just invoked a tool claims the
  *      next stable file of a matching kind ({@link MediaWatcher.claimNext}).
  *      Registered before the invoke, so it wins over everything else.
- *   2. **Turn registry** (services/turn-registry.ts): the most recently
- *      active chat turn window. If several sessions are mid-turn at once we
- *      pick the newest — with N concurrent media-generating turns this CAN
- *      mis-attribute files across them (and a claim can grab a file whose
- *      write began before the claim was registered). Acceptable at current
- *      scale (single box, low concurrency); a real fix needs gateway-side
- *      task→file correlation, which does not exist (spike probe #4).
- *   3. **History sync** (injected callback): resolve the file against synced
+ *   2. **History sync** (injected callback): resolve the file against synced
  *      gateway transcripts. The production wiring is the PUSH direction —
  *      services/history-sync.ts reports `MEDIA:<path>` sightings on synced
  *      completion messages to {@link createAttachmentSightingHandler}, which
  *      ingests in attach mode. This pull hook exists for a watcher-initiated
  *      lookup and defaults to null.
- *   4. **Park**: ingest with no session/user — a bare `media_assets` row. A
+ *   3. **Park**: ingest with no session/user — a bare `media_assets` row. A
  *      later history-sync sighting re-ingests it with a session (the
  *      pipeline fills the null correlation columns in), so parking is a
  *      recoverable state, not a dead end.
  *
- * Double-observation of the same file by different paths (watcher + sighting
- * handler) is harmless: the pipeline dedupes on sha256 per session and the
- * media manna debit key is `media:<sha256>:<sessionId>`.
+ * A live turn window is deliberately not used: it cannot prove which of two
+ * concurrent sessions owns a provider artifact, so using it could charge one
+ * account for another account's media. Double-observation is harmless because
+ * the pipeline dedupes on sha256 per session.
  */
 
 // ---------------------------------------------------------------------------
@@ -260,7 +254,7 @@ interface PendingClaim {
 /** How a stable file was routed (observability + tests). */
 export interface MediaWatcherOutcome {
   file: MediaFileEvent;
-  via: 'claim' | 'live-window' | 'history-sync' | 'parked';
+  via: 'claim' | 'history-sync' | 'parked';
   sessionId?: string | null;
   result?: IngestFileResult;
   error?: unknown;
@@ -274,7 +268,7 @@ export interface MediaWatcherOptions {
   pollIntervalMs?: number;
   /** Consecutive polls the size must be unchanged before ingest (default 2). */
   stablePolls?: number;
-  /** Live chat windows (services/turn-registry.ts); default: none. */
+  /** @deprecated Never used for file attribution; retained for source compatibility. */
   turnRegistry?: TurnRegistryLike;
   historySync?: MediaHistorySync | null;
   logger?: MediaLogger;
@@ -312,7 +306,6 @@ export class MediaWatcher {
   private readonly pollIntervalMs: number;
   private readonly stablePolls: number;
   private readonly log: MediaLogger;
-  private readonly turnRegistry: TurnRegistryLike;
   private readonly historySync: MediaHistorySync | null;
   private readonly onOutcome: ((outcome: MediaWatcherOutcome) => void) | null;
 
@@ -331,7 +324,6 @@ export class MediaWatcher {
     this.dirs = opts.dirs ?? defaultWatchDirs();
     this.pollIntervalMs = opts.pollIntervalMs ?? 1500;
     this.stablePolls = opts.stablePolls ?? 2;
-    this.turnRegistry = opts.turnRegistry ?? EMPTY_REGISTRY;
     this.historySync = opts.historySync ?? null;
     this.log = opts.logger ?? console;
     this.onOutcome = opts.onOutcome ?? null;
@@ -376,7 +368,7 @@ export class MediaWatcher {
 
   /**
    * Claim the next stable file (of an optionally restricted kind) that lands
-   * AFTER this call. Claims queue FIFO and take priority over turn-registry
+   * AFTER this call. Claims queue FIFO and take priority over transcript
    * correlation; a claimed file is handed to the claimant, NOT auto-ingested.
    */
   claimNext(opts: MediaClaimOptions): MediaClaim {
@@ -518,18 +510,8 @@ export class MediaWatcher {
       }
     }
 
-    // 2. Most recently active turn window (path carries no agent identity).
-    const turn = mostRecentActiveTurn(this.turnRegistry);
-    if (turn) {
-      await this.ingest(file, 'live-window', {
-        sessionId: turn.sessionId,
-        agentAccountId: turn.agentAccountId ?? null,
-        tool: toolFromPath(file.path, file.kind),
-      });
-      return;
-    }
-
-    // 3. Injected pull-direction history-sync lookup.
+    // 2. Injected pull-direction history-sync lookup. Never infer ownership
+    // from a live turn: paths have no durable task/session correlation.
     if (this.historySync) {
       try {
         const match = await this.historySync(file);
@@ -546,7 +528,7 @@ export class MediaWatcher {
       }
     }
 
-    // 4. Park — asset row only; a later sighting may correlate it.
+    // 3. Park — asset row only; a later exact sighting may correlate it.
     await this.ingest(file, 'parked', { tool: toolFromPath(file.path, file.kind) });
   }
 
@@ -609,9 +591,8 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * `HistorySync.setAttachmentCallback` (services/history-sync.ts): map the
  * container path to the host, then ingest in ATTACH mode — the attachment
  * lands on the already-persisted completion message, the creation's agent
- * defaults to that message's sender, and the session owner is debited via
- * the sha256+session idempotency key (a no-op when the watcher's live-window
- * path already ingested the same file).
+ * defaults to that message's sender, and the exact pending media authorization
+ * is settled with the attachment in one transaction.
  *
  * Fire-and-forget (the callback contract is synchronous); failures are
  * logged, never thrown. `lastRun` exposes the trailing task for tests.
