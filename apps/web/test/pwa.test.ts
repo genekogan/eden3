@@ -84,9 +84,13 @@ describe("PWA manifest", () => {
 
   it("wires cover viewport, safe-area styling, manifest, and registration", () => {
     const layout = readFileSync(resolve(WEB_ROOT, "app/layout.tsx"), "utf8");
+    const appShell = readFileSync(
+      resolve(WEB_ROOT, "components/shell/app-shell.tsx"),
+      "utf8",
+    );
     expect(layout).toContain('manifest: "/manifest.webmanifest"');
     expect(layout).toContain('viewportFit: "cover"');
-    expect(layout).toContain("pwa-safe-area-shell");
+    expect(appShell).toContain("pwa-safe-area-shell");
     expect(layout).toContain("<ServiceWorkerRegistration />");
   });
 });

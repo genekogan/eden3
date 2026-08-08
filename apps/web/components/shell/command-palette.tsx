@@ -15,6 +15,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { StudioTool } from "@/lib/types";
 import { fuzzyFilter } from "@/lib/fuzzy";
+import {
+  agentSectionHref,
+  isEveConcealedSubpath,
+  isEveUsername,
+} from "@/lib/eve";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { sortTools, toolLabel, FALLBACK_TOOLS } from "@/components/studio/catalog";
 import {
@@ -97,6 +102,7 @@ export function CommandPalette() {
     if (username) {
       const base = `/agents/${encodeURIComponent(username)}`;
       for (const [sub, label] of AGENT_SECTIONS) {
+        if (isEveUsername(username) && isEveConcealedSubpath(sub)) continue;
         out.push({
           id: `section:${sub}`,
           label,
@@ -114,7 +120,7 @@ export function CommandPalette() {
         label: `Switch to ${agent.name?.trim() || agent.username}`,
         keywords: `@${agent.username} agent switch`,
         hint: `@${agent.username}`,
-        href: `/agents/${encodeURIComponent(agent.username)}/${subPath ?? "chats"}`,
+        href: agentSectionHref(agent.username, subPath ?? "chats"),
         avatar: agent,
       });
     }

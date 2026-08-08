@@ -12,6 +12,11 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { AgentAvatar } from "@/components/agent-avatar";
 import {
+  agentSectionHref,
+  agentSubpathForUsername,
+  isEveUsername,
+} from "@/lib/eve";
+import {
   agentSubPathFromPathname,
   useMyAgents,
   useSelectedAgent,
@@ -62,7 +67,10 @@ export function AgentSelector({ collapsed = false }: { collapsed?: boolean }) {
 
   const subPath = agentSubPathFromPathname(pathname);
   const hrefFor = (agentUsername: string) =>
-    `/agents/${encodeURIComponent(agentUsername)}/${subPath ?? "chats"}`;
+    agentSectionHref(
+      agentUsername,
+      agentSubpathForUsername(agentUsername, subPath),
+    );
 
   const displayName = agent?.name?.trim() || agent?.username || username;
 
@@ -136,46 +144,79 @@ export function AgentSelector({ collapsed = false }: { collapsed?: boolean }) {
           aria-label="Your agents"
           className="absolute inset-x-0 top-full z-50 mt-1.5 max-h-80 min-w-52 overflow-y-auto rounded-xl border border-edge bg-raised p-1.5 shadow-xl shadow-black/30"
         >
+          <button
+            type="button"
+            role="option"
+            aria-selected={isEveUsername(username)}
+            onClick={() => {
+              setOpen(false);
+              if (!isEveUsername(username)) router.push(hrefFor("eve"));
+            }}
+            className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors ${
+              isEveUsername(username)
+                ? "bg-accent/10 text-foreground"
+                : "text-muted hover:bg-foreground/[0.04] hover:text-foreground"
+            }`}
+          >
+            <span
+              aria-hidden
+              className="grid size-[26px] shrink-0 place-items-center rounded-full bg-accent/12 font-mono text-xs text-accent-soft"
+            >
+              e
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-[13px] leading-tight">eve</span>
+              <span className="block truncate font-mono text-[10px] text-faint">
+                @eve · Eden guide
+              </span>
+            </span>
+            {isEveUsername(username) ? (
+              <span aria-hidden className="size-1.5 rounded-full bg-accent" />
+            ) : null}
+          </button>
+          <div className="my-1 border-t border-edge" />
           {agents === null ? (
             <p className="px-2.5 py-2 text-xs text-faint">Loading your agents…</p>
           ) : agents.length === 0 ? (
-            <p className="px-2.5 py-2 text-xs text-faint">No agents yet.</p>
+            <p className="px-2.5 py-2 text-xs text-faint">No agents of your own yet.</p>
           ) : (
             <ul className="space-y-0.5">
-              {agents.map((candidate) => {
-                const active = candidate.username === username;
-                return (
-                  <li key={candidate.id}>
-                    <button
-                      type="button"
-                      role="option"
-                      aria-selected={active}
-                      onClick={() => {
-                        setOpen(false);
-                        if (!active) router.push(hrefFor(candidate.username));
-                      }}
-                      className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors ${
-                        active
-                          ? "bg-accent/10 text-foreground"
-                          : "text-muted hover:bg-foreground/[0.04] hover:text-foreground"
-                      }`}
-                    >
-                      <AgentAvatar account={candidate} size={26} />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[13px] leading-tight">
-                          {candidate.name?.trim() || candidate.username}
+              {agents
+                .filter((candidate) => !isEveUsername(candidate.username))
+                .map((candidate) => {
+                  const active = candidate.username === username;
+                  return (
+                    <li key={candidate.id}>
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={active}
+                        onClick={() => {
+                          setOpen(false);
+                          if (!active) router.push(hrefFor(candidate.username));
+                        }}
+                        className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors ${
+                          active
+                            ? "bg-accent/10 text-foreground"
+                            : "text-muted hover:bg-foreground/[0.04] hover:text-foreground"
+                        }`}
+                      >
+                        <AgentAvatar account={candidate} size={26} />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[13px] leading-tight">
+                            {candidate.name?.trim() || candidate.username}
+                          </span>
+                          <span className="block truncate font-mono text-[10px] text-faint">
+                            @{candidate.username}
+                          </span>
                         </span>
-                        <span className="block truncate font-mono text-[10px] text-faint">
-                          @{candidate.username}
-                        </span>
-                      </span>
-                      {active ? (
-                        <span aria-hidden className="size-1.5 rounded-full bg-accent" />
-                      ) : null}
-                    </button>
-                  </li>
-                );
-              })}
+                        {active ? (
+                          <span aria-hidden className="size-1.5 rounded-full bg-accent" />
+                        ) : null}
+                      </button>
+                    </li>
+                  );
+                })}
             </ul>
           )}
           <div className="mt-1 border-t border-edge pt-1">

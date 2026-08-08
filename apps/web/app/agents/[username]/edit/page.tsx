@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { agentSettingsLandingHref } from "@/lib/eve";
 
 /** Legacy /agents/[username]/edit → Settings › Identity. */
 export default async function LegacyAgentEditPage({
@@ -7,5 +8,5 @@ export default async function LegacyAgentEditPage({
   params: Promise<{ username: string }>;
 }) {
   const { username } = await params;
-  redirect(`/agents/${username}/settings/identity`);
+  redirect(agentSettingsLandingHref(decodeURIComponent(username)));
 }

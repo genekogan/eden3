@@ -18,6 +18,7 @@ import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import type { StudioTool } from "@/lib/types";
 import { getLastAgent } from "@/lib/last-agent";
+import { isEveConcealedSubpath, isEveUsername } from "@/lib/eve";
 import {
   categorizeTool,
   sortTools,
@@ -26,6 +27,7 @@ import {
   type StudioCategory,
 } from "@/components/studio/catalog";
 import { AgentSelector } from "./agent-selector";
+import { EveSidebarEntry } from "@/components/eve/eve-empty-state";
 import { EnvChip } from "./env-chip";
 import { UserArea } from "./user-area";
 import { useMyAgents, useSelectedAgent } from "./selected-agent-context";
@@ -174,32 +176,17 @@ function AgentNav({
   const { username } = useSelectedAgent();
   const { agents, phase } = useMyAgents();
 
-  if (phase === "ready" && agents !== null && agents.length === 0) {
+  if (
+    phase === "ready" &&
+    agents !== null &&
+    agents.length === 0 &&
+    !isEveUsername(username)
+  ) {
     return (
-      <div className="mt-4 rounded-xl border border-dashed border-edge px-2 py-4 text-center lg:px-3">
-        <p className={`text-xs leading-relaxed text-muted ${labels === "responsive" ? "hidden lg:block" : ""}`}>
-          No agents yet. Create your first one to begin.
-        </p>
-        <Link
-          href="/agents/new"
-          onClick={onNavigate}
-          title="Create your first agent"
-          className="mt-3 inline-flex items-center justify-center gap-1.5 rounded-lg border border-accent/40 px-2.5 py-1.5 text-xs text-accent-soft transition-colors hover:bg-accent/10"
-        >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.5}
-            strokeLinecap="round"
-            aria-hidden
-            className="size-3.5"
-          >
-            <path d="M12 5v14M5 12h14" />
-          </svg>
-          <span className={labelClass(labels)}>Create agent</span>
-        </Link>
-      </div>
+      <EveSidebarEntry
+        onNavigate={onNavigate}
+        labelsAlways={labels === "always"}
+      />
     );
   }
 
@@ -236,7 +223,10 @@ function AgentNav({
         <span className={labelClass(labels)}>New Chat</span>
       </Link>
       <ul className="space-y-0.5">
-        {AGENT_NAV.map((item) => {
+        {AGENT_NAV.filter(
+          (item) =>
+            !isEveUsername(username) || !isEveConcealedSubpath(item.sub),
+        ).map((item) => {
           const href = `${base}/${item.sub}`;
           // "New Chat" owns …/chats/new; everything else under chats lights Chats.
           const active =
