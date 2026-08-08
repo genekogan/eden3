@@ -53,6 +53,8 @@ export interface UploadProgress {
 export interface ResumableUploaderOptions {
   apiBaseUrl?: string;
   fetch?: typeof fetch;
+  /** Supplies the current browser auth token for authenticated control calls. */
+  getAuthToken?: () => Promise<string | null>;
   refreshCredentials?: () => Promise<void>;
   maxPartAttempts?: number;
   defaultPartSizeBytes?: number;
@@ -62,6 +64,8 @@ export interface UploadFileOptions {
   purpose: UploadPurpose;
   /** Existing durable session to continue after reload/process loss. */
   uploadId?: string;
+  /** Fires as soon as a durable session exists, before any part transfer. */
+  onSession?: (session: { uploadId: string; objectId: string }) => void;
   onProgress?: (progress: UploadProgress) => void;
   signal?: AbortSignal;
 }
@@ -89,6 +93,7 @@ export class UploadClientError extends Error {
 export class ResumableUploader {
   private readonly apiBaseUrl: string;
   private readonly fetcher: typeof fetch;
+  private readonly getAuthToken?: () => Promise<string | null>;
   private readonly refreshCredentials?: () => Promise<void>;
   private readonly maxPartAttempts: number;
   private readonly defaultPartSizeBytes: number;
@@ -96,6 +101,7 @@ export class ResumableUploader {
   constructor(options: ResumableUploaderOptions = {}) {
     this.apiBaseUrl = (options.apiBaseUrl ?? '').replace(/\/$/, '');
     this.fetcher = options.fetch ?? fetch;
+    this.getAuthToken = options.getAuthToken;
     this.refreshCredentials = options.refreshCredentials;
     this.maxPartAttempts = options.maxPartAttempts ?? 3;
     this.defaultPartSizeBytes = options.defaultPartSizeBytes ?? 8 * 1024 * 1024;
@@ -120,7 +126,13 @@ export class ResumableUploader {
           }),
         }, options.signal);
     const uploadId = options.uploadId ?? initiated!.uploadId;
+    if (initiated) {
+      options.onSession?.({ uploadId, objectId: initiated.objectId });
+    }
     let status = await this.api<UploadStatus>(`/uploads/${uploadId}`, {}, options.signal);
+    if (!initiated) {
+      options.onSession?.({ uploadId, objectId: status.objectId });
+    }
     if (
       status.declaredSizeBytes !== file.size ||
       status.declaredSha256 !== fullSha256 ||
@@ -191,7 +203,13 @@ export class ResumableUploader {
         // manually. The backend signature still binds the automatically
         // emitted value; the slice length is fixed by durable session state.
         const { ['content-length']: _contentLength, ...browserSettableHeaders } = signed.requiredHeaders;
-        const response = await this.fetcher(signed.url, {
+        // The local backend returns an API-relative capability route. Browser
+        // calls must keep it behind the same /api rewrite as control calls;
+        // R2 returns an absolute provider URL and is left untouched.
+        const transferUrl = signed.url.startsWith('/uploads/')
+          ? `${this.apiBaseUrl}${signed.url}`
+          : signed.url;
+        const response = await this.fetcher(transferUrl, {
           method: 'PUT',
           headers: {
             'content-type': signed.url.startsWith('/uploads/')
@@ -220,12 +238,19 @@ export class ResumableUploader {
   }
 
   private async api<T = unknown>(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<T> {
-    const request = () => this.fetcher(`${this.apiBaseUrl}${path}`, {
-      ...init,
-      credentials: 'include',
-      headers: { 'content-type': 'application/json', ...init.headers },
-      signal,
-    });
+    const request = async () => {
+      const authToken = await this.getAuthToken?.();
+      return this.fetcher(`${this.apiBaseUrl}${path}`, {
+        ...init,
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/json',
+          ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+          ...init.headers,
+        },
+        signal,
+      });
+    };
     let response = await request();
     if (response.status === 401 && this.refreshCredentials) {
       await this.refreshCredentials();

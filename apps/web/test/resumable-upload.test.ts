@@ -12,6 +12,76 @@ function fixture(contents: string, name = 'fixture.txt') {
 }
 
 describe('ResumableUploader', () => {
+  it('reports a durable session before status transfer and authenticates control calls', async () => {
+    const sessions: Array<{ uploadId: string; objectId: string }> = [];
+    const fetcher = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = String(input);
+      const headers = new Headers(init.headers);
+      expect(headers.get('authorization')).toBe('Bearer clerk-token');
+      if (url === '/api/uploads') {
+        return json({ uploadId: 'session-durable', objectId: 'object-durable', partSizeBytes: 3, partCount: 1 }, 201);
+      }
+      if (url === '/api/uploads/session-durable') {
+        return json({ error: { code: 'database_unavailable', message: 'retry' } }, 503);
+      }
+      throw new Error(`Unexpected ${url}`);
+    });
+    const uploader = new ResumableUploader({
+      apiBaseUrl: '/api',
+      fetch: fetcher as typeof fetch,
+      getAuthToken: async () => 'clerk-token',
+    });
+
+    await expect(
+      uploader.uploadFile(fixture('abc'), {
+        purpose: 'chat',
+        onSession: (session) => sessions.push(session),
+      }),
+    ).rejects.toMatchObject({ status: 503, code: 'database_unavailable' });
+    expect(sessions).toEqual([{ uploadId: 'session-durable', objectId: 'object-durable' }]);
+  });
+
+  it('routes local capability PUTs through the API rewrite without leaking Clerk auth', async () => {
+    const contents = 'abc';
+    const sha = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad';
+    const fetcher = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = String(input);
+      const method = init.method ?? 'GET';
+      const headers = new Headers(init.headers);
+      if (url === '/api/uploads' && method === 'POST') {
+        return json({ uploadId: 'local-1', objectId: 'object-1', partSizeBytes: 3, partCount: 1 }, 201);
+      }
+      if (url === '/api/uploads/local-1' && method === 'GET') {
+        return json({ uploadId: 'local-1', objectId: 'object-1', state: 'initiated', partSizeBytes: 3,
+          partCount: 1, completedParts: [], nextOffset: 0, objectUrl: null,
+          declaredSizeBytes: 3, declaredMime: 'text/plain', declaredSha256: sha });
+      }
+      if (url === '/api/uploads/local-1/parts/1' && method === 'POST') {
+        return json({ url: '/uploads/local-1/parts/1', requiredHeaders: {
+          'x-eden-upload-capability': 'capability-only', 'content-length': '3',
+        }, expiresAt: new Date().toISOString() });
+      }
+      if (url === '/api/uploads/local-1/parts/1' && method === 'PUT') {
+        expect(headers.get('x-eden-upload-capability')).toBe('capability-only');
+        expect(headers.get('authorization')).toBeNull();
+        expect(headers.get('content-type')).toBe('application/octet-stream');
+        return json({ partNumber: 1 }, 201);
+      }
+      if (url === '/api/uploads/local-1/parts/1/complete') return json({ partNumber: 1 });
+      if (url === '/api/uploads/local-1/complete') {
+        return json({ object: { id: 'object-1', url: '/media/object-1' } });
+      }
+      throw new Error(`Unexpected ${method} ${url}`);
+    });
+    const uploader = new ResumableUploader({
+      apiBaseUrl: '/api', fetch: fetcher as typeof fetch, getAuthToken: async () => 'clerk-token',
+    });
+
+    await expect(uploader.uploadFile(fixture(contents), { purpose: 'chat' })).resolves.toEqual({
+      objectId: 'object-1', url: '/media/object-1',
+    });
+  });
+
   it('resumes at a nonzero offset and refreshes an expired part URL without re-uploading completed parts', async () => {
     const calls: Array<{ url: string; method: string }> = [];
     let signCount = 0;
