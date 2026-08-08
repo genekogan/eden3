@@ -79,6 +79,8 @@ import type {
   TaskCreateInput,
   TaskRunResult,
   TaskUpdateInput,
+  TelegramManagedBotOnboardingStart,
+  TelegramManagedBotOnboardingStatus,
   TriggerDto,
   VoucherRedeemResult,
   WorkspaceFileResponse,
@@ -907,6 +909,44 @@ export const api = {
     async create(input: ChannelConnectionCreateInput): Promise<ChannelConnectionDto> {
       return unwrap<ChannelConnectionDto>(
         await post<unknown>("/channels/connections", input),
+        "connection",
+      );
+    },
+
+    /** Start owner binding without accepting or returning a raw Telegram bot token. */
+    startManagedTelegram(input: {
+      suggestedBotUsername?: string;
+    }): Promise<TelegramManagedBotOnboardingStart> {
+      return post<TelegramManagedBotOnboardingStart>(
+        "/channels/telegram/managed-bots/onboarding",
+        input,
+      );
+    },
+
+    /** Poll safe onboarding state; provider ids and SecretRefs are never returned. */
+    managedTelegramStatus(intentId: string): Promise<TelegramManagedBotOnboardingStatus> {
+      return get<TelegramManagedBotOnboardingStatus>(
+        `/channels/telegram/managed-bots/onboarding/${enc(intentId)}`,
+      );
+    },
+
+    cancelManagedTelegram(intentId: string): Promise<{ ok?: true }> {
+      return post<{ ok?: true }>(
+        `/channels/telegram/managed-bots/onboarding/${enc(intentId)}/cancel`,
+        {},
+      );
+    },
+
+    /** Attach the stored managed credential to an owned agent. */
+    async attachManagedTelegram(
+      intentId: string,
+      input: { agentUsername: string; label?: string },
+    ): Promise<ChannelConnectionDto> {
+      return unwrap<ChannelConnectionDto>(
+        await post<unknown>(
+          `/channels/telegram/managed-bots/onboarding/${enc(intentId)}/attach`,
+          input,
+        ),
         "connection",
       );
     },
