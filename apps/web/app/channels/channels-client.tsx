@@ -21,6 +21,8 @@ import {
   channelClientDeepLink,
   connectionHealthLabel,
   discordInviteUrl,
+  parseDiscordGroupCoordinates,
+  parseTelegramGroupCoordinates,
   telegramManagedStep,
   trustedTelegramUrl,
   xClientDeepLink,
@@ -43,6 +45,7 @@ const MAX_AGENT_PAGES = 5;
 interface ConnectionDraft {
   dmPolicy: "pairing" | "allowlist";
   allowFrom: string;
+  groups: string;
 }
 
 type Phase = "loading" | "ready" | "error";
@@ -70,6 +73,12 @@ function initialDraft(connection: ChannelConnectionDto): ConnectionDraft {
   return {
     dmPolicy: connection.config.dmPolicy,
     allowFrom: connection.config.allowFrom.join(", "),
+    groups:
+      connection.channel === "discord"
+        ? connection.config.discordGuilds
+            .flatMap((guild) => guild.channelIds.map((channelId) => `${guild.guildId}/${channelId}`))
+            .join(", ")
+        : connection.config.telegramGroups.map((group) => group.groupId).join(", "),
   };
 }
 
@@ -513,11 +522,29 @@ export function ChannelsClient({
       setNote("Allowlist policy requires at least one user ID.");
       return;
     }
+    const discordGuilds =
+      connection.channel === "discord" ? parseDiscordGroupCoordinates(draft.groups) : [];
+    const telegramGroups =
+      connection.channel === "telegram" ? parseTelegramGroupCoordinates(draft.groups) : [];
+    if (!discordGuilds || !telegramGroups) {
+      setNote(
+        connection.channel === "discord"
+          ? "Discord groups must use guildId/channelId numeric pairs."
+          : "Telegram group IDs must be negative numeric chat IDs.",
+      );
+      return;
+    }
+    if ((discordGuilds.length > 0 || telegramGroups.length > 0) && allowFrom.length === 0) {
+      setNote("Group access requires at least one allowed sender ID.");
+      return;
+    }
     setBusy(`activate:${connection.id}`);
     try {
       const result = await api.channels.activate(connection.id, {
         dmPolicy: draft.dmPolicy,
         allowFrom,
+        discordGuilds,
+        telegramGroups,
       });
       if (!alive.current) return;
       mergeConnection(result.connection);
@@ -660,14 +687,19 @@ export function ChannelsClient({
           </FormField>
         </div>
 
-        {connection.channel === "discord" ? (
-          <div className="mt-3 rounded-lg border border-edge bg-background/50 p-3">
-            <p className="font-mono text-[10px] uppercase tracking-wider text-faint">Direct messages only</p>
-            <p className="mt-2 text-xs text-muted">
-              Guild and channel delivery is disabled so shared transcripts cannot access private user memory.
-            </p>
-          </div>
-        ) : null}
+        <div className="mt-3 rounded-lg border border-edge bg-background/50 p-3">
+          <FormField label={connection.channel === "discord" ? "Allowlisted guild/channel pairs" : "Allowlisted Telegram group IDs"}>
+            <input
+              value={draft.groups}
+              onChange={(event) => setDrafts((current) => ({ ...current, [connection.id]: { ...draft, groups: event.target.value } }))}
+              placeholder={connection.channel === "discord" ? "guildId/channelId, guildId/channelId" : "-1001234567890"}
+              className={inputClass}
+            />
+          </FormField>
+          <p className="mt-2 text-xs text-muted">
+            Optional. Group replies require an allowed sender and an explicit bot mention. Group memory is isolated from every participant&apos;s private DM memory.
+          </p>
+        </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
           {connection.desiredState === "active" ? (

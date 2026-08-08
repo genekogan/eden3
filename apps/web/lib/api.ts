@@ -1026,6 +1026,8 @@ export const api = {
       input: {
         dmPolicy: "pairing" | "allowlist";
         allowFrom: string[];
+        discordGuilds?: Array<{ guildId: string; channelIds: string[] }>;
+        telegramGroups?: Array<{ groupId: string }>;
       },
     ): Promise<{
       ok: boolean;

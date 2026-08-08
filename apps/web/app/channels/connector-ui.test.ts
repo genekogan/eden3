@@ -6,6 +6,8 @@ import {
   channelClientDeepLink,
   connectionHealthLabel,
   discordInviteUrl,
+  parseDiscordGroupCoordinates,
+  parseTelegramGroupCoordinates,
   telegramManagedStep,
   trustedTelegramUrl,
   xClientDeepLink,
@@ -34,6 +36,7 @@ function connection(overrides: Partial<ChannelConnectionDto> = {}): ChannelConne
       allowFrom: [],
       deliveryScope: 'direct_messages_only',
       discordGuilds: [],
+      telegramGroups: [],
     },
     createdAt: '2026-08-08T00:00:00.000Z',
     updatedAt: '2026-08-08T00:00:00.000Z',
@@ -42,6 +45,18 @@ function connection(overrides: Partial<ChannelConnectionDto> = {}): ChannelConne
 }
 
 describe('connector links', () => {
+  it('parses only canonical allowlisted provider group coordinates', () => {
+    expect(parseDiscordGroupCoordinates('111/222, 111/333, 444/555')).toEqual([
+      { guildId: '111', channelIds: ['222', '333'] },
+      { guildId: '444', channelIds: ['555'] },
+    ]);
+    expect(parseDiscordGroupCoordinates('111')).toBeNull();
+    expect(parseTelegramGroupCoordinates('-100123, -100456')).toEqual([
+      { groupId: '-100123' },
+      { groupId: '-100456' },
+    ]);
+    expect(parseTelegramGroupCoordinates('100123')).toBeNull();
+  });
   it('builds a fixed-scope Discord invite from a validated snowflake', () => {
     const url = new URL(discordInviteUrl('123456789')!);
     expect(url.searchParams.get('client_id')).toBe('123456789');

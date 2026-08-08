@@ -1,3 +1,5 @@
+import { parseSecretId } from '@eden3/gateway';
+
 /**
  * Narrow hand-off into the existing encrypted channel-token vault.
  *
@@ -49,4 +51,3 @@ export function assertRequestScopedSecretHandle(handle: ChannelSecretHandle): vo
     throw new Error('channel custody returned a cross-connection SecretRef');
   }
 }
-import { parseSecretId } from '@eden3/gateway';

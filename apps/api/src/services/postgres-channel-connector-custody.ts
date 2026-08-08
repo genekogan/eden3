@@ -1,11 +1,10 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { getEnv } from '@eden3/core';
-import { db, pg, secretAccessAuditEvents } from '@eden3/db';
+import { pg } from '@eden3/db';
 import {
-  CAPABILITY_EPOCH_DEFAULT,
   deriveCapabilityKey,
-  mintCapabilityId,
+  hostedChannelSecretRef,
 } from '@eden3/gateway';
 
 import {
@@ -46,13 +45,15 @@ function capabilityKey(): Buffer {
 function handleFor(row: Pick<CustodyRow, 'id' | 'account_id' | 'channel' | 'runtime_account_id'>, capKey: Buffer): ChannelSecretHandle {
   return {
     connectionId: row.id,
-    secretRefId: mintCapabilityId(capKey, {
-      connectionId: row.id,
-      accountId: row.account_id,
-      channel: row.channel,
-      runtimeAccountId: row.runtime_account_id,
-      epoch: CAPABILITY_EPOCH_DEFAULT,
-    }),
+    secretRefId: hostedChannelSecretRef(
+      {
+        connectionId: row.id,
+        accountId: row.account_id,
+        channel: row.channel,
+        runtimeAccountId: row.runtime_account_id,
+      },
+      capKey,
+    ).id,
   };
 }
 
@@ -77,7 +78,7 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
     this.capKey = capKey ?? capabilityKey();
   }
 
-  async seal(input: {
+  async sealScoped(input: {
     accountId: string;
     agentId: string | null;
     channel: string;
@@ -91,7 +92,7 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
       input.plaintext,
       channelTokenSecretContext({ connectionId: id, accountId: input.accountId, channel: 'x' }),
     );
-    const rows = await pg.begin(async (tx) => {
+    return pg.begin(async (tx) => {
       await tx`select pg_advisory_xact_lock(hashtextextended(${`channel-credential-token:x:${encrypted.tokenSha256}`}, 0))`;
       const conflict = await tx<{ id: string }[]>`
         select id from channel_connections
@@ -124,11 +125,12 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
           ${tx.json(JSON.stringify({ channel: row.channel, runtimeAccountId: row.runtime_account_id }))}
         )
       `;
-      return inserted;
+      const handle = handleFor(row, this.capKey);
+      // Validation is intentionally inside the transaction: a bad capability
+      // mint cannot publish an orphaned encrypted credential row.
+      assertRequestScopedSecretHandle(handle);
+      return handle;
     });
-    const row = rows[0];
-    if (!row) throw new Error('channel credential custody write failed');
-    return handleFor(row, this.capKey);
   }
 
   async withPlaintext<T>(
@@ -149,7 +151,15 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
       if (!row || !sameSecretRef(handleFor(row, this.capKey).secretRefId, handle.secretRefId)) {
         throw new Error('channel credential unavailable');
       }
-      await this.audit(row, 'connector_retrieve');
+      await tx`
+        insert into secret_access_audit_events (
+          actor_account_id, owner_account_id, secret_kind, secret_id, action, metadata
+        ) values (
+          ${row.account_id}, ${row.account_id}, 'channel_token', ${row.id},
+          'connector_retrieve',
+          ${tx.json(JSON.stringify({ channel: row.channel, runtimeAccountId: row.runtime_account_id }))}
+        )
+      `;
       const plaintext = this.vault.decrypt(
         {
           tokenCiphertext: row.token_ciphertext,
@@ -169,7 +179,7 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
 
   async revoke(handle: ChannelSecretHandle): Promise<void> {
     assertRequestScopedSecretHandle(handle);
-    const row = await pg.begin(async (tx) => {
+    await pg.begin(async (tx) => {
       await tx`select pg_advisory_xact_lock(hashtextextended(${`channel-connector-use:${handle.connectionId}`}, 0))`;
       const candidates = await tx<CustodyRow[]>`
         select id, account_id, channel, runtime_account_id,
@@ -191,19 +201,15 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
             updated_at = now()
         where id = ${candidate.id} and channel = 'x'
       `;
-      return candidate;
-    });
-    await this.audit(row, 'revoke');
-  }
-
-  private async audit(row: Pick<CustodyRow, 'id' | 'account_id' | 'channel' | 'runtime_account_id'>, action: string): Promise<void> {
-    await db.insert(secretAccessAuditEvents).values({
-      actorAccountId: row.account_id,
-      ownerAccountId: row.account_id,
-      secretKind: 'channel_token',
-      secretId: row.id,
-      action,
-      metadata: { channel: row.channel, runtimeAccountId: row.runtime_account_id },
+      await tx`
+        insert into secret_access_audit_events (
+          actor_account_id, owner_account_id, secret_kind, secret_id, action, metadata
+        ) values (
+          ${candidate.account_id}, ${candidate.account_id}, 'channel_token', ${candidate.id},
+          'revoke',
+          ${tx.json(JSON.stringify({ channel: candidate.channel, runtimeAccountId: candidate.runtime_account_id }))}
+        )
+      `;
     });
   }
 }
