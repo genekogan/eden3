@@ -488,7 +488,9 @@ export const TURN_CEILINGS: readonly TurnCeilingEntry[] = [
     provider: 'anthropic',
     model: 'claude-haiku-4-5',
     maxTurnUsd: 0.045,
-    maxOutputTokens: 16384,
+    // 8192 × $5/M = $0.041 ≤ the $0.045 ceiling: the declared per-call output
+    // cap can never by itself exceed the economic authorization.
+    maxOutputTokens: 8192,
     effectiveDate: '2026-08-08',
     source:
       'T08-U02 policy snapshot: ≈2.3× observed max (26 manna); ≈61 manna — below the 100-manna signup grant so the default route stays usable',
@@ -513,7 +515,8 @@ export const TURN_CEILINGS: readonly TurnCeilingEntry[] = [
     provider: 'anthropic',
     model: 'claude-opus-4-6',
     maxTurnUsd: 1.12,
-    maxOutputTokens: 32768,
+    // 14336 × $75/M = $1.075 ≤ the $1.12 ceiling.
+    maxOutputTokens: 14336,
     effectiveDate: '2026-08-08',
     source:
       'T08-U02 policy snapshot: 5× sonnet rates; observed max 235 manna; ≈1512 manna ceiling',

@@ -126,5 +126,12 @@ describe('runTurn refund-guard (pre-stream failure)', () => {
     expect(refundTx, 'a chat refund should have been recorded').toBeDefined();
     expect(Number(spend!.amount)).toBe(-61);
     expect(Number(refundTx!.amount)).toBe(61);
+    // State-machine truth, not just aggregate balance (checkpoint-#2): the
+    // authorization ended 'reversed' and the refund is linked to the debit.
+    const [authz] = await pg<{ state: string }[]>`
+      select ta.state from turn_authorizations ta
+      join manna_transactions mt on mt.id = ta.reservation_tx_id
+      where mt.idempotency_key is not null and ta.account_id = ${userId}`;
+    expect(authz).toMatchObject({ state: 'reversed' });
   });
 });

@@ -366,7 +366,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         throw new ApiError(
           402,
           'insufficient_manna',
-          `Not enough manna: this run costs ${err.required}, you have ${err.available}`,
+          `Not enough manna: this run reserves up to ${err.required} (unused is refunded when the turn settles), you have ${err.available}`,
         );
       }
       if (err instanceof DailyCapExceededError) {

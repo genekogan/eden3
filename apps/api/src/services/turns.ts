@@ -691,18 +691,32 @@ async function runClaimedTurn(
       ...(taskExternalId ? { taskExternalId } : {}),
       db: tx,
     });
-    // A replayed reservation (restart-safe scheduled turn ids) must hold
-    // EXACTLY this authorization's amount — a legacy or foreign debit under
-    // the same key can never masquerade as a larger authorization.
-    if (
-      debited.alreadyApplied &&
-      -numericToNumber(debited.transaction.amount) !== authorization.manna
-    ) {
-      throw new ApiError(
-        409,
-        'turn_reservation_conflict',
-        `Turn ${turnId} already holds a reservation of a different amount — refusing to run`,
-      );
+    // A replayed reservation (restart-safe scheduled turn ids) must be
+    // EXACTLY this authorization's debit — same amount, same payer, same
+    // spend type, and still unrefunded. A legacy, foreign, or already-
+    // reversed debit under the same key can never masquerade as a live
+    // authorization (checkpoint-#2).
+    if (debited.alreadyApplied) {
+      const conflict = (reason: string): ApiError =>
+        new ApiError(
+          409,
+          'turn_reservation_conflict',
+          `Turn ${turnId} reservation replay rejected (${reason}) — refusing to run`,
+        );
+      if (-numericToNumber(debited.transaction.amount) !== authorization.manna) {
+        throw conflict('amount mismatch');
+      }
+      if (debited.transaction.type !== spendType) throw conflict('spend-type mismatch');
+      const owner = (await tx.execute(sql`
+        select 1 from manna_accounts
+        where id = ${debited.transaction.mannaAccountId} and account_id = ${user.accountId}
+      `)) as unknown as unknown[];
+      if (owner.length === 0) throw conflict('payer mismatch');
+      const refunds = (await tx.execute(sql`
+        select 1 from manna_transactions
+        where refunds_transaction_id = ${debited.transaction.id} and amount > 0 limit 1
+      `)) as unknown as unknown[];
+      if (refunds.length > 0) throw conflict('reservation already reversed');
     }
     const authzRow = await insertTurnAuthorization(tx, {
       turnId,
@@ -914,7 +928,7 @@ async function runClaimedTurn(
       const metering = record.metering ?? meterChatUsage(record.usage, meteringModel);
       // Paired with the usage_events_turn_unique partial index: a retried or
       // crashed-and-replayed pipeline cannot double-record this turn.
-      await (options.dbc ?? db).insert(usageEvents).values({
+      const inserted = await (options.dbc ?? db).insert(usageEvents).values({
         eventType: usageEventType,
         status: record.status,
         userId: user.accountId,
@@ -962,7 +976,28 @@ async function runClaimedTurn(
           userMessageId: userMessage.id,
           source: params.source ?? null,
         },
-      }).onConflictDoNothing();
+      }).onConflictDoNothing().returning({ id: usageEvents.id });
+      if (options.strict === true && inserted.length === 0) {
+        // A conflicting usage row already exists for this turn. In strict
+        // (terminal-transaction) mode a silent no-op could commit settlement
+        // against a stale error row — verify the survivor is an equivalent
+        // terminal row, else abort the transaction (checkpoint-#2).
+        const survivor = (await (options.dbc ?? db).execute(sql`
+          select status, manna from usage_events
+          where event_type = ${usageEventType} and turn_id = ${turnId}
+        `)) as unknown as { status: string; manna: number | null }[];
+        const expectedManna =
+          record.chargedManna ?? record.settlement?.chargedManna ?? null;
+        const matches =
+          survivor.length === 1 &&
+          survivor[0]!.status === record.status &&
+          (expectedManna === null || Number(survivor[0]!.manna) === expectedManna);
+        if (!matches) {
+          throw new Error(
+            `usage event for turn ${turnId} already exists with a different terminal state — refusing to finalize`,
+          );
+        }
+      }
       usageEventRecorded = true;
     } catch (err) {
       if (options.strict === true) throw err;
@@ -1103,6 +1138,36 @@ async function runClaimedTurn(
             publish({ type: 'error', turnId, code: errorCode, message: errorMessage });
             break;
           }
+          if (event.emptyTurn && isAutomation) {
+            // Scheduled/heartbeat turns with no assistant output are failures
+            // by product rule (SCHEDULED_TASK_EMPTY_RESPONSE). Reverse INSIDE
+            // the state machine instead of settling and letting the scheduler
+            // refund a 'settled' charge out-of-band (checkpoint-#2 critical).
+            const errorCode = 'scheduled_task_empty_response';
+            const errorMessage = 'Scheduled task completed without an assistant response';
+            outcome.errorCode = errorCode;
+            outcome.errorMessage = errorMessage;
+            const fullyRefunded = await reverseTurn();
+            await params.beforeTerminal?.();
+            await withClaimFence((dbc) =>
+              recordUsageEvent(
+                {
+                  status: 'error',
+                  usage: effectiveUsage,
+                  chargedManna: fullyRefunded ? 0 : authorization.manna,
+                  errorCode,
+                  errorMessage,
+                  finishReason: event.finishReason ?? null,
+                  emptyTurn: true,
+                  usageCapture: usageCapture ?? null,
+                  usageSource,
+                },
+                dbc ? { dbc, strict: true } : {},
+              ),
+            );
+            publish({ type: 'error', turnId, code: errorCode, message: errorMessage });
+            break;
+          }
           const metering = meterChatUsage(effectiveUsage, meteringModel);
           const meteredManna = metering.status === 'metered' ? metering.manna : null;
           // The hard economic ceiling: settle ≤ authorized-max, always. A
@@ -1176,6 +1241,10 @@ async function runClaimedTurn(
           try {
             terminal = await db.transaction(async (tx) => {
               if (params.fundingFence) await params.fundingFence(tx);
+              // Authorization row FIRST, ledger second — the same lock order
+              // as reverseTurnAuthorization, so settle and reap/reverse can
+              // never ABBA-deadlock (checkpoint-#2).
+              await markTurnSettled(tx, turnId, { chargedManna, overrun });
               const leg = await settleReservation({
                 reservationKey: ledgerTurnKey,
                 chargeManna: chargedManna,
@@ -1183,7 +1252,6 @@ async function runClaimedTurn(
                 type: isMemoryDream ? 'refund:memory-dream:settle' : 'refund:chat:settle',
                 db: tx,
               });
-              await markTurnSettled(tx, turnId, { chargedManna, overrun });
               const settlement: ChatChargeSettlement = {
                 status: metering.status === 'metered' ? 'settled' : 'unmetered',
                 reservedManna: authorization.manna,
@@ -1237,7 +1305,10 @@ async function runClaimedTurn(
             if (terminalErr instanceof TurnClaimLostError) throw terminalErr;
             // Nothing of the terminal committed (state is still 'reserved'):
             // fail closed — reverse the whole reservation, expose no
-            // under-billed success.
+            // under-billed success. The rolled-back transaction may have set
+            // the usage flag before aborting — clear it so the error row
+            // below is actually written.
+            usageEventRecorded = false;
             onError(terminalErr, 'chat turn terminal settlement');
             const errorCode = settlementErrorCode(terminalErr);
             const errorMessage =

@@ -330,10 +330,18 @@ describe('economic authorization kernel (T08-U02, FG-ECON core)', () => {
   it('A5: two concurrent turns racing a balance that funds only one — exactly one reaches the provider', async () => {
     const fixture = await makeFixture(Math.floor(HAIKU_AUTHORIZED_MAX * 1.5)); // 91 < 2×61
     let providerCalls = 0;
+    // Deterministic race: the winner BLOCKS inside the provider until the
+    // loser's pre-provider rejection has been observed, so this can never
+    // degenerate into a sequential pass (checkpoint-#2).
+    let loserRejected!: () => void;
+    const loserGate = new Promise<void>((resolve) => {
+      loserRejected = resolve;
+    });
     const compat: CompatClientLike = {
       async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
         providerCalls += 1;
         yield { type: 'turn.started' };
+        await loserGate;
         yield {
           type: 'turn.completed',
           text: 'winner output',
@@ -351,7 +359,12 @@ describe('economic authorization kernel (T08-U02, FG-ECON core)', () => {
         content: 'race the balance',
         beginStream: sink,
       });
-    const outcomes = await Promise.allSettled([run(), run()]);
+    const first = run();
+    const second = run().catch((err) => {
+      loserRejected();
+      throw err;
+    });
+    const outcomes = await Promise.allSettled([first, second]);
     const fulfilled = outcomes.filter((o) => o.status === 'fulfilled');
     const rejected = outcomes.filter((o): o is PromiseRejectedResult => o.status === 'rejected');
     expect(providerCalls).toBe(1);
@@ -463,6 +476,67 @@ describe('economic authorization kernel (T08-U02, FG-ECON core)', () => {
     expect(usage!.metadata.settlement).toMatchObject({ status: 'unmetered', reason: 'missing_usage' });
     const authz = await authzRow(outcome.turnId);
     expect(authz).toMatchObject({ state: 'settled' });
+  });
+
+  it('A6b: a stream that drops without a terminal event fully reverses the reservation', async () => {
+    const fixture = await makeFixture(200);
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield { type: 'token', delta: 'partial…' };
+        // Generator ends without turn.completed/error — the drop case.
+      },
+    };
+    const outcome = await runTurn(makeDeps(compat), {
+      session: fixture.session,
+      agent: fixture.agent,
+      user: fixture.user,
+      content: 'drop mid-stream',
+      beginStream: sink,
+    });
+    expect(outcome.errorCode).toBe('gateway_stream_error');
+    expect((await getBalance(fixture.user.accountId)).total).toBe(200);
+    expect(await authzRow(outcome.turnId)).toMatchObject({ state: 'reversed' });
+  });
+
+  it('A3b: mixed subscription/durable pots settle and restore split-exactly through the full pipeline', async () => {
+    const fixture = await makeFixture(50);
+    await credit({
+      accountId: fixture.user.accountId,
+      amount: 40,
+      type: 'credit:subscription',
+      toSubscriptionBalance: true,
+    });
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield {
+          type: 'turn.completed',
+          text: 'mixed pots',
+          emptyTurn: false,
+          finishReason: 'stop',
+          // 30k in + 2k out on haiku = 54 manna actual.
+          usage: { promptTokens: 30_000, completionTokens: 2_000, totalTokens: 32_000 },
+        };
+      },
+    };
+    const outcome = await runTurn(makeDeps(compat), {
+      session: fixture.session,
+      agent: fixture.agent,
+      user: fixture.user,
+      content: 'draw both pots',
+      beginStream: sink,
+    });
+    expect(outcome.errorCode).toBeNull();
+    // Reservation drew 40 sub + 21 durable; charge 54 draws subscription-
+    // first (40 sub + 14 durable); the unused 7 restores to durable.
+    const balance = await getBalance(fixture.user.accountId);
+    expect(balance.subscriptionBalance).toBe(0);
+    expect(balance.balance).toBe(50 - 14);
+    const authz = await authzRow(outcome.turnId);
+    expect(authz).toMatchObject({ state: 'settled' });
+    expect(Number(authz!.reserved_subscription_manna)).toBe(40);
+    expect(Number(authz!.charged_manna)).toBe(54);
   });
 
   it('F10: a foreign debit under the turn key can never masquerade as the authorization', async () => {

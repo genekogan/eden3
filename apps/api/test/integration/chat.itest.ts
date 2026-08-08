@@ -194,6 +194,10 @@ beforeAll(async () => {
   const [broke] = await pg<{ id: string }[]>`
     insert into accounts (type, username) values ('user', ${usernames.broke}) returning id`;
   brokeId = broke!.id;
+  // 60 manna: comfortably funds the OLD flat 1-manna reserve but NOT the
+  // worst-case 61-manna haiku authorization — this 402 exists ONLY under the
+  // kernel (checkpoint-#2 discriminating case).
+  await pg`insert into manna_accounts (account_id, balance) values (${brokeId}, '60.0000')`;
 
   // Reuse an existing testbot agents row when present (unique openclaw_id).
   const existingAgent = await pg<{ accountId: string; username: string }[]>`

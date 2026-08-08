@@ -204,6 +204,13 @@
       "when": 1786175723859,
       "tag": "0028_turn_authorizations",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1786183566548,
+      "tag": "0029_turn_authorization_constraints",
+      "breakpoints": true
     }
   ]
 }

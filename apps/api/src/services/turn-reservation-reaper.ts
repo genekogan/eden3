@@ -1,5 +1,5 @@
 import { db, turnAuthorizations } from '@eden3/db';
-import { and, eq, lt } from 'drizzle-orm';
+import { and, asc, eq, inArray, lt } from 'drizzle-orm';
 
 import { reverseTurnAuthorization } from './turn-authorization';
 
@@ -31,6 +31,12 @@ export interface TurnReservationReaperOptions {
   /** Ledger label for reaped reversals. */
   refundType?: string;
   now?: () => Date;
+  /**
+   * Restrict the sweep to these payer accounts. TEST ISOLATION ONLY — suites
+   * running against a shared database must never reap rows they did not seed.
+   * Production always runs unscoped.
+   */
+  accountScope?: string[];
 }
 
 export interface ReapOutcome {
@@ -44,6 +50,7 @@ export class TurnReservationReaper {
   private readonly onError: (err: unknown, context: string) => void;
   private readonly refundType: string;
   private readonly now: () => Date;
+  private readonly accountScope: string[] | null;
   private timer: NodeJS.Timeout | null = null;
   private running = false;
 
@@ -53,6 +60,7 @@ export class TurnReservationReaper {
     this.onError = options.onError ?? (() => {});
     this.refundType = options.refundType ?? 'refund:turn-reservation-reaped';
     this.now = options.now ?? (() => new Date());
+    this.accountScope = options.accountScope ?? null;
   }
 
   start(): void {
@@ -76,12 +84,19 @@ export class TurnReservationReaper {
     this.running = true;
     try {
       const cutoff = new Date(this.now().getTime() - this.ttlMs);
+      // Oldest first: a page of transiently-failing rows must not starve
+      // still-older orphans behind an unordered LIMIT.
       const stale = await db
         .select({ turnId: turnAuthorizations.turnId })
         .from(turnAuthorizations)
         .where(
-          and(eq(turnAuthorizations.state, 'reserved'), lt(turnAuthorizations.createdAt, cutoff)),
+          and(
+            eq(turnAuthorizations.state, 'reserved'),
+            lt(turnAuthorizations.createdAt, cutoff),
+            ...(this.accountScope ? [inArray(turnAuthorizations.accountId, this.accountScope)] : []),
+          ),
         )
+        .orderBy(asc(turnAuthorizations.createdAt))
         .limit(200);
 
       let reaped = 0;

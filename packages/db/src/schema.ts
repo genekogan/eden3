@@ -614,6 +614,25 @@ export const turnAuthorizations = pgTable(
   (t) => [
     // The reaper's scan: old rows still in 'reserved'.
     index('turn_authorizations_state_created_idx').on(t.state, t.createdAt),
+    // One authorization per reservation debit — a ledger row can never fund
+    // two authorizations (checkpoint-#2).
+    uniqueIndex('turn_authorizations_reservation_tx_uq').on(t.reservationTxId),
+    // The database enforces the money state machine's arithmetic, not just
+    // the application: valid state, positive max, split within the max,
+    // charge within the max (settle ≤ authorized-max at the DDL level).
+    check(
+      'turn_authorizations_state_chk',
+      sql`${t.state} in ('reserved','settled','reversed','reaped')`,
+    ),
+    check('turn_authorizations_max_positive_chk', sql`${t.authorizedMaxManna} > 0`),
+    check(
+      'turn_authorizations_split_within_max_chk',
+      sql`${t.reservedSubscriptionManna} >= 0 and ${t.reservedSubscriptionManna} <= ${t.authorizedMaxManna}`,
+    ),
+    check(
+      'turn_authorizations_charge_within_max_chk',
+      sql`${t.chargedManna} is null or (${t.chargedManna} >= 0 and ${t.chargedManna} <= ${t.authorizedMaxManna})`,
+    ),
   ],
 );
 

@@ -105,7 +105,7 @@ describe('turn-reservation reaper (T08-U02 compensation)', () => {
       state: 'reserved',
       ageMinutes: 90,
     });
-    const reaper = new TurnReservationReaper();
+    const reaper = new TurnReservationReaper({ accountScope: [seeded.accountId] });
     const first = await reaper.runOnce();
     expect(first.reaped).toBeGreaterThanOrEqual(1);
     expect(await stateOf(seeded.turnId)).toBe('reaped');
@@ -133,7 +133,9 @@ describe('turn-reservation reaper (T08-U02 compensation)', () => {
     });
     const reversed = await seedReservation({ amount: 61, state: 'reversed', ageMinutes: 240 });
 
-    const reaper = new TurnReservationReaper();
+    const reaper = new TurnReservationReaper({
+      accountScope: [fresh.accountId, settled.accountId, reversed.accountId],
+    });
     await reaper.runOnce();
 
     expect(await stateOf(fresh.turnId)).toBe('reserved');
@@ -153,7 +155,7 @@ describe('turn-reservation reaper (T08-U02 compensation)', () => {
       ageMinutes: 120,
       settleCharge: 17,
     });
-    const reaper = new TurnReservationReaper();
+    const reaper = new TurnReservationReaper({ accountScope: [seeded.accountId] });
     await reaper.runOnce();
     expect(await stateOf(seeded.turnId)).toBe('reaped');
     expect((await getBalance(seeded.accountId)).total).toBe(200);

@@ -725,13 +725,32 @@ async function refundLeg(params: RefundLegParams): Promise<RefundLegResult | nul
   const legKey = params.key ?? refundIdempotencyKey(params.originalIdempotencyKey);
   const run = async (tx: Tx): Promise<RefundLegResult | null> => {
     const original = await findTransactionByKey(tx, params.originalIdempotencyKey);
+    if (original) {
+      // Serialize refund legs per original debit BEFORE any replay inspection:
+      // two concurrent identical legs must resolve as winner-inserts /
+      // loser-replays, never as a spurious over-refund error (checkpoint-#2).
+      await tx.execute(
+        sql`select id from manna_transactions where id = ${original.id} for update`,
+      );
+    }
     const existing = await findTransactionByKey(tx, legKey);
     if (existing) {
-      // Replay validation: the leg row must reverse THIS original.
+      // Replay validation: the leg row must reverse THIS original, and when
+      // the caller names an amount it must be the amount that leg applied.
       if (original && existing.refundsTransactionId !== original.id) {
         throw new Error(
           `manna: refund key ${legKey} already reverses transaction ` +
             `${existing.refundsTransactionId ?? '<none>'}, not ${original.id}; refusing to replay`,
+        );
+      }
+      const appliedManna = numericToNumber(existing.amount);
+      if (
+        params.amount !== undefined &&
+        Math.abs(appliedManna - Number(params.amount.toFixed(4))) > 1e-9
+      ) {
+        throw new Error(
+          `manna: refund key ${legKey} already applied ${appliedManna}, ` +
+            `refusing a replay that requests ${params.amount}`,
         );
       }
       const remaining = original
@@ -741,7 +760,7 @@ async function refundLeg(params: RefundLegParams): Promise<RefundLegResult | nul
         transaction: existing,
         balance: await balanceOfMannaAccount(tx, existing.mannaAccountId),
         alreadyApplied: true,
-        appliedManna: numericToNumber(existing.amount),
+        appliedManna,
         remainingRefundable: Number(Math.max(0, remaining).toFixed(4)),
       };
     }
@@ -754,12 +773,6 @@ async function refundLeg(params: RefundLegParams): Promise<RefundLegResult | nul
       );
     }
 
-    // Serialize refund legs per original debit: lock the original row for the
-    // duration of this transaction so two legs cannot both read the same
-    // already-refunded sum and jointly over-credit.
-    await tx.execute(
-      sql`select id from manna_transactions where id = ${original.id} for update`,
-    );
     const refunded = await alreadyRefundedManna(tx, original.id);
     const refundable = Number(Math.max(0, originalAmount - refunded).toFixed(4));
     const requested = params.amount ?? refundable;
@@ -824,14 +837,37 @@ async function refundLeg(params: RefundLegParams): Promise<RefundLegResult | nul
     return await inTransaction(dbc, run);
   } catch (err) {
     if (isUniqueViolation(err)) {
+      // Validate the surviving leg exactly like an in-transaction replay —
+      // the race loser must never bless a leg that reverses a different
+      // original or a different amount (checkpoint-#2).
       const existing = await findTransactionByKey(dbc, legKey);
       if (existing) {
+        const original = await findTransactionByKey(dbc, params.originalIdempotencyKey);
+        if (original && existing.refundsTransactionId !== original.id) {
+          throw new Error(
+            `manna: refund key ${legKey} already reverses transaction ` +
+              `${existing.refundsTransactionId ?? '<none>'}, not ${original.id}; refusing to replay`,
+          );
+        }
+        const appliedManna = numericToNumber(existing.amount);
+        if (
+          params.amount !== undefined &&
+          Math.abs(appliedManna - Number(params.amount.toFixed(4))) > 1e-9
+        ) {
+          throw new Error(
+            `manna: refund key ${legKey} already applied ${appliedManna}, ` +
+              `refusing a replay that requests ${params.amount}`,
+          );
+        }
+        const remaining = original
+          ? -numericToNumber(original.amount) - (await alreadyRefundedManna(dbc, original.id))
+          : 0;
         return {
           transaction: existing,
           balance: await balanceOfMannaAccount(dbc, existing.mannaAccountId),
           alreadyApplied: true,
-          appliedManna: numericToNumber(existing.amount),
-          remainingRefundable: 0,
+          appliedManna,
+          remainingRefundable: Number(Math.max(0, remaining).toFixed(4)),
         };
       }
     }

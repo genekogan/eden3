@@ -354,11 +354,14 @@ describe('chat rate limits', () => {
   });
 
   it('rejects over-daily-cap turns before gateway or ledger side effects', async () => {
-    const restore = withEnv('DAILY_MANNA_SPEND_CAP_PER_USER', '1');
+    // Discriminating numbers (checkpoint-#2): 45 spent of a 100 cap leaves
+    // plenty of room for the OLD flat 1-manna reserve but NOT for the
+    // worst-case 61-manna authorization — only the kernel rejects this turn.
+    const restore = withEnv('DAILY_MANNA_SPEND_CAP_PER_USER', '100');
     const fixture = await makeFixture();
     await debit({
       accountId: fixture.userId,
-      amount: 1,
+      amount: 45,
       type: 'spend:chat',
       idempotencyKey: `${marker}:prior-spend:${randomUUID()}`,
     });

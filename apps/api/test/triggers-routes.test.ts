@@ -613,6 +613,7 @@ describe('POST /tasks', () => {
       where id = ${task.id}
     `;
 
+    const compatCallsBeforeReject = compatCalls.length;
     const scheduler = new TaskScheduler({
       runTask: makeScheduledTaskRunner({
         compat: fakeCompat,
@@ -626,6 +627,10 @@ describe('POST /tasks', () => {
     });
     const tick = await scheduler.tick();
     expect(tick.outcomes).toContainEqual({ triggerId: task.id, outcome: 'failed' });
+    // THE kernel property: the provider was never called and no reservation
+    // ledger row / authorization row landed for the rejected occurrence — the
+    // old pipeline would have streamed first and only failed at settlement.
+    expect(compatCalls).toHaveLength(compatCallsBeforeReject);
 
     const [row] = await pg<{
       status: string;
@@ -969,16 +974,23 @@ describe('POST /tasks', () => {
     `;
     expect(row).toMatchObject({ status: 'paused', error_count: 20 });
     expect(row!.last_error).toContain('without an assistant response');
-    const [usage] = await pg<{ error_code: string | null; metadata: { emptyTurn?: boolean } }[]>`
-      select error_code, metadata from usage_events
+    const [usage] = await pg<{
+      error_code: string | null;
+      manna: number | null;
+      metadata: { emptyTurn?: boolean } | null;
+    }[]>`
+      select error_code, manna, metadata from usage_events
       where metadata->'source'->>'triggerId' = ${task.id}
       order by created_at desc limit 1
     `;
-    // Usage truthfully remains a provider completion; the scheduled-task
-    // circuit breaker derives its failure from the durable emptyTurn marker.
-    expect(usage!.metadata.emptyTurn).toBe(true);
-    expect(usage!.error_code).toBeNull();
-    expect(SCHEDULED_TASK_EMPTY_RESPONSE).toBe('scheduled_task_empty_response');
+    // T08-U02: an empty scheduled completion is now failed INSIDE the
+    // authorization state machine (reserved → reversed, charge 0) instead of
+    // being settled and refunded out-of-band by the scheduler — the usage row
+    // is a zero-manna error carrying the empty-response code, and the durable
+    // emptyTurn marker still drives the circuit breaker.
+    expect(usage!.metadata?.emptyTurn).toBe(true);
+    expect(usage!.error_code).toBe(SCHEDULED_TASK_EMPTY_RESPONSE);
+    expect(usage!.manna).toBe(0);
   });
 
   it('reaps a stale funded occurrence through refund-only recovery with zero provider calls', async () => {

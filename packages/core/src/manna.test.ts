@@ -773,15 +773,26 @@ describe('reservation settle/reverse kernel (T08-U02, MVP gap 42)', () => {
       settleReservation({ reservationKey: key, chargeManna: 17, reservedSubscriptionManna: 0 }),
       refund({ originalIdempotencyKey: key, type: 'refund:chat' }),
     ]);
-    expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
-    // Whatever interleaving won, total credited back can never exceed 61.
+    // Exactly two valid interleavings (checkpoint-#2 demanded exactness):
+    //  (a) settle first: 44 back, then the full reversal returns the 17
+    //      remainder — both fulfilled;
+    //  (b) reversal first: 61 back, then the settle leg refuses (nothing
+    //      refundable for a 44-manna leg) — settle rejected.
+    // EITHER WAY the account ends exactly whole and exactly 61 returns.
+    const settleOutcome = results[0]!;
+    const refundOutcome = results[1]!;
+    expect(refundOutcome.status).toBe('fulfilled');
     const balance = await getBalance(accountId);
-    expect(balance.total).toBeLessThanOrEqual(200);
-    expect(balance.total).toBeGreaterThanOrEqual(200 - 61);
+    expect(balance.total).toBe(200);
     const rows = await ledgerRowsFor(accountId);
     const refunds = rows.filter((r) => Number(r.amount) > 0 && r.type?.startsWith('refund'));
     const totalRefunded = refunds.reduce((sum, r) => sum + Number(r.amount), 0);
-    expect(totalRefunded).toBeLessThanOrEqual(61);
+    expect(totalRefunded).toBe(61);
+    if (settleOutcome.status === 'fulfilled') {
+      expect(refunds.map((r) => Number(r.amount)).sort((a, b) => a - b)).toEqual([17, 44]);
+    } else {
+      expect(refunds.map((r) => Number(r.amount))).toEqual([61]);
+    }
   });
 
   it('debit reports subscriptionDrawn=0 with no subscription pot', async () => {

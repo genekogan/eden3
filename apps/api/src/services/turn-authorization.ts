@@ -72,6 +72,12 @@ export async function insertTurnAuthorization(
   if (existing.state !== 'reserved') return null;
   if (numericToNumber(existing.authorizedMaxManna) !== row.authorizedMaxManna) return null;
   if (existing.reservationTxId !== row.reservationTxId) return null;
+  // Full identity tuple: a replayed authorization must belong to the same
+  // payer, agent, route, and pricing basis — never a same-sized foreign row
+  // (checkpoint-#2).
+  if (existing.accountId !== row.accountId) return null;
+  if (existing.provider !== row.provider || existing.model !== row.model) return null;
+  if (existing.pricingBasis !== row.pricingBasis) return null;
   return existing;
 }
 

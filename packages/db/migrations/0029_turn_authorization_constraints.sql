@@ -1,0 +1,7 @@
+-- T08-U02 checkpoint-2: the database enforces the money state machine, not
+-- just the application. Additive constraints on the (new, small) table only.
+CREATE UNIQUE INDEX "turn_authorizations_reservation_tx_uq" ON "turn_authorizations" USING btree ("reservation_tx_id");--> statement-breakpoint
+ALTER TABLE "turn_authorizations" ADD CONSTRAINT "turn_authorizations_state_chk" CHECK ("turn_authorizations"."state" in ('reserved','settled','reversed','reaped'));--> statement-breakpoint
+ALTER TABLE "turn_authorizations" ADD CONSTRAINT "turn_authorizations_max_positive_chk" CHECK ("turn_authorizations"."authorized_max_manna" > 0);--> statement-breakpoint
+ALTER TABLE "turn_authorizations" ADD CONSTRAINT "turn_authorizations_split_within_max_chk" CHECK ("turn_authorizations"."reserved_subscription_manna" >= 0 and "turn_authorizations"."reserved_subscription_manna" <= "turn_authorizations"."authorized_max_manna");--> statement-breakpoint
+ALTER TABLE "turn_authorizations" ADD CONSTRAINT "turn_authorizations_charge_within_max_chk" CHECK ("turn_authorizations"."charged_manna" is null or ("turn_authorizations"."charged_manna" >= 0 and "turn_authorizations"."charged_manna" <= "turn_authorizations"."authorized_max_manna"));

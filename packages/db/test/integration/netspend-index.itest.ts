@@ -135,10 +135,34 @@ async function journalHasMigration(client: postgres.Sql): Promise<boolean> {
   return rows.length === 1;
 }
 
-/** Remove 0027's journal row so the real migrator will attempt it again. */
-async function unjournalMigration(client: postgres.Sql) {
-  const hash = migrationHash(await migrationSql());
-  await client`delete from drizzle.__drizzle_migrations where hash = ${hash}`;
+/**
+ * Build a temp migrations folder containing only migrations with idx < 27 —
+ * the exact prod-box state before this tranche (0000–0026 applied, the index
+ * created live outside the journal). Running the FULL folder afterwards
+ * exercises 0027's guard plus every later migration fresh, which is what the
+ * box will actually do. (Replaces U01's single-row journal rewind, which the
+ * growing chain made unsound — the tail-fragility its own checkpoint #1
+ * flagged; journaled test edit, T08-U02.)
+ */
+async function buildPreBoxMigrationsDir(): Promise<string> {
+  const { mkdtemp, cp, writeFile } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const path = await import('node:path');
+  const source = fileURLToPath(new URL('../../migrations', import.meta.url));
+  const target = await mkdtemp(path.join(tmpdir(), 't08u02-premig-'));
+  const journal = JSON.parse(await readFile(path.join(source, 'meta/_journal.json'), 'utf8')) as {
+    entries: { idx: number; tag: string }[];
+  };
+  const kept = journal.entries.filter((e) => e.idx < 27);
+  await cp(path.join(source, 'meta'), path.join(target, 'meta'), { recursive: true });
+  await writeFile(
+    path.join(target, 'meta/_journal.json'),
+    JSON.stringify({ ...journal, entries: kept }, null, 2),
+  );
+  for (const entry of kept) {
+    await cp(path.join(source, `${entry.tag}.sql`), path.join(target, `${entry.tag}.sql`));
+  }
+  return target;
 }
 
 describe('scratch-DB migration paths (DDL confined to self-created, verified databases)', () => {
@@ -179,16 +203,17 @@ describe('scratch-DB migration paths (DDL confined to self-created, verified dat
     const observer = await scratchClient(name);
     try {
       const db = drizzle(client);
-      await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+      // Prod-box state: chain through 0026 applied, then the index created
+      // live (CREATE INDEX CONCURRENTLY produces an identical relation).
+      await migrate(db, { migrationsFolder: await buildPreBoxMigrationsDir() });
+      await client.unsafe(
+        'create index idx_manna_tx_refunds_tx on public.manna_transactions (refunds_transaction_id) where refunds_transaction_id is not null',
+      );
       const before = await indexRow(client);
       expect(before).toHaveLength(1);
-
-      // Rewind the journal so the migrator will run 0027 again against a DB
-      // where the correct index already exists — exactly the prod-box state
-      // (its index was made with CREATE INDEX CONCURRENTLY; the resulting
-      // relation is identical).
-      await unjournalMigration(client);
       expect(await journalHasMigration(client)).toBe(false);
+
+      // The full folder now runs 0027 (guard no-op) + every later migration.
       await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
       expect(await journalHasMigration(client)).toBe(true); // journaled success
       const after = await indexRow(client);
@@ -260,11 +285,11 @@ describe('scratch-DB migration paths (DDL confined to self-created, verified dat
     const client = await scratchClient(name);
     try {
       const db = drizzle(client);
-      await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+      // Pre-box chain (through 0026), then a same-named WRONG index — the
+      // full migrator must refuse at 0027 and journal nothing.
+      await migrate(db, { migrationsFolder: await buildPreBoxMigrationsDir() });
 
       // Wrong definition: same name, missing partial predicate.
-      await unjournalMigration(client);
-      await client.unsafe(`drop index "${INDEX_NAME}"`);
       await client.unsafe(
         'create index idx_manna_tx_refunds_tx on manna_transactions (refunds_transaction_id)',
       );
