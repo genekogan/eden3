@@ -15,7 +15,6 @@ import {
   type UploadRepository,
 } from './upload-repository';
 import { quarantineError, verifyUploadHeader } from './upload-verification';
-import type { UploadPolicyEventWorker } from './upload-policy-events';
 
 export interface UploadedPartResult {
   etag: string;
@@ -122,7 +121,7 @@ export interface UploadServiceOptions {
     header: Buffer;
     bytes: Buffer;
   }) => Promise<UploadPolicyDecision>;
-  policyEventWorker?: Pick<UploadPolicyEventWorker, 'tick'>;
+  policyEventWorker?: { tick(): Promise<unknown> };
   securityMode?: 'production' | 'test';
 }
 
@@ -159,7 +158,7 @@ export class UploadService {
   private readonly sessionTtlSeconds: number;
   private readonly backingStore: 'local' | 'r2';
   private readonly policyScanner?: UploadServiceOptions['policyScanner'];
-  private readonly policyEventWorker?: Pick<UploadPolicyEventWorker, 'tick'>;
+  private readonly policyEventWorker?: UploadServiceOptions['policyEventWorker'];
   private readonly completions = new Set<string>();
   private readonly partWrites = new Set<string>();
 

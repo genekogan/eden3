@@ -80,6 +80,7 @@ import {
   type StorageRuntime,
 } from './services/storage-runtime';
 import type { MultipartCleanupTickResult } from './services/upload-multipart-cleanup';
+import type { PolicyEventTickResult } from './services/upload-policy-events';
 
 const requireCjs = createRequire(import.meta.url);
 const pkg = requireCjs('../package.json') as { version: string };
@@ -612,24 +613,40 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     await app.register(mediaObjectRoutes, { resolver: storageRuntime.mediaResolver });
     await app.register(uploadsRoutes, { service: storageRuntime.uploadService });
     if (opts.storage?.autoStartPolicyWorker === true) {
-      const intervalMs = storagePolicyIntervalMs();
-      let running = false;
-      const tick = () => {
-        if (running) return;
-        running = true;
-        void storageRuntime.policyEventWorker
-          .tick()
-          .catch((err) => app.log.error({ err }, 'upload policy event tick failed'))
-          .finally(() => {
-            running = false;
-          });
-      };
-      if (intervalMs > 0) tick();
-      const timer = intervalMs > 0 ? setInterval(tick, intervalMs) : null;
-      timer?.unref();
-      app.addHook('onClose', async () => {
-        if (timer) clearInterval(timer);
+      const hasPolicyActivity = (result: PolicyEventTickResult): boolean =>
+        result.recovered > 0 ||
+        result.recoveryFailed > 0 ||
+        result.claimed > 0 ||
+        result.delivered > 0 ||
+        result.retried > 0 ||
+        result.terminalFailed > 0 ||
+        result.stale > 0 ||
+        result.metrics.pending > 0 ||
+        result.metrics.claimed > 0 ||
+        result.metrics.failed > 0 ||
+        result.metrics.oldestPendingAgeMs > 0 ||
+        result.metrics.maxAttemptCount > 0;
+      const policyLoop = await startBackgroundWorkerLoop({
+        intervalMs: storagePolicyIntervalMs(),
+        tick: () => storageRuntime.policyEventWorker.tick(),
+        onResult: (result) => {
+          if (!hasPolicyActivity(result)) return;
+          const context = { policyEvents: result };
+          if (
+            result.recoveryFailed > 0 ||
+            result.retried > 0 ||
+            result.terminalFailed > 0 ||
+            result.stale > 0 ||
+            result.metrics.failed > 0
+          ) {
+            app.log.warn(context, 'upload policy event tick requires attention');
+          } else {
+            app.log.info(context, 'upload policy event tick');
+          }
+        },
+        onError: (err) => app.log.error({ err }, 'upload policy event tick failed'),
       });
+      app.addHook('onClose', async () => policyLoop.stop());
 
       const hasCleanupActivity = (result: MultipartCleanupTickResult): boolean =>
         result.expiredEnqueued > 0 ||

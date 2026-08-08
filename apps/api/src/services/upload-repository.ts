@@ -54,8 +54,20 @@ export interface ClaimedPolicyEvent extends StoredPolicyEvent {
   claimToken: string;
 }
 
+export interface PolicyEventMetrics {
+  pending: number;
+  claimed: number;
+  failed: number;
+  oldestPendingAgeMs: number;
+  maxAttemptCount: number;
+}
+
 export interface UploadPolicyEventStore {
-  recoverExpiredPolicyEvents(now: Date, maxAttempts: number): Promise<void>;
+  recoverExpiredPolicyEvents(input: {
+    now: Date;
+    limit: number;
+    maxAttempts: number;
+  }): Promise<{ requeued: number; failed: number }>;
   claimDuePolicyEvents(input: {
     now: Date;
     limit: number;
@@ -67,10 +79,11 @@ export interface UploadPolicyEventStore {
     eventId: string;
     claimToken: string;
     now: Date;
-    nextAttemptAt: Date;
+    retryDelayMs: number;
     maxAttempts: number;
     errorCode: string;
-  }): Promise<boolean>;
+  }): Promise<'pending' | 'failed' | 'stale'>;
+  policyEventMetrics(now: Date): Promise<PolicyEventMetrics>;
 }
 
 export interface StoredUpload {
@@ -136,6 +149,7 @@ export class InMemoryUploadRepository implements UploadRepository, UploadPolicyE
   readonly policyEvents = new Map<string, StoredPolicyEvent>();
   private readonly policyNextAt = new Map<string, Date>();
   private readonly policyClaimExpiresAt = new Map<string, Date>();
+  private readonly policyCreatedAt = new Map<string, Date>();
 
   async create(input: CreateUploadRecord): Promise<StoredUpload> {
     const upload: StoredUpload = {
@@ -241,22 +255,34 @@ export class InMemoryUploadRepository implements UploadRepository, UploadPolicyE
     };
     this.policyEvents.set(id, event);
     if (!this.policyNextAt.has(id)) this.policyNextAt.set(id, new Date(0));
+    if (!this.policyCreatedAt.has(id)) this.policyCreatedAt.set(id, new Date());
     return { ...event };
   }
 
-  async recoverExpiredPolicyEvents(now: Date, maxAttempts: number): Promise<void> {
+  async recoverExpiredPolicyEvents(input: {
+    now: Date;
+    limit: number;
+    maxAttempts: number;
+  }): Promise<{ requeued: number; failed: number }> {
+    let requeued = 0;
+    let failedCount = 0;
     for (const [id, row] of this.policyEvents) {
+      if (requeued + failedCount >= input.limit) break;
       const claimExpiry = this.policyClaimExpiresAt.get(id);
-      if (row.state !== 'delivering' || !claimExpiry || claimExpiry > now) continue;
-      const failed = row.attemptCount >= maxAttempts;
+      if (row.state !== 'delivering' || !claimExpiry || claimExpiry > input.now) continue;
+      const failed = row.attemptCount >= input.maxAttempts;
       this.policyEvents.set(id, {
         ...row,
         state: failed ? 'failed' : 'pending',
         claimToken: null,
       });
       this.policyClaimExpiresAt.delete(id);
-      if (!failed) this.policyNextAt.set(id, now);
+      if (!failed) {
+        this.policyNextAt.set(id, input.now);
+        requeued += 1;
+      } else failedCount += 1;
     }
+    return { requeued, failed: failedCount };
   }
 
   async claimDuePolicyEvents(input: {
@@ -301,12 +327,12 @@ export class InMemoryUploadRepository implements UploadRepository, UploadPolicyE
     eventId: string;
     claimToken: string;
     now: Date;
-    nextAttemptAt: Date;
+    retryDelayMs: number;
     maxAttempts: number;
     errorCode: string;
-  }): Promise<boolean> {
+  }): Promise<'pending' | 'failed' | 'stale'> {
     const row = this.policyEvents.get(input.eventId);
-    if (!row || row.state !== 'delivering' || row.claimToken !== input.claimToken) return false;
+    if (!row || row.state !== 'delivering' || row.claimToken !== input.claimToken) return 'stale';
     const failed = row.attemptCount >= input.maxAttempts;
     this.policyEvents.set(input.eventId, {
       ...row,
@@ -314,8 +340,26 @@ export class InMemoryUploadRepository implements UploadRepository, UploadPolicyE
       claimToken: null,
     });
     this.policyClaimExpiresAt.delete(input.eventId);
-    if (!failed) this.policyNextAt.set(input.eventId, input.nextAttemptAt);
-    return true;
+    if (!failed) this.policyNextAt.set(input.eventId, new Date(input.now.getTime() + input.retryDelayMs));
+    return failed ? 'failed' : 'pending';
+  }
+
+  async policyEventMetrics(now: Date): Promise<PolicyEventMetrics> {
+    const pending = [...this.policyEvents.entries()].filter(([, row]) => row.state === 'pending');
+    return {
+      pending: pending.length,
+      claimed: [...this.policyEvents.values()].filter((row) => row.state === 'delivering').length,
+      failed: [...this.policyEvents.values()].filter((row) => row.state === 'failed').length,
+      oldestPendingAgeMs: pending.length === 0
+        ? 0
+        : Math.max(0, ...pending.map(([id]) => now.getTime() - (this.policyCreatedAt.get(id)?.getTime() ?? now.getTime()))),
+      maxAttemptCount: Math.max(
+        0,
+        ...[...this.policyEvents.values()]
+          .filter((row) => row.state !== 'delivered')
+          .map((row) => row.attemptCount),
+      ),
+    };
   }
 
   async abort(uploadId: string, ownerAccountId: string): Promise<boolean> {

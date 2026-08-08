@@ -187,7 +187,8 @@ export class PostgresUploadMultipartCleanupStore implements MultipartCleanupStor
              count(*) filter (where cleanup_state = 'failed') as failed,
              coalesce(greatest(0, extract(epoch from (statement_timestamp() - min(cleanup_enqueued_at)
                filter (where cleanup_state = 'pending'))) * 1000), 0) as oldest_pending_age_ms,
-             coalesce(max(cleanup_attempt_count), 0) as max_attempt_count
+             coalesce(max(cleanup_attempt_count)
+               filter (where cleanup_state in ('pending', 'claimed', 'failed')), 0) as max_attempt_count
       from storage_uploads
       where cleanup_state <> 'not_required'
     `;

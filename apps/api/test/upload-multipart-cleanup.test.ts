@@ -159,7 +159,12 @@ class MemoryCleanupStore implements MultipartCleanupStore {
       oldestPendingAgeMs: pending.length === 0
         ? 0
         : Math.max(...pending.map((row) => now.getTime() - row.enqueuedAt!.getTime())),
-      maxAttemptCount: Math.max(0, ...[...this.jobs.values()].map((row) => row.attemptCount)),
+      maxAttemptCount: Math.max(
+        0,
+        ...[...this.jobs.values()]
+          .filter((row) => ['pending', 'claimed', 'failed'].includes(row.cleanupState))
+          .map((row) => row.attemptCount),
+      ),
     };
   }
 }
@@ -197,7 +202,7 @@ describe('durable multipart abort/expiry cleanup (DEBT-018)', () => {
     now = new Date(now.getTime() + 1_000);
     const second = await makeWorker().tick();
     expect(second).toMatchObject({ claimed: 1, succeeded: 1, retried: 0 });
-    expect(second.metrics).toMatchObject({ pending: 0, failed: 0, maxAttemptCount: 2 });
+    expect(second.metrics).toMatchObject({ pending: 0, failed: 0, maxAttemptCount: 0 });
     expect(calls).toBe(2);
   });
 
@@ -367,5 +372,27 @@ describe('durable multipart abort/expiry cleanup (DEBT-018)', () => {
     const result = await worker.tick();
     expect(result.recoveryFailed).toBe(2);
     expect([...store.jobs.values()].filter((row) => row.cleanupState === 'claimed')).toHaveLength(1);
+  });
+
+  it('counts lost success and retry CAS outcomes only as stale', async () => {
+    const successStore = new MemoryCleanupStore();
+    successStore.add({ uploadId: 'stale-success', ownerAccountId: OWNER_A });
+    successStore.markCleanupSucceeded = async () => false;
+    const success = await new UploadMultipartCleanupWorker({
+      store: successStore,
+      backend: { abortMultipart: async () => undefined },
+      onError: () => undefined,
+    }).tick();
+    expect(success).toMatchObject({ claimed: 1, succeeded: 0, retried: 0, stale: 1 });
+
+    const retryStore = new MemoryCleanupStore();
+    retryStore.add({ uploadId: 'stale-retry', ownerAccountId: OWNER_A });
+    retryStore.retryCleanup = async () => 'stale';
+    const retry = await new UploadMultipartCleanupWorker({
+      store: retryStore,
+      backend: { abortMultipart: async () => { throw new Error('provider outage'); } },
+      onError: () => undefined,
+    }).tick();
+    expect(retry).toMatchObject({ claimed: 1, succeeded: 0, retried: 0, terminalFailed: 0, stale: 1 });
   });
 });
