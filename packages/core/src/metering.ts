@@ -437,6 +437,119 @@ export function mannaForEstimate(
   return mannaFromUsd(estimate.totalCostUsd, options);
 }
 
+// ---------------------------------------------------------------------------
+// Turn authorization ceilings (MVP gap 42, T08-U02)
+// ---------------------------------------------------------------------------
+
+export const TURN_CEILING_TABLE_VERSION = '2026-08-08.authz-v1';
+
+export class TurnCeilingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TurnCeilingError';
+  }
+}
+
+export interface TurnCeilingEntry {
+  provider: CostProvider;
+  model: string;
+  /**
+   * Maximum PERMITTED provider cost per turn, USD, pre-markup. This is the
+   * economic authorization ceiling: the turn reserves `mannaFromUsd(maxTurnUsd)`
+   * before any provider call, and settlement may never charge beyond it.
+   */
+  maxTurnUsd: number;
+  effectiveDate: string;
+  source: string;
+}
+
+/**
+ * Per-model per-turn authorization ceilings — POLICY values (operator-tunable,
+ * ruling RP-1 in T08-U02), not token-derived worst cases: an OpenClaw compat
+ * "turn" aggregates an unbounded agentic loop and cannot be cancelled
+ * mid-stream, so no finite token-derived maximum exists at this interface.
+ * Values are grounded in observed turn telemetry (2026-08-08, usage_events on
+ * canonical eden3 + eden3_stg) at ≈2× the observed per-model maximum:
+ *   haiku  p50 17 / max 26 manna (189 turns, ≤95k prompt tokens)
+ *   sonnet max 456 manna (380k prompt tokens, 41k cache-write — agentic loop)
+ *   opus   max 235 manna
+ * A turn whose metered actual exceeds the ceiling settles AT the ceiling
+ * (never above), records `overrun`, and alerts — the platform absorbs the
+ * bounded overage; the user is never charged beyond what was authorized.
+ */
+export const TURN_CEILINGS: readonly TurnCeilingEntry[] = [
+  {
+    provider: 'anthropic',
+    model: 'claude-haiku-4-5',
+    maxTurnUsd: 0.045,
+    effectiveDate: '2026-08-08',
+    source:
+      'T08-U02 policy snapshot: ≈2.3× observed max (26 manna); ≈61 manna — below the 100-manna signup grant so the default route stays usable',
+  },
+  {
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-5',
+    maxTurnUsd: 0.67,
+    effectiveDate: '2026-08-08',
+    source: 'T08-U02 policy snapshot: ≈2× observed sonnet max (456 manna); ≈905 manna',
+  },
+  {
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-6',
+    maxTurnUsd: 0.67,
+    effectiveDate: '2026-08-08',
+    source: 'T08-U02 policy snapshot: ≈2× observed sonnet max (456 manna); ≈905 manna',
+  },
+  {
+    provider: 'anthropic',
+    model: 'claude-opus-4-6',
+    maxTurnUsd: 1.12,
+    effectiveDate: '2026-08-08',
+    source:
+      'T08-U02 policy snapshot: 5× sonnet rates; observed max 235 manna; ≈1512 manna ceiling',
+  },
+] as const;
+
+export interface TurnAuthorizationCeiling {
+  /** Worst-case manna to reserve before the provider call (markup applied). */
+  manna: number;
+  /** The underlying pre-markup USD ceiling. */
+  usd: number;
+  tableVersion: string;
+  provider: CostProvider;
+  model: string;
+}
+
+/**
+ * The economic authorization for one LLM turn on `provider/model`.
+ * FAIL-CLOSED: a model without a ceiling entry cannot start a metered turn —
+ * throws {@link TurnCeilingError} (the metering doctrine: never zero, never a
+ * silent default).
+ */
+export function turnAuthorizedMax(
+  route: { provider: string; model: string },
+  options: MannaConversionOptions = {},
+): TurnAuthorizationCeiling {
+  const provider = route.provider as CostProvider;
+  const normalized = normalizeModel(provider, route.model);
+  const entry = TURN_CEILINGS.find(
+    (item) =>
+      item.provider === provider && (item.model === normalized || item.model === route.model),
+  );
+  if (!entry) {
+    throw new TurnCeilingError(
+      `no turn-authorization ceiling for ${route.provider}/${normalized} (table ${TURN_CEILING_TABLE_VERSION})`,
+    );
+  }
+  return {
+    manna: mannaFromUsd(entry.maxTurnUsd, options),
+    usd: entry.maxTurnUsd,
+    tableVersion: TURN_CEILING_TABLE_VERSION,
+    provider,
+    model: normalized,
+  };
+}
+
 /**
  * Metered manna price of the DEFAULT provider route for each in-chat media
  * kind, at the default quantity (image 1 · video 5s · music 1 clip · tts 120

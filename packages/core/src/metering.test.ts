@@ -7,6 +7,9 @@ import {
   costFromParams,
   mannaForEstimate,
   mannaFromUsd,
+  TURN_CEILING_TABLE_VERSION,
+  TurnCeilingError,
+  turnAuthorizedMax,
 } from './metering';
 
 describe('CostTable', () => {
@@ -139,5 +142,56 @@ describe('manna conversion', () => {
       units: { image: 1 },
     });
     expect(mannaForEstimate(estimate, { markup: 0, mannaPerUsd: 1_000 })).toBe(25);
+  });
+});
+
+describe('turn authorization ceilings (T08-U02, MVP gap 42)', () => {
+  it('covers every registered anthropic chat model with a frozen expected max', () => {
+    // Expected manna values are FROZEN literals (not recomputed from the
+    // table): a silent ceiling-table regression must fail this test. True
+    // independent route-envelope oracles are T08-U03's deliverable.
+    const expected: Record<string, number> = {
+      'claude-haiku-4-5': 61,
+      'claude-sonnet-4-5': 905,
+      'claude-sonnet-4-6': 905,
+      'claude-opus-4-6': 1512,
+    };
+    for (const [model, manna] of Object.entries(expected)) {
+      const auth = turnAuthorizedMax({ provider: 'anthropic', model });
+      expect(auth.manna, model).toBe(manna);
+      expect(auth.tableVersion).toBe(TURN_CEILING_TABLE_VERSION);
+      expect(auth.usd).toBeGreaterThan(0);
+    }
+  });
+
+  it('accepts provider-prefixed model ids (the agents.model form)', () => {
+    expect(turnAuthorizedMax({ provider: 'anthropic', model: 'anthropic/claude-haiku-4-5' }).manna).toBe(61);
+  });
+
+  it('fails closed on a model without a ceiling entry', () => {
+    expect(() => turnAuthorizedMax({ provider: 'anthropic', model: 'claude-nonexistent' })).toThrow(
+      TurnCeilingError,
+    );
+    expect(() => turnAuthorizedMax({ provider: 'google', model: 'gemini-3-pro' })).toThrow(
+      TurnCeilingError,
+    );
+  });
+
+  it('propagates the markup knob (T-BILL: one knob moves every monetary stage)', () => {
+    const base = turnAuthorizedMax({ provider: 'anthropic', model: 'claude-haiku-4-5' });
+    const doubled = turnAuthorizedMax(
+      { provider: 'anthropic', model: 'claude-haiku-4-5' },
+      { markup: 1.7 },
+    );
+    expect(doubled.manna).toBeGreaterThan(base.manna);
+    expect(doubled.manna).toBe(Math.ceil(0.045 * 2.7 * 1000));
+  });
+
+  it('ceiling values dominate every observed real turn (2026-08-08 telemetry)', () => {
+    // Observed per-model maxima from canonical eden3 + eden3_stg usage_events
+    // (documented in the unit file): haiku 26, sonnet 456, opus 235.
+    expect(turnAuthorizedMax({ provider: 'anthropic', model: 'claude-haiku-4-5' }).manna).toBeGreaterThan(26);
+    expect(turnAuthorizedMax({ provider: 'anthropic', model: 'claude-sonnet-4-6' }).manna).toBeGreaterThan(456);
+    expect(turnAuthorizedMax({ provider: 'anthropic', model: 'claude-opus-4-6' }).manna).toBeGreaterThan(235);
   });
 });

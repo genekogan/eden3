@@ -17,6 +17,9 @@ import {
   numericToNumber,
   refund,
   refundIdempotencyKey,
+  reverseReservation,
+  settleReservation,
+  settleReservationIdempotencyKey,
   scopedLedgerIdempotencyKey,
   scopedNetSpendSince,
 } from './manna';
@@ -594,5 +597,202 @@ describe('refund', () => {
     const key = `credit-${randomUUID()}`;
     await credit({ accountId, amount: 5, type: 'credit:test', idempotencyKey: key });
     await expect(refund({ originalIdempotencyKey: key })).rejects.toThrow(/not a debit/);
+  });
+});
+
+describe('reservation settle/reverse kernel (T08-U02, MVP gap 42)', () => {
+  it('settleReservation refunds exactly the unused reserve under the disjoint authz-settle key', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 100, type: 'credit:test' });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+
+    const settled = await settleReservation({
+      reservationKey: key,
+      chargeManna: 17,
+      reservedSubscriptionManna: 0,
+      type: 'refund:chat:settle',
+    });
+    expect(settled.appliedManna).toBe(44);
+    expect(settled.remainingRefundable).toBe(17);
+    expect(settled.alreadyApplied).toBe(false);
+    expect((await getBalance(accountId)).total).toBe(100 - 17);
+
+    const rows = await ledgerRowsFor(accountId);
+    const leg = rows.find((r) => r.idempotencyKey === settleReservationIdempotencyKey(key));
+    expect(leg).toBeDefined();
+    expect(Number(leg!.amount)).toBe(44);
+    const original = rows.find((r) => r.idempotencyKey === key);
+    expect(leg!.refundsTransactionId).toBe(original!.id);
+
+    // Idempotent replay: same result, no double credit.
+    const replay = await settleReservation({
+      reservationKey: key,
+      chargeManna: 17,
+      reservedSubscriptionManna: 0,
+      type: 'refund:chat:settle',
+    });
+    expect(replay.alreadyApplied).toBe(true);
+    expect(replay.appliedManna).toBe(44);
+    expect((await getBalance(accountId)).total).toBe(100 - 17);
+  });
+
+  it('full reversal after a settle leg credits only the remainder (never over-credits)', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 100, type: 'credit:test' });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+    await settleReservation({
+      reservationKey: key,
+      chargeManna: 17,
+      reservedSubscriptionManna: 0,
+    });
+
+    // e.g. the turn later fails before terminal persistence → full reversal.
+    const reversed = await refund({ originalIdempotencyKey: key, type: 'refund:chat' });
+    expect(reversed).not.toBeNull();
+    expect(Number(reversed!.transaction.amount)).toBe(17);
+    expect((await getBalance(accountId)).total).toBe(100);
+
+    // Reversing again is a no-op replay.
+    const again = await refund({ originalIdempotencyKey: key, type: 'refund:chat' });
+    expect(again?.alreadyApplied).toBe(true);
+    expect((await getBalance(accountId)).total).toBe(100);
+  });
+
+  it('reverseReservation restores the exact subscription/durable split', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 50, type: 'credit:test' });
+    await credit({ accountId, amount: 40, type: 'credit:subscription', toSubscriptionBalance: true });
+    const key = `resv-${randomUUID()}`;
+    const debited = await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+    // 61 drew subscription-first: 40 sub + 21 durable.
+    expect(debited.subscriptionDrawn).toBe(40);
+    expect(debited.balance.subscriptionBalance).toBe(0);
+    expect(debited.balance.balance).toBe(29);
+
+    const reversed = await reverseReservation({
+      reservationKey: key,
+      reservedSubscriptionManna: 40,
+      type: 'refund:chat',
+    });
+    expect(reversed.appliedManna).toBe(61);
+    const balance = await getBalance(accountId);
+    expect(balance.subscriptionBalance).toBe(40);
+    expect(balance.balance).toBe(50);
+  });
+
+  it('settle + reverse compose split-exactly: charge draws subscription-first', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 50, type: 'credit:test' });
+    await credit({ accountId, amount: 40, type: 'credit:subscription', toSubscriptionBalance: true });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+
+    // Charge 17 → drawn from subscription; unused 44 restores 23 sub + 21 durable.
+    const settled = await settleReservation({
+      reservationKey: key,
+      chargeManna: 17,
+      reservedSubscriptionManna: 40,
+    });
+    expect(settled.appliedManna).toBe(44);
+    const afterSettle = await getBalance(accountId);
+    expect(afterSettle.subscriptionBalance).toBe(23); // 40 − 17
+    expect(afterSettle.balance).toBe(50);
+    expect(afterSettle.total).toBe(90 - 17);
+
+    // A later full reversal (failed terminal persistence) restores the charge
+    // to its source pot too.
+    const reversed = await reverseReservation({
+      reservationKey: key,
+      reservedSubscriptionManna: 40,
+      type: 'refund:chat',
+    });
+    expect(reversed.appliedManna).toBe(17);
+    const final = await getBalance(accountId);
+    expect(final.subscriptionBalance).toBe(40);
+    expect(final.balance).toBe(50);
+  });
+
+  it('charge equal to the full reserve refunds nothing and stays settled', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 100, type: 'credit:test' });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+    const settled = await settleReservation({
+      reservationKey: key,
+      chargeManna: 61,
+      reservedSubscriptionManna: 0,
+    });
+    expect(settled.appliedManna).toBe(0);
+    expect(settled.remainingRefundable).toBe(61);
+    expect((await getBalance(accountId)).total).toBe(39);
+  });
+
+  it('rejects a settle charge above the reservation', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 100, type: 'credit:test' });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+    await expect(
+      settleReservation({ reservationKey: key, chargeManna: 62, reservedSubscriptionManna: 0 }),
+    ).rejects.toThrow(/exceeds/);
+  });
+
+  it('scheduler-recovery-style refund of a legacy :settle debit never cross-credits the authz-settle leg', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 200, type: 'credit:test' });
+    const turnKey = `turn-${randomUUID()}`;
+    // New-style reservation + settle leg.
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: turnKey });
+    await settleReservation({ reservationKey: turnKey, chargeManna: 17, reservedSubscriptionManna: 0 });
+    // Legacy-style settle DEBIT under `<turn>:settle` (pre-deploy shape).
+    await debit({ accountId, amount: 5, type: 'spend:chat:settle', idempotencyKey: `${turnKey}:settle` });
+
+    // Recovery reverses the legacy settle debit by its own key: refunds 5,
+    // and must NOT collide with or double-count the authz-settle leg.
+    const recovered = await refund({
+      originalIdempotencyKey: `${turnKey}:settle`,
+      type: 'refund:chat:settle',
+    });
+    expect(recovered).not.toBeNull();
+    expect(Number(recovered!.transaction.amount)).toBe(5);
+    // Then the reservation reversal refunds only the outstanding 17.
+    const reversed = await refund({ originalIdempotencyKey: turnKey, type: 'refund:chat' });
+    expect(Number(reversed!.transaction.amount)).toBe(17);
+    expect((await getBalance(accountId)).total).toBe(200);
+  });
+
+  it('concurrent reversal legs on one reservation never over-credit (raced)', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 200, type: 'credit:test' });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+
+    const results = await Promise.allSettled([
+      settleReservation({ reservationKey: key, chargeManna: 17, reservedSubscriptionManna: 0 }),
+      refund({ originalIdempotencyKey: key, type: 'refund:chat' }),
+    ]);
+    expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+    // Whatever interleaving won, total credited back can never exceed 61.
+    const balance = await getBalance(accountId);
+    expect(balance.total).toBeLessThanOrEqual(200);
+    expect(balance.total).toBeGreaterThanOrEqual(200 - 61);
+    const rows = await ledgerRowsFor(accountId);
+    const refunds = rows.filter((r) => Number(r.amount) > 0 && r.type?.startsWith('refund'));
+    const totalRefunded = refunds.reduce((sum, r) => sum + Number(r.amount), 0);
+    expect(totalRefunded).toBeLessThanOrEqual(61);
+  });
+
+  it('debit reports subscriptionDrawn=0 with no subscription pot', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 10, type: 'credit:test' });
+    const debited = await debit({
+      accountId,
+      amount: 3,
+      type: 'spend:chat',
+      idempotencyKey: `resv-${randomUUID()}`,
+    });
+    expect(debited.subscriptionDrawn).toBe(0);
   });
 });
