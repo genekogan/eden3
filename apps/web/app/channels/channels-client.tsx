@@ -8,10 +8,21 @@ import type {
   ChannelConnectionDto,
   ChannelKind,
   ChannelPairingRequestDto,
+  XByoCredentialsInput,
+  XConnectionDto,
 } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton";
 import { formatRelativeTime } from "@/lib/format";
+import {
+  DISCORD_DEVELOPER_PORTAL,
+  X_DEVELOPER_PORTAL,
+  channelClientDeepLink,
+  connectionHealthLabel,
+  discordInviteUrl,
+  xClientDeepLink,
+  xFailureAction,
+} from "./connector-ui";
 
 const CHANNELS: Array<{ value: ChannelKind; label: string }> = [
   { value: "discord", label: "Discord" },
@@ -37,10 +48,6 @@ function errorCopy(error: unknown): string {
   if (isEndpointMissing(error)) return "Connections are not available in this API build.";
   if (error instanceof ApiError) return error.message;
   return "The API is offline. Start @eden3/api and retry.";
-}
-
-function tokenPreview(connection: ChannelConnectionDto): string {
-  return connection.tokenPreview ? `•••• ${connection.tokenPreview}` : "encrypted";
 }
 
 function statusTone(connection: ChannelConnectionDto): string {
@@ -87,6 +94,7 @@ export function ChannelsClient() {
   const [agents, setAgents] = useState<AgentDto[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [connections, setConnections] = useState<ChannelConnectionDto[]>([]);
+  const [xConnections, setXConnections] = useState<XConnectionDto[]>([]);
   const [phase, setPhase] = useState<Phase>("loading");
   const [channel, setChannel] = useState<ChannelKind>("discord");
   const [label, setLabel] = useState("");
@@ -99,6 +107,13 @@ export function ChannelsClient() {
   const [pairingCodes, setPairingCodes] = useState<Record<string, string>>({});
   const [rotateTokens, setRotateTokens] = useState<Record<string, string>>({});
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const [xCredentials, setXCredentials] = useState<XByoCredentialsInput>({
+    apiKey: "",
+    apiSecret: "",
+    accessToken: "",
+    accessTokenSecret: "",
+  });
+  const [xLabel, setXLabel] = useState("");
   const alive = useRef(true);
 
   const mergeConnection = useCallback((connection: ChannelConnectionDto) => {
@@ -116,7 +131,7 @@ export function ChannelsClient() {
   const load = useCallback(async () => {
     setPhase("loading");
     try {
-      const [mine, channelList] = await Promise.all([
+      const [mine, channelList, xList] = await Promise.all([
         (async () => {
           const items: AgentDto[] = [];
           let cursor: string | undefined;
@@ -129,10 +144,15 @@ export function ChannelsClient() {
           return items;
         })(),
         api.channels.list(),
+        api.channels.listX().catch((error) => {
+          if (isEndpointMissing(error)) return { items: [], nextCursor: null };
+          throw error;
+        }),
       ]);
       if (!alive.current) return;
       setAgents(mine);
       setConnections(channelList.items);
+      setXConnections(xList.items);
       setDrafts(Object.fromEntries(channelList.items.map((item) => [item.id, initialDraft(item)])));
       setSelectedAgentId((current) => {
         if (current && mine.some((agent) => agent.id === current)) return current;
@@ -172,6 +192,11 @@ export function ChannelsClient() {
   const agentConnections = useMemo(
     () => connections.filter((item) => item.agentId === selectedAgentId),
     [connections, selectedAgentId],
+  );
+
+  const agentXConnections = useMemo(
+    () => xConnections.filter((item) => item.agentId === selectedAgentId),
+    [xConnections, selectedAgentId],
   );
 
   /** Connections whose bound agent is no longer in the owned list (e.g. deleted agent). */
@@ -241,6 +266,51 @@ export function ChannelsClient() {
           ? connection.lastError.message
           : "Token verified. Configure access below, then activate the connection.",
       );
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const connectX = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!selectedAgent) {
+      setNote("Pick one of your agents first.");
+      return;
+    }
+    if (Object.values(xCredentials).some((value) => !value.trim())) {
+      setNote("Enter all four values from your X developer app.");
+      return;
+    }
+    setBusy("create:x");
+    setNote(null);
+    try {
+      const connection = await api.channels.connectX({
+        agentUsername: selectedAgent.username,
+        ...(xLabel.trim() ? { label: xLabel.trim() } : {}),
+        credentials: xCredentials,
+      });
+      if (!alive.current) return;
+      setXConnections((current) => [connection, ...current.filter((item) => item.id !== connection.id)]);
+      setXCredentials({ apiKey: "", apiSecret: "", accessToken: "", accessTokenSecret: "" });
+      setXLabel("");
+      setNote(`X connected as @${connection.user?.username ?? "your account"}.`);
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const revokeX = async (connection: XConnectionDto) => {
+    setBusy(`revoke:x:${connection.id}`);
+    setNote(null);
+    try {
+      await api.channels.revokeX(connection.id);
+      if (!alive.current) return;
+      setXConnections((current) => current.filter((item) => item.id !== connection.id));
+      setNote("Eden access to this X app was revoked. Revoke the token in X too if it may be exposed.");
     } catch (error) {
       if (alive.current) setNote(errorCopy(error));
     } finally {
@@ -373,6 +443,11 @@ export function ChannelsClient() {
   const renderConnection = (connection: ChannelConnectionDto) => {
     const draft = drafts[connection.id] ?? initialDraft(connection);
     const pending = (pairings[connection.id] ?? []).filter((item) => item.status === "pending");
+    const clientLink = channelClientDeepLink(connection);
+    const inviteLink =
+      connection.channel === "discord" && connection.bot?.id
+        ? discordInviteUrl(connection.bot.id)
+        : null;
     return (
       <li key={connection.id} className="rounded-xl border border-edge bg-surface p-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
@@ -384,9 +459,10 @@ export function ChannelsClient() {
               </span>
             </div>
             <p className="mt-1 text-xs text-muted">
-              {LABELS[connection.channel]} · {tokenPreview(connection)}
+              {LABELS[connection.channel]} · Credential encrypted
               {connection.bot?.username ? ` · @${connection.bot.username}` : ""}
             </p>
+            <p className="mt-1 text-xs text-muted">{connectionHealthLabel(connection)}</p>
             <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">Updated {formatRelativeTime(connection.updatedAt)}</p>
           </div>
           <button type="button" disabled={busy === `delete:${connection.id}`} onClick={() => void remove(connection)} className={`rounded-lg border px-3 py-1.5 text-xs ${confirmingId === connection.id ? "border-rose-400/50 bg-rose-400/10 text-rose-300" : "border-edge text-muted hover:text-rose-300"}`}>
@@ -427,13 +503,18 @@ export function ChannelsClient() {
 
         <div className="mt-4 flex flex-wrap gap-2">
           {connection.desiredState === "active" ? (
-            <button type="button" onClick={() => void deactivate(connection)} disabled={busy === `deactivate:${connection.id}`} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">Deactivate</button>
+            <>
+              <button type="button" onClick={() => void activate(connection)} disabled={busy === `activate:${connection.id}`} className="rounded-lg border border-accent/30 px-3 py-2 text-xs text-accent-soft disabled:opacity-50">{busy === `activate:${connection.id}` ? "Saving…" : "Save access"}</button>
+              <button type="button" onClick={() => void deactivate(connection)} disabled={busy === `deactivate:${connection.id}`} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">Deactivate</button>
+            </>
           ) : (
             <button type="button" onClick={() => void activate(connection)} disabled={connection.observedState === "error" || busy === `activate:${connection.id}`} className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft disabled:opacity-40">{busy === `activate:${connection.id}` ? "Activating…" : "Activate"}</button>
           )}
           <button type="button" onClick={() => void loadPairing(connection)} disabled={busy === `pairing:${connection.id}`} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">
             Pending requests{pending.length ? ` (${pending.length})` : ""}
           </button>
+          {clientLink ? <a href={clientLink} target="_blank" rel="noreferrer" className="rounded-lg border border-edge px-3 py-2 text-xs text-muted">Open in {LABELS[connection.channel]}</a> : null}
+          {inviteLink ? <a href={inviteLink} target="_blank" rel="noreferrer" className="rounded-lg border border-edge px-3 py-2 text-xs text-muted">Invite bot to Discord</a> : null}
         </div>
 
         {pairings[connection.id] ? (
@@ -482,14 +563,43 @@ export function ChannelsClient() {
     );
   };
 
+  const renderXConnection = (connection: XConnectionDto) => {
+    const clientLink = xClientDeepLink(connection);
+    const action = xFailureAction(connection.lastError?.code ?? null);
+    return (
+      <li key={connection.id} className="rounded-xl border border-edge bg-surface p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-sm font-medium">{connection.label || connection.user?.name || "X app"}</h3>
+              <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${connection.status === "active" || connection.status === "verified" ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300" : "border-rose-400/25 bg-rose-400/10 text-rose-300"}`}>
+                {connection.status}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-muted">X · Credential encrypted{connection.user?.username ? ` · @${connection.user.username}` : ""}</p>
+            <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">Updated {formatRelativeTime(connection.updatedAt)}</p>
+          </div>
+          <button type="button" onClick={() => void revokeX(connection)} disabled={busy === `revoke:x:${connection.id}`} className="rounded-lg border border-rose-400/30 px-3 py-1.5 text-xs text-rose-300 disabled:opacity-40">Revoke</button>
+        </div>
+        {connection.lastError ? (
+          <div className="mt-3 rounded-lg border border-rose-400/25 bg-rose-400/10 p-3 text-xs text-rose-200">
+            <p>{connection.lastError.message}</p>
+            {action ? <p className="mt-1 text-rose-100/80">{action}</p> : null}
+          </div>
+        ) : null}
+        {clientLink ? <a href={clientLink} target="_blank" rel="noreferrer" className="mt-3 inline-block rounded-lg border border-edge px-3 py-2 text-xs text-muted">Open profile on X</a> : null}
+      </li>
+    );
+  };
+
   return (
     <div className="mx-auto w-full max-w-6xl px-6 py-14 md:px-10">
       <header>
         <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">Autonomy</p>
         <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">Connections</h1>
         <p className="mt-2 max-w-2xl text-sm text-muted">
-          Give an agent its own Discord or Telegram bot. Tokens stay encrypted; only the last
-          four characters are ever shown here.
+          Give an agent its own Discord or Telegram bot, or connect your own X developer app.
+          Credentials are encrypted and are never shown again.
         </p>
       </header>
 
@@ -535,6 +645,7 @@ export function ChannelsClient() {
           />
         </div>
       ) : (
+        <>
         <div className="mt-8 grid gap-6 lg:grid-cols-[minmax(0,0.72fr)_minmax(0,1.28fr)]">
           <form onSubmit={(event) => void create(event)} className="h-fit rounded-xl border border-edge bg-surface p-4">
             <h2 className="text-sm font-medium">
@@ -546,6 +657,17 @@ export function ChannelsClient() {
                   {CHANNELS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                 </select>
               </FormField>
+              {channel === "discord" ? (
+                <div className="rounded-lg border border-edge bg-background/50 p-3 text-xs text-muted">
+                  <p className="font-medium text-foreground">Discord BYOB walkthrough</p>
+                  <ol className="mt-2 list-decimal space-y-1.5 pl-4">
+                    <li><a href={DISCORD_DEVELOPER_PORTAL} target="_blank" rel="noreferrer" className="text-accent-soft underline underline-offset-2">Open the Discord developer portal</a> and create an application.</li>
+                    <li>Open Bot, add a bot, then copy its token. Never paste a user token.</li>
+                    <li>Save below. Eden validates it with Discord’s bot identity endpoint.</li>
+                    <li>After validation, use the fixed-permission invite shown on the connection.</li>
+                  </ol>
+                </div>
+              ) : null}
               <FormField label="Bot token">
                 <input value={token} onChange={(event) => setToken(event.target.value)} type="password" autoComplete="off" placeholder="••••••••" className={inputClass} />
               </FormField>
@@ -578,6 +700,36 @@ export function ChannelsClient() {
             ) : null}
           </div>
         </div>
+        <section className="mt-12 border-t border-edge pt-8">
+          <div>
+            <p className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">User-owned publishing</p>
+            <h2 className="mt-2 text-xl font-light">X developer app</h2>
+            <p className="mt-1 max-w-2xl text-sm text-muted">Connect credentials from an app you own. X bills API usage to your developer account; Eden encrypts the credentials and posts only when you ask.</p>
+          </div>
+          <div className="mt-5 grid gap-6 lg:grid-cols-[minmax(0,0.72fr)_minmax(0,1.28fr)]">
+            <form onSubmit={(event) => void connectX(event)} className="h-fit rounded-xl border border-edge bg-surface p-4">
+              <div className="rounded-lg border border-edge bg-background/50 p-3 text-xs text-muted">
+                <ol className="list-decimal space-y-1.5 pl-4">
+                  <li><a href={X_DEVELOPER_PORTAL} target="_blank" rel="noreferrer" className="text-accent-soft underline underline-offset-2">Open the X developer portal</a> and create or select your app.</li>
+                  <li>Enable read and write access, then generate user access tokens.</li>
+                  <li>Paste all four values once. They are validated before encrypted storage.</li>
+                </ol>
+              </div>
+              <div className="mt-4 space-y-3">
+                <FormField label="API key"><input type="password" autoComplete="off" value={xCredentials.apiKey} onChange={(event) => setXCredentials((current) => ({ ...current, apiKey: event.target.value }))} className={inputClass} /></FormField>
+                <FormField label="API key secret"><input type="password" autoComplete="off" value={xCredentials.apiSecret} onChange={(event) => setXCredentials((current) => ({ ...current, apiSecret: event.target.value }))} className={inputClass} /></FormField>
+                <FormField label="Access token"><input type="password" autoComplete="off" value={xCredentials.accessToken} onChange={(event) => setXCredentials((current) => ({ ...current, accessToken: event.target.value }))} className={inputClass} /></FormField>
+                <FormField label="Access token secret"><input type="password" autoComplete="off" value={xCredentials.accessTokenSecret} onChange={(event) => setXCredentials((current) => ({ ...current, accessTokenSecret: event.target.value }))} className={inputClass} /></FormField>
+                <FormField label="Label (optional)"><input value={xLabel} onChange={(event) => setXLabel(event.target.value)} maxLength={120} placeholder="Publishing app" className={inputClass} /></FormField>
+              </div>
+              <button type="submit" disabled={busy === "create:x" || !selectedAgent} className="mt-5 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white disabled:opacity-50">{busy === "create:x" ? "Validating…" : "Validate & connect"}</button>
+            </form>
+            <div>
+              {agentXConnections.length === 0 ? <EmptyState title="No X app connected" hint="Connect a user-owned developer app to publish from this agent." /> : <ul className="space-y-4">{agentXConnections.map(renderXConnection)}</ul>}
+            </div>
+          </div>
+        </section>
+        </>
       )}
     </div>
   );

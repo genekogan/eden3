@@ -361,7 +361,6 @@ export interface ChannelConnectionDto {
     | "live"
     | "stopped"
     | "error";
-  tokenPreview: string | null;
   lastError: { code: string; message: string } | null;
   lastValidatedAt: string | null;
   retryCount: number;
@@ -391,6 +390,37 @@ export interface ChannelMockMessageResult {
   channel: ChannelKind;
   routed: true;
   messageLength: number;
+}
+
+export interface XByoCredentialsInput {
+  apiKey: string;
+  apiSecret: string;
+  accessToken: string;
+  accessTokenSecret: string;
+}
+
+export interface XConnectionDto {
+  id: string;
+  accountId: string;
+  agentId: string | null;
+  channel: "x";
+  label: string | null;
+  status: "verified" | "active" | "error" | "revoked";
+  user: { id: string; username: string; name: string | null } | null;
+  lastError: {
+    code: "invalid_credentials" | "revoked" | "rate_limited" | "provider_unavailable";
+    message: string;
+    retryAfterSeconds?: number;
+  } | null;
+  lastValidatedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface XConnectionCreateInput {
+  agentUsername?: string;
+  label?: string;
+  credentials: XByoCredentialsInput;
 }
 
 export type SkillSource = "curated" | "user";
