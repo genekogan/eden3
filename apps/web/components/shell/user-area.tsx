@@ -14,6 +14,7 @@ import type { AuthMeResponse } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { AuthUserControl } from "@/components/AuthUserControl";
 import { MannaBadge } from "@/components/manna-badge";
+import { NotificationCenter } from "@/components/notification-center";
 import { ThemeToggle } from "@/components/theme-provider";
 
 const LINKS: Array<{ href: string; label: string; adminOnly?: boolean }> = [
@@ -89,17 +90,19 @@ export function UserArea({ collapsed = false }: { collapsed?: boolean }) {
         </div>
       ) : null}
 
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        aria-haspopup="menu"
-        aria-expanded={open}
-        title={user ? `@${user.username}` : "Account"}
-        data-testid="user-area"
-        className={`flex w-full items-center p-2 text-left transition-colors hover:bg-foreground/[0.03] ${
-          collapsed ? "justify-center" : "gap-2.5 px-3 py-2.5"
-        }`}
-      >
+      <div className={`flex items-center ${collapsed ? "flex-col" : ""}`}>
+        <NotificationCenter accountKey={user?.id ?? null} collapsed={collapsed} />
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          aria-haspopup="menu"
+          aria-expanded={open}
+          title={user ? `@${user.username}` : "Account"}
+          data-testid="user-area"
+          className={`flex min-w-0 flex-1 items-center p-2 text-left transition-colors hover:bg-foreground/[0.03] ${
+            collapsed ? "justify-center" : "gap-2.5 pr-3 py-2.5"
+          }`}
+        >
         <AgentAvatar
           account={user ?? undefined}
           name={user?.username ?? "?"}
@@ -117,7 +120,8 @@ export function UserArea({ collapsed = false }: { collapsed?: boolean }) {
             </span>
           </span>
         )}
-      </button>
+        </button>
+      </div>
     </div>
   );
 }

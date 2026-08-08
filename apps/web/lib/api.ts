@@ -23,7 +23,11 @@
  * isApiUnavailable instead of blocking on live data.
  */
 
-import { streamSseBody, subscribeSessionEvents } from "./sse";
+import {
+  decodeSessionEventData,
+  streamSseBody,
+  subscribeSessionEvents,
+} from "./sse";
 import type { SessionEventStreamOptions, StreamSseOptions } from "./sse";
 import { getClerkToken } from "./clerk";
 import type {
@@ -73,6 +77,7 @@ import type {
   SessionShareSummaryDto,
   UserUsageSummary,
   AgentSkillsResponse,
+  AppNotificationsResponseDto,
   SessionDetail,
   SessionDto,
   SessionEvent,
@@ -409,6 +414,21 @@ export function subscribeSession(
   );
 }
 
+/** Account-scoped notification SSE. Initial/history authority stays in GET. */
+export function subscribeNotifications(
+  onCreated: () => void,
+  options: { url?: string; onConnectionError?: (event: Event) => void } = {},
+): () => void {
+  if (typeof EventSource === "undefined") return () => {};
+  const source = new EventSource(options.url ?? "/api/notifications/events");
+  source.onmessage = (message: MessageEvent<string>) => {
+    const event = decodeSessionEventData(message.data);
+    if (event?.type === "notification.created") onCreated();
+  };
+  if (options.onConnectionError) source.onerror = options.onConnectionError;
+  return () => source.close();
+}
+
 // ---------------------------------------------------------------------------
 // Detail-envelope normalizers (tolerant of a bare DTO while the api lands)
 // ---------------------------------------------------------------------------
@@ -509,6 +529,24 @@ export const api = {
     /** GET /api/account/export — complete owner-scoped account ZIP. */
     exportBundle(): Promise<Blob> {
       return apiBlob("/account/export");
+    },
+  },
+
+  notifications: {
+    list(limit = 30): Promise<AppNotificationsResponseDto> {
+      return get<AppNotificationsResponseDto>(`/notifications${qs({ limit })}`);
+    },
+    markRead(id: string): Promise<{ ok: true }> {
+      return post<{ ok: true }>(`/notifications/${enc(id)}/read`);
+    },
+    markAllRead(): Promise<{ ok: true; updated: number }> {
+      return post<{ ok: true; updated: number }>("/notifications/read-all");
+    },
+    dismiss(id: string): Promise<void> {
+      return apiFetch<void>(`/notifications/${enc(id)}`, { method: "DELETE" });
+    },
+    subscribe(onCreated: () => void): () => void {
+      return subscribeNotifications(onCreated);
     },
   },
 
