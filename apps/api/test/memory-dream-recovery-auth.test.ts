@@ -14,9 +14,12 @@ import {
   type MemoryDreamRunClaim,
 } from '../src/services/memory-dreaming';
 import {
+  claimTurnProviderStart,
   insertTurnAuthorization,
+  markTurnUsableOutput,
   reverseTurnAuthorization,
 } from '../src/services/turn-authorization';
+import { TurnReservationReaper } from '../src/services/turn-reservation-reaper';
 import { TurnClaimLostError } from '../src/services/turns';
 import { EventsBus } from '../src/events-bus';
 import { HistorySync } from '../src/services/history-sync';
@@ -341,6 +344,44 @@ describe('memory dream canonical recovery authorization (DEBT-003)', () => {
         manna: 61,
         errorCode: 'gateway_stream_error',
         messageId: null,
+      },
+      authorization: {
+        state: 'settled',
+        authorizedMaxManna: 61,
+        chargedManna: 61,
+      },
+    });
+  });
+
+  it('reaps a crash-shaped dream usable prefix into terminal charged truth', async () => {
+    const fixture = await seedReservation({ durable: 61, subscription: 0 });
+    expect(
+      await claimTurnProviderStart(fixture.claim.id, {
+        fence: (tx) => renewMemoryDreamRunClaim(fixture.claim, tx),
+      }),
+    ).toBe(true);
+    expect(
+      await markTurnUsableOutput(fixture.claim.id, {
+        fence: (tx) => renewMemoryDreamRunClaim(fixture.claim, tx),
+      }),
+    ).toBe(true);
+    await pg`
+      update turn_authorizations set created_at = now() - interval '2 hours'
+      where turn_id = ${fixture.claim.id}`;
+
+    const result = await new TurnReservationReaper({
+      accountScope: [fixture.ownerId],
+    }).runOnce();
+    expect(result.partialSettled).toBe(1);
+    expect((await getBalance(fixture.ownerId)).total).toBe(0);
+    const evidence = await new PostgresMemoryDreamDurability().inspect(fixture.claim.id);
+    expect(isSettledPartialOutputDreamFailure(evidence)).toBe(true);
+    expect(evidence).toMatchObject({
+      providerStatus: 'started',
+      usage: {
+        status: 'error',
+        manna: 61,
+        errorCode: 'provider_process_lost_after_output',
       },
       authorization: {
         state: 'settled',
