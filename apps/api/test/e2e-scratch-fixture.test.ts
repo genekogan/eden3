@@ -161,6 +161,9 @@ describe('isolated E2E scratch user fixture', () => {
       [fixture],
       [fixture, { ...platformEve, username: 'eve-lookalike' }],
       [fixture, { ...platformEve, type: 'user' }],
+      [fixture, { ...platformEve, externalId: 'eve-external' }],
+      [fixture, { ...platformEve, clerkUserId: 'eve-clerk' }],
+      [fixture, { ...platformEve, userImage: 'https://example.invalid/eve.png' }],
       [fixture, { ...platformEve, ownerId: fixture.id }],
       [fixture, { ...platformEve, openclawId: 'not-main' }],
       [fixture, { ...platformEve, deleted: true }],
@@ -298,6 +301,11 @@ describe('isolated E2E scratch user fixture', () => {
     expect(repository.lockModes).toContain(true);
     expect(repository.deleteInputs).toEqual([seeded.fixture]);
     expect(repository.rows).toEqual([platformEve]);
+    repository.counts.usageCount = 1;
+    await expect(cleanupE2EScratchUser({ repository, databaseName })).rejects.toThrow(
+      /side effects/,
+    );
+    repository.counts.usageCount = 0;
     expect((await cleanupE2EScratchUser({ repository, databaseName })).removed).toBe(false);
   });
 
