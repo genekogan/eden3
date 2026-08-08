@@ -45,6 +45,7 @@ export interface ChatMediaAuthorizationMetadata {
   toolCallIdHash: string;
   tool: StudioToolName;
   action: string;
+  outputKind: 'image' | 'video' | 'audio';
   quote: {
     provider: string;
     model: string;
@@ -89,6 +90,19 @@ function safeHostIdentity(value: string, name: string): string {
 
 function digestIdentity(value: string): string {
   return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function outputKindForTool(tool: StudioToolName): 'image' | 'video' | 'audio' {
+  if (tool === 'image_generate') return 'image';
+  if (tool === 'video_generate') return 'video';
+  return 'audio';
+}
+
+function outputKindForAction(action: string): 'image' | 'video' | 'audio' {
+  if (action === 'image') return 'image';
+  if (action === 'video') return 'video';
+  if (action === 'music' || action === 'tts') return 'audio';
+  throw new Error('chat-media-authorization: unsupported settlement action');
 }
 
 function uuidFromDigest(input: string): string {
@@ -172,7 +186,8 @@ function readMetadata(value: unknown): ChatMediaAuthorizationMetadata {
     typeof reservation.subscriptionManna !== 'number' ||
     typeof reservation.durableManna !== 'number' ||
     typeof value.runIdHash !== 'string' ||
-    typeof value.toolCallIdHash !== 'string'
+    typeof value.toolCallIdHash !== 'string' ||
+    !['image', 'video', 'audio'].includes(String(value.outputKind))
   ) {
     throw new Error('chat-media-authorization: incomplete metadata');
   }
@@ -228,6 +243,7 @@ export async function reserveChatMedia(options: {
   if (!isChatMediaTool(request.tool)) throw new Error('chat-media-authorization: unsupported tool');
   const quote = quoteChatMediaTool(request.tool, request.args);
   const action = String(quote.action);
+  const outputKind = outputKindForTool(request.tool);
 
   return await dbc.transaction(async (tx) => {
     const targets = (await tx.execute(sql`
@@ -255,14 +271,14 @@ export async function reserveChatMedia(options: {
     // claim it exactly; a different-cost same-action call never reaches the
     // provider or lands a second debit.
     await tx.execute(sql`
-      select pg_advisory_xact_lock(hashtextextended(${'chat-media:' + target.session_id + ':' + action}, 0))
+      select pg_advisory_xact_lock(hashtextextended(${'chat-media:' + target.session_id + ':' + outputKind}, 0))
     `);
     const active = (await tx.execute(sql`
       select turn_id from usage_events
       where event_type = ${CHAT_MEDIA_EVENT_TYPE}
         and session_id = ${target.session_id}
         and status in ('pending', 'refund_pending')
-        and metadata->>'action' = ${action}
+        and metadata->>'outputKind' = ${outputKind}
       limit 1
     `)) as unknown as Array<{ turn_id: string }>;
     if (active[0] && active[0].turn_id !== authorizationId) {
@@ -328,6 +344,7 @@ export async function reserveChatMedia(options: {
       toolCallIdHash: digestIdentity(toolCallId),
       tool: request.tool,
       action,
+      outputKind,
       quote: {
         provider: quote.provider,
         model: quote.model,
@@ -387,8 +404,9 @@ export async function completePendingChatMedia(
     now?: Date;
   },
 ): Promise<{ accountId: string; authorizationId: string; balance: number } | null> {
+  const outputKind = outputKindForAction(options.action);
   await tx.execute(sql`
-    select pg_advisory_xact_lock(hashtextextended(${'chat-media:' + options.sessionId + ':' + options.action}, 0))
+    select pg_advisory_xact_lock(hashtextextended(${'chat-media:' + options.sessionId + ':' + outputKind}, 0))
   `);
   const rows = (await tx.execute(sql`
     select turn_id, user_id, agent_id, created_at, metadata

@@ -11,10 +11,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   MediaPipeline,
   attachmentKindForMime,
-  mediaDebitIdempotencyKey,
   mimeForPath,
   pricedActionForTool,
 } from '../src/services/media-pipeline';
+import { reserveChatMedia, type ChatMediaAuthorization } from '../src/services/chat-media-authorization';
 
 loadRootEnv();
 
@@ -33,6 +33,7 @@ let agentId = '';
 let brokeUserId = '';
 let sessionId = '';
 let brokeSessionId = '';
+const openclawId = `${marker}-agent`;
 
 const events: Array<{ sessionId: string; event: SessionEvent }> = [];
 const bus = {
@@ -72,6 +73,29 @@ function fakeBinaryFile(name: string): string {
   return filePath;
 }
 
+function generationArgs(tool: 'image_generate' | 'video_generate' | 'music_generate' | 'tts') {
+  if (tool === 'tts') return { text: 'x'.repeat(120) };
+  if (tool === 'video_generate') return { prompt: 'test', duration: 5 };
+  return { prompt: 'test' };
+}
+
+async function authorize(
+  targetSessionId: string,
+  tool: 'image_generate' | 'video_generate' | 'music_generate' | 'tts',
+): Promise<ChatMediaAuthorization> {
+  return reserveChatMedia({
+    request: {
+      runId: randomUUID(),
+      toolCallId: randomUUID(),
+      sessionKey: `agent:${openclawId}:eden3:s:${targetSessionId}`,
+      agentId: openclawId,
+      tool,
+      args: generationArgs(tool),
+    },
+    dailyCap: 100_000,
+  });
+}
+
 beforeAll(async () => {
   const accounts = await pg<{ id: string }[]>`
     insert into accounts (type, username) values
@@ -83,6 +107,8 @@ beforeAll(async () => {
   userId = accounts[0]!.id;
   agentId = accounts[1]!.id;
   brokeUserId = accounts[2]!.id;
+  await pg`insert into agents (account_id, owner_id, openclaw_id, provision_status)
+           values (${agentId}, ${userId}, ${openclawId}, 'ready')`;
 
   const sessions = await pg<{ id: string }[]>`
     insert into sessions (owner_id, title) values
@@ -92,6 +118,10 @@ beforeAll(async () => {
   `;
   sessionId = sessions[0]!.id;
   brokeSessionId = sessions[1]!.id;
+  await pg`update sessions set gateway_session_key = 'eden3:s:' || id::text
+           where id in (${sessionId}, ${brokeSessionId})`;
+  await pg`insert into session_agents (session_id, agent_account_id)
+           values (${sessionId}, ${agentId}), (${brokeSessionId}, ${agentId})`;
 
   await credit({ accountId: userId, amount: 2_000, type: 'credit:test' });
 });
@@ -101,10 +131,13 @@ afterAll(async () => {
            or creation_id in (select id from creations where user_id in (${userId}, ${brokeUserId}))`;
   await pg`delete from messages where session_id in (${sessionId}, ${brokeSessionId})`;
   await pg`delete from creations where user_id in (${userId}, ${brokeUserId}) or agent_id = ${agentId}`;
+  await pg`delete from usage_events where user_id in (${userId}, ${brokeUserId})`;
+  await pg`delete from session_agents where session_id in (${sessionId}, ${brokeSessionId})`;
   await pg`delete from sessions where id in (${sessionId}, ${brokeSessionId})`;
   await pg`delete from manna_transactions where manna_account_id in
            (select id from manna_accounts where account_id in (${userId}, ${agentId}, ${brokeUserId}))`;
   await pg`delete from manna_accounts where account_id in (${userId}, ${agentId}, ${brokeUserId})`;
+  await pg`delete from agents where account_id = ${agentId}`;
   await pg`delete from accounts where username like ${`${marker}%`}`;
   await pg.end({ timeout: 5 });
 }, 30_000);
@@ -133,6 +166,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
   it('in-chat ingest: asset + creation + message + debit + events', async () => {
     const file = fakePngFile('chat.png');
     const before = await getBalance(userId);
+    const authorization = await authorize(sessionId, 'image_generate');
 
     const result = await pipeline.ingestFile(file, {
       sessionId,
@@ -178,13 +212,15 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
       select message_count as "messageCount" from sessions where id = ${sessionId}`;
     expect(session!.messageCount).toBe(1);
 
-    // manna: 5 debited from the session owner with the sha+session key
+    // manna was authorized before provider/file work and the pipeline consumed
+    // that exact durable authorization.
     expect(result.billedAccountId).toBe(userId);
     expect(result.debitError).toBeNull();
-    expect(result.debit?.balance.total).toBe(before.total - defaultChatMediaManna('image'));
+    expect(result.mediaAuthorizationId).toBe(authorization.authorizationId);
+    expect((await getBalance(userId)).total).toBe(before.total - defaultChatMediaManna('image'));
     const [tx] = await pg<{ amount: string; type: string }[]>`
       select amount, type from manna_transactions
-      where idempotency_key = ${mediaDebitIdempotencyKey(result.sha256, sessionId)}`;
+      where idempotency_key = ${`chat-media:${authorization.authorizationId}`}`;
     expect(tx).toMatchObject({
       amount: `-${defaultChatMediaManna('image')}.0000`,
       type: 'spend:image',
@@ -231,6 +267,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
       });
       const file = fakeBinaryFile(mediaCase.fileName);
       const before = await getBalance(userId);
+      const authorization = await authorize(sessionId, mediaCase.tool);
 
       const result = await pipeline.ingestFile(file, {
         sessionId,
@@ -265,12 +302,11 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
 
       expect(result.billedAccountId).toBe(userId);
       expect(result.debitError).toBeNull();
-      expect(result.debit?.balance.total).toBe(
-        before.total - defaultChatMediaManna(mediaCase.action),
-      );
+      expect(result.mediaAuthorizationId).toBe(authorization.authorizationId);
+      expect((await getBalance(userId)).total).toBe(before.total - defaultChatMediaManna(mediaCase.action));
       const [tx] = await pg<{ amount: string; type: string }[]>`
         select amount, type from manna_transactions
-        where idempotency_key = ${mediaDebitIdempotencyKey(result.sha256, sessionId)}`;
+        where idempotency_key = ${`chat-media:${authorization.authorizationId}`}`;
       expect(Number(tx!.amount)).toBe(-defaultChatMediaManna(mediaCase.action));
       expect(tx!.type).toBe(`spend:${mediaCase.action}`);
 
@@ -289,6 +325,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
 
   it('re-ingesting the same file into the same session is a no-op', async () => {
     const file = fakePngFile('dedupe.png');
+    await authorize(sessionId, 'image_generate');
     const first = await pipeline.ingestFile(file, {
       sessionId,
       agentAccountId: agentId,
@@ -315,6 +352,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
   it('concurrent double-ingest of the same NEW file creates exactly one creation (W2 #7)', async () => {
     const file = fakePngFile('concurrent.png');
     const before = await getBalance(userId);
+    const authorization = await authorize(sessionId, 'image_generate');
 
     // Two ingests of the SAME brand-new file race into ingestFile at once. The
     // sha256 UNIQUE claim must serialize them so only ONE creation/message/
@@ -350,12 +388,13 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     expect((await getBalance(userId)).total).toBe(before.total - defaultChatMediaManna('image'));
     const [debitCount] = await pg<{ count: string }[]>`
       select count(*) from manna_transactions
-      where idempotency_key = ${mediaDebitIdempotencyKey(a.sha256, sessionId)}`;
+      where idempotency_key = ${`chat-media:${authorization.authorizationId}`}`;
     expect(Number(debitCount!.count)).toBe(1);
   });
 
   it('attach mode appends to an existing message and derives the agent from it', async () => {
     const file = fakePngFile('attach.png');
+    await authorize(sessionId, 'image_generate');
     const [row] = await pg<{ id: string }[]>`
       insert into messages (session_id, sender_id, role, content)
       values (${sessionId}, ${agentId}, 'assistant', 'Done! MEDIA:/home/node/.openclaw/media/x.png')
@@ -399,6 +438,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     const messageId = row!.id;
 
     const before = await getBalance(userId);
+    await authorize(sessionId, 'image_generate');
     const attached = await pipeline.ingestFile(file, {
       sessionId,
       messageId,
@@ -431,7 +471,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
         and attachments @> ${JSON.stringify([{ creationId: attached.creation!.id }])}::jsonb`;
     expect(Number(messageCount!.count)).toBe(1);
 
-    expect(attached.debit?.balance.total).toBe(before.total - defaultChatMediaManna('image'));
+    expect((await getBalance(userId)).total).toBe(before.total - defaultChatMediaManna('image'));
     const event = events.find((e) => e.event.type === 'media.attached')?.event;
     expect(event).toMatchObject({
       type: 'media.attached',
@@ -453,9 +493,10 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     events.length = 0;
     await credit({ accountId: userId, amount: defaultChatMediaManna('image'), type: 'credit:test' });
     const file = fakePngFile('orphan-rehome.png');
+    const balBefore = await getBalance(userId);
+    await authorize(sessionId, 'image_generate');
 
     // 1. in-session ingest with NO messageId → creation + orphan empty message.
-    const balBefore = await getBalance(userId);
     const orphaned = await pipeline.ingestFile(file, { sessionId, tool: 'image_generate' });
     expect(orphaned.creation).not.toBeNull();
     expect(orphaned.message).not.toBeNull();
@@ -526,6 +567,7 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     expect(parked.asset.sessionId).toBeNull();
     expect(parked.debit).toBeNull();
 
+    await authorize(sessionId, 'image_generate');
     const correlated = await pipeline.ingestFile(file, {
       sessionId,
       agentAccountId: agentId,
@@ -540,17 +582,18 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     expect(correlated.asset.creationId).toBe(correlated.creation!.id);
   });
 
-  it('keeps the artifact when the owner cannot pay (debitError, no negative balance)', async () => {
+  it('parks an artifact when no pre-provider authorization exists', async () => {
     const file = fakePngFile('broke.png');
     const result = await pipeline.ingestFile(file, {
       sessionId: brokeSessionId,
       agentAccountId: agentId,
       tool: 'image_generate',
     });
-    expect(result.creation).not.toBeNull();
-    expect(result.message).not.toBeNull();
+    expect(result.creation).toBeNull();
+    expect(result.message).toBeNull();
+    expect(result.asset.sessionId).toBeNull();
     expect(result.debit).toBeNull();
-    expect(result.debitError).toBe('insufficient_manna');
+    expect(result.debitError).toBeNull();
     expect((await getBalance(brokeUserId)).total).toBe(0);
   });
 
