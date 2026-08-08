@@ -770,19 +770,19 @@ export function ChannelsClient({
           <div>
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="text-sm font-medium">{connection.label || connection.user?.name || "X app"}</h3>
-              <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${connection.status === "active" || connection.status === "verified" ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300" : "border-rose-400/25 bg-rose-400/10 text-rose-300"}`}>
+              <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${connection.status === "active" || connection.status === "verified" ? "border-success/25 bg-success/10 text-success-soft" : "border-danger/25 bg-danger/10 text-danger-soft"}`}>
                 {connection.status}
               </span>
             </div>
             <p className="mt-1 text-xs text-muted">X · Credential encrypted{connection.user?.username ? ` · @${connection.user.username}` : ""}</p>
             <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">Updated {formatRelativeTime(connection.updatedAt)}</p>
           </div>
-          <button type="button" onClick={() => void revokeX(connection)} disabled={busy === `revoke:x:${connection.id}`} className="rounded-lg border border-rose-400/30 px-3 py-1.5 text-xs text-rose-300 disabled:opacity-40">Revoke</button>
+          <button type="button" onClick={() => void revokeX(connection)} disabled={busy === `revoke:x:${connection.id}`} className="rounded-lg border border-danger/30 px-3 py-1.5 text-xs text-danger-soft disabled:opacity-40">Revoke</button>
         </div>
         {connection.lastError ? (
-          <div className="mt-3 rounded-lg border border-rose-400/25 bg-rose-400/10 p-3 text-xs text-rose-200">
+          <div className="mt-3 rounded-lg border border-danger/25 bg-danger/10 p-3 text-xs text-danger-soft">
             <p>{connection.lastError.message}</p>
-            {action ? <p className="mt-1 text-rose-100/80">{action}</p> : null}
+            {action ? <p className="mt-1 text-danger-soft">{action}</p> : null}
           </div>
         ) : null}
         {clientLink ? <a href={clientLink} target="_blank" rel="noreferrer" className="mt-3 inline-block rounded-lg border border-edge px-3 py-2 text-xs text-muted">Open profile on X</a> : null}
