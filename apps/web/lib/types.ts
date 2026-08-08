@@ -385,6 +385,24 @@ export interface ChannelConnectionCreateInput {
   agentUsername?: string;
 }
 
+/** Safe, short-lived Telegram Managed Bots onboarding metadata. */
+export interface TelegramManagedBotIntentDto {
+  id: string;
+  state: string;
+  expiresAt: string;
+}
+
+export interface TelegramManagedBotOnboardingStart {
+  intent: TelegramManagedBotIntentDto;
+  ownerBindingUrl: string;
+}
+
+export interface TelegramManagedBotOnboardingStatus {
+  intent: TelegramManagedBotIntentDto;
+  managedBotUrl: string | null;
+  connection: ChannelConnectionDto | null;
+}
+
 export interface ChannelMockMessageResult {
   ok: true;
   channel: ChannelKind;

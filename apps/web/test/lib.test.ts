@@ -310,6 +310,52 @@ describe("lib/api browser transport", () => {
     expect(error.message).toContain("Wait for the provider limit to reset.");
   });
 
+  it("uses the frozen Telegram Managed Bots onboarding routes", async () => {
+    vi.stubGlobal("window", {});
+    const intent = {
+      id: "intent/one",
+      state: "pending_owner",
+      expiresAt: "2026-08-08T12:00:00.000Z",
+    };
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ intent, ownerBindingUrl: "https://t.me/eden?start=owner" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ))
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ intent: { ...intent, state: "stored" }, managedBotUrl: null, connection: null }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ))
+      .mockResolvedValueOnce(new Response(
+        JSON.stringify({ connection: { id: "connection-1" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.channels.startManagedTelegram({ suggestedBotUsername: "my_eden_bot" });
+    await api.channels.managedTelegramStatus(intent.id);
+    await api.channels.attachManagedTelegram(intent.id, { agentUsername: "eden" });
+    await api.channels.cancelManagedTelegram(intent.id);
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/channels/telegram/managed-bots/onboarding",
+      "/api/channels/telegram/managed-bots/onboarding/intent%2Fone",
+      "/api/channels/telegram/managed-bots/onboarding/intent%2Fone/attach",
+      "/api/channels/telegram/managed-bots/onboarding/intent%2Fone/cancel",
+    ]);
+    expect(JSON.parse(String(fetchMock.mock.calls[0]![1]?.body))).toEqual({
+      suggestedBotUsername: "my_eden_bot",
+    });
+    expect(JSON.parse(String(fetchMock.mock.calls[2]![1]?.body))).toEqual({
+      agentUsername: "eden",
+    });
+  });
+
   it("normalizes the auth settings payload", async () => {
     vi.stubGlobal("window", {});
     const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>

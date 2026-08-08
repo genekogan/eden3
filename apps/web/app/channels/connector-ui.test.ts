@@ -6,6 +6,8 @@ import {
   channelClientDeepLink,
   connectionHealthLabel,
   discordInviteUrl,
+  telegramManagedStep,
+  trustedTelegramUrl,
   xClientDeepLink,
   xFailureAction,
 } from './connector-ui';
@@ -58,6 +60,25 @@ describe('connector links', () => {
     expect(
       xClientDeepLink({ user: { id: '1', username: '@eden', name: null } } as XConnectionDto),
     ).toBe('https://x.com/eden');
+  });
+
+  it('accepts only provider-owned Telegram onboarding links', () => {
+    expect(trustedTelegramUrl('https://t.me/eden_managed_bot?start=abc')).toBe(
+      'https://t.me/eden_managed_bot?start=abc',
+    );
+    expect(trustedTelegramUrl('javascript:alert(1)')).toBeNull();
+    expect(trustedTelegramUrl('https://example.com/not-telegram')).toBeNull();
+  });
+});
+
+describe('Telegram Managed Bots state', () => {
+  it('maps the frozen onboarding milestones to UI steps', () => {
+    expect(telegramManagedStep('pending_owner')).toBe('bind_owner');
+    expect(telegramManagedStep('awaiting_bot')).toBe('choose_bot');
+    expect(telegramManagedStep('stored')).toBe('attach');
+    expect(telegramManagedStep('attached')).toBe('complete');
+    expect(telegramManagedStep('cancelled')).toBe('terminal');
+    expect(telegramManagedStep('expired')).toBe('terminal');
   });
 });
 

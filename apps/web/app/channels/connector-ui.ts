@@ -4,6 +4,42 @@ export const DISCORD_DEVELOPER_PORTAL = 'https://discord.com/developers/applicat
 export const X_DEVELOPER_PORTAL = 'https://developer.x.com/en/portal/dashboard';
 export const DISCORD_BOT_PERMISSIONS = 0;
 
+export type TelegramManagedStep =
+  | 'bind_owner'
+  | 'choose_bot'
+  | 'attach'
+  | 'complete'
+  | 'terminal';
+
+export function telegramManagedStep(state: string): TelegramManagedStep {
+  switch (state) {
+    case 'awaiting_bot':
+      return 'choose_bot';
+    case 'stored':
+      return 'attach';
+    case 'attached':
+      return 'complete';
+    case 'cancelled':
+    case 'expired':
+      return 'terminal';
+    default:
+      return 'bind_owner';
+  }
+}
+
+/** Reject unexpected schemes/hosts before rendering provider-owned links. */
+export function trustedTelegramUrl(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && (url.hostname === 't.me' || url.hostname === 'telegram.me')
+      ? url.toString()
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 export function discordInviteUrl(clientId: string): string | null {
   if (!/^\d{3,25}$/.test(clientId)) return null;
   const url = new URL('https://discord.com/oauth2/authorize');
