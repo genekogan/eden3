@@ -5,6 +5,7 @@ import {
   getEnv,
   InsufficientMannaError,
   resolveAgentByUsername,
+  TurnCeilingError,
 } from '@eden3/core';
 import { channelConnections, db, pg, secretAccessAuditEvents } from '@eden3/db';
 import {
@@ -204,7 +205,6 @@ interface ChannelConnectionRow {
   token_iv: string;
   token_auth_tag: string;
   token_sha256: string;
-  token_preview: string | null;
   key_version: string;
   last_error_code: string | null;
   last_error_message: string | null;
@@ -352,7 +352,6 @@ function dto(row: ChannelConnectionRow) {
     status: row.status,
     desiredState: row.desired_state,
     observedState: row.observed_state,
-    tokenPreview: row.token_preview,
     lastError:
       row.last_error_code
         ? { code: row.last_error_code, message: row.last_error_message ?? 'Connection error' }
@@ -373,7 +372,7 @@ function dto(row: ChannelConnectionRow) {
 const CONNECTION_COLUMNS = pg`
   id, account_id, agent_id, channel, label, runtime_account_id,
   desired_state, observed_state, status, token_ciphertext, token_iv,
-  token_auth_tag, token_sha256, token_preview, key_version,
+  token_auth_tag, token_sha256, key_version,
   last_error_code, last_error_message, last_validated_at, retry_count,
   next_retry_at, activated_at, metadata, created_at, updated_at
 `;
@@ -610,15 +609,15 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         insert into channel_connections (
           id, account_id, agent_id, channel, label, runtime_account_id,
           desired_state, observed_state, status, token_ciphertext, token_iv,
-          token_auth_tag, token_sha256, token_preview, key_version,
+          token_auth_tag, token_sha256, key_version,
           last_error_code, last_error_message, last_validated_at, retry_count,
           next_retry_at, metadata
         ) values (
           ${connectionId}, ${account.accountId}, ${agentId}, ${body.channel},
           ${body.label ?? null}, ${runtimeAccountId}, 'inactive', ${state.observedState},
           ${state.status}, ${encrypted.tokenCiphertext}, ${encrypted.tokenIv},
-          ${encrypted.tokenAuthTag}, ${encrypted.tokenSha256}, ${encrypted.tokenPreview},
-          ${encrypted.keyVersion}, ${state.lastErrorCode}, ${state.lastErrorMessage},
+          ${encrypted.tokenAuthTag}, ${encrypted.tokenSha256}, ${encrypted.keyVersion},
+          ${state.lastErrorCode}, ${state.lastErrorMessage},
           now(), ${state.retryCount}, ${state.nextRetryAt?.toISOString() ?? null},
           ${tx.json(JSON.stringify(metadata))}
         )
@@ -735,7 +734,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             ${encrypted
               ? tx`, token_ciphertext = ${encrypted.tokenCiphertext}, token_iv = ${encrypted.tokenIv},
                     token_auth_tag = ${encrypted.tokenAuthTag}, token_sha256 = ${encrypted.tokenSha256},
-                    token_preview = ${encrypted.tokenPreview}, key_version = ${encrypted.keyVersion}`
+                    token_preview = null, key_version = ${encrypted.keyVersion}`
               : tx``}
         where id = ${row.id}
         returning ${CONNECTION_COLUMNS}
@@ -1765,6 +1764,13 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       }
       if (error instanceof DailyCapExceededError) {
         throw new ApiError(429, 'daily_manna_cap_exceeded', 'Daily manna cap reached');
+      }
+      if (error instanceof TurnCeilingError) {
+        throw new ApiError(
+          422,
+          'unsupported_channel_model',
+          'This agent model is not configured for channel turns',
+        );
       }
       throw error;
     }

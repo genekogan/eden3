@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { TurnCeilingError } from '@eden3/core';
+
 import {
   ChannelExecutionMismatchError,
   REAPABLE_CHANNEL_TURN_STATUSES,
@@ -108,6 +110,30 @@ describe('ChannelTurnMeteringService economic authorization', () => {
       }),
     ).rejects.toThrow('insufficient manna');
     expect(persistence.markError).toHaveBeenCalledWith(record.turnId, 'reserve_failed');
+  });
+
+  it('fails closed before any provider permission when the model has no authorization ceiling', async () => {
+    const unsupported = {
+      ...connection,
+      model: 'openrouter/anthropic/claude-haiku-4-5',
+      pricingBasis: 'provider-reported' as const,
+    };
+    const persistence = store({
+      getBillableConnection: vi.fn(async () => unsupported),
+    });
+
+    await expect(
+      new ChannelTurnMeteringService(persistence).reserve({
+        turnId: randomUUID(),
+        connectionId: unsupported.connectionId,
+        runtimeAccountId: unsupported.runtimeAccountId,
+      }),
+    ).rejects.toBeInstanceOf(TurnCeilingError);
+
+    // `reserve` is the runtime's provider-permission gate. An unsupported
+    // ceiling never creates/claims a turn and can never authorize execution.
+    expect(persistence.claimTurn).not.toHaveBeenCalled();
+    expect(persistence.authorize).not.toHaveBeenCalled();
   });
 
   it('FG-ECON-CHANNEL-02 never charges above authorized-max and records the clamped settlement', async () => {
