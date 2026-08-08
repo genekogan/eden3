@@ -7,12 +7,130 @@ import {
   costFromParams,
   mannaForEstimate,
   mannaFromUsd,
+  selectCostTableEntry,
+  selectTurnCeilingEntry,
   TURN_CEILING_TABLE_VERSION,
+  type CostTableEntry,
+  type TurnCeilingEntry,
   TurnCeilingError,
   turnAuthorizedMax,
 } from './metering';
 
 describe('CostTable', () => {
+  const rate = (
+    effectiveDate: string,
+    usdPerUnit: number,
+    model = 'dated-model',
+  ): CostTableEntry => ({
+    provider: 'anthropic',
+    model,
+    unit: 'input_1m_tokens',
+    usdPerUnit,
+    effectiveDate,
+    source: `test rate ${effectiveDate}`,
+  });
+
+  it('selects the latest eligible rate independent of registry order', () => {
+    const older = rate('2026-01-01', 1);
+    const current = rate('2026-02-01', 2);
+    const future = rate('2026-03-01', 3);
+    const route = {
+      provider: 'anthropic' as const,
+      model: 'anthropic/dated-model',
+      unit: 'input_1m_tokens' as const,
+    };
+
+    for (const table of [
+      [older, current, future],
+      [future, older, current],
+      [current, future, older],
+    ]) {
+      expect(selectCostTableEntry(route, { table, asOf: '2026-02-15' })).toBe(current);
+    }
+  });
+
+  it('fails before the first rate, switches exactly at the boundary, and ignores future rows', () => {
+    const older = rate('2026-01-01', 1);
+    const current = rate('2026-02-01', 2);
+    const future = rate('2027-01-01', 99);
+    const table = [future, current, older];
+    const route = {
+      provider: 'anthropic' as const,
+      model: 'dated-model',
+      unit: 'input_1m_tokens' as const,
+    };
+
+    expect(() => selectCostTableEntry(route, { table, asOf: '2025-12-31' })).toThrow(
+      CostTableError,
+    );
+    expect(selectCostTableEntry(route, { table, asOf: '2026-01-01' })).toBe(older);
+    expect(selectCostTableEntry(route, { table, asOf: '2026-01-31' })).toBe(older);
+    expect(selectCostTableEntry(route, { table, asOf: '2026-02-01' })).toBe(current);
+    expect(selectCostTableEntry(route, { table, asOf: '2026-12-31' })).toBe(current);
+  });
+
+  it('rejects duplicate-date and normalized-model overlaps instead of using first match', () => {
+    const route = {
+      provider: 'anthropic' as const,
+      model: 'dated-model',
+      unit: 'input_1m_tokens' as const,
+    };
+    expect(() =>
+      selectCostTableEntry(route, {
+        table: [rate('2026-01-01', 1), rate('2026-01-01', 2)],
+        asOf: '2026-01-01',
+      }),
+    ).toThrow(/ambiguous/i);
+    expect(() =>
+      selectCostTableEntry(route, {
+        table: [rate('2026-2-01', 1)],
+        asOf: '2026-02-01',
+      }),
+    ).toThrow(CostTableError);
+    for (const effectiveDate of [undefined, new Date('2026-01-01T00:00:00.000Z')]) {
+      expect(() =>
+        selectCostTableEntry(route, {
+          table: [
+            {
+              ...rate('2026-01-01', 1),
+              effectiveDate,
+            } as unknown as CostTableEntry,
+          ],
+          asOf: '2026-02-01',
+        }),
+      ).toThrow(CostTableError);
+    }
+    expect(() =>
+      selectCostTableEntry(route, {
+        table: [
+          rate('2026-01-01', 1, 'dated-model'),
+          rate('2026-01-01', 2, 'anthropic\/dated-model'),
+        ],
+        asOf: '2026-01-01',
+      }),
+    ).toThrow(/ambiguous/i);
+  });
+
+  it('uses an eligible exact model over the wildcard fallback', () => {
+    const wildcard = rate('2026-02-01', 9, '*');
+    const exact = rate('2026-01-01', 2);
+    const route = {
+      provider: 'anthropic' as const,
+      model: 'dated-model',
+      unit: 'input_1m_tokens' as const,
+    };
+
+    expect(
+      selectCostTableEntry(route, { table: [wildcard, exact], asOf: '2026-02-15' }),
+    ).toBe(exact);
+    expect(
+      selectCostTableEntry(route, {
+        table: [wildcard, rate('2027-01-01', 2)],
+        asOf: '2026-02-15',
+      }),
+    ).toBe(wildcard);
+  });
+
   it('throws for unknown provider/model/unit combinations', () => {
     expect(() =>
       costFromParams({
@@ -21,6 +139,25 @@ describe('CostTable', () => {
         units: { image: 1 },
       }),
     ).toThrow(CostTableError);
+  });
+
+  it('threads historical as-of dates through ordinary cost estimates', () => {
+    expect(() =>
+      costFromParams({
+        provider: 'anthropic',
+        model: 'claude-haiku-4-5',
+        units: { input_1m_tokens: 1 },
+        asOf: '2026-07-05',
+      }),
+    ).toThrow(CostTableError);
+    expect(
+      costFromParams({
+        provider: 'anthropic',
+        model: 'claude-haiku-4-5',
+        units: { input_1m_tokens: 1 },
+        asOf: '2026-07-06',
+      }).totalCostUsd,
+    ).toBe(1);
   });
 
   it('computes LLM token costs and marks the table version', () => {
@@ -146,6 +283,105 @@ describe('manna conversion', () => {
 });
 
 describe('turn authorization ceilings (T08-U02, MVP gap 42)', () => {
+  const ceiling = (
+    effectiveDate: string,
+    maxTurnUsd: number,
+    model = 'dated-model',
+  ): TurnCeilingEntry => ({
+    provider: 'anthropic',
+    model,
+    maxTurnUsd,
+    maxOutputTokens: 1_024,
+    effectiveDate,
+    source: `test ceiling ${effectiveDate}`,
+  });
+
+  it('selects the latest eligible ceiling independent of order at exact date boundaries', () => {
+    const older = ceiling('2026-01-01', 1);
+    const current = ceiling('2026-02-01', 2);
+    const future = ceiling('2027-01-01', 99);
+    const route = { provider: 'anthropic', model: 'anthropic/dated-model' };
+
+    expect(() =>
+      selectTurnCeilingEntry(route, {
+        table: [current, older, future],
+        asOf: '2025-12-31',
+      }),
+    ).toThrow(TurnCeilingError);
+    expect(
+      selectTurnCeilingEntry(route, {
+        table: [future, current, older],
+        asOf: '2026-01-31',
+      }),
+    ).toBe(older);
+    expect(
+      selectTurnCeilingEntry(route, {
+        table: [future, older, current],
+        asOf: '2026-02-01',
+      }),
+    ).toBe(current);
+    expect(
+      selectTurnCeilingEntry(route, {
+        table: [current, future, older],
+        asOf: '2026-12-31',
+      }),
+    ).toBe(current);
+  });
+
+  it('rejects duplicate effective-date ceilings and invalid as-of dates', () => {
+    const route = { provider: 'anthropic', model: 'dated-model' };
+    expect(() =>
+      selectTurnCeilingEntry(route, {
+        table: [ceiling('2026-01-01', 1), ceiling('2026-01-01', 2)],
+        asOf: '2026-01-01',
+      }),
+    ).toThrow(/ambiguous/i);
+    expect(() =>
+      selectTurnCeilingEntry(route, {
+        table: [ceiling('2026-01-01', 1)],
+        asOf: '2026-02-30',
+      }),
+    ).toThrow(TurnCeilingError);
+    expect(() =>
+      selectTurnCeilingEntry(route, {
+        table: [ceiling('not-a-date', 1)],
+        asOf: '2026-02-01',
+      }),
+    ).toThrow(TurnCeilingError);
+    for (const effectiveDate of [undefined, new Date('2026-01-01T00:00:00.000Z')]) {
+      expect(() =>
+        selectTurnCeilingEntry(route, {
+          table: [
+            {
+              ...ceiling('2026-01-01', 1),
+              effectiveDate,
+            } as unknown as TurnCeilingEntry,
+          ],
+          asOf: '2026-02-01',
+        }),
+      ).toThrow(TurnCeilingError);
+    }
+  });
+
+  it('uses an eligible exact-model ceiling over wildcard fallback', () => {
+    const wildcard = ceiling('2026-02-01', 9, '*');
+    const exact = ceiling('2026-01-01', 2);
+    const route = { provider: 'anthropic', model: 'dated-model' };
+
+    expect(
+      selectTurnCeilingEntry(route, {
+        table: [wildcard, exact],
+        asOf: '2026-02-15',
+      }),
+    ).toBe(exact);
+    expect(
+      selectTurnCeilingEntry(route, {
+        table: [wildcard, ceiling('2027-01-01', 2)],
+        asOf: '2026-02-15',
+      }),
+    ).toBe(wildcard);
+  });
+
   it('covers every registered anthropic chat model with a frozen expected max', () => {
     // Expected manna values are FROZEN literals (not recomputed from the
     // table): a silent ceiling-table regression must fail this test. True
@@ -166,6 +402,21 @@ describe('turn authorization ceilings (T08-U02, MVP gap 42)', () => {
 
   it('accepts provider-prefixed model ids (the agents.model form)', () => {
     expect(turnAuthorizedMax({ provider: 'anthropic', model: 'anthropic/claude-haiku-4-5' }).manna).toBe(61);
+  });
+
+  it('threads historical as-of dates through ordinary turn authorization', () => {
+    expect(() =>
+      turnAuthorizedMax(
+        { provider: 'anthropic', model: 'claude-haiku-4-5' },
+        { asOf: '2026-08-07' },
+      ),
+    ).toThrow(TurnCeilingError);
+    expect(
+      turnAuthorizedMax(
+        { provider: 'anthropic', model: 'claude-haiku-4-5' },
+        { asOf: '2026-08-08' },
+      ).manna,
+    ).toBe(61);
   });
 
   it('fails closed on a model without a ceiling entry', () => {
