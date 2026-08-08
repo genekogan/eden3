@@ -336,6 +336,9 @@ describe('ensureBaseline', () => {
           allowedOrigins: ['http://127.0.0.1:18789', 'http://localhost:18789'],
         },
       },
+      channels: {
+        discord: { healthMonitor: { enabled: false } },
+      },
       agents: {
         defaults: {
           timeoutSeconds: AGENT_TURN_TIMEOUT_SECONDS,
@@ -687,6 +690,9 @@ describe('ensureBaseline', () => {
     });
     expect(gateway.controlUi).toEqual({
       allowedOrigins: ['http://127.0.0.1:18789', 'http://localhost:18789'],
+    });
+    expect(config.channels).toMatchObject({
+      discord: { healthMonitor: { enabled: false } },
     });
     const agents = config.agents as {
       defaults: {
