@@ -117,10 +117,13 @@ export function resolveWorkspacePath(
   if (rawPath.includes('\0') || rawPath.includes('\\')) throw invalidPath();
   if (path.isAbsolute(rawPath) || /^[a-zA-Z]:/.test(rawPath)) throw invalidPath();
 
-  const segments = rawPath.split('/').filter((segment) => segment !== '');
+  const segments = rawPath.split('/');
   if (segments.length === 0) throw invalidPath();
   for (const segment of segments) {
-    if (segment === '.' || segment === '..') throw invalidPath();
+    // Empty segments make aliases such as `SOUL.md/` and `SOUL.md//` resolve
+    // to a managed doctrine file after ownership policy has run. Reject them
+    // instead of normalizing so one spelling always means one policy.
+    if (segment === '' || segment === '.' || segment === '..') throw invalidPath();
     if (isHiddenName(segment)) throw hiddenPath(forWrite);
   }
 

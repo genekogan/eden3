@@ -10,6 +10,7 @@ import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildServer } from '../src/server';
+import { reconcileAgentRuntime } from '../src/services/agent-runtime-sync';
 import {
   deleteFixturesByMarker,
   devCookie,
@@ -40,10 +41,12 @@ const agentGhost = `${marker}_ghost`; // private, provisioned
 const agentBare = `${marker}_bare`; // public, NOT provisioned
 const agentVoid = `${marker}_void`; // provisioned but workspace dir never created
 const agentBig = `${marker}_big`; // workspace with >2000 entries
+const agentRace = `${marker}_race`; // canonical workspace for projector/save race
 
 let parentDir = ''; // holds the workspaces + an outside file (escape target)
 let wsFiles = '';
 let wsNeighbor = '';
+let wsRace = '';
 
 const NOTES_CONTENT = '# Notes\nhello world\n';
 const notesSha = createHash('sha256').update(NOTES_CONTENT).digest('hex');
@@ -99,6 +102,7 @@ beforeAll(async () => {
   wsFiles = path.join(parentDir, 'workspace-files-agent');
   wsNeighbor = path.join(parentDir, 'workspace-neighbor-agent');
   const wsBig = path.join(parentDir, 'workspace-big-agent');
+  wsRace = path.join(parentDir, `workspace-${agentRace}`);
 
   // Populated workspace: visible files, hidden/internal names, binaries,
   // and symlinks that try to escape the jail.
@@ -136,6 +140,18 @@ beforeAll(async () => {
   );
   await writeFile(path.join(wsFiles, 'MEMORY.md'), '');
   await writeFile(path.join(wsFiles, 'HEARTBEAT.md'), '');
+  await mkdir(wsRace, { recursive: true });
+  for (const file of [
+    'SOUL.md',
+    'IDENTITY.md',
+    'AGENTS.md',
+    'USER.md',
+    'TOOLS.md',
+    'MEMORY.md',
+    'HEARTBEAT.md',
+  ]) {
+    await writeFile(path.join(wsRace, file), await readFile(path.join(wsFiles, file)));
+  }
   await writeFile(path.join(wsFiles, 'art', 'plan.md'), 'make art\n');
   await writeFile(path.join(wsFiles, 'memory', 'users', 'alice.md'), '# alice\n');
   await writeFile(path.join(wsFiles, 'data', 'blob.bin'), Buffer.from([0x00, 0x01, 0xff, 0x00, 0x7f]));
@@ -198,6 +214,15 @@ beforeAll(async () => {
     public: true,
     openclawId: agentBig,
     workspacePath: wsBig,
+    provisionStatus: 'ready',
+  });
+  await insertAgentAccount(agentRace, {
+    ownerId,
+    name: 'Race Agent',
+    persona: 'You are the Files Agent.',
+    public: true,
+    openclawId: agentRace,
+    workspacePath: wsRace,
     provisionStatus: 'ready',
   });
 
@@ -906,6 +931,142 @@ describe('PUT /agents/:username/workspace/file', () => {
       expect(await readFile(path.join(wsFiles, file), 'utf8')).toBe(before);
     },
   );
+
+  it.each([
+    'SOUL.md',
+    'IDENTITY.md',
+    'AGENTS.md',
+    'USER.md',
+    'TOOLS.md',
+    'MEMORY.md',
+    'HEARTBEAT.md',
+  ])('rejects slash and case aliases for managed doctrine %s without mutation', async (file) => {
+    const before = await readFile(path.join(wsFiles, file), 'utf8');
+    const [beforeRow] = await pg<{ persona: string | null; runtime_sync_version: number }[]>`
+      select g.persona, g.runtime_sync_version
+      from agents g join accounts a on a.id = g.account_id
+      where a.username = ${agentFiles}
+    `;
+    for (const [alias, expectedStatus] of [
+      [`${file}/`, 400],
+      [`${file}//`, 400],
+      [file.toLowerCase(), 409],
+    ] as const) {
+      const response = await app.inject({
+        method: 'PUT',
+        url: `${treeUrl(agentFiles)}/file`,
+        headers: asOwner,
+        payload: { path: alias, content: 'alias overwrite', baseSha256: 'new' },
+      });
+      expect(response.statusCode, alias).toBe(expectedStatus);
+    }
+    expect(await readFile(path.join(wsFiles, file), 'utf8')).toBe(before);
+    const [afterRow] = await pg<{ persona: string | null; runtime_sync_version: number }[]>`
+      select g.persona, g.runtime_sync_version
+      from agents g join accounts a on a.id = g.account_id
+      where a.username = ${agentFiles}
+    `;
+    expect(afterRow).toEqual(beforeRow);
+  });
+
+  it('waits for an active runtime projector before committing a newer SOUL revision', async () => {
+    const oldPersona = 'You are the Files Agent. Projector revision.';
+    await writeFile(path.join(wsRace, 'SOUL.md'), oldPersona);
+    const [pending] = await pg<{ runtime_sync_version: number }[]>`
+      update agents
+      set persona = ${oldPersona},
+          runtime_synced_version = runtime_sync_version,
+          runtime_sync_version = runtime_sync_version + 1,
+          runtime_sync_claim_token = null,
+          runtime_sync_lease_expires_at = null
+      where account_id = (select id from accounts where username = ${agentRace})
+      returning runtime_sync_version
+    `;
+
+    let releaseProjector!: () => void;
+    let markProjectorEntered!: () => void;
+    const projectorHeld = new Promise<void>((resolve) => {
+      releaseProjector = resolve;
+    });
+    const projectorEntered = new Promise<void>((resolve) => {
+      markProjectorEntered = resolve;
+    });
+    const provisioner = makeFakeProvisioner();
+    const basePersonaUpdate = provisioner.updateAgentPersona.bind(provisioner);
+    let pause = true;
+    provisioner.updateAgentPersona = async (params) => {
+      if (pause) {
+        markProjectorEntered();
+        await projectorHeld;
+      }
+      await writeFile(path.join(wsRace, 'SOUL.md'), params.persona);
+      return basePersonaUpdate(params);
+    };
+    const toolSync = makeFakeToolSync();
+    const projector = reconcileAgentRuntime(agentRace, {
+      provisioner,
+      toolSync,
+      dataDir: parentDir,
+    });
+    await projectorEntered;
+
+    const loaded = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentRace, 'SOUL.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    expect(loaded.doctrineRevision).toBe(pending!.runtime_sync_version);
+    const winnerPersona = 'You are the Files Agent. Workspace winner.';
+    let saveSettled = false;
+    const savePromise = app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentRace)}/file`,
+      headers: asOwner,
+      payload: {
+        path: 'SOUL.md',
+        content: winnerPersona,
+        baseSha256: loaded.sha256,
+        baseRevision: loaded.doctrineRevision,
+      },
+    }).finally(() => {
+      saveSettled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(saveSettled).toBe(false);
+
+    pause = false;
+    releaseProjector();
+    await expect(projector).resolves.toEqual({
+      status: 'synced',
+      version: pending!.runtime_sync_version,
+    });
+    const save = await savePromise;
+    expect(save.statusCode).toBe(200);
+    const saved = (save.json() as TextFileBody).file;
+    expect(saved.doctrineRevision).toBe(pending!.runtime_sync_version + 1);
+    expect(await readFile(path.join(wsRace, 'SOUL.md'), 'utf8')).toBe(winnerPersona);
+
+    const [afterSave] = await pg<{
+      persona: string | null;
+      runtime_sync_version: number;
+      runtime_synced_version: number;
+      runtime_sync_claim_token: string | null;
+    }[]>`
+      select persona, runtime_sync_version, runtime_synced_version, runtime_sync_claim_token
+      from agents where account_id = (select id from accounts where username = ${agentRace})
+    `;
+    expect(afterSave).toEqual({
+      persona: winnerPersona,
+      runtime_sync_version: saved.doctrineRevision,
+      runtime_synced_version: pending!.runtime_sync_version,
+      runtime_sync_claim_token: null,
+    });
+
+    await expect(
+      reconcileAgentRuntime(agentRace, { provisioner, toolSync, dataDir: parentDir }),
+    ).resolves.toEqual({ status: 'synced', version: saved.doctrineRevision });
+    expect(await readFile(path.join(wsRace, 'SOUL.md'), 'utf8')).toBe(winnerPersona);
+  });
 });
 
 // ---------------------------------------------------------------------------

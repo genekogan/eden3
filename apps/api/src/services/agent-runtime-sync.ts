@@ -19,7 +19,7 @@ import { projectApprovedAgentSkills } from './agent-skills';
 const CLAIM_HEARTBEAT_MS = 60_000;
 const CLAIM_LEASE_MINUTES = 35;
 const FAILURE_RETRY_MS = 5 * 60_000;
-const RUNTIME_SYNC_LOCK_SEED = 92;
+export const AGENT_RUNTIME_SYNC_LOCK_SEED = 92;
 const MAX_IMMEDIATE_REVISIONS = 3;
 
 interface RuntimeSyncLogger {
@@ -89,16 +89,20 @@ function normalizedToolGroups(value: unknown): string[] {
  * session advisory lock is released automatically if the process/connection
  * dies, while the durable claim lease remains the crash-recovery signal.
  */
+export function agentRuntimeSyncLockKey(accountId: string): string {
+  return `eden3:agent-runtime-sync:${accountId}`;
+}
+
 async function withAgentRuntimeSyncLock<T>(
   accountId: string,
   run: () => Promise<T>,
 ): Promise<T> {
   const connection = await pg.reserve();
-  const lockKey = `eden3:agent-runtime-sync:${accountId}`;
+  const lockKey = agentRuntimeSyncLockKey(accountId);
   let locked = false;
   try {
     await connection.unsafe(
-      `select pg_advisory_lock(hashtextextended($1::text, ${RUNTIME_SYNC_LOCK_SEED}))`,
+      `select pg_advisory_lock(hashtextextended($1::text, ${AGENT_RUNTIME_SYNC_LOCK_SEED}))`,
       [lockKey],
     );
     locked = true;
@@ -107,7 +111,7 @@ async function withAgentRuntimeSyncLock<T>(
     try {
       if (locked) {
         await connection.unsafe(
-          `select pg_advisory_unlock(hashtextextended($1::text, ${RUNTIME_SYNC_LOCK_SEED}))`,
+          `select pg_advisory_unlock(hashtextextended($1::text, ${AGENT_RUNTIME_SYNC_LOCK_SEED}))`,
           [lockKey],
         );
       }

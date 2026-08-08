@@ -5,6 +5,7 @@ import {
   SOUL_WORKSPACE_FILE,
   workspaceDoctrineWritePolicy,
 } from '../src/services/workspace-doctrine-policy';
+import { resolveWorkspacePath } from '../src/services/workspace-files';
 
 describe('workspace doctrine write ownership', () => {
   it('permits the proven SOUL.md two-way path', () => {
@@ -26,6 +27,17 @@ describe('workspace doctrine write ownership', () => {
     },
   );
 
+  it.each(BOOTSTRAP_FILE_NAMES)(
+    'treats noncanonical case for %s as managed instead of an ordinary file',
+    (file) => {
+      expect(workspaceDoctrineWritePolicy(file.toLowerCase())).toEqual({
+        kind: 'managed-generated',
+        file,
+        writable: false,
+      });
+    },
+  );
+
   it('leaves ordinary workspace files writable', () => {
     expect(workspaceDoctrineWritePolicy('notes/idea.md')).toEqual({
       kind: 'ordinary-file',
@@ -33,4 +45,13 @@ describe('workspace doctrine write ownership', () => {
       writable: true,
     });
   });
+
+  it.each(['SOUL.md/', 'SOUL.md//', 'notes//idea.md'])(
+    'rejects noncanonical empty-segment path %s instead of normalizing it',
+    (file) => {
+      expect(() => resolveWorkspacePath('/tmp/agent-workspace', file, { forWrite: true })).toThrow(
+        /stay inside the agent workspace/,
+      );
+    },
+  );
 });

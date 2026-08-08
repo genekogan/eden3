@@ -13,10 +13,15 @@ import {
   listWorkspaceTree,
   openWorkspaceDownload,
   readWorkspaceFile,
+  resolveWorkspacePath,
   sha256Hex,
   workspaceDownloadMime,
   writeWorkspaceFile,
 } from '../services/workspace-files';
+import {
+  AGENT_RUNTIME_SYNC_LOCK_SEED,
+  agentRuntimeSyncLockKey,
+} from '../services/agent-runtime-sync';
 import {
   SOUL_WORKSPACE_FILE,
   workspaceDoctrineWritePolicy,
@@ -194,7 +199,10 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     const { account, root } = await resolveManagedWorkspace(req, username);
-    const doctrinePolicy = workspaceDoctrineWritePolicy(body.path);
+    // Canonicalize/reject aliases before ownership policy. Policy must never
+    // classify one spelling while the filesystem writer resolves another.
+    const canonicalPath = resolveWorkspacePath(root, body.path, { forWrite: true }).rel;
+    const doctrinePolicy = workspaceDoctrineWritePolicy(canonicalPath);
     if (!doctrinePolicy.writable) {
       throw new ApiError(
         409,
@@ -226,8 +234,13 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
 
     if (doctrinePolicy.kind === 'two-way-settings') {
       const outcome = await pg.begin(async (tx) => {
-        // Match PATCH /agents/:username's lock namespace and ordering. This
-        // makes Workspace and Settings one serialized desired-state writer.
+        // The runtime projector owns this exact cross-process session-lock
+        // identity. Taking its transaction-scoped form first ensures no stale
+        // renderer can resume after this filesystem write and clobber it.
+        await tx`select pg_advisory_xact_lock(hashtextextended(${agentRuntimeSyncLockKey(account.id)}::text, ${AGENT_RUNTIME_SYNC_LOCK_SEED}))`;
+        // Match PATCH /agents/:username's desired-row lock namespace after the
+        // external-mutation fence. Settings releases seed 91 before it enters
+        // runtime synchronization, so this order cannot cycle with PATCH.
         await tx`select pg_advisory_xact_lock(hashtextextended(${account.id}::text, 91))`;
         const rows = await tx<DoctrineRevisionRow[]>`
           select persona, runtime_sync_version
@@ -239,7 +252,7 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
         if (!current) throw new ApiError(404, 'agent_not_found', 'Agent no longer exists');
 
         if (current.runtime_sync_version !== body.baseRevision) {
-          const file = await readWorkspaceFile(root, body.path);
+          const file = await readWorkspaceFile(root, canonicalPath);
           return {
             ok: false as const,
             currentSha256: file.kind === 'text' ? file.sha256 : null,
@@ -250,7 +263,7 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
 
         const result = await writeWorkspaceFile({
           root,
-          path: body.path,
+          path: canonicalPath,
           content: body.content,
           baseSha256: body.baseSha256,
         });
@@ -266,8 +279,6 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
           update agents
           set persona = ${persona},
               runtime_sync_version = runtime_sync_version + 1,
-              runtime_sync_claim_token = null,
-              runtime_sync_lease_expires_at = null,
               runtime_sync_error = null
           where account_id = ${account.id}
           returning runtime_sync_version
@@ -303,7 +314,7 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
 
     const result = await writeWorkspaceFile({
       root,
-      path: body.path,
+      path: canonicalPath,
       content: body.content,
       baseSha256: body.baseSha256,
     });

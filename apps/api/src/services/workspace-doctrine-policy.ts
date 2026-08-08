@@ -16,10 +16,17 @@ export type WorkspaceDoctrineWritePolicy =
  * provenance-preserving save path exists for its owning Settings surface.
  */
 export function workspaceDoctrineWritePolicy(filePath: string): WorkspaceDoctrineWritePolicy {
-  if (!(BOOTSTRAP_FILE_NAMES as readonly string[]).includes(filePath)) {
+  const canonical = (BOOTSTRAP_FILE_NAMES as readonly string[]).find(
+    (file) => file.toLowerCase() === filePath.toLowerCase(),
+  );
+  if (!canonical) {
     return { kind: 'ordinary-file', file: null, writable: true };
   }
-  const file = filePath as BootstrapFileName;
+  const file = canonical as BootstrapFileName;
+  // On case-insensitive hosts `soul.md` is the same inode as `SOUL.md`.
+  // Treat every noncanonical case spelling as managed/read-only everywhere,
+  // including Linux, so deployment filesystem semantics cannot change policy.
+  if (filePath !== file) return { kind: 'managed-generated', file, writable: false };
   if (file === SOUL_WORKSPACE_FILE) {
     return { kind: 'two-way-settings', file, writable: true };
   }
