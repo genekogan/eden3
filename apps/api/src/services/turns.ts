@@ -61,9 +61,12 @@ import {
   type SubscriptionTurnClaimsLike,
 } from './subscription-turn-claims';
 import {
+  claimTurnProviderStart,
   insertTurnAuthorization,
+  markTurnUsableOutput,
   markTurnSettled,
   reverseTurnAuthorization,
+  settlePartialOutputAuthorization,
 } from './turn-authorization';
 
 export { renderPeerContext };
@@ -825,6 +828,28 @@ async function runClaimedTurn(
   }
   const { debited, reservedSubscriptionManna } = reserved;
 
+  // Consume the durable one-shot provider ticket BEFORE user-message
+  // persistence, SSE hijack, or provider construction. A replay loser owns
+  // none of the shared reservation and must never reverse the winner's money.
+  let providerStartAcquired: boolean;
+  try {
+    providerStartAcquired = await claimTurnProviderStart(turnId);
+  } catch (err) {
+    try {
+      await reverseTurnAuthorization({ turnId, refundType });
+    } catch (reverseErr) {
+      onError(reverseErr, 'turn reservation reversal (provider-start failure)');
+    }
+    throw err;
+  }
+  if (!providerStartAcquired) {
+    throw new ApiError(
+      409,
+      'turn_provider_already_started',
+      `Turn ${turnId} has already consumed its provider-start authorization`,
+    );
+  }
+
   // Reverse the reservation for the PRE-STREAM window (no SSE sink exists
   // yet, so we cannot publish manna.updated). Any throw between the committed
   // reservation and beginStream() would otherwise orphan it — reverse, then
@@ -922,9 +947,37 @@ async function runClaimedTurn(
    * — e.g. a post-settlement error must not undo a delivered, persisted,
    * exactly-charged turn).
    */
+  let usageEventRecorded = false;
+  let usableOutputMarked = false;
+  const settleMarkedPartialOutput = async (): Promise<boolean> => {
+    try {
+      const partial = await settlePartialOutputAuthorization({
+        turnId,
+        errorCode: outcome.errorCode ?? 'provider_stream_interrupted_after_output',
+        errorMessage:
+          outcome.errorMessage ?? 'Provider stream ended after emitting usable output',
+      });
+      if (!partial.eligible) return false;
+      usageEventRecorded = true;
+      if (partial.settled && partial.balanceTotal !== undefined) {
+        publish({
+          type: 'manna.updated',
+          accountId: user.accountId,
+          balance: partial.balanceTotal,
+        });
+      }
+      return true;
+    } catch (err) {
+      onError(err, 'partial-output full-reserve settlement');
+      return false;
+    }
+  };
+
   const reverseTurn = async (): Promise<boolean> => {
+    if (usableOutputMarked && (await settleMarkedPartialOutput())) return true;
     try {
       const result = await reverseTurnAuthorization({ turnId, refundType });
+      if (result.partialOutputRequired) return await settleMarkedPartialOutput();
       if (result.reversed && result.balanceTotal !== undefined) {
         publish({
           type: 'manna.updated',
@@ -939,7 +992,6 @@ async function runClaimedTurn(
     }
   };
 
-  let usageEventRecorded = false;
   let chargeSettlement: ChatChargeSettlement | undefined;
   const recordUsageEvent = async (record: {
     status: 'completed' | 'missing_usage' | 'unmetered' | 'error';
@@ -1088,6 +1140,13 @@ async function runClaimedTurn(
               'post-terminal gateway token',
             );
             break;
+          }
+          if (!usableOutputMarked && event.delta.trim() !== '') {
+            // Durable before emit: once value can reach a client, a later
+            // explicit error or crash follows full-reserve-v1 instead of
+            // returning a useful prefix for free. One DB roundtrip per turn.
+            await markTurnUsableOutput(turnId);
+            usableOutputMarked = true;
           }
           publish({ type: 'token', turnId, delta: event.delta });
           break;

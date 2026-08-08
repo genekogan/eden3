@@ -41,10 +41,9 @@ async function main(): Promise<void> {
     async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
       // The reservation + authorization row are already committed here.
       yield { type: 'turn.started' };
-      // Stream a usable token BEFORE hanging, so the SIGKILL leaves a `reserved`
-      // orphan whose client already SAW output — proving the predeclared rule
-      // (an unpersisted turn is a failed turn and refunds in full, even after a
-      // streamed byte; partial-output settlement is DEBT-004, not decided).
+      // Stream a usable token BEFORE hanging. runTurn durably records the first
+      // non-whitespace output before emission, so the SIGKILL leaves a
+      // `reserved` orphan that the reaper must settle under full-reserve-v1.
       yield { type: 'token', delta: 'partial output before the crash' };
       process.stdout.write(`RESERVED ${turnId}\n`);
       // Hang forever — the parent will SIGKILL us mid-turn.

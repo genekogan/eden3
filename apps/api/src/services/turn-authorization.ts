@@ -1,6 +1,13 @@
 import type { DbHandle } from '@eden3/core';
-import { numericToNumber, reverseReservation } from '@eden3/core';
-import { db, mannaTransactions, turnAuthorizations, type TurnAuthorization } from '@eden3/db';
+import { numericToNumber, reverseReservation, settleReservation } from '@eden3/core';
+import {
+  db,
+  mannaTransactions,
+  turnAuthorizations,
+  turnProviderRuns,
+  usageEvents,
+  type TurnAuthorization,
+} from '@eden3/db';
 import { and, eq, sql } from 'drizzle-orm';
 
 /**
@@ -30,6 +37,205 @@ export interface ReserveAuthorizationRow {
   authorizedMaxManna: number;
   reservedSubscriptionManna: number;
   reservationTxId: string;
+}
+
+export const PARTIAL_OUTPUT_SETTLEMENT_RULE = 'full-reserve-v1' as const;
+
+/**
+ * Atomically consume the authorization's one provider-start ticket. The
+ * insertion is durable and cross-process exclusive; false means another
+ * claimant already consumed it or the parent authorization is no longer
+ * reserved. Callers losing this race must not reverse the winner's money.
+ */
+export async function claimTurnProviderStart(
+  turnId: string,
+  dbc: DbHandle = db,
+): Promise<boolean> {
+  const inserted = (await dbc.execute(sql`
+    insert into turn_provider_runs (turn_id)
+    select turn_id from turn_authorizations
+    where turn_id = ${turnId} and state = 'reserved'
+    on conflict (turn_id) do nothing
+    returning turn_id
+  `)) as unknown as { turn_id: string }[];
+  return inserted.length === 1;
+}
+
+/**
+ * Persist the first non-whitespace output checkpoint before emitting that
+ * output. The DB guard permits only NULL -> one timestamp while the parent is
+ * reserved. This is intentionally a one-time first-token roundtrip.
+ */
+export async function markTurnUsableOutput(
+  turnId: string,
+  dbc: DbHandle = db,
+): Promise<boolean> {
+  return await dbc.transaction(async (tx) => {
+    // Preserve the global auth-row -> dependent-row lock order used by every
+    // settle/reverse path; the DB trigger rechecks the same parent invariant.
+    await tx.execute(sql`
+      select turn_id from turn_authorizations where turn_id = ${turnId} for update
+    `);
+    const [updated] = await tx
+      .update(turnProviderRuns)
+      .set({ usableOutputAt: new Date() })
+      .where(
+        and(
+          eq(turnProviderRuns.turnId, turnId),
+          sql`${turnProviderRuns.usableOutputAt} is null`,
+        ),
+      )
+      .returning({ turnId: turnProviderRuns.turnId });
+    if (updated) return true;
+    const [existing] = await tx
+      .select({ usableOutputAt: turnProviderRuns.usableOutputAt })
+      .from(turnProviderRuns)
+      .where(eq(turnProviderRuns.turnId, turnId))
+      .limit(1);
+    if (!existing?.usableOutputAt) {
+      throw new Error(`turn-authorization: turn ${turnId} has no provider-start lease`);
+    }
+    return false;
+  });
+}
+
+export interface PartialOutputSettlementResult {
+  /** True only for the transaction that performed the terminal settlement. */
+  settled: boolean;
+  /** True when the row was eligible for full-reserve-v1, including a replay. */
+  eligible: boolean;
+  balanceTotal?: number;
+  chargedManna?: number;
+}
+
+/**
+ * Terminalize a durably marked streamed-prefix failure under the predeclared
+ * full-reserve-v1 rule. With no trustworthy terminal usage receipt, the full
+ * preauthorized maximum remains charged. Authorization, zero-refund settle,
+ * and loud error usage truth commit together; no assistant row is fabricated.
+ */
+export async function settlePartialOutputAuthorization(options: {
+  turnId: string;
+  errorCode: string;
+  errorMessage: string;
+  db?: DbHandle;
+}): Promise<PartialOutputSettlementResult> {
+  const dbc = options.db ?? db;
+  return await dbc.transaction(async (tx) => {
+    await tx.execute(sql`
+      select turn_id from turn_authorizations where turn_id = ${options.turnId} for update
+    `);
+    const rows = (await tx.execute(sql`
+      select a.turn_id, a.state, a.account_id, a.agent_account_id, a.session_id,
+             a.provider, a.model, a.pricing_basis, a.ceiling_table_version,
+             a.authorized_max_manna, a.reserved_subscription_manna,
+             p.provider_started_at, p.usable_output_at,
+             mt.idempotency_key as reservation_key, mt.type as reservation_type
+      from turn_authorizations a
+      join turn_provider_runs p on p.turn_id = a.turn_id
+      join manna_transactions mt on mt.id = a.reservation_tx_id
+      where a.turn_id = ${options.turnId}
+      for update of p
+    `)) as unknown as {
+      turn_id: string;
+      state: string;
+      account_id: string;
+      agent_account_id: string | null;
+      session_id: string | null;
+      provider: string;
+      model: string;
+      pricing_basis: string;
+      ceiling_table_version: string;
+      authorized_max_manna: string;
+      reserved_subscription_manna: string;
+      provider_started_at: Date;
+      usable_output_at: Date | null;
+      reservation_key: string | null;
+      reservation_type: string | null;
+    }[];
+    const row = rows[0];
+    if (!row || row.usable_output_at === null) return { settled: false, eligible: false };
+    if (row.state !== 'reserved') {
+      return { settled: false, eligible: row.state === 'settled' };
+    }
+    if (!row.reservation_key) {
+      throw new Error(`turn-authorization: turn ${options.turnId} reservation has no idempotency key`);
+    }
+    if (
+      row.pricing_basis !== 'provider-api' &&
+      row.pricing_basis !== 'notional-subscription'
+    ) {
+      throw new Error(
+        `turn-authorization: turn ${options.turnId} has invalid pricing basis ${row.pricing_basis}`,
+      );
+    }
+
+    const chargedManna = numericToNumber(row.authorized_max_manna);
+    await markTurnSettled(tx, options.turnId, { chargedManna, overrun: false });
+    const leg = await settleReservation({
+      reservationKey: row.reservation_key,
+      chargeManna: chargedManna,
+      reservedSubscriptionManna: numericToNumber(row.reserved_subscription_manna),
+      type:
+        row.reservation_type === 'spend:memory-dream'
+          ? 'refund:memory-dream:partial-output-settle'
+          : 'refund:chat:partial-output-settle',
+      db: tx,
+    });
+    const eventType =
+      row.reservation_type === 'spend:memory-dream' ? 'memory_dream' : 'chat_turn';
+    const [usage] = await tx
+      .insert(usageEvents)
+      .values({
+        eventType,
+        status: 'error',
+        userId: row.account_id,
+        agentId: row.agent_account_id,
+        sessionId: row.session_id,
+        messageId: null,
+        turnId: row.turn_id,
+        provider: row.provider,
+        model: row.model,
+        pricingBasis: row.pricing_basis,
+        tableVersion: null,
+        manna: chargedManna,
+        errorCode: options.errorCode,
+        errorMessage: options.errorMessage,
+        metadata: {
+          partialOutputSettlement: {
+            rule: PARTIAL_OUTPUT_SETTLEMENT_RULE,
+            chargedManna,
+            ceilingTableVersion: row.ceiling_table_version,
+            providerStartedAt: row.provider_started_at,
+            usableOutputAt: row.usable_output_at,
+          },
+        },
+      })
+      .onConflictDoNothing()
+      .returning({ id: usageEvents.id });
+    if (!usage) {
+      const survivor = (await tx.execute(sql`
+        select status, manna from usage_events
+        where event_type = ${eventType} and turn_id = ${row.turn_id}
+      `)) as unknown as { status: string; manna: number | null }[];
+      if (
+        survivor.length !== 1 ||
+        survivor[0]!.status !== 'error' ||
+        Number(survivor[0]!.manna) !== chargedManna
+      ) {
+        throw new Error(
+          `turn-authorization: turn ${options.turnId} has conflicting partial-output usage truth`,
+        );
+      }
+    }
+
+    return {
+      settled: true,
+      eligible: true,
+      balanceTotal: leg.balance.total,
+      chargedManna,
+    };
+  });
 }
 
 /**
@@ -114,6 +320,8 @@ export interface ReverseTurnAuthorizationResult {
   reversed: boolean;
   /** Balance after the reversal (only when `reversed`). */
   balanceTotal?: number;
+  /** A durable usable prefix must settle under full-reserve-v1, never refund. */
+  partialOutputRequired?: boolean;
 }
 
 /**
@@ -132,16 +340,24 @@ export async function reverseTurnAuthorization(options: {
   return await dbc.transaction(async (tx) => {
     // Lock the authorization row so a racing settle/reverse serializes here.
     const rows = (await tx.execute(sql`
-      select turn_id, state, reserved_subscription_manna, reservation_tx_id
-      from turn_authorizations where turn_id = ${options.turnId} for update
+      select a.turn_id, a.state, a.reserved_subscription_manna, a.reservation_tx_id,
+             p.usable_output_at
+      from turn_authorizations a
+      left join turn_provider_runs p on p.turn_id = a.turn_id
+      where a.turn_id = ${options.turnId}
+      for update of a
     `)) as unknown as {
       turn_id: string;
       state: string;
       reserved_subscription_manna: string;
       reservation_tx_id: string;
+      usable_output_at: Date | null;
     }[];
     const row = rows[0];
     if (!row || row.state !== 'reserved') return { reversed: false };
+    if (row.usable_output_at !== null) {
+      return { reversed: false, partialOutputRequired: true };
+    }
 
     const [reservationTx] = await tx
       .select({ idempotencyKey: mannaTransactions.idempotencyKey })

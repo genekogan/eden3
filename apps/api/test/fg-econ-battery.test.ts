@@ -465,6 +465,7 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
     const usage = { promptTokens: 1000, completionTokens: 50 };
     const expected = oracleSettlement(usage, model);
     const { compat, calls, release } = gatedCompat(usage);
+    let streamOpenCount = 0;
     const run = () =>
       runTurn(makeDeps(compat), {
         session: fixture.session,
@@ -472,7 +473,10 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
         user: fixture.user,
         content: 'same id',
         turnId,
-        beginStream: sink,
+        beginStream: () => {
+          streamOpenCount += 1;
+          return sink();
+        },
       });
     const a = run();
     const b = run();
@@ -500,6 +504,11 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
     expect((await getBalance(fixture.user.accountId)).total).toBe(startBalance - expected.charged);
 
     expect(calls(), 'one durable authorization must be a one-shot provider ticket').toBe(1);
+    expect(streamOpenCount, 'the replay loser must return before opening SSE').toBe(1);
+    const [userMessages] = await pg<{ n: string }[]>`
+      select count(*)::text as n from messages
+      where session_id = ${fixture.session.id} and role = 'user' and content = 'same id'`;
+    expect(Number(userMessages!.n), 'the replay loser must return before message persistence').toBe(1);
   });
 });
 

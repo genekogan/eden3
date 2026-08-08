@@ -108,10 +108,10 @@ afterAll(async () => {
 });
 
 describe('FG-ECON crash → reaper (T08-U03)', () => {
-  // FG-ECON-REAP-01: a GENUINE process crash between reservation and terminal
-  // leaves a real `reserved` orphan (no catch/reversal runs); the reaper then
-  // reverses it in full, split-exactly.
-  it('FG-ECON-REAP-01: SIGKILL mid-turn leaves a reserved orphan; the reaper reverses it split-exact', async () => {
+  // FG-ECON-REAP-01: a GENUINE process crash after a durably marked usable
+  // prefix leaves a real `reserved` orphan (no catch runs); the reaper applies
+  // the predeclared full-reserve-v1 settlement instead of serving free value.
+  it('FG-ECON-REAP-01: SIGKILL after usable output settles the full reserve exactly once', async () => {
     const reservation = oracleReservation(HAIKU);
     const subShare = 20;
     const durableFund = 200;
@@ -162,11 +162,13 @@ describe('FG-ECON crash → reaper (T08-U03)', () => {
     child.kill('SIGKILL');
     await new Promise<void>((resolve) => child.on('exit', () => resolve()));
 
-    // The orphan is still 'reserved' (nothing reversed it in-process) — even
-    // though the client already saw a streamed token. The predeclared rule: an
-    // unpersisted turn is a failed turn and refunds in full (partial-output
-    // settlement is DEBT-004, undecided). No assistant message was persisted.
+    // The orphan is still 'reserved' (nothing terminalized it in-process), but
+    // the first usable token checkpoint is durable. No assistant message was
+    // fabricated for an incomplete provider stream.
     expect(await authzState(turnId)).toBe('reserved');
+    const [providerRun] = await pg<{ usable_output_at: Date | null }[]>`
+      select usable_output_at from turn_provider_runs where turn_id = ${turnId}`;
+    expect(providerRun?.usable_output_at).not.toBeNull();
     const [assistantCount] = await pg<{ n: string }[]>`
       select count(*)::text as n from messages where session_id = ${fixture.sessionId} and role = 'assistant'`;
     expect(Number(assistantCount!.n)).toBe(0);
@@ -180,28 +182,41 @@ describe('FG-ECON crash → reaper (T08-U03)', () => {
     await seedForeignReserved(foreign, foreignTurn, foreignDebit, oracleReservation(HAIKU));
     expect(await authzState(foreignTurn)).toBe('reserved');
 
-    // Age the (marker-scoped) row past the reaper TTL and compensate it, scoped
-    // to ONLY our account.
+    // Age the row past the reaper TTL and recover it, scoped to ONLY our
+    // account. A durable usable prefix retains the full preauthorized max.
     await pg`update turn_authorizations set created_at = now() - interval '2 hours' where turn_id = ${turnId}`;
     const reaper = new TurnReservationReaper({ accountScope: [fixture.userId] });
     const result = await reaper.runOnce();
-    expect(result.reaped).toBeGreaterThanOrEqual(1);
-    expect(await authzState(turnId)).toBe('reaped');
+    expect(result.partialSettled).toBeGreaterThanOrEqual(1);
+    expect(await authzState(turnId)).toBe('settled');
 
-    // Split-exact full restoration: both pots return to their pre-turn values.
-    const restored = await getBalance(fixture.userId);
-    expect(restored.subscriptionBalance).toBe(subShare);
-    expect(restored.balance).toBe(durableFund);
-    expect(restored.total).toBe(durableFund + subShare);
+    const charged = await getBalance(fixture.userId);
+    expect(charged.subscriptionBalance).toBe(0);
+    expect(charged.balance).toBe(durableFund - (reservation - subShare));
+    expect(charged.total).toBe(durableFund + subShare - reservation);
+    const [usage] = await pg<{ status: string; manna: number; error_code: string }[]>`
+      select status, manna, error_code from usage_events
+      where event_type = 'chat_turn' and turn_id = ${turnId}`;
+    expect(usage).toMatchObject({
+      status: 'error',
+      manna: reservation,
+      error_code: 'provider_process_lost_after_output',
+    });
 
     // The foreign orphan is UNTOUCHED — the scope held.
     expect(await authzState(foreignTurn)).toBe('reserved');
     expect((await getBalance(foreign.userId)).total).toBe(150 - oracleReservation(HAIKU));
 
-    // Idempotent: a second sweep neither double-credits nor re-touches it.
+    // Idempotent: a second sweep neither moves money nor duplicates usage.
     await reaper.runOnce();
-    expect((await getBalance(fixture.userId)).total).toBe(durableFund + subShare);
-    expect(await authzState(turnId)).toBe('reaped');
+    expect((await getBalance(fixture.userId)).total).toBe(
+      durableFund + subShare - reservation,
+    );
+    expect(await authzState(turnId)).toBe('settled');
+    const [usageCount] = await pg<{ n: string }[]>`
+      select count(*)::text as n from usage_events
+      where event_type = 'chat_turn' and turn_id = ${turnId}`;
+    expect(Number(usageCount!.n)).toBe(1);
     expect(await authzState(foreignTurn)).toBe('reserved');
   }, 60_000);
 
