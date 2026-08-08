@@ -386,7 +386,7 @@ export function Sidebar() {
           <Link
             href={mobileNewChatHref}
             aria-label="New Chat"
-            className="flex size-9 items-center justify-center rounded-lg border border-edge text-muted transition-colors"
+            className="flex size-11 items-center justify-center rounded-lg border border-edge text-muted transition-colors"
           >
             <NavIcon d={ICONS.newChat} />
           </Link>
@@ -396,7 +396,7 @@ export function Sidebar() {
             aria-expanded={mobileOpen}
             aria-controls="mobile-navigation-sheet"
             onClick={() => setMobileOpen((open) => !open)}
-            className="flex size-9 items-center justify-center rounded-lg border border-edge text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+            className="flex size-11 items-center justify-center rounded-lg border border-edge text-muted transition-colors hover:border-accent/50 hover:text-foreground"
           >
             <span aria-hidden className="relative block h-3.5 w-4">
               <span

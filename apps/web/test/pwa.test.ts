@@ -48,7 +48,7 @@ function loadServiceWorker() {
     { URL, Promise, caches, fetch, self },
   );
 
-  return { listeners, addAll, cacheMatch, cachesMatch, fetch };
+  return { listeners, addAll, cacheMatch, put, caches, cachesMatch, fetch };
 }
 
 describe("PWA manifest", () => {
@@ -93,6 +93,17 @@ describe("PWA manifest", () => {
     expect(appShell).toContain("pwa-safe-area-shell");
     expect(layout).toContain("<ServiceWorkerRegistration />");
   });
+
+  it("keeps primary installed-mode phone controls at a 44px touch target", () => {
+    const sidebar = readFileSync(
+      resolve(WEB_ROOT, "components/shell/sidebar.tsx"),
+      "utf8",
+    );
+    const pwaCss = readFileSync(resolve(WEB_ROOT, "app/pwa.css"), "utf8");
+    expect(sidebar.match(/size-11/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(pwaCss).toContain("#mobile-navigation-sheet :is(a, button, select)");
+    expect(pwaCss).toContain("min-height: 2.75rem");
+  });
 });
 
 describe("service worker", () => {
@@ -125,10 +136,10 @@ describe("service worker", () => {
   });
 
   it("falls back to the offline page only for failed navigations", async () => {
-    const { listeners, cachesMatch, fetch } = loadServiceWorker();
+    const { listeners, cacheMatch, cachesMatch, fetch } = loadServiceWorker();
     const offlineResponse = new Response("offline");
     fetch.mockRejectedValueOnce(new TypeError("network unavailable"));
-    cachesMatch.mockResolvedValueOnce(offlineResponse);
+    cacheMatch.mockResolvedValueOnce(offlineResponse);
 
     let response: Promise<Response | undefined> | undefined;
     listeners.get("fetch")?.({
@@ -143,7 +154,8 @@ describe("service worker", () => {
     });
 
     expect(await response).toBe(offlineResponse);
-    expect(cachesMatch).toHaveBeenCalledWith("/offline.html");
+    expect(cacheMatch).toHaveBeenCalledWith("/offline.html");
+    expect(cachesMatch).not.toHaveBeenCalled();
   });
 
   it("does not intercept API requests or cache authenticated responses", () => {
@@ -162,6 +174,67 @@ describe("service worker", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it.each(["/api/sessions", "/media/object-1", "/agents/alice/chats/session-1"])(
+    "does not intercept non-navigation user data at %s",
+    (pathname) => {
+      const { listeners, fetch } = loadServiceWorker();
+      const respondWith = vi.fn();
+      listeners.get("fetch")?.({
+        request: {
+          method: "GET",
+          mode: "cors",
+          url: `https://eden.test${pathname}`,
+        },
+        respondWith,
+      });
+
+      expect(respondWith).not.toHaveBeenCalled();
+      expect(fetch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("returns authenticated navigation responses without persisting them", async () => {
+    const { listeners, put, fetch } = loadServiceWorker();
+    const online = new Response("private cockpit");
+    fetch.mockResolvedValueOnce(online);
+
+    let response: Promise<Response | undefined> | undefined;
+    listeners.get("fetch")?.({
+      request: {
+        method: "GET",
+        mode: "navigate",
+        url: "https://eden.test/agents/alice/chats",
+      },
+      respondWith: (promise: Promise<Response | undefined>) => {
+        response = promise;
+      },
+    });
+
+    expect(await response).toBe(online);
+    expect(put).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      url: "https://eden.test/_next/static/chunks/app.js?token=secret",
+      headers: new Headers(),
+    },
+    {
+      url: "https://eden.test/_next/static/chunks/app.js",
+      headers: new Headers({ authorization: "Bearer secret" }),
+    },
+  ])("never caches token-bearing static requests", ({ url, headers }) => {
+    const { listeners, fetch } = loadServiceWorker();
+    const respondWith = vi.fn();
+    listeners.get("fetch")?.({
+      request: { method: "GET", mode: "cors", url, headers },
+      respondWith,
+    });
+
+    expect(respondWith).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it("serves previously cached immutable Next assets", async () => {
     const { listeners, cacheMatch, fetch } = loadServiceWorker();
     const cachedResponse = new Response("chunk");
@@ -173,6 +246,7 @@ describe("service worker", () => {
         method: "GET",
         mode: "cors",
         url: "https://eden.test/_next/static/chunks/app.js",
+        headers: new Headers(),
       },
       respondWith: (promise: Promise<Response>) => {
         response = promise;

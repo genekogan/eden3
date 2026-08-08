@@ -25,6 +25,12 @@
   top: calc(3.5rem + var(--eden-safe-top));
 }
 
+/* Primary phone navigation remains comfortably tappable without inflating the
+ * compact desktop rail. 2.75rem is the platform-standard 44px minimum. */
+.pwa-safe-area-shell > #mobile-navigation-sheet :is(a, button, select) {
+  min-height: 2.75rem;
+}
+
 .pwa-safe-area-shell > aside {
   height: calc(100dvh - var(--eden-safe-top) - var(--eden-safe-bottom));
 }

@@ -27,6 +27,22 @@ import {
 
 type UploadRunner = Pick<ResumableUploader, "uploadFile">;
 
+/**
+ * Hints mobile pickers to offer the photo library while retaining the file
+ * types the closed-cohort verifier can make available. `capture` is omitted
+ * deliberately: people may choose an existing photo/video or use the camera
+ * option supplied by their operating system.
+ */
+export const MOBILE_LIBRARY_ACCEPT = [
+  "image/*",
+  "video/*",
+  "audio/mpeg",
+  "audio/wav",
+  "application/pdf",
+  "text/plain",
+  "application/json",
+].join(",");
+
 function UploadIcon() {
   return (
     <svg
@@ -121,12 +137,12 @@ export function UploadQueueList({
                       ? ` · ${item.completedParts}/${item.partCount} parts`
                       : ""}
                   </p>
-                  <div className="flex items-center gap-3 text-xs">
+                  <div className="flex items-center gap-1 text-xs sm:gap-3">
                     {item.phase === "uploading" ? (
                       <button
                         type="button"
                         onClick={() => onPause(item)}
-                        className="text-muted transition-colors hover:text-foreground"
+                        className="min-h-11 px-2 text-muted transition-colors hover:text-foreground"
                       >
                         Pause
                       </button>
@@ -135,7 +151,7 @@ export function UploadQueueList({
                       <button
                         type="button"
                         onClick={() => onResume(item)}
-                        className="text-accent-soft transition-colors hover:text-accent"
+                        className="min-h-11 px-2 text-accent-soft transition-colors hover:text-accent"
                       >
                         {item.phase === "failed" ? "Retry" : "Resume"}
                       </button>
@@ -145,7 +161,7 @@ export function UploadQueueList({
                         href={item.url}
                         target="_blank"
                         rel="noreferrer"
-                        className="text-accent-soft transition-colors hover:text-accent"
+                        className="flex min-h-11 items-center px-2 text-accent-soft transition-colors hover:text-accent"
                       >
                         Open file
                       </a>
@@ -154,7 +170,7 @@ export function UploadQueueList({
                       <button
                         type="button"
                         onClick={() => onRemove(item)}
-                        className="text-faint transition-colors hover:text-foreground"
+                        className="min-h-11 px-2 text-faint transition-colors hover:text-foreground"
                       >
                         Remove
                       </button>
@@ -304,7 +320,7 @@ export function UploadPanel({ uploader: providedUploader }: { uploader?: UploadR
           <select
             value={purpose}
             onChange={(event) => setPurpose(event.target.value as UploadPurpose)}
-            className="ml-2 rounded-lg border border-edge bg-raised px-2.5 py-2 text-sm text-foreground"
+            className="ml-2 min-h-11 rounded-lg border border-edge bg-raised px-2.5 py-2 text-sm text-foreground"
           >
             <option value="chat">General file</option>
             <option value="skill-asset">Skill asset</option>
@@ -336,7 +352,7 @@ export function UploadPanel({ uploader: providedUploader }: { uploader?: UploadR
         <button
           type="button"
           onClick={() => inputRef.current?.click()}
-          className="mt-4 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-soft"
+          className="mt-4 min-h-11 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent-soft"
         >
           Choose files
         </button>
@@ -344,6 +360,7 @@ export function UploadPanel({ uploader: providedUploader }: { uploader?: UploadR
           ref={inputRef}
           type="file"
           multiple
+          accept={MOBILE_LIBRARY_ACCEPT}
           onChange={onInput}
           className="sr-only"
           aria-label="Choose files to upload"

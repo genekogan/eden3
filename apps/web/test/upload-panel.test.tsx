@@ -2,7 +2,11 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { UploadQueueList } from "../components/uploads/upload-panel";
+import {
+  MOBILE_LIBRARY_ACCEPT,
+  UploadPanel,
+  UploadQueueList,
+} from "../components/uploads/upload-panel";
 import {
   describeUploadFailure,
   uploadQueueReducer,
@@ -30,6 +34,18 @@ function item(overrides: Partial<UploadQueueItem> = {}): UploadQueueItem {
 }
 
 describe("upload queue", () => {
+  it("offers supported photo and video sources without forcing camera capture", () => {
+    expect(MOBILE_LIBRARY_ACCEPT.split(",")).toEqual(
+      expect.arrayContaining(["image/*", "video/*"]),
+    );
+    expect(MOBILE_LIBRARY_ACCEPT).not.toContain("capture");
+    const html = renderToStaticMarkup(
+      <UploadPanel uploader={{ uploadFile: async () => ({ objectId: "unused", url: "/unused" }) }} />,
+    );
+    expect(html).toContain(`accept="${MOBILE_LIBRARY_ACCEPT}"`);
+    expect(html).not.toContain("capture=");
+  });
+
   it("keeps the durable session through pause/resume and ignores stale failures", () => {
     let items = uploadQueueReducer([], { type: "add", items: [item()] });
     items = uploadQueueReducer(items, { type: "start", id: "item-1", attempt: 1 });
