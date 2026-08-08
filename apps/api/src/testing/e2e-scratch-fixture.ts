@@ -23,6 +23,15 @@ export interface E2EScratchSideEffects {
   mannaTransactionCount: number;
 }
 
+export interface E2EScratchFixtureRepository {
+  transaction<T>(operation: (repository: E2EScratchFixtureRepository) => Promise<T>): Promise<T>;
+  currentDatabase(): Promise<string>;
+  accountRows(options?: { forUpdate?: boolean }): Promise<readonly unknown[]>;
+  insertUser(fixture: E2EScratchUser): Promise<void>;
+  sideEffectCounts(): Promise<E2EScratchSideEffects>;
+  deleteExactUser(fixture: E2EScratchUser): Promise<readonly string[]>;
+}
+
 export function parseE2EScratchDatabaseUrl(raw: string): {
   databaseName: string;
   url: URL;
@@ -143,4 +152,80 @@ export async function verifyE2EScratchPreflight(options: {
   const counts = await options.readSideEffects();
   assertNoE2EScratchSideEffects(counts);
   return options.fixture;
+}
+
+async function assertRepositoryDatabase(
+  repository: E2EScratchFixtureRepository,
+  expected: string,
+): Promise<void> {
+  if ((await repository.currentDatabase()) !== expected) {
+    throw new Error('scratch fixture connected to an unexpected database');
+  }
+}
+
+export async function seedE2EScratchUser(options: {
+  repository: E2EScratchFixtureRepository;
+  databaseName: string;
+}): Promise<{ action: 'insert' | 'existing'; fixture: E2EScratchUser }> {
+  const fixture = e2eScratchUser(options.databaseName);
+  return options.repository.transaction(async (repository) => {
+    await assertRepositoryDatabase(repository, options.databaseName);
+    const action = assertE2EScratchAccountInventory(await repository.accountRows(), fixture);
+    if (action === 'insert') await repository.insertUser(fixture);
+    if (
+      assertE2EScratchAccountInventory(await repository.accountRows(), fixture) !== 'existing'
+    ) {
+      throw new Error('scratch fixture insert did not converge');
+    }
+    assertNoE2EScratchSideEffects(await repository.sideEffectCounts());
+    return { action, fixture };
+  });
+}
+
+export async function preflightE2EScratchUser(options: {
+  repository: E2EScratchFixtureRepository;
+  databaseName: string;
+  fetchUsers: () => Promise<unknown>;
+}): Promise<E2EScratchUser> {
+  const fixture = e2eScratchUser(options.databaseName);
+  await assertRepositoryDatabase(options.repository, options.databaseName);
+  return verifyE2EScratchPreflight({
+    fixture,
+    fetchUsers: options.fetchUsers,
+    readSideEffects: async () => {
+      if (
+        assertE2EScratchAccountInventory(await options.repository.accountRows(), fixture) !==
+        'existing'
+      ) {
+        throw new Error('scratch fixture account disappeared before preflight');
+      }
+      return options.repository.sideEffectCounts();
+    },
+  });
+}
+
+export async function cleanupE2EScratchUser(options: {
+  repository: E2EScratchFixtureRepository;
+  databaseName: string;
+}): Promise<{ fixture: E2EScratchUser; removed: boolean }> {
+  const fixture = e2eScratchUser(options.databaseName);
+  return options.repository.transaction(async (repository) => {
+    await assertRepositoryDatabase(repository, options.databaseName);
+    // FOR UPDATE conflicts with the FOR KEY SHARE check every FK insert takes.
+    // Once held, no owner-side row can appear between the inventory and DELETE.
+    const rows = await repository.accountRows({ forUpdate: true });
+    if (rows.length === 0) return { fixture, removed: false };
+    if (assertE2EScratchAccountInventory(rows, fixture) !== 'existing') {
+      throw new Error('scratch fixture cleanup identity mismatch');
+    }
+    assertNoE2EScratchSideEffects(await repository.sideEffectCounts());
+    const deleted = await repository.deleteExactUser(fixture);
+    if (deleted.length !== 1 || deleted[0] !== fixture.id) {
+      throw new Error('scratch fixture cleanup did not delete the exact user');
+    }
+    if ((await repository.accountRows()).length !== 0) {
+      throw new Error('scratch fixture cleanup left an account behind');
+    }
+    return { fixture, removed: true };
+  });
 }

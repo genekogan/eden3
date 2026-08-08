@@ -3,13 +3,76 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   assertE2EScratchAccountInventory,
   assertNoE2EScratchSideEffects,
+  cleanupE2EScratchUser,
   e2eScratchUser,
   parseE2EScratchDatabaseUrl,
+  preflightE2EScratchUser,
+  seedE2EScratchUser,
   verifyE2EScratchPreflight,
+  type E2EScratchFixtureRepository,
+  type E2EScratchSideEffects,
+  type E2EScratchUser,
 } from '../src/testing/e2e-scratch-fixture';
 
 const databaseName = 'eden3_runtime_e2e_20260808t210520z';
 const databaseUrl = `postgres://eden3:eden3@127.0.0.1:5433/${databaseName}`;
+
+const noSideEffects = (): E2EScratchSideEffects => ({
+  accountCount: 1,
+  agentCount: 0,
+  sessionCount: 0,
+  usageCount: 0,
+  providerRunCount: 0,
+  mannaAccountCount: 0,
+  mannaTransactionCount: 0,
+});
+
+class MemoryFixtureRepository implements E2EScratchFixtureRepository {
+  rows: unknown[] = [];
+  counts = noSideEffects();
+  lockModes: boolean[] = [];
+  deleteInputs: E2EScratchUser[] = [];
+  inTransaction = false;
+
+  async transaction<T>(
+    operation: (repository: E2EScratchFixtureRepository) => Promise<T>,
+  ): Promise<T> {
+    if (this.inTransaction) throw new Error('nested fixture transaction');
+    this.inTransaction = true;
+    try {
+      return await operation(this);
+    } finally {
+      this.inTransaction = false;
+    }
+  }
+
+  async currentDatabase() {
+    return databaseName;
+  }
+
+  async accountRows(options: { forUpdate?: boolean } = {}) {
+    this.lockModes.push(options.forUpdate === true);
+    return structuredClone(this.rows);
+  }
+
+  async insertUser(fixture: E2EScratchUser) {
+    this.rows.push(structuredClone(fixture));
+    this.counts.accountCount = this.rows.length;
+  }
+
+  async sideEffectCounts() {
+    return structuredClone(this.counts);
+  }
+
+  async deleteExactUser(fixture: E2EScratchUser) {
+    this.deleteInputs.push(structuredClone(fixture));
+    const exact = this.rows.find((row) => (row as { id?: string }).id === fixture.id);
+    if (!exact) return [];
+    this.rows = [];
+    this.counts.accountCount = 0;
+    return [fixture.id];
+  }
+}
 
 describe('isolated E2E scratch user fixture', () => {
   it('accepts only a uniquely named local scratch database', () => {
@@ -113,16 +176,74 @@ describe('isolated E2E scratch user fixture', () => {
     ).rejects.toThrow(/exact synthetic scratch user/);
     expect(readSideEffects).not.toHaveBeenCalled();
 
+    for (const key of [
+      'agentCount',
+      'sessionCount',
+      'usageCount',
+      'providerRunCount',
+      'mannaAccountCount',
+      'mannaTransactionCount',
+    ] as const) {
+      expect(() =>
+        assertNoE2EScratchSideEffects({ ...noSideEffects(), [key]: 1 }),
+      ).toThrow(/side effects/);
+    }
     expect(() =>
-      assertNoE2EScratchSideEffects({
-        accountCount: 1,
-        agentCount: 0,
-        sessionCount: 0,
-        usageCount: 0,
-        providerRunCount: 1,
-        mannaAccountCount: 0,
-        mannaTransactionCount: 0,
-      }),
+      assertNoE2EScratchSideEffects({ ...noSideEffects(), accountCount: 2 }),
     ).toThrow(/side effects/);
+  });
+
+  it('executes seed, HTTP+DB preflight, exact cleanup, and idempotent cleanup', async () => {
+    const repository = new MemoryFixtureRepository();
+    const seeded = await seedE2EScratchUser({ repository, databaseName });
+    expect(seeded.action).toBe('insert');
+    expect(repository.rows).toEqual([seeded.fixture]);
+    expect((await seedE2EScratchUser({ repository, databaseName })).action).toBe('existing');
+
+    const preflight = await preflightE2EScratchUser({
+      repository,
+      databaseName,
+      fetchUsers: async () => ({
+        users: [
+          {
+            id: seeded.fixture.id,
+            externalId: null,
+            type: 'user',
+            username: 'gene',
+            userImage: null,
+          },
+        ],
+      }),
+    });
+    expect(preflight).toEqual(seeded.fixture);
+
+    const cleaned = await cleanupE2EScratchUser({ repository, databaseName });
+    expect(cleaned).toEqual({ fixture: seeded.fixture, removed: true });
+    expect(repository.lockModes).toContain(true);
+    expect(repository.deleteInputs).toEqual([seeded.fixture]);
+    expect((await cleanupE2EScratchUser({ repository, databaseName })).removed).toBe(false);
+  });
+
+  it('rechecks Clerk identity in Postgres even when the HTTP projection looks exact', async () => {
+    const repository = new MemoryFixtureRepository();
+    const fixture = e2eScratchUser(databaseName);
+    repository.rows = [{ ...fixture, clerkUserId: 'clerk_subject' }];
+    await expect(
+      preflightE2EScratchUser({
+        repository,
+        databaseName,
+        fetchUsers: async () => ({
+          users: [
+            {
+              id: fixture.id,
+              externalId: null,
+              type: 'user',
+              username: 'gene',
+              userImage: null,
+            },
+          ],
+        }),
+      }),
+    ).rejects.toThrow(/exact synthetic scratch user/);
   });
 });
