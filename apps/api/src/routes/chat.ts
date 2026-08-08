@@ -2,10 +2,8 @@ import { randomUUID } from 'node:crypto';
 
 import {
   DailyCapExceededError,
-  getEnv,
   InsufficientMannaError,
   gatewaySessionKey,
-  PRICING,
   resolveAgentByUsername,
   resolveSession,
 } from '@eden3/core';
@@ -22,10 +20,10 @@ import { z } from 'zod';
 
 import { ApiError } from '../errors';
 import { DEFAULT_AGENT_MODEL, type GatewayGlue } from '../gateway-glue';
-import { concurrentTurnLimit, dailyMannaSpend } from '../services/chat-limits';
+import { concurrentTurnLimit } from '../services/chat-limits';
 import { installDefaultAgentSkills } from '../services/agent-skills';
 import { projectAgentConcepts } from '../services/concepts';
-import { runTurn, type TurnAgent, type TurnSink } from '../services/turns';
+import { assertTurnAdmissible, runTurn, type TurnAgent, type TurnSink } from '../services/turns';
 import { canAccessSession } from './sessions';
 import { enqueueLazyMemoryDistillation } from '../services/memory-distillation';
 
@@ -375,18 +373,20 @@ export const chatRoutes: FastifyPluginAsync = async (app) => {
         if (!body.agentUsername) {
           throw new ApiError(400, 'agent_required', 'agentUsername is required to start a new session');
         }
+        // Friendly authorization pre-check BEFORE the session insert, so a
+        // user who cannot fund the first turn does not mint empty sessions.
+        // (Race-free authority stays the in-debit reservation check.)
+        const preResolved = await resolveAgentByUsername(body.agentUsername);
+        if (!preResolved) {
+          throw new ApiError(404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
+        }
+        await assertTurnAdmissible(account.accountId, preResolved.agent.model ?? undefined);
         target = await createSession(account.accountId, body.agentUsername, body.content, app.gatewayGlue);
       } else {
         target = await resolveExisting(req.params.idOrNew, account, app.gatewayGlue);
-      }
-
-      const env = getEnv();
-      const spentToday = await dailyMannaSpend(account.accountId);
-      if (spentToday + PRICING.chatTurn > env.DAILY_MANNA_SPEND_CAP_PER_USER) {
-        throw new ApiError(
-          429,
-          'daily_manna_cap_exceeded',
-          `Daily manna cap exceeded: ${spentToday} spent today, cap is ${env.DAILY_MANNA_SPEND_CAP_PER_USER}`,
+        await assertTurnAdmissible(
+          account.accountId,
+          target.agent.gatewayModelOverride ?? target.agent.model,
         );
       }
 
@@ -428,7 +428,8 @@ export const chatRoutes: FastifyPluginAsync = async (app) => {
           throw new ApiError(
             402,
             'insufficient_manna',
-            `Not enough manna: this turn costs ${err.required}, you have ${err.available}`,
+            `Not enough manna: this turn reserves up to ${err.required} ` +
+              `(unused is refunded when the turn settles), you have ${err.available}`,
           );
         }
         // The reservation's in-transaction cap check (race-free, unlike the

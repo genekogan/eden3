@@ -35,6 +35,7 @@ import {
   TaskScheduler,
 } from './services/task-scheduler';
 import { TurnRegistry } from './services/turn-registry';
+import { TurnReservationReaper } from './services/turn-reservation-reaper';
 import type { CompatClientLike } from './services/turns';
 import { createAttachmentSightingHandler, MediaWatcher } from './workers/media-watcher';
 import { accountRoutes } from './routes/account';
@@ -114,6 +115,8 @@ declare module 'fastify' {
     turnLimiter: TurnConcurrencyLimiter;
     /** Eden3-side scheduled-task loop (null when the gateway is not configured). */
     taskScheduler: TaskScheduler | null;
+    /** Orphaned turn-reservation compensation loop (T08-U02). */
+    turnReservationReaper: TurnReservationReaper;
     /** Eden-managed, activity-gated native deep + metered REM loop. */
     memoryDreamScheduler: MemoryDreamScheduler | null;
   }
@@ -382,6 +385,20 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     taskScheduler?.stop();
   });
   if (opts.scheduler?.autoStart === true) taskScheduler?.start();
+
+  // Compensation for orphaned worst-case turn reservations (gap 42): a
+  // process death between the committed reservation and terminal persistence
+  // leaves the authorization row 'reserved'; the reaper reverses it after the
+  // TTL. Provider-free, gateway-independent — alive even in degraded mode.
+  // Follows the scheduler's autoStart discipline (tests drive runOnce()).
+  const turnReservationReaper = new TurnReservationReaper({
+    onError: (err, context) => app.log.error({ err, context }, 'turn-reservation reaper side-error'),
+  });
+  app.decorate('turnReservationReaper', turnReservationReaper);
+  app.addHook('onClose', async () => {
+    turnReservationReaper.stop();
+  });
+  if (opts.scheduler?.autoStart === true) turnReservationReaper.start();
 
   const memoryDreamScheduler =
     gatewayClients && historySync

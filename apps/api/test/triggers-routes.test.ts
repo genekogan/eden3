@@ -1,4 +1,4 @@
-import { credit, debit, refund, refundIdempotencyKey, resetEnvCache } from '@eden3/core';
+import { credit, debit, refund, refundIdempotencyKey, resetEnvCache, settleReservationIdempotencyKey } from '@eden3/core';
 import { db, loadRootEnv, pg, triggers } from '@eden3/db';
 import type { GatewayTurnEvent, GatewayUsage } from '@eden3/gateway';
 import type { TriggerDto } from '@eden3/shared';
@@ -188,7 +188,10 @@ beforeAll(async () => {
   });
   await credit({
     accountId: userId,
-    amount: 100,
+    // Every scheduled turn now fronts the worst-case reservation (haiku
+    // authorized-max 61, T08-U02); these tests exercise scheduling semantics,
+    // not balance — fund far above it.
+    amount: 5000,
     type: 'credit:test',
     idempotencyKey: `${marker}:credit`,
   });
@@ -209,6 +212,16 @@ afterEach(async () => {
   for (const key of automationSeedKeys.splice(0)) {
     await refund({ originalIdempotencyKey: key, type: 'refund:test' });
   }
+  // Each test owns a fresh 80-manna rolling automation window: settled turns
+  // now charge their worst-case-authorized actuals against it (T08-U02), so
+  // residue from one test would starve the next test's 61-manna reservation.
+  // Marker-scoped hygiene, not a semantics change — every test still runs its
+  // own reservations against the real cap.
+  await pg`
+    update manna_transactions
+    set created_at = created_at - interval '2 hours'
+    where idempotency_key like ${'budget:automation:' + agentId + ':%'}
+  `;
   await pg`
     update triggers
     set status = 'paused', next_scheduled_run = null
@@ -553,7 +566,7 @@ describe('POST /tasks', () => {
     expect(listedTask?.lastRunSessionId).toBe(run.sessionId);
   });
 
-  it('auto-pauses when actual metering no longer fits after the one-manna reservation', async () => {
+  it('auto-pauses when the worst-case reservation no longer fits the automation budget (rejected pre-provider)', async () => {
     const created = await app.inject({
       method: 'POST',
       url: '/tasks',
@@ -568,8 +581,10 @@ describe('POST /tasks', () => {
     expect(created.statusCode).toBe(201);
     const { task } = created.json() as TaskBody;
 
-    // Leave exactly one manna of rolling-hour headroom. The initial reserve
-    // succeeds; the 54-manna actual charge must then fail at settlement.
+    // Leave exactly one manna of rolling-hour headroom. The worst-case
+    // reservation (haiku authorized-max 61, T08-U02) is refused at
+    // reservation time — before any provider call — and the task pauses with
+    // the budget error.
     await credit({
       accountId: userId,
       amount: 500,
@@ -1454,7 +1469,7 @@ describe('POST /tasks', () => {
     expect(refunds).toHaveLength(1);
   });
 
-  it('atomically fences terminal assistant and usage writes after settlement', async () => {
+  it('atomically fences terminal settlement, assistant, and usage writes', async () => {
     const created = await app.inject({
       method: 'POST',
       url: '/tasks',
@@ -1499,13 +1514,16 @@ describe('POST /tasks', () => {
     );
     try {
       await terminalEntered;
+      // The worst-case reservation is durable; settlement is PART of the
+      // atomic terminal write the zombie is paused in front of (T08-U02) —
+      // nothing of it may have landed yet.
       const [landed] = await pg<{ reservation: number; settlement: number }[]>`
         select
           count(*) filter (where idempotency_key = ${reservationKey})::int as reservation,
-          count(*) filter (where idempotency_key = ${settlementKey})::int as settlement
+          count(*) filter (where idempotency_key = ${settleReservationIdempotencyKey(reservationKey)})::int as settlement
         from manna_transactions
       `;
-      expect(landed).toEqual({ reservation: 1, settlement: 1 });
+      expect(landed).toEqual({ reservation: 1, settlement: 0 });
 
       // Model a process suspended beyond the lease after its terminal
       // preflight but immediately before the atomic assistant/usage write.
@@ -1544,16 +1562,20 @@ describe('POST /tasks', () => {
           where session_id = ${occurrence.id} and role = 'assistant') as assistant
     `;
     expect(terminal).toEqual({ usage: 0, assistant: 0 });
-    const refunds = await pg<{ idempotency_key: string }[]>`
-      select idempotency_key from manna_transactions
+    // Recovery reverses the reservation in full; there is no settlement debit
+    // to reverse in the authorization kernel (settlement is a refund leg that
+    // never landed — the zombie's terminal transaction rolled back whole).
+    const refunds = await pg<{ idempotency_key: string; amount: string }[]>`
+      select idempotency_key, amount from manna_transactions
       where idempotency_key in (
         ${refundIdempotencyKey(settlementKey)},
-        ${refundIdempotencyKey(reservationKey)}
+        ${refundIdempotencyKey(reservationKey)},
+        ${settleReservationIdempotencyKey(reservationKey)}
       )
     `;
-    expect(new Set(refunds.map((row) => row.idempotency_key))).toEqual(
-      new Set([refundIdempotencyKey(settlementKey), refundIdempotencyKey(reservationKey)]),
-    );
+    expect(refunds.map((row) => row.idempotency_key)).toEqual([
+      refundIdempotencyKey(reservationKey),
+    ]);
   });
 
   it('does not re-call the provider after a crash in the started-before-usage window', async () => {

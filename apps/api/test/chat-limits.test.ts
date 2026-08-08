@@ -73,7 +73,9 @@ async function makeFixture(): Promise<ChatFixture> {
   `;
   await credit({
     accountId: userId,
-    amount: 100,
+    // Cover several concurrent worst-case reservations (haiku authorized-max
+    // is 61 manna, T08-U02) — these fixtures test limits, not balance.
+    amount: 500,
     type: 'credit:test',
     idempotencyKey: `${marker}:credit:${suffix}`,
   });

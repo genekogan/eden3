@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { AuthSession } from '@eden3/core';
-import { credit, gatewaySessionKey, resetEnvCache } from '@eden3/core';
+import { credit, gatewaySessionKey, resetEnvCache, settleReservationIdempotencyKey } from '@eden3/core';
 import { db, pg, sessions, type Session } from '@eden3/db';
 import {
   NO_RESPONSE_SENTINEL,
@@ -124,6 +124,8 @@ afterAll(async () => {
   await pg`delete from session_users where session_id in
            (select id from sessions where title like ${`${marker}%`})`;
   await pg`delete from sessions where title like ${`${marker}%`}`;
+  await pg`delete from turn_authorizations where account_id in
+           (select id from accounts where username::text like ${`${marker}%`})`;
   await pg`delete from manna_transactions where manna_account_id in
            (select m.id from manna_accounts m join accounts a on a.id = m.account_id
             where a.username::text like ${`${marker}%`})`;
@@ -136,61 +138,56 @@ afterAll(async () => {
 }, 30_000);
 
 describe('runTurn usage events', () => {
-  it('fails and fully refunds an actual token charge that exceeds the post-reserve daily cap', async () => {
+  it('refuses a worst-case reservation over the daily cap before any provider call', async () => {
+    // Pre-kernel, this scenario streamed the provider output and only failed
+    // at settlement (the gap-42 defect); the kernel rejects it at reservation
+    // time with nothing streamed and nothing charged (T08-U02).
     const fixture = await makeFixture();
     const previous = process.env.DAILY_MANNA_SPEND_CAP_PER_USER;
     process.env.DAILY_MANNA_SPEND_CAP_PER_USER = '2';
     resetEnvCache();
-    const emitted: SessionEvent[] = [];
+    let streamOpened = false;
     const compat: CompatClientLike = {
+      // eslint-disable-next-line require-yield
       async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
-        yield { type: 'turn.started' };
-        yield {
-          type: 'turn.completed',
-          text: 'must not become an under-billed success',
-          emptyTurn: false,
-          usage: { promptTokens: 40_000, completionTokens: 0, totalTokens: 40_000 },
-        };
+        throw new Error('provider must not run over the daily cap');
       },
     };
     try {
-      const outcome = await runTurn(makeDeps(compat), {
-        session: fixture.session,
-        agent: fixture.agent,
-        user: fixture.user,
-        content: 'daily cap edge',
-        source: {
-          kind: 'scheduled_task',
-          triggerId: randomUUID(),
-        },
-        beginStream: () => ({
-          emit(event) {
-            emitted.push(event);
+      const turnId = randomUUID();
+      await expect(
+        runTurn(makeDeps(compat), {
+          session: fixture.session,
+          agent: fixture.agent,
+          user: fixture.user,
+          content: 'daily cap edge',
+          source: {
+            kind: 'scheduled_task',
+            triggerId: randomUUID(),
           },
-          end() {},
+          turnId,
+          beginStream: () => {
+            streamOpened = true;
+            return sink();
+          },
         }),
-      });
+      ).rejects.toMatchObject({ name: 'DailyCapExceededError' });
+      expect(streamOpened).toBe(false);
 
-      expect(outcome).toMatchObject({
-        assistantMessageId: null,
-        errorCode: 'daily_manna_cap_exceeded',
-      });
-      expect(emitted).toContainEqual(
-        expect.objectContaining({ type: 'error', code: 'daily_manna_cap_exceeded' }),
-      );
+      // Autonomous cap rejections stay auditable: an error usage row with
+      // zero manna and the cap error code.
       const [usage] = await pg<{
         status: string;
         manna: number | null;
-        metadata: { settlement?: { chargedManna?: number; meteredManna?: number } } | null;
+        error_code: string | null;
       }[]>`
-        select status, manna, metadata from usage_events where turn_id = ${outcome.turnId}
+        select status, manna, error_code from usage_events where turn_id = ${turnId}
       `;
       expect(usage).toMatchObject({
         status: 'error',
         manna: 0,
-        metadata: { settlement: { chargedManna: 0 } },
+        error_code: 'daily_manna_cap_exceeded',
       });
-      expect(usage!.metadata?.settlement?.meteredManna).toBeGreaterThan(2);
       const [net] = await pg<{ spend: string }[]>`
         select coalesce(sum(case
           when type like 'spend%' and amount < 0 then -amount
@@ -209,7 +206,7 @@ describe('runTurn usage events', () => {
     }
   });
 
-  it('serializes concurrent actual-cost settlements under the strict agent-hour cap', async () => {
+  it('admits only the reservations that fit the agent-hour cap; actuals settle beneath it', async () => {
     const fixture = await makeFixture();
     const compat: CompatClientLike = {
       async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
@@ -218,8 +215,8 @@ describe('runTurn usage events', () => {
           type: 'turn.completed',
           text: 'bounded automation output',
           emptyTurn: false,
-          // Haiku input pricing makes this 54 manna: each fits alone, but two
-          // concurrent settlements cannot both fit the 80-manna rolling cap.
+          // Haiku input pricing makes this a 54-manna actual — beneath the
+          // 61-manna worst-case reservation it settles under.
           usage: { promptTokens: 40_000, completionTokens: 0, totalTokens: 40_000 },
         };
       },
@@ -234,22 +231,31 @@ describe('runTurn usage events', () => {
         beginStream: sink,
       });
 
-    const outcomes = await Promise.all([run(), run()]);
-    expect(outcomes.map((outcome) => outcome.errorCode).sort()).toEqual([
-      null,
-      'automation_hourly_budget_exceeded',
-    ].sort());
+    // Two 61-manna worst-case reservations cannot both fit the 80-manna
+    // rolling automation window: exactly one turn reaches the provider; the
+    // loser is rejected AT RESERVATION, before any provider call (pre-kernel
+    // both streamed and one failed only at settlement — the gap-42 defect).
+    const outcomes = await Promise.allSettled([run(), run()]);
+    const fulfilled = outcomes.filter(
+      (o): o is PromiseFulfilledResult<Awaited<ReturnType<typeof run>>> => o.status === 'fulfilled',
+    );
+    const rejected = outcomes.filter((o): o is PromiseRejectedResult => o.status === 'rejected');
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect(fulfilled[0]!.value.errorCode).toBeNull();
+    expect((rejected[0]!.reason as Error).name).toBe('RollingSpendCapExceededError');
+    // The winner settled its 54-manna actual; the unused reserve released.
     expect(await automationMannaSpendLastHour(fixture.agent.accountId)).toBe(54);
     const rows = await pg<{ status: string; manna: number | null }[]>`
       select status, manna from usage_events
-      where turn_id in (${outcomes[0]!.turnId}, ${outcomes[1]!.turnId})
+      where session_id = ${fixture.session.id}
       order by status, manna
     `;
     expect(rows).toEqual([
       { status: 'completed', manna: 54 },
       { status: 'error', manna: 0 },
     ]);
-    expect(outcomes.filter((outcome) => outcome.assistantMessageId !== null)).toHaveLength(1);
+    expect(fulfilled[0]!.value.assistantMessageId).not.toBeNull();
   });
 
   it.each([
@@ -327,9 +333,9 @@ describe('runTurn usage events', () => {
           emptyTurn: false,
           finishReason: 'stop',
           usage: {
-            promptTokens: 1_000_000,
-            completionTokens: 100_000,
-            totalTokens: 1_100_000,
+            promptTokens: 30_000,
+            completionTokens: 2_000,
+            totalTokens: 32_000,
           },
         };
       },
@@ -380,30 +386,34 @@ describe('runTurn usage events', () => {
       provider: 'anthropic',
       model: 'claude-haiku-4-5',
       pricing_basis: 'provider-api',
-      prompt_tokens: 1_000_000,
-      completion_tokens: 100_000,
-      total_tokens: 1_100_000,
-      cost_usd: '1.50000000',
-      manna: 2025,
+      prompt_tokens: 30_000,
+      completion_tokens: 2_000,
+      total_tokens: 32_000,
+      cost_usd: '0.04000000',
+      manna: 54,
     });
     expect(rows[0]!.latency_ms).toBeGreaterThanOrEqual(0);
-    expect(rows[0]!.metadata?.metering).toMatchObject({ status: 'metered', costUsd: 1.5 });
+    expect(rows[0]!.metadata?.metering).toMatchObject({ status: 'metered', costUsd: 0.04 });
 
     const ledger = await pg<{ type: string; amount: string; idempotency_key: string | null }[]>`
       select type, amount, idempotency_key
       from manna_transactions
       where manna_account_id in (select id from manna_accounts where account_id = ${fixture.user.accountId})
       order by created_at asc`;
+    // Kernel anatomy (T08-U02): the worst-case reservation (61) lands before
+    // the provider call; settlement refunds the unused 7 under the disjoint
+    // authz-settle leg. There is no settlement debit.
     expect(ledger.map((row) => [row.type, Number(row.amount), row.idempotency_key])).toContainEqual([
       'spend:chat',
-      -1,
+      -61,
       outcome.turnId,
     ]);
     expect(ledger.map((row) => [row.type, Number(row.amount), row.idempotency_key])).toContainEqual([
-      'spend:chat:settle',
-      -2024,
-      `${outcome.turnId}:settle`,
+      'refund:chat:settle',
+      7,
+      settleReservationIdempotencyKey(outcome.turnId),
     ]);
+    expect(ledger.some((row) => row.type === 'spend:chat:settle')).toBe(false);
   });
 
   it('persists empty media turns without the OpenClaw filler and emits media.pending', async () => {
@@ -533,10 +543,10 @@ describe('runTurn usage events', () => {
           emptyTurn: false,
           finishReason: 'stop',
           usage: {
-            promptTokens: 1_000_000,
-            cachedTokens: 900_000,
+            promptTokens: 100_000,
+            cachedTokens: 90_000,
             completionTokens: 0,
-            totalTokens: 1_000_000,
+            totalTokens: 100_000,
           },
         };
       },
@@ -569,16 +579,16 @@ describe('runTurn usage events', () => {
     `;
 
     expect(row).toMatchObject({
-      cachedTokens: 900_000,
-      costUsd: '0.19000000',
-      manna: 257,
+      cachedTokens: 90_000,
+      costUsd: '0.01900000',
+      manna: 26,
     });
     expect(row?.metadata?.metering).toMatchObject({ status: 'metered' });
     const cacheLine = row?.metadata?.metering?.lineItems?.find(
       (line) => line.unit === 'cache_read_1m_tokens',
     );
-    expect(cacheLine).toMatchObject({ quantity: 0.9 });
-    expect(cacheLine!.costUsd).toBeCloseTo(0.09, 10);
+    expect(cacheLine).toMatchObject({ quantity: 0.09 });
+    expect(cacheLine!.costUsd).toBeCloseTo(0.009, 10);
   });
 
   it('uses deduped Claude transcript usage and snapshots notional subscription pricing', async () => {
@@ -605,11 +615,11 @@ describe('runTurn usage events', () => {
           providerMessageIds: ['msg_1', 'msg_2'],
           models: ['claude-sonnet-4-6'],
           usage: {
-            promptTokens: 1_000_000,
-            cachedTokens: 900_000,
-            cacheWriteTokens: 200_000,
-            completionTokens: 10_000,
-            totalTokens: 1_210_000,
+            promptTokens: 100_000,
+            cachedTokens: 90_000,
+            cacheWriteTokens: 20_000,
+            completionTokens: 1_000,
+            totalTokens: 121_000,
           },
         };
       },
@@ -664,12 +674,12 @@ describe('runTurn usage events', () => {
 
     expect(row).toMatchObject({
       pricingBasis: 'notional-subscription',
-      promptTokens: 1_000_000,
-      cachedTokens: 900_000,
-      cacheWriteTokens: 200_000,
-      completionTokens: 10_000,
-      costUsd: '1.47000000',
-      manna: 1985,
+      promptTokens: 100_000,
+      cachedTokens: 90_000,
+      cacheWriteTokens: 20_000,
+      completionTokens: 1_000,
+      costUsd: '0.14700000',
+      manna: 199,
     });
     expect(row?.metadata).toMatchObject({
       usageSource: 'claude-transcript',
@@ -1029,8 +1039,11 @@ describe('runTurn usage events', () => {
       where manna_account_id in (select id from manna_accounts where account_id = ${fixture.user.accountId})
       order by created_at asc
     `;
-    expect(ledger.filter((row) => row.type === 'spend:chat' && Number(row.amount) === -1)).toHaveLength(1);
+    expect(ledger.filter((row) => row.type === 'spend:chat' && Number(row.amount) === -61)).toHaveLength(1);
+    // The unused reserve returns on the settle leg; a FULL reversal
+    // ('refund:chat', the failure path) must never appear for this success.
     expect(ledger.some((row) => row.type === 'refund:chat')).toBe(false);
+    expect(ledger.some((row) => row.type === 'refund:chat:settle')).toBe(true);
   });
 
   it('treats the first terminal event as final: error then completion refunds only once', async () => {
@@ -1102,8 +1115,8 @@ describe('runTurn usage events', () => {
     `;
     expect(ledger.map((row) => [row.type, Number(row.amount)])).toEqual(
       expect.arrayContaining([
-        ['spend:chat', -1],
-        ['refund:chat', 1],
+        ['spend:chat', -905],
+        ['refund:chat', 905],
       ]),
     );
     expect(ledger.filter((row) => row.type === 'refund:chat')).toHaveLength(1);

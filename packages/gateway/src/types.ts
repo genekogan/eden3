@@ -108,6 +108,13 @@ export interface ChatTurnParams {
    */
   modelOverride?: string;
   /**
+   * Optional per-turn output-token ceiling, sent as the OpenAI-compat
+   * `max_tokens` body field (T08-U02 economic-authorization hardening).
+   * Enforcement depends on OpenClaw honoring it per provider call — the
+   * economic ceiling (reserve → settle ≤ authorized-max) never relies on it.
+   */
+  maxOutputTokens?: number;
+  /**
    * Abort streaming: the upstream turn cannot be cancelled, so on abort the
    * client just stops reading and the iterator ends (no further events).
    */

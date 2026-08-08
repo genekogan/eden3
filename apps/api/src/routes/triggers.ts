@@ -4,10 +4,9 @@ import {
   InsufficientMannaError,
   isHex24,
   isUuid,
-  PRICING,
   resolveAgentByUsername,
 } from '@eden3/core';
-import { db, pg, triggers, type Trigger } from '@eden3/db';
+import { agents, db, pg, triggers, type Trigger } from '@eden3/db';
 import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
@@ -15,8 +14,9 @@ import { z } from 'zod';
 import { ApiError, sendError } from '../errors';
 import type { GatewayGlue } from '../gateway-glue';
 import { triggerDtoFromEntity } from '../route-helpers';
-import { concurrentTurnLimit, dailyMannaSpend } from '../services/chat-limits';
+import { concurrentTurnLimit } from '../services/chat-limits';
 import { runScheduledTask } from '../services/scheduled-tasks';
+import { assertTurnAdmissible } from '../services/turns';
 import { nextOccurrence, TaskScheduleError } from '../services/task-schedule';
 import { agentTaskLimitError, MAX_ENABLED_TASKS_PER_AGENT } from '../services/task-limits';
 
@@ -326,15 +326,18 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       throw new ApiError(409, 'task_missing_owner', `Task ${existing.id} has no owner`);
     }
 
-    const env = getEnv();
-    const spentToday = await dailyMannaSpend(existing.userId);
-    if (spentToday + PRICING.chatTurn > env.DAILY_MANNA_SPEND_CAP_PER_USER) {
-      throw new ApiError(
-        429,
-        'daily_manna_cap_exceeded',
-        `Daily manna cap exceeded: ${spentToday} spent today, cap is ${env.DAILY_MANNA_SPEND_CAP_PER_USER}`,
-      );
+    // Friendly worst-case-reserve pre-check for the task agent's route
+    // (race-free authority = the in-debit reservation check).
+    let taskModel: string | undefined;
+    if (existing.agentId) {
+      const [agentRow] = await db
+        .select({ model: agents.model })
+        .from(agents)
+        .where(eq(agents.accountId, existing.agentId))
+        .limit(1);
+      taskModel = agentRow?.model ?? undefined;
     }
+    await assertTurnAdmissible(existing.userId, taskModel);
 
     const turnLimit = await concurrentTurnLimit(existing.userId);
     const releaseTurn = app.turnLimiter.acquire(existing.userId, turnLimit.limit);

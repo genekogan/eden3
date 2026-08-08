@@ -459,6 +459,12 @@ export interface TurnCeilingEntry {
    * before any provider call, and settlement may never charge beyond it.
    */
   maxTurnUsd: number;
+  /**
+   * Per-provider-call output-token cap passed to the gateway as `max_tokens`
+   * (belt: enforcement depends on OpenClaw honoring it; the economic ceiling
+   * never relies on it).
+   */
+  maxOutputTokens: number;
   effectiveDate: string;
   source: string;
 }
@@ -482,6 +488,7 @@ export const TURN_CEILINGS: readonly TurnCeilingEntry[] = [
     provider: 'anthropic',
     model: 'claude-haiku-4-5',
     maxTurnUsd: 0.045,
+    maxOutputTokens: 16384,
     effectiveDate: '2026-08-08',
     source:
       'T08-U02 policy snapshot: ≈2.3× observed max (26 manna); ≈61 manna — below the 100-manna signup grant so the default route stays usable',
@@ -490,6 +497,7 @@ export const TURN_CEILINGS: readonly TurnCeilingEntry[] = [
     provider: 'anthropic',
     model: 'claude-sonnet-4-5',
     maxTurnUsd: 0.67,
+    maxOutputTokens: 32768,
     effectiveDate: '2026-08-08',
     source: 'T08-U02 policy snapshot: ≈2× observed sonnet max (456 manna); ≈905 manna',
   },
@@ -497,6 +505,7 @@ export const TURN_CEILINGS: readonly TurnCeilingEntry[] = [
     provider: 'anthropic',
     model: 'claude-sonnet-4-6',
     maxTurnUsd: 0.67,
+    maxOutputTokens: 32768,
     effectiveDate: '2026-08-08',
     source: 'T08-U02 policy snapshot: ≈2× observed sonnet max (456 manna); ≈905 manna',
   },
@@ -504,6 +513,7 @@ export const TURN_CEILINGS: readonly TurnCeilingEntry[] = [
     provider: 'anthropic',
     model: 'claude-opus-4-6',
     maxTurnUsd: 1.12,
+    maxOutputTokens: 32768,
     effectiveDate: '2026-08-08',
     source:
       'T08-U02 policy snapshot: 5× sonnet rates; observed max 235 manna; ≈1512 manna ceiling',
@@ -515,6 +525,8 @@ export interface TurnAuthorizationCeiling {
   manna: number;
   /** The underlying pre-markup USD ceiling. */
   usd: number;
+  /** Per-call output-token cap to pass to the gateway (`max_tokens`). */
+  maxOutputTokens: number;
   tableVersion: string;
   provider: CostProvider;
   model: string;
@@ -544,6 +556,7 @@ export function turnAuthorizedMax(
   return {
     manna: mannaFromUsd(entry.maxTurnUsd, options),
     usd: entry.maxTurnUsd,
+    maxOutputTokens: entry.maxOutputTokens,
     tableVersion: TURN_CEILING_TABLE_VERSION,
     provider,
     model: normalized,

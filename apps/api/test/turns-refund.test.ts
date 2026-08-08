@@ -61,10 +61,14 @@ beforeAll(async () => {
   const rows = await pg<{ id: string }[]>`
     insert into accounts (type, username) values ('user', ${`${marker}_user`}) returning id`;
   userId = rows[0]!.id;
-  await credit({ accountId: userId, amount: 10, type: 'credit:test' });
+  // Cover the haiku worst-case reservation (61 manna, T08-U02); this test
+  // exercises the pre-stream refund guard, not balance rejection.
+  await credit({ accountId: userId, amount: 100, type: 'credit:test' });
 });
 
 afterAll(async () => {
+  await pg`delete from turn_authorizations where account_id = ${userId}
+           or account_id in (select id from accounts where username like ${`${marker}%`})`;
   await pg`delete from manna_transactions where manna_account_id in
            (select id from manna_accounts where account_id = ${userId})`;
   await pg`delete from manna_accounts where account_id = ${userId}`;
@@ -120,7 +124,7 @@ describe('runTurn refund-guard (pre-stream failure)', () => {
     const refundTx = txs.find((t) => t.type === 'refund:chat');
     expect(spend, 'a chat debit should have been recorded').toBeDefined();
     expect(refundTx, 'a chat refund should have been recorded').toBeDefined();
-    expect(Number(spend!.amount)).toBe(-1);
-    expect(Number(refundTx!.amount)).toBe(1);
+    expect(Number(spend!.amount)).toBe(-61);
+    expect(Number(refundTx!.amount)).toBe(61);
   });
 });

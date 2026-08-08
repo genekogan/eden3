@@ -227,6 +227,12 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
   await pg`delete from triggers where user_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
   await pg`delete from billing_subscriptions where account_id = any(${ids}::uuid[])`;
   await pg`delete from distill_state where agent_account_id = any(${ids}::uuid[])`;
+  // Authorization rows FK-reference the ledger (reservation_tx_id) — remove
+  // them first (T08-U02).
+  await pg`
+    delete from turn_authorizations
+    where account_id = any(${ids}::uuid[]) or agent_account_id = any(${ids}::uuid[])
+  `;
   await pg`
     delete from manna_transactions
     where manna_account_id in (select id from manna_accounts where account_id = any(${ids}::uuid[]))
