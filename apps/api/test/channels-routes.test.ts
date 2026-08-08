@@ -148,7 +148,6 @@ interface ConnectionDto {
   desiredState: 'inactive' | 'active';
   observedState: string;
   status: string;
-  tokenPreview: string | null;
   lastError: { code: string; message: string } | null;
   bot: { username: string | null } | null;
 }
@@ -212,7 +211,7 @@ afterAll(async () => {
 });
 
 describe('channel custody and validation', () => {
-  it('stores only AES ciphertext, returns preview metadata, and audits storage', async () => {
+  it('stores only AES ciphertext, exposes no token-derived preview, and audits storage', async () => {
     const token = `valid_${marker}_secret_1234`;
     const connection = await createConnection({
       token,
@@ -225,9 +224,9 @@ describe('channel custody and validation', () => {
       channel: 'discord',
       desiredState: 'inactive',
       observedState: 'verified',
-      tokenPreview: '1234',
       bot: { username: 'discord_fixture_bot' },
     });
+    expect(connection).not.toHaveProperty('tokenPreview');
 
     const rows = await pg<
       Array<{
@@ -284,8 +283,9 @@ describe('channel custody and validation', () => {
     expect(retried.statusCode).toBe(200);
     expect(retried.json()).toMatchObject({
       ok: true,
-      connection: { observedState: 'verified', tokenPreview: '7777', lastError: null },
+      connection: { observedState: 'verified', lastError: null },
     });
+    expect(retried.json().connection).not.toHaveProperty('tokenPreview');
     expect(retried.body).not.toContain(`valid_${marker}_replacement_7777`);
   });
 
