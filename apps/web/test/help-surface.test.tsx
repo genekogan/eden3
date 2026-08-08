@@ -54,39 +54,101 @@ describe("authenticated help surface", () => {
     expect(searchHelpArticles("no-such-help-topic")).toEqual([]);
 
     const zero = renderToStaticMarkup(
-      <HelpSearch selectedAgentUsername="gene" initialQuery="no-such-help-topic" />,
+      <HelpSearch
+        agentAuthority={{ loadedUsername: "gene", phase: "ready", canManage: true }}
+        initialQuery="no-such-help-topic"
+      />,
     );
     expect(zero).toContain("No help guide matches that search");
     expect(zero).toContain("Show all guides");
     expect(zero).toContain('role="status"');
   });
 
-  it("derives agent actions only from a validated selected-agent handle", () => {
+  it("derives agent actions only from a loaded accessible agent", () => {
+    const loadedAccessible = {
+      loadedUsername: "gene_1",
+      phase: "ready" as const,
+      canManage: false,
+    };
+    const noLoadedAgent = { phase: "loading" as const, canManage: false };
+
     for (const article of HELP_ARTICLES) {
-      expectSafeHelpAction(resolveHelpAction(article, "gene_1").href);
-      expectSafeHelpAction(resolveHelpAction(article, null).href);
-      expectSafeHelpAction(resolveHelpAction(article, "victim/../../operator").href);
+      expectSafeHelpAction(resolveHelpAction(article, loadedAccessible).href);
+      expectSafeHelpAction(resolveHelpAction(article, noLoadedAgent).href);
     }
 
     const chat = HELP_ARTICLES.find((article) => article.id === "start-chat")!;
-    expect(resolveHelpAction(chat, "gene_1")).toEqual({
+    expect(resolveHelpAction(chat, loadedAccessible)).toEqual({
       href: "/agents/gene_1/chats/new",
       label: "Start a chat",
     });
-    expect(resolveHelpAction(chat, "victim/../../operator")).toEqual({
+    expect(
+      resolveHelpAction(chat, {
+        loadedUsername: "victim",
+        phase: "loading",
+        canManage: false,
+      }),
+    ).toEqual({
       href: "/agents",
       label: "Choose an agent first",
     });
+    expect(
+      resolveHelpAction(chat, {
+        loadedUsername: "victim",
+        phase: "error",
+        canManage: false,
+      }),
+    ).toEqual({ href: "/agents", label: "Choose an agent first" });
+    for (const reserved of ["new", "builder"]) {
+      expect(
+        resolveHelpAction(chat, {
+          loadedUsername: reserved,
+          phase: "ready",
+          canManage: true,
+        }),
+      ).toEqual({ href: "/agents", label: "Choose an agent first" });
+    }
+
+    const library = HELP_ARTICLES.find((article) => article.id === "library-files")!;
+    expect(resolveHelpAction(library, loadedAccessible).href).toBe("/agents/gene_1/library");
 
     const gateway = HELP_ARTICLES.find((article) => article.id === "connect-channel")!;
-    expect(resolveHelpAction(gateway, "eve")).toEqual({
+    expect(resolveHelpAction(gateway, loadedAccessible)).toEqual({
       href: "/agents",
       label: "Choose your own agent",
     });
+    for (const managementAuthority of ["owner", "admin"]) {
+      expect(
+        resolveHelpAction(gateway, {
+          loadedUsername: `${managementAuthority}_agent`,
+          phase: "ready",
+          canManage: true,
+        }).href,
+      ).toBe(`/agents/${managementAuthority}_agent/gateway`);
+    }
+    expect(
+      resolveHelpAction(gateway, {
+        loadedUsername: "eve",
+        phase: "ready",
+        canManage: true,
+      }),
+    ).toEqual({ href: "/agents", label: "Choose your own agent" });
+
+    const helpSearchSource = readFileSync(
+      resolve(REPO_ROOT, "apps/web/components/help/help-search.tsx"),
+      "utf8",
+    );
+    expect(helpSearchSource).toContain("const { agent, phase, canManage } = useSelectedAgent()");
+    expect(helpSearchSource).toContain("loadedUsername: agent?.username");
+    expect(helpSearchSource).not.toContain("const { username } = useSelectedAgent()");
   });
 
   it("renders semantic local search, safe actions, and contextual links", () => {
-    const html = renderToStaticMarkup(<HelpSearch selectedAgentUsername="gene" />);
+    const html = renderToStaticMarkup(
+      <HelpSearch
+        agentAuthority={{ loadedUsername: "gene", phase: "ready", canManage: true }}
+      />,
+    );
     expect(html).toContain('role="search"');
     expect(html).toContain('type="search"');
     expect(html).toContain('for="help-search"');

@@ -12,6 +12,15 @@ export const HELP_ARTICLE_IDS = [
 
 export type HelpArticleId = (typeof HELP_ARTICLE_IDS)[number];
 type AgentAction = "new-chat" | "library" | "gateway";
+type HelpAgentPhase = "idle" | "loading" | "ready" | "missing" | "error";
+
+export type HelpAgentAuthority = {
+  loadedUsername?: string | null;
+  canManage: boolean;
+  phase: HelpAgentPhase;
+};
+
+const RESERVED_AGENT_USERNAMES = new Set(["new", "builder", "edit", "api", "media"]);
 
 export type HelpArticle = {
   id: HelpArticleId;
@@ -141,19 +150,27 @@ export function helpHref(id: HelpArticleId): `/help#${HelpArticleId}` {
 
 export function resolveHelpAction(
   article: HelpArticle,
-  selectedAgentUsername: string | null | undefined,
+  authority: HelpAgentAuthority,
 ): { href: string; label: string } {
   if (article.action.kind === "static") return article.action;
-  if (!isValidAgentUsername(selectedAgentUsername)) {
+  const loadedUsername = authority.loadedUsername;
+  if (
+    authority.phase !== "ready" ||
+    !isValidAgentUsername(loadedUsername) ||
+    RESERVED_AGENT_USERNAMES.has(loadedUsername.toLocaleLowerCase("en-US"))
+  ) {
     return { href: "/agents", label: "Choose an agent first" };
   }
-  if (article.action.target === "gateway" && isEveUsername(selectedAgentUsername)) {
+  if (
+    article.action.target === "gateway" &&
+    (!authority.canManage || isEveUsername(loadedUsername))
+  ) {
     return { href: "/agents", label: "Choose your own agent" };
   }
   const subpath =
     article.action.target === "new-chat" ? "chats/new" : article.action.target;
   return {
-    href: agentSectionHref(selectedAgentUsername, subpath),
+    href: agentSectionHref(loadedUsername, subpath),
     label: article.action.label,
   };
 }

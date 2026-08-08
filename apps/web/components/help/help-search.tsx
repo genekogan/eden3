@@ -3,14 +3,18 @@
 import Link from "next/link";
 import React, { useState } from "react";
 
-import { resolveHelpAction, searchHelpArticles } from "@/lib/help-content";
+import {
+  resolveHelpAction,
+  searchHelpArticles,
+  type HelpAgentAuthority,
+} from "@/lib/help-content";
 import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 
 export function HelpSearch({
-  selectedAgentUsername,
+  agentAuthority = { phase: "idle", canManage: false },
   initialQuery = "",
 }: {
-  selectedAgentUsername?: string | null;
+  agentAuthority?: HelpAgentAuthority;
   initialQuery?: string;
 }) {
   const [query, setQuery] = useState(initialQuery);
@@ -74,7 +78,7 @@ export function HelpSearch({
       ) : (
         <div className="mt-4 space-y-5">
           {results.map((article) => {
-            const action = resolveHelpAction(article, selectedAgentUsername);
+            const action = resolveHelpAction(article, agentAuthority);
             return (
               <article
                 key={article.id}
@@ -115,6 +119,10 @@ export function HelpSearch({
 }
 
 export function HelpCenter() {
-  const { username } = useSelectedAgent();
-  return <HelpSearch selectedAgentUsername={username} />;
+  const { agent, phase, canManage } = useSelectedAgent();
+  return (
+    <HelpSearch
+      agentAuthority={{ loadedUsername: agent?.username, phase, canManage }}
+    />
+  );
 }
