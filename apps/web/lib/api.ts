@@ -697,6 +697,11 @@ export const api = {
       return post(`/agents/${enc(username)}/repair`);
     },
 
+    /** POST /api/agents/:username/retry-provision -> owner retries a failed first build. */
+    retryProvision(username: string): Promise<{ ok: boolean; status: "provisioning" }> {
+      return post(`/agents/${enc(username)}/retry-provision`);
+    },
+
     /** GET /api/agents/:username/activity -> owner logs peek (recent usage events). */
     activity(username: string): Promise<{ items: AgentActivityEvent[] }> {
       return get<{ items: AgentActivityEvent[] }>(`/agents/${enc(username)}/activity`);

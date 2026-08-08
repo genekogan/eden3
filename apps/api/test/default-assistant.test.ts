@@ -55,7 +55,7 @@ function eveRouteInventory(): EveRouteInventoryItem[] {
   const agentRoutes = declaredRoutes('agents', '/agents').filter(
     (route) =>
       (route.method === 'PATCH' && route.path === '/agents/:username') ||
-      /^\/agents\/:username\/(?:memory(?:\/|$)|repair$|activity$|export$|avatar$)/.test(
+      /^\/agents\/:username\/(?:memory(?:\/|$)|repair$|retry-provision$|activity$|export$|avatar$)/.test(
         route.path,
       ),
   );
@@ -290,6 +290,7 @@ describe('platform-owned Eve assistant', () => {
       'POST /agents/:username/memory/rebuild',
       'POST /agents/:username/memory/search-probe',
       'POST /agents/:username/repair',
+      'POST /agents/:username/retry-provision',
       'POST /agents/:username/skills',
       'POST /tasks',
       'POST /tasks/:id/runs',
