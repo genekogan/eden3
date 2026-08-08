@@ -882,8 +882,12 @@ describe('runTurn usage events', () => {
     });
   });
 
-  it('fails closed and refunds a Claude CLI completion with no attributable usage', async () => {
+  it('fails closed and retains the authorized max after a streamed Claude CLI prefix with no usage', async () => {
     const fixture = await makeFixture();
+    const authorized = turnAuthorizedMax({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+    }).manna;
     const emitted: SessionEvent[] = [];
     const compat: CompatClientLike = {
       async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
@@ -949,7 +953,9 @@ describe('runTurn usage events', () => {
         pricingBasis: string;
         manna: number | null;
         errorCode: string | null;
-        metadata: { usageSource?: string; agentConfig?: { agentRuntime?: string } } | null;
+        metadata: {
+          partialOutputSettlement?: { rule?: string; chargedManna?: number };
+        } | null;
       }>
     >`
       select status, pricing_basis as "pricingBasis", manna, error_code as "errorCode", metadata
@@ -958,11 +964,10 @@ describe('runTurn usage events', () => {
     expect(usage).toMatchObject({
       status: 'error',
       pricingBasis: 'notional-subscription',
-      manna: 0,
+      manna: authorized,
       errorCode: 'subscription_runtime_unavailable',
       metadata: {
-        usageSource: 'missing',
-        agentConfig: { agentRuntime: 'claude-cli' },
+        partialOutputSettlement: { rule: 'full-reserve-v1', chargedManna: authorized },
       },
     });
     const [net] = await pg<{ spend: string }[]>`
@@ -975,7 +980,7 @@ describe('runTurn usage events', () => {
         select id from manna_accounts where account_id = ${fixture.user.accountId}
       )
     `;
-    expect(Number(net!.spend)).toBe(0);
+    expect(Number(net!.spend)).toBe(authorized);
   });
 
   it('ignores duplicate gateway completion events without double-persisting or double-charging', async () => {
