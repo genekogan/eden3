@@ -1,6 +1,5 @@
-import { turnAuthorizations } from '@eden3/db';
+import { db, turnAuthorizations } from '@eden3/db';
 import { and, eq, lt } from 'drizzle-orm';
-import { db } from '@eden3/db';
 
 import { reverseTurnAuthorization } from './turn-authorization';
 
