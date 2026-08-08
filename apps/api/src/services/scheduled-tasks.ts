@@ -829,7 +829,9 @@ export async function runScheduledTask(
         claimId,
         outcome,
         recovered.sessionId,
-        trigger.lastRunTime ?? recovered.createdAt,
+        occurrence.kind === 'scheduled'
+          ? occurrence.dueAt!
+          : (trigger.lastRunTime ?? recovered.createdAt),
       );
       const result = {
         triggerId: trigger.id,
