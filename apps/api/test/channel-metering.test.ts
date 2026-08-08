@@ -110,6 +110,20 @@ describe('ChannelTurnMeteringService economic authorization', () => {
     expect(persistence.markError).toHaveBeenCalledWith(record.turnId, 'reserve_failed');
   });
 
+  it('fails closed before creating a turn when the channel model has no frozen ceiling', async () => {
+    const unsupported = { ...connection, model: 'openrouter/unsupported-model' };
+    const persistence = store({ getBillableConnection: vi.fn(async () => unsupported) });
+    await expect(
+      new ChannelTurnMeteringService(persistence).reserve({
+        turnId: randomUUID(),
+        connectionId: unsupported.connectionId,
+        runtimeAccountId: unsupported.runtimeAccountId,
+      }),
+    ).rejects.toMatchObject({ name: 'TurnCeilingError' });
+    expect(persistence.claimTurn).not.toHaveBeenCalled();
+    expect(persistence.authorize).not.toHaveBeenCalled();
+  });
+
   it('FG-ECON-CHANNEL-02 never charges above authorized-max and records the clamped settlement', async () => {
     const record = turn('settling');
     const persistence = store({
