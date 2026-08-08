@@ -225,6 +225,13 @@
       "when": 1786201208971,
       "tag": "0031_channel_onboarding_intents",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1786201841114,
+      "tag": "0032_storage_upload_part_authorizations",
+      "breakpoints": true
     }
   ]
 }
