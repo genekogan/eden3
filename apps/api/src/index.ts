@@ -17,6 +17,7 @@ await refreshActiveConceptInventories();
 const app = await buildServer({
   logger: { level: 'info', base: undefined }, // compact: no pid/hostname
   media: { autoStartWatcher: true },
+  storage: { enabled: true, autoStartPolicyWorker: true },
   scheduler: { autoStart: true }, // eden3-side scheduled-task firing
 });
 

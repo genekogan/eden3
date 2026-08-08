@@ -50,6 +50,7 @@ import { creationsRoutes } from './routes/creations';
 import { devRoutes } from './routes/dev';
 import { feedRoutes } from './routes/feed';
 import { mannaRoutes } from './routes/manna';
+import { mediaObjectRoutes } from './routes/media-objects';
 import { operatorRoutes } from './routes/operator';
 import { sessionsRoutes } from './routes/sessions';
 import { skillsRoutes } from './routes/skills';
@@ -57,6 +58,12 @@ import { studioRoutes } from './routes/studio';
 import { triggersRoutes } from './routes/triggers';
 import { usageRoutes } from './routes/usage';
 import { workspaceRoutes } from './routes/workspace';
+import { uploadsRoutes } from './routes/uploads';
+import {
+  createStorageRuntime,
+  storagePolicyIntervalMs,
+  type StorageRuntime,
+} from './services/storage-runtime';
 
 const requireCjs = createRequire(import.meta.url);
 const pkg = requireCjs('../package.json') as { version: string };
@@ -93,6 +100,14 @@ export interface BuildServerOptions {
   };
   billing?: BillingRoutesOptions;
   channels?: ChannelsRoutesOptions;
+  storage?: {
+    /** Construct the production object/upload runtime. Tests leave this false. */
+    enabled?: boolean;
+    /** Fully injected runtime for narrow route/server tests. */
+    runtime?: StorageRuntime;
+    /** Run the durable quarantine outbox loop; production entrypoints enable it. */
+    autoStartPolicyWorker?: boolean;
+  };
   scheduler?: {
     /**
      * Start the scheduled-task loop during server boot. Entrypoints should
@@ -214,14 +229,6 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     exposedHeaders: ['x-session-id'], // new-session hint on POST …/messages
   });
 
-  // Media files (content-addressed) served from MEDIA_DIR at /media/.
-  mkdirSync(env.MEDIA_DIR, { recursive: true });
-  await app.register(fastifyStatic, {
-    root: env.MEDIA_DIR,
-    prefix: '/media/',
-    index: false,
-    list: false,
-  });
   // Creation URLs can legitimately use the API origin directly while the web
   // app is served from localhost (or a separate production hostname). Keep
   // the global API default `same-site`, but opt public media into embedding.
@@ -460,6 +467,48 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Distinct from /operator (admin platform view); never exposes cost_usd.
   await app.register(usageRoutes, { prefix: '/usage' });
   await app.register(operatorRoutes, { prefix: '/operator' });
+  const storageRuntime =
+    opts.storage?.runtime ??
+    (opts.storage?.enabled === true
+      ? await createStorageRuntime({ mediaDir: env.MEDIA_DIR, logger: app.log })
+      : null);
+  if (storageRuntime) {
+    // Register the lifecycle-aware UUID route before the legacy static
+    // wildcard. The backend and hydration cache are separately rooted and
+    // can never be reached through the public MEDIA_DIR mount.
+    await app.register(mediaObjectRoutes, { resolver: storageRuntime.mediaResolver });
+    await app.register(uploadsRoutes, { service: storageRuntime.uploadService });
+    if (opts.storage?.autoStartPolicyWorker === true) {
+      const intervalMs = storagePolicyIntervalMs();
+      let running = false;
+      const tick = () => {
+        if (running) return;
+        running = true;
+        void storageRuntime.policyEventWorker
+          .tick()
+          .catch((err) => app.log.error({ err }, 'upload policy event tick failed'))
+          .finally(() => {
+            running = false;
+          });
+      };
+      if (intervalMs > 0) tick();
+      const timer = intervalMs > 0 ? setInterval(tick, intervalMs) : null;
+      timer?.unref();
+      app.addHook('onClose', async () => {
+        if (timer) clearInterval(timer);
+      });
+    }
+  }
+  // Existing generated media keeps its content-addressed filename URLs. This
+  // wildcard is deliberately registered after `/media/:objectId`; it serves
+  // only MEDIA_DIR and cannot see pending/quarantined object-backend bytes.
+  mkdirSync(env.MEDIA_DIR, { recursive: true });
+  await app.register(fastifyStatic, {
+    root: env.MEDIA_DIR,
+    prefix: '/media/',
+    index: false,
+    list: false,
+  });
   // Trigger routes live at /tasks on the wire (web contract).
   await app.register(triggersRoutes, { prefix: '/tasks' });
   await app.register(studioRoutes, {

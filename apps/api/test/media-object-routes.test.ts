@@ -2,6 +2,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import fastifyStatic from '@fastify/static';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -99,6 +100,27 @@ describe('GET /media/:objectId lifecycle boundary', () => {
     expect(JSON.stringify(response.headers)).not.toContain('objects/');
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(counts()).toMatchObject({ hydrations: 1, releases: 1 });
+  });
+
+  it('keeps the lifecycle route ahead of the legacy static wildcard', async () => {
+    const { app } = await setup();
+    const publicDir = await mkdtemp(path.join(os.tmpdir(), 'eden3-public-media-'));
+    dirs.push(publicDir);
+    await writeFile(path.join(publicDir, OBJECT_ID), 'public-bypass');
+    await app.register(fastifyStatic, {
+      root: publicDir,
+      prefix: '/media/',
+      index: false,
+      list: false,
+    });
+    const anonymous = await app.inject({ method: 'GET', url: `/media/${OBJECT_ID}` });
+    expect(anonymous.statusCode).toBe(404);
+    expect(anonymous.body).not.toContain('public-bypass');
+    const owner = await app.inject({
+      method: 'GET', url: `/media/${OBJECT_ID}`, headers: { 'x-test-account': OWNER },
+    });
+    expect(owner.statusCode).toBe(200);
+    expect(owner.body).toBe('0123456789');
   });
 
   it('allows anonymous public references and supports HEAD and a single byte range', async () => {
