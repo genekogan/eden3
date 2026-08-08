@@ -90,6 +90,12 @@ import {
 } from './services/storage-runtime';
 import type { MultipartCleanupTickResult } from './services/upload-multipart-cleanup';
 import type { PolicyEventTickResult } from './services/upload-policy-events';
+import {
+  isShareCapabilityRequest,
+  registerShareCapabilityResponseBoundary,
+  safeCapabilityErrorMessage,
+  safeNotFoundMessage,
+} from './services/share-cache-policy';
 
 const requireCjs = createRequire(import.meta.url);
 const pkg = requireCjs('../package.json') as { version: string };
@@ -202,6 +208,12 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1',
   });
 
+  // Capability URLs carry bearer material in their path. Mark them before
+  // rate limiting, auth, cohort admission, routing, and parsing can terminate
+  // the request. This hook changes response policy only; admission remains
+  // exclusively owned by auth-plugin's exact method/path rules.
+  registerShareCapabilityResponseBoundary(app);
+
   app.addHook('onRequest', async (req, reply) => {
     reply.header('x-request-id', req.id);
   });
@@ -263,14 +275,23 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       code = statusCode >= 500 ? 'internal_error' : (err.code ?? 'bad_request');
       message = err.message || 'Internal server error';
     }
-    if (statusCode >= 500) req.log.error({ err }, 'request failed');
-    void reply.code(statusCode).send(errorEnvelope(statusCode, code, message));
+    const capabilityRequest = isShareCapabilityRequest(req.url);
+    if (statusCode >= 500) {
+      if (capabilityRequest) {
+        req.log.error({ requestId: req.id, statusCode, code }, 'share capability request failed');
+      } else {
+        req.log.error({ err }, 'request failed');
+      }
+    }
+    void reply
+      .code(statusCode)
+      .send(errorEnvelope(statusCode, code, safeCapabilityErrorMessage(req.url, message)));
   });
 
   app.setNotFoundHandler((req, reply) => {
     void reply
       .code(404)
-      .send(errorEnvelope(404, 'not_found', `Route ${req.method} ${req.url} not found`));
+      .send(errorEnvelope(404, 'not_found', safeNotFoundMessage(req.method, req.url)));
   });
 
   registerHttpHardening(app, {
