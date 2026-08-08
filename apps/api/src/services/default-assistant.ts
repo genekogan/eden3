@@ -59,6 +59,8 @@ export interface EveAssistantResult {
   openclawId: typeof DEFAULT_EVE_OPENCLAW_ID;
 }
 
+export const EVE_RECONCILIATION_ADVISORY_LOCK = 'eden3:platform:eve:reconcile';
+
 export interface EveBootstrapExistingIdentityPrecondition {
   accountId: string;
   username: string;
@@ -81,6 +83,8 @@ export interface EnsureEveAssistantOptions {
    * bootstrap advisory lock and row locks are held, before any write occurs.
    */
   existingIdentityPrecondition?: EveBootstrapExistingIdentityPrecondition;
+  /** Internal capability: the caller already holds the exclusive session fence. */
+  reconciliationLeaseHeld?: boolean;
 }
 
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -90,6 +94,13 @@ export async function ensureEveAssistant(
   options: EnsureEveAssistantOptions = {},
 ): Promise<EveAssistantResult> {
   const result: EveAssistantResult = await pg.begin(async (sql) => {
+    if (options.reconciliationLeaseHeld !== true) {
+      await sql`
+        select pg_advisory_xact_lock_shared(
+          hashtextextended(${EVE_RECONCILIATION_ADVISORY_LOCK}, 0)
+        )
+      `;
+    }
     // A transaction-scoped lock makes concurrent API starts converge on one
     // account/runtime identity instead of briefly creating competing rows.
     await sql`select pg_advisory_xact_lock(hashtextextended('eden3:platform:eve', 0))`;
@@ -102,11 +113,27 @@ export async function ensureEveAssistant(
         ownerId: string | null;
         accountStableHash: string;
         agentHash: string;
+        bootstrapCanonical: boolean;
       }[]
     >`
       select a.id, a.type, a.username::text as username, g.owner_id as "ownerId",
              md5((to_jsonb(a) - 'username' - 'updated_at')::text) as "accountStableHash",
-             md5(to_jsonb(g)::text) as "agentHash"
+             md5(to_jsonb(g)::text) as "agentHash",
+             (
+               g.owner_id is null
+               and g.name = ${PLATFORM_EVE_DATABASE_PROFILE.name}
+               and g.description = ${PLATFORM_EVE_DATABASE_PROFILE.description}
+               and g.persona = ${PLATFORM_EVE_DATABASE_PROFILE.persona}
+               and g.is_persona_public = true
+               and g.greeting = ${PLATFORM_EVE_DATABASE_PROFILE.greeting}
+               and g.public = true
+               and g.openclaw_id = ${DEFAULT_EVE_OPENCLAW_ID}
+               and g.tool_groups = ${pg.json(JSON.stringify(PLATFORM_EVE_TOOL_GROUPS))}::jsonb
+               and g.is_pilot = true
+               and g.is_synthetic = false
+               and g.provision_status = 'ready'
+               and g.provisioned_at is not null
+             ) as "bootstrapCanonical"
       from agents g
       join accounts a on a.id = g.account_id
       where g.openclaw_id = ${DEFAULT_EVE_OPENCLAW_ID}
@@ -123,6 +150,13 @@ export async function ensureEveAssistant(
         existingRuntime.agentHash !== precondition.agentHash)
     ) {
       throw new Error('platform Eve bootstrap identity changed after reconciliation phase 1');
+    }
+    if (
+      existingRuntime &&
+      existingRuntime.username.toLowerCase() !== DEFAULT_EVE_USERNAME &&
+      !existingRuntime.bootstrapCanonical
+    ) {
+      throw new Error('OpenClaw main profile drifted before Eve handle bootstrap');
     }
 
     let account: {

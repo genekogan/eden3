@@ -1,6 +1,10 @@
 import { pg } from '@eden3/db';
 
-import { ensureEveAssistant, PLATFORM_EVE_DATABASE_PROFILE } from './default-assistant';
+import {
+  ensureEveAssistant,
+  EVE_RECONCILIATION_ADVISORY_LOCK,
+  PLATFORM_EVE_DATABASE_PROFILE,
+} from './default-assistant';
 import {
   DEFAULT_EVE_OPENCLAW_ID,
   DEFAULT_EVE_USERNAME,
@@ -10,7 +14,6 @@ import {
 type PgTransaction = Parameters<Parameters<typeof pg.begin>[1]>[0];
 type SqlExecutor = typeof pg | PgTransaction;
 
-const RECONCILIATION_LOCK = 'eden3:platform:eve:reconcile';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HANDLE = /^[a-z0-9][a-z0-9_-]{2,31}$/;
 const SAFE_RUNTIME_ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}$/;
@@ -24,6 +27,46 @@ const RESERVED_HANDLES = new Set([
   'api',
   'media',
 ]);
+
+let localReconciliationTail: Promise<void> = Promise.resolve();
+
+async function acquireReconciliationLease(): Promise<() => Promise<void>> {
+  let releaseLocal!: () => void;
+  const predecessor = localReconciliationTail;
+  localReconciliationTail = new Promise<void>((resolve) => {
+    releaseLocal = resolve;
+  });
+  await predecessor;
+
+  const connection = await pg.reserve();
+  let locked = false;
+  try {
+    await connection`
+      select pg_advisory_lock(hashtextextended(${EVE_RECONCILIATION_ADVISORY_LOCK}, 0))
+    `;
+    locked = true;
+  } catch (error) {
+    connection.release();
+    releaseLocal();
+    throw error;
+  }
+
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    try {
+      if (locked) {
+        await connection`
+          select pg_advisory_unlock(hashtextextended(${EVE_RECONCILIATION_ADVISORY_LOCK}, 0))
+        `;
+      }
+    } finally {
+      connection.release();
+      releaseLocal();
+    }
+  };
+}
 
 export type EveReconciliationState = 'blocked' | 'reconciled' | 'bootstrapped';
 
@@ -368,6 +411,31 @@ async function loadManifest(
   };
 }
 
+async function loadManifestSnapshot(
+  input: EveReconciliationInput,
+): Promise<EveReconciliationManifest> {
+  return pg.begin(
+    'isolation level repeatable read',
+    async (sql) => {
+      // Establish the coherent snapshot and hold the selected identities until
+      // classification commits. A concurrent selected-row writer either wins
+      // before this point and is observed, or waits until after this manifest's
+      // linearization point.
+      await sql`
+        select id from accounts
+        where id in (${input.expectedCollisionAccountId}, ${input.expectedPlatformAccountId})
+        for share
+      `;
+      await sql`
+        select account_id from agents
+        where account_id in (${input.expectedCollisionAccountId}, ${input.expectedPlatformAccountId})
+        for share
+      `;
+      return loadManifest(sql, input);
+    },
+  );
+}
+
 function assertPreserved(
   before: EveReconciliationManifest,
   after: EveReconciliationManifest,
@@ -470,7 +538,7 @@ export async function reconcileEveCollision(
   }
 
   if (options.apply !== true) {
-    const manifest = await loadManifest(pg, input);
+    const manifest = await loadManifestSnapshot(input);
     return {
       dryRun: true,
       state: manifest.state,
@@ -480,10 +548,11 @@ export async function reconcileEveCollision(
     };
   }
 
+  const releaseReconciliationLease = await acquireReconciliationLease();
+  try {
   let phase1: EveReconciliationApplyResult['phase1'];
   try {
-    phase1 = await pg.begin(async (sql) => {
-      await sql`select pg_advisory_xact_lock(hashtextextended(${RECONCILIATION_LOCK}, 0))`;
+    phase1 = await pg.begin('isolation level repeatable read', async (sql) => {
       await sql`
         select id from accounts
         where id in (${input.expectedCollisionAccountId}, ${input.expectedPlatformAccountId})
@@ -542,6 +611,7 @@ export async function reconcileEveCollision(
     await options.afterPhase1CommitBeforeBootstrap?.();
     const bootstrap = await ensureEveAssistant({
       syncWorkspace: false,
+      reconciliationLeaseHeld: true,
       existingIdentityPrecondition: {
         accountId: phase1.before.platform.accountId,
         username: phase1.before.platform.username,
@@ -555,7 +625,7 @@ export async function reconcileEveCollision(
     ) {
       fail('bootstrap_identity_mismatch', 'Normal Eve bootstrap returned a different identity');
     }
-    const finalManifest = await loadManifest(pg, input);
+    const finalManifest = await loadManifestSnapshot(input);
     if (finalManifest.state !== 'bootstrapped') {
       fail('bootstrap_verification_failed', 'Normal Eve bootstrap did not reach bootstrapped state');
     }
@@ -573,7 +643,7 @@ export async function reconcileEveCollision(
     }
     let manifest: EveReconciliationManifest | null = null;
     try {
-      manifest = await loadManifest(pg, input);
+      manifest = await loadManifestSnapshot(input);
     } catch {
       // Keep the loud handoff payload bounded if concurrent drift prevents a
       // trustworthy post-failure manifest.
@@ -598,5 +668,8 @@ export async function reconcileEveCollision(
       state: manifest?.state ?? 'unknown',
       resumeCommand: eveReconciliationCommand(input),
     });
+  }
+  } finally {
+    await releaseReconciliationLease();
   }
 }
