@@ -624,6 +624,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
 
   async reverseAuthorized(turnId: string, errorCode: string): Promise<void> {
     await db.transaction(async (tx) => {
+      let terminalErrorCode = errorCode;
       const authRows = (await tx.execute(sql`
         select a.state, a.reserved_subscription_manna,
                t.status as channel_status, t.error_code as channel_error_code
@@ -644,6 +645,12 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
           channelStatus: auth.channel_status,
           channelErrorCode: auth.channel_error_code,
         });
+        if (reversalKind === 'delivery_compensation') {
+          // The stale reaper and the explicit delivery-failed callback are
+          // two claim paths for the same post-settlement compensation. Keep
+          // their terminal channel/usage evidence canonical.
+          terminalErrorCode = 'channel_delivery_failed';
+        }
         await reverseReservation({
           reservationKey: channelTurnLedgerKey(turnId),
           reservedSubscriptionManna: numericToNumber(auth.reserved_subscription_manna),
@@ -677,7 +684,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
       const updated = (await tx.execute(sql`
         update channel_turns
         set status = 'refunded', metered_manna = 0,
-            error_code = ${errorCode}, updated_at = now(), completed_at = now()
+            error_code = ${terminalErrorCode}, updated_at = now(), completed_at = now()
         where turn_id = ${turnId} and status = 'refunding'
         returning turn_id
       `)) as unknown as { turn_id: string }[];
@@ -687,9 +694,9 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
         // ledger instead of leaving a misleading completed/charged event.
         await tx.execute(sql`
           update usage_events
-          set status = 'error', manna = 0, error_code = ${errorCode},
+          set status = 'error', manna = 0, error_code = ${terminalErrorCode},
               error_message = case
-                when ${errorCode} = 'channel_delivery_failed'
+                when ${terminalErrorCode} = 'channel_delivery_failed'
                   then 'Channel reply delivery failed after provider completion; charge refunded'
                 else error_message
               end

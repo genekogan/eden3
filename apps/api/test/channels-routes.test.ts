@@ -41,6 +41,7 @@ let strangerId = '';
 let adminId = '';
 let firstAgentId = '';
 let firstAgentUsername = '';
+let secondAgentId = '';
 let secondAgentUsername = '';
 let adminAgentUsername = '';
 let app: FastifyInstance;
@@ -48,6 +49,8 @@ let app: FastifyInstance;
 const ensureCalls: Array<Record<string, unknown>> = [];
 const removeCalls: Array<Record<string, unknown>> = [];
 let ensureFailuresRemaining = 0;
+let providerValidationPause: Promise<void> | null = null;
+let providerValidationEntered: (() => void) | null = null;
 const fakeChannelSync = {
   async ensureHostedChannelAccount(opts: Record<string, unknown>) {
     ensureCalls.push(opts);
@@ -65,6 +68,10 @@ const fakeChannelSync = {
 
 const providerClient: ChannelProviderClientLike = {
   async validate(channel, token) {
+    if (providerValidationPause) {
+      providerValidationEntered?.();
+      await providerValidationPause;
+    }
     if (token.includes('bad')) {
       return {
         ok: false,
@@ -234,7 +241,7 @@ beforeAll(async () => {
     openclawId: firstAgentUsername,
     provisionStatus: 'ready',
   });
-  await insertAgentAccount(secondAgentUsername, {
+  secondAgentId = await insertAgentAccount(secondAgentUsername, {
     ownerId,
     public: true,
     openclawId: secondAgentUsername,
@@ -713,6 +720,37 @@ describe('Telegram Managed Bots onboarding', () => {
     expect(attached.statusCode).toBe(200);
     expect(attached.json().connection).toMatchObject({ agentId: firstAgentId, label: 'Managed fixture' });
 
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connectionId}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    const callsBeforeReattach = ensureCalls.length;
+    const activeReattach = await app.inject({
+      method: 'POST',
+      url: `/channels/telegram/managed-bots/onboarding/${created.intent.id}/attach`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { agentUsername: secondAgentUsername },
+    });
+    expect(activeReattach.statusCode).toBe(409);
+    expect(activeReattach.json()).toMatchObject({
+      error: { code: 'telegram_managed_bot_active' },
+    });
+    expect(ensureCalls).toHaveLength(callsBeforeReattach);
+    const stillBound = await pg<
+      Array<{ desired_state: string; agent_id: string | null; runtime_account_id: string | null }>
+    >`
+      select desired_state, agent_id, runtime_account_id
+      from channel_connections where id = ${connectionId}
+    `;
+    expect(stillBound[0]).toEqual({
+      desired_state: 'active',
+      agent_id: firstAgentId,
+      runtime_account_id: expect.any(String),
+    });
+
     const replay = await app.inject({
       method: 'POST',
       url: '/channels/telegram/managed-bots/webhook',
@@ -778,6 +816,48 @@ describe('Telegram Managed Bots onboarding', () => {
 });
 
 describe('named-account lifecycle', () => {
+  it('rejects activation when the attached agent changes during provider validation', async () => {
+    const connection = await createConnection({
+      token: `valid_${marker}_activation_agent_race`,
+      agentUsername: firstAgentUsername,
+    });
+    let releaseValidation!: () => void;
+    let signalEntered!: () => void;
+    providerValidationPause = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    providerValidationEntered = signalEntered;
+    const callsBefore = ensureCalls.length;
+    const activation = app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
+    });
+    await entered;
+    await pg`
+      update channel_connections
+      set agent_id = ${secondAgentId}, updated_at = now()
+      where id = ${connection.id} and desired_state = 'inactive'
+    `;
+    releaseValidation();
+    providerValidationPause = null;
+    providerValidationEntered = null;
+    const denied = await activation;
+    expect(denied.statusCode).toBe(409);
+    expect(denied.json()).toMatchObject({ error: { code: 'channel_connection_changed' } });
+    expect(ensureCalls).toHaveLength(callsBefore);
+    const persisted = await pg<
+      Array<{ desired_state: string; agent_id: string | null }>
+    >`
+      select desired_state, agent_id from channel_connections where id = ${connection.id}
+    `;
+    expect(persisted[0]).toEqual({ desired_state: 'inactive', agent_id: secondAgentId });
+  });
+
   it('activates two isolated Discord bots and one Telegram bot without a plaintext token', async () => {
     ensureCalls.length = 0;
     const first = await createConnection({
@@ -960,6 +1040,36 @@ describe('named-account lifecycle', () => {
       desired_state: 'active',
       observed_state: 'error',
       status: 'error',
+      last_error_code: 'delivery_ack_lost',
+    });
+
+    const liveAgain = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/status',
+      headers: { authorization: `Bearer ${runtimeToken}` },
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        state: 'live',
+      },
+    });
+    expect(liveAgain.statusCode).toBe(200);
+    const preserved = await pg<
+      Array<{
+        desired_state: string;
+        observed_state: string;
+        status: string;
+        last_error_code: string | null;
+      }>
+    >`
+      select desired_state, observed_state, status, last_error_code
+      from channel_connections
+      where id = ${connection.id}
+    `;
+    expect(preserved[0]).toEqual({
+      desired_state: 'active',
+      observed_state: 'live',
+      status: 'connected',
       last_error_code: 'delivery_ack_lost',
     });
   });
@@ -1379,5 +1489,44 @@ describe('channel money crash boundaries against Postgres', () => {
     await expect(store.markDelivered(compensationWonTurn)).rejects.toBeInstanceOf(
       ChannelDeliveryTerminalCompensatedError,
     );
+
+    const staleDeliveryTurn = randomUUID();
+    await settle(staleDeliveryTurn);
+    await pg`
+      update channel_turns
+      set updated_at = now() - interval '2 hours'
+      where turn_id = ${staleDeliveryTurn}
+    `;
+    expect(await metering.refundStale({ olderThanMs: 60_000, limit: 100 })).toBeGreaterThan(0);
+    const staleDelivery = await pg<
+      Array<{
+        channel_status: string;
+        error_code: string | null;
+        authorization_state: string;
+        usage_status: string;
+        usage_error_code: string | null;
+        reversal_count: number;
+      }>
+    >`
+      select ct.status as channel_status, ct.error_code,
+             ta.state as authorization_state, ue.status as usage_status,
+             ue.error_code as usage_error_code,
+             (
+               select count(*)::int from manna_transactions mt
+               where mt.idempotency_key = ${`refund:${channelTurnLedgerKey(staleDeliveryTurn)}`}
+             ) as reversal_count
+      from channel_turns ct
+      join turn_authorizations ta on ta.turn_id = ct.turn_id
+      join usage_events ue on ue.turn_id = ct.turn_id and ue.event_type = 'channel_chat'
+      where ct.turn_id = ${staleDeliveryTurn}
+    `;
+    expect(staleDelivery[0]).toEqual({
+      channel_status: 'refunded',
+      error_code: 'channel_delivery_failed',
+      authorization_state: 'settled',
+      usage_status: 'error',
+      usage_error_code: 'channel_delivery_failed',
+      reversal_count: 1,
+    });
   });
 });
