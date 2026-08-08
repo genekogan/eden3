@@ -89,6 +89,7 @@ async function creationPayload(creation: Creation, viewer: AuthSession | null) {
       ...(creator !== undefined ? { creator } : {}),
       ...(agent !== undefined ? { agent } : {}),
       viewerHasLiked,
+      reportable: isPubliclyReachableCreation(creation),
     }),
   };
 }

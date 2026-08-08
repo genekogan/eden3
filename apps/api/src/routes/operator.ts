@@ -90,11 +90,9 @@ function contentReportDto(row: ContentReportRow) {
     reviewerId: row.reviewer_id,
     reviewedAt: row.reviewed_at === null ? null : new Date(row.reviewed_at).toISOString(),
     createdAt: new Date(row.created_at).toISOString(),
-    target: {
-      exists: row.target_exists,
-      public: row.target_public,
-      deleted: row.target_deleted,
-    },
+    targetExists: row.target_exists,
+    targetPublic: row.target_public,
+    targetDeleted: row.target_deleted,
   };
 }
 

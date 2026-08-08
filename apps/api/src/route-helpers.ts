@@ -345,7 +345,12 @@ export function creationDtoFromRow(row: CreationRow): CreationDto {
 
 export function creationDtoFromEntity(
   creation: Creation,
-  embeds: { creator?: AccountSummary; agent?: AccountSummary; viewerHasLiked?: boolean } = {},
+  embeds: {
+    creator?: AccountSummary;
+    agent?: AccountSummary;
+    viewerHasLiked?: boolean;
+    reportable?: boolean;
+  } = {},
 ): CreationDto {
   return {
     id: creation.id,
@@ -360,6 +365,7 @@ export function creationDtoFromEntity(
     likeCount: creation.likeCount,
     ...(embeds.viewerHasLiked !== undefined ? { viewerHasLiked: embeds.viewerHasLiked } : {}),
     public: creation.public,
+    ...(embeds.reportable !== undefined ? { reportable: embeds.reportable } : {}),
     ...(embeds.creator !== undefined ? { creator: embeds.creator } : {}),
     ...(embeds.agent !== undefined ? { agent: embeds.agent } : {}),
     createdAt: creation.createdAt.toISOString(),

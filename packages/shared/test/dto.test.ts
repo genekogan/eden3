@@ -118,10 +118,12 @@ describe('resource DTOs', () => {
       mediaAttributes: { width: 1024, height: 1024 },
       likeCount: 3,
       public: true,
+      reportable: true,
       createdAt: now,
       updatedAt: now,
     };
     expect(creationDto.parse(creation)).toEqual(creation);
+    expect(creationDto.safeParse({ ...creation, reportable: "yes" }).success).toBe(false);
 
     const collection = {
       id: uuid('6'),

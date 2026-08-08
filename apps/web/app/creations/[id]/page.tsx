@@ -231,7 +231,7 @@ export default async function CreationPage({ params }: Props) {
             </Link>
           ) : null}
 
-          <ReportCreation creationId={creation.id} />
+          {creation.reportable === true ? <ReportCreation creationId={creation.id} /> : null}
 
           <p className="break-all font-mono text-[10px] leading-relaxed text-faint">
             {creation.id}

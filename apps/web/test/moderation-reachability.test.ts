@@ -12,7 +12,7 @@ describe("closed-cohort moderation reachability", () => {
     const reportControl = source("components/creations/report-creation.tsx");
     const api = source("lib/api.ts");
 
-    expect(page).toContain("<ReportCreation creationId={creation.id} />");
+    expect(page).toContain("creation.reportable === true ? <ReportCreation creationId={creation.id} /> : null");
     expect(reportControl).toContain("Report this creation");
     expect(reportControl).toContain("api.creations.report(creationId");
     expect(reportControl).toContain("Sign in to report this creation.");
@@ -26,8 +26,10 @@ describe("closed-cohort moderation reachability", () => {
 
     expect(operator).toContain("<ContentReportsPanel />");
     expect(panel).toContain('api.operator.contentReports({ status: "open"');
-    expect(panel).toContain('decide(report, "takedown")');
-    expect(panel).toContain('decide(report, "dismiss")');
+    expect(panel).toContain('report.targetType === "creation"');
+    expect(panel).toContain("report.targetExists");
+    expect(panel).toContain("report.targetPublic === true");
+    expect(panel).toContain("report.targetDeleted === false");
     expect(api).toContain("/operator/content-reports/${enc(id)}/resolve");
   });
 

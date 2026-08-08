@@ -508,11 +508,9 @@ export interface ContentReportDto {
   reviewerId: string | null;
   reviewedAt: string | null;
   createdAt: string;
-  target: {
-    exists: boolean;
-    public: boolean | null;
-    deleted: boolean | null;
-  };
+  targetExists: boolean;
+  targetPublic: boolean | null;
+  targetDeleted: boolean | null;
 }
 
 /** GET /api/operator/usage/summary */

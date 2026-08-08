@@ -1,9 +1,75 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import type { ContentReportDto } from "@/lib/types";
+
+export function isContentReportActionable(report: ContentReportDto): boolean {
+  return (
+    report.targetType === "creation" &&
+    report.targetExists &&
+    report.targetPublic === true &&
+    report.targetDeleted === false
+  );
+}
+
+export function ContentReportQueueItem({
+  report,
+  acting,
+  onDecide,
+}: {
+  report: ContentReportDto;
+  acting: boolean;
+  onDecide: (report: ContentReportDto, decision: "takedown" | "dismiss") => void;
+}) {
+  const actionable = isContentReportActionable(report);
+
+  return (
+    <li className="space-y-3 px-4 py-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-sm text-foreground">
+            @{report.reporter.username}: {report.reason || "No reason supplied"}
+          </p>
+          <p className="mt-1 font-mono text-[11px] text-faint">
+            {report.targetType} · {report.targetId}
+          </p>
+        </div>
+        {actionable ? (
+          <Link
+            href={`/creations/${encodeURIComponent(report.targetId)}`}
+            className="min-h-11 px-2 py-3 text-xs text-accent-soft hover:underline"
+          >
+            Review target
+          </Link>
+        ) : (
+          <span className="px-2 py-3 text-xs text-faint">Target unavailable</span>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-2">
+        {actionable ? (
+          <button
+            type="button"
+            disabled={acting}
+            onClick={() => onDecide(report, "takedown")}
+            className="min-h-11 rounded-md border border-danger/40 px-3.5 py-2 text-xs text-danger disabled:opacity-50"
+          >
+            Take down
+          </button>
+        ) : null}
+        <button
+          type="button"
+          disabled={acting}
+          onClick={() => onDecide(report, "dismiss")}
+          className="min-h-11 rounded-md border border-edge px-3.5 py-2 text-xs text-muted disabled:opacity-50"
+        >
+          Dismiss
+        </button>
+      </div>
+    </li>
+  );
+}
 
 export function ContentReportsPanel() {
   const [reports, setReports] = useState<ContentReportDto[] | null>(null);
@@ -64,46 +130,12 @@ export function ContentReportsPanel() {
       ) : (
         <ul className="divide-y divide-edge">
           {reports.map((report) => (
-            <li key={report.id} className="space-y-3 px-4 py-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-sm text-foreground">
-                    @{report.reporter.username}: {report.reason || "No reason supplied"}
-                  </p>
-                  <p className="mt-1 font-mono text-[11px] text-faint">
-                    {report.targetType} · {report.targetId}
-                  </p>
-                </div>
-                {report.target.exists && !report.target.deleted ? (
-                  <Link
-                    href={`/creations/${encodeURIComponent(report.targetId)}`}
-                    className="min-h-11 px-2 py-3 text-xs text-accent-soft hover:underline"
-                  >
-                    Review target
-                  </Link>
-                ) : (
-                  <span className="px-2 py-3 text-xs text-faint">Target unavailable</span>
-                )}
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  disabled={acting === report.id}
-                  onClick={() => void decide(report, "takedown")}
-                  className="min-h-11 rounded-md border border-danger/40 px-3.5 py-2 text-xs text-danger disabled:opacity-50"
-                >
-                  Take down
-                </button>
-                <button
-                  type="button"
-                  disabled={acting === report.id}
-                  onClick={() => void decide(report, "dismiss")}
-                  className="min-h-11 rounded-md border border-edge px-3.5 py-2 text-xs text-muted disabled:opacity-50"
-                >
-                  Dismiss
-                </button>
-              </div>
-            </li>
+            <ContentReportQueueItem
+              key={report.id}
+              report={report}
+              acting={acting === report.id}
+              onDecide={(row, decision) => void decide(row, decision)}
+            />
           ))}
         </ul>
       )}

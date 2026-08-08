@@ -38,8 +38,13 @@ let agentId = '';
 let viewerId = '';
 let reportedCreationId = '';
 let dismissedCreationId = '';
+let privateCreationId = '';
+let deletedCreationId = '';
 let takedownReportId = '';
 let dismissReportId = '';
+let privateReportId = '';
+let deletedReportId = '';
+let unsupportedReportId = '';
 let app: FastifyInstance;
 const runtimeState = new Map<AgentModel, AgentRuntime>(
   AGENT_MODEL_OPTIONS.map((model) => [model, DEFAULT_AGENT_RUNTIME_BY_MODEL[model]]),
@@ -62,6 +67,8 @@ beforeAll(async () => {
   agentId = await insertAgentAccount(`${marker}_agent`, { openclawId: `${marker}_agent` });
   reportedCreationId = await insertCreation({ userId, agentId, public: true });
   dismissedCreationId = await insertCreation({ userId, agentId, public: true });
+  privateCreationId = await insertCreation({ userId, agentId, public: false });
+  deletedCreationId = await insertCreation({ userId, agentId, public: true, deleted: true });
   takedownReportId = (
     await pg<{ id: string }[]>`
       insert into content_reports (reporter_id, target_type, target_id, reason)
@@ -73,6 +80,27 @@ beforeAll(async () => {
     await pg<{ id: string }[]>`
       insert into content_reports (reporter_id, target_type, target_id, reason)
       values (${viewerId}, 'creation', ${dismissedCreationId}, 'operator test dismiss')
+      returning id
+    `
+  )[0]!.id;
+  privateReportId = (
+    await pg<{ id: string }[]>`
+      insert into content_reports (reporter_id, target_type, target_id, reason)
+      values (${viewerId}, 'creation', ${privateCreationId}, 'private target')
+      returning id
+    `
+  )[0]!.id;
+  deletedReportId = (
+    await pg<{ id: string }[]>`
+      insert into content_reports (reporter_id, target_type, target_id, reason)
+      values (${viewerId}, 'creation', ${deletedCreationId}, 'deleted target')
+      returning id
+    `
+  )[0]!.id;
+  unsupportedReportId = (
+    await pg<{ id: string }[]>`
+      insert into content_reports (reporter_id, target_type, target_id, reason)
+      values (${viewerId}, 'agent', ${agentId}, 'unsupported target')
       returning id
     `
   )[0]!.id;
@@ -266,7 +294,10 @@ describe('/operator/content-reports', () => {
         targetId: string;
         reason: string | null;
         reporter: { id: string; username: string };
-        target: { exists: boolean; public: boolean; deleted: boolean };
+        targetType: string;
+        targetExists: boolean;
+        targetPublic: boolean | null;
+        targetDeleted: boolean | null;
       }>;
     };
     expect(body.reports).toEqual(
@@ -276,11 +307,52 @@ describe('/operator/content-reports', () => {
           targetId: reportedCreationId,
           reason: 'operator test takedown',
           reporter: { id: viewerId, username: `${marker}_viewer` },
-          target: { exists: true, public: true, deleted: false },
+          targetType: 'creation',
+          targetExists: true,
+          targetPublic: true,
+          targetDeleted: false,
         }),
       ]),
     );
     expect(res.payload).not.toContain(`${marker}_user@`);
+  });
+
+  it('marks unsupported, private, and deleted queue targets as ineligible DTOs', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/operator/content-reports?status=open',
+      headers: { cookie: devCookie(adminId) },
+    });
+    expect(res.statusCode).toBe(200);
+    const reports = (res.json() as {
+      reports: Array<{
+        id: string;
+        targetType: string;
+        targetExists: boolean;
+        targetPublic: boolean | null;
+        targetDeleted: boolean | null;
+      }>;
+    }).reports;
+    const byId = new Map(reports.map((report) => [report.id, report]));
+
+    expect(byId.get(unsupportedReportId)).toMatchObject({
+      targetType: 'agent',
+      targetExists: false,
+      targetPublic: null,
+      targetDeleted: null,
+    });
+    expect(byId.get(privateReportId)).toMatchObject({
+      targetType: 'creation',
+      targetExists: true,
+      targetPublic: false,
+      targetDeleted: false,
+    });
+    expect(byId.get(deletedReportId)).toMatchObject({
+      targetType: 'creation',
+      targetExists: true,
+      targetPublic: true,
+      targetDeleted: true,
+    });
   });
 
   it('atomically resolves a report and removes public reachability without deleting owner data', async () => {
@@ -296,7 +368,8 @@ describe('/operator/content-reports', () => {
         id: takedownReportId,
         status: 'resolved',
         reviewerId: adminId,
-        target: { exists: true, deleted: true },
+        targetExists: true,
+        targetDeleted: true,
       },
     });
     expect(

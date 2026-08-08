@@ -248,6 +248,8 @@ export const creationDto = z.object({
   /** Present when the viewer is authenticated or the route computes it. */
   viewerHasLiked: z.boolean().optional(),
   public: z.boolean(),
+  /** Present on creation detail responses; derived from public visibility policy. */
+  reportable: z.boolean().optional(),
   /** Optional embedded creator summaries (when the API joins them in). */
   creator: accountSummaryDto.optional(),
   agent: accountSummaryDto.optional(),
