@@ -1,4 +1,5 @@
 import { redirect } from "next/navigation";
+import { agentSettingsLandingHref } from "@/lib/eve";
 
 /** /agents/[username]/settings → Identity (the first section). */
 export default async function AgentSettingsIndexPage({
@@ -7,5 +8,5 @@ export default async function AgentSettingsIndexPage({
   params: Promise<{ username: string }>;
 }) {
   const { username } = await params;
-  redirect(`/agents/${username}/settings/identity`);
+  redirect(agentSettingsLandingHref(decodeURIComponent(username)));
 }

@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { StudioTool } from "@/lib/types";
 import { createOntologyRegistry, resolveOntologyRegistry } from "@/lib/ontology";
+import { isEveConfigurationHref } from "@/lib/eve";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { sortTools, toolLabel, FALLBACK_TOOLS } from "@/components/studio/catalog";
 import { useTheme, type ThemePreference } from "@/components/theme-provider";
@@ -89,7 +90,7 @@ export function CommandPalette() {
         description: tool.description ?? undefined,
       })),
     });
-    const ontology = resolveOntologyRegistry(
+    const resolvedOntology = resolveOntologyRegistry(
       {
         authenticated: viewer !== null,
         isAdmin: viewer?.isAdmin === true,
@@ -97,6 +98,11 @@ export function CommandPalette() {
         agentUsername: username,
       },
       registry,
+    );
+    const ontology = resolvedOntology.filter(
+      (entry) =>
+        entry.target.type !== "navigate" ||
+        !isEveConfigurationHref(username, entry.target.href),
     );
     return buildPaletteCommands({
       ontology,

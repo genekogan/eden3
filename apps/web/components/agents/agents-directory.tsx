@@ -15,6 +15,7 @@ import type { AgentDto } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
 import { Skeleton } from "@/components/skeleton";
 import { AgentCard } from "@/components/agents/agent-card";
+import { EveEmptyState } from "@/components/eve/eve-empty-state";
 import {
   dedupeById,
   describeApiFailure,
@@ -199,31 +200,13 @@ export function AgentsDirectory() {
             </button>
           }
         />
+      ) : items.length === 0 && !trimmedQuery ? (
+        <EveEmptyState />
       ) : items.length === 0 ? (
         <EmptyState
           className="mt-6"
-          title={
-            trimmedQuery
-              ? `No agents match “${trimmedQuery}”`
-              : "You don't have an agent yet"
-          }
-          hint={
-            trimmedQuery
-              ? "Try a different name or handle."
-              : "Adopt one: start from a template, or let the builder interview you and shape it with you."
-          }
-          action={
-            trimmedQuery ? undefined : (
-              <span className="flex flex-wrap justify-center gap-2">
-                <Link href="/agents/new" className={primaryButtonClass}>
-                  Create agent
-                </Link>
-                <Link href="/agents/builder" className={quietButtonClass}>
-                  Try the builder
-                </Link>
-              </span>
-            )
-          }
+          title={`No agents match “${trimmedQuery}”`}
+          hint="Try a different name or handle."
         />
       ) : (
         <>

@@ -1,18 +1,35 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
+import { AccessGate } from "@/components/AccessGate";
 import { AppShell } from "@/components/shell/app-shell";
 import { DevUserGate } from "@/components/DevUserGate";
 import { ErrorBoundary } from "@/components/error-boundary";
+import { ServiceWorkerRegistration } from "@/components/pwa/service-worker-registration";
 import { ThemeProvider } from "@/components/theme-provider";
 import "./globals.css";
+import "./pwa.css";
 
 export const metadata: Metadata = {
   title: { default: "Eden", template: "%s · Eden" },
   description:
     "Eden — chat with creative agents, generate media, explore creations.",
+  applicationName: "Eden",
+  manifest: "/manifest.webmanifest",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "black-translucent",
+    title: "Eden",
+  },
+  formatDetection: { telephone: false },
+  icons: {
+    apple: [{ url: "/icons/apple-touch-icon.png", sizes: "180x180" }],
+  },
 };
 
 export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
   themeColor: [
     { media: "(prefers-color-scheme: dark)", color: "#0a0b0a" },
     { media: "(prefers-color-scheme: light)", color: "#f5f7f5" },
@@ -36,10 +53,13 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <ThemeProvider>
           <AppShell>
             <ErrorBoundary>
-              <DevUserGate>{children}</DevUserGate>
+              <DevUserGate>
+                <AccessGate>{children}</AccessGate>
+              </DevUserGate>
             </ErrorBoundary>
           </AppShell>
         </ThemeProvider>
+        <ServiceWorkerRegistration />
       </body>
     </html>
   );
