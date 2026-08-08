@@ -78,16 +78,17 @@ class MemoryFixtureRepository implements E2EScratchFixtureRepository {
 describe('isolated E2E scratch user fixture', () => {
   it('accepts only a uniquely named local scratch database', () => {
     expect(parseE2EScratchDatabaseUrl(databaseUrl).databaseName).toBe(databaseName);
+    const encodedDatabaseName = `${databaseName.slice(0, -1)}%7A`;
     for (const candidate of [
       'postgres://eden3:eden3@127.0.0.1:5433/eden3',
       'postgres://eden3:eden3@127.0.0.1:5433/eden3_stg',
-      'postgres://eden3:eden3@example.com:5433/eden3_runtime_e2e_x',
-      'postgres://eden3:eden3@127.0.0.1:5432/eden3_runtime_e2e_x',
-      'postgres://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_x?sslmode=disable',
-      'http://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_x',
-      'postgres://other:eden3@127.0.0.1:5433/eden3_runtime_e2e_x',
-      'postgres://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_%78',
-      'postgres://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_x#fragment',
+      `postgres://eden3:eden3@example.com:5433/${databaseName}`,
+      `postgres://eden3:eden3@127.0.0.1:5432/${databaseName}`,
+      `${databaseUrl}?sslmode=disable`,
+      `http://eden3:eden3@127.0.0.1:5433/${databaseName}`,
+      `postgres://other:eden3@127.0.0.1:5433/${databaseName}`,
+      `postgres://eden3:eden3@127.0.0.1:5433/${encodedDatabaseName}`,
+      `${databaseUrl}#fragment`,
     ]) {
       expect(() => parseE2EScratchDatabaseUrl(candidate)).toThrow(/scratch database URL/);
     }
@@ -105,6 +106,7 @@ describe('isolated E2E scratch user fixture', () => {
       'https://127.0.0.1:4381/',
       'http://example.com:4381/',
       'http://user@127.0.0.1:4381/',
+      'http://:pass@127.0.0.1:4381/',
       'http://127.0.0.1:4381/dev/users',
       'http://127.0.0.1:4381/?q=gene',
       'http://127.0.0.1:4381/#fragment',
