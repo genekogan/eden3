@@ -1,7 +1,14 @@
 import { randomUUID } from 'node:crypto';
 
 import type { AuthSession } from '@eden3/core';
-import { credit, gatewaySessionKey, resetEnvCache, settleReservationIdempotencyKey } from '@eden3/core';
+import {
+  credit,
+  gatewaySessionKey,
+  getBalance,
+  resetEnvCache,
+  settleReservationIdempotencyKey,
+  turnAuthorizedMax,
+} from '@eden3/core';
 import { db, pg, sessions, type Session } from '@eden3/db';
 import {
   NO_RESPONSE_SENTINEL,
@@ -138,6 +145,66 @@ afterAll(async () => {
 }, 30_000);
 
 describe('runTurn usage events', () => {
+  it('settles the full preauthorized max when a provider errors after usable output', async () => {
+    const fixture = await makeFixture();
+    const turnId = randomUUID();
+    const authorized = turnAuthorizedMax({
+      provider: 'anthropic',
+      model: 'claude-haiku-4-5',
+    }).manna;
+    let providerCalls = 0;
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        providerCalls += 1;
+        yield { type: 'turn.started' };
+        yield { type: 'token', delta: 'usable prefix' };
+        yield {
+          type: 'error',
+          code: 'gateway_stream_error',
+          message: 'connection lost after prefix',
+        };
+      },
+    };
+
+    const outcome = await runTurn(makeDeps(compat), {
+      session: fixture.session,
+      agent: fixture.agent,
+      user: fixture.user,
+      content: 'stream then fail',
+      turnId,
+      beginStream: sink,
+    });
+
+    expect(providerCalls).toBe(1);
+    expect(outcome).toMatchObject({
+      assistantMessageId: null,
+      errorCode: 'gateway_stream_error',
+    });
+    expect((await getBalance(fixture.user.accountId)).total).toBe(5_000 - authorized);
+    const [authz] = await pg<{ state: string; charged_manna: string }[]>`
+      select state, charged_manna from turn_authorizations where turn_id = ${turnId}`;
+    expect(authz?.state).toBe('settled');
+    expect(Number(authz?.charged_manna)).toBe(authorized);
+    const [usage] = await pg<{
+      status: string;
+      manna: number;
+      error_code: string;
+      metadata: { partialOutputSettlement?: { rule?: string } };
+    }[]>`
+      select status, manna, error_code, metadata
+      from usage_events where event_type = 'chat_turn' and turn_id = ${turnId}`;
+    expect(usage).toMatchObject({
+      status: 'error',
+      manna: authorized,
+      error_code: 'gateway_stream_error',
+      metadata: { partialOutputSettlement: { rule: 'full-reserve-v1' } },
+    });
+    const [assistant] = await pg<{ n: string }[]>`
+      select count(*)::text as n from messages
+      where session_id = ${fixture.session.id} and role = 'assistant'`;
+    expect(Number(assistant!.n)).toBe(0);
+  });
+
   it('refuses a worst-case reservation over the daily cap before any provider call', async () => {
     // Pre-kernel, this scenario streamed the provider output and only failed
     // at settlement (the gap-42 defect); the kernel rejects it at reservation

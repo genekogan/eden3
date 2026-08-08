@@ -1,15 +1,18 @@
 import { db, turnAuthorizations } from '@eden3/db';
 import { and, asc, eq, inArray, lt } from 'drizzle-orm';
 
-import { reverseTurnAuthorization } from './turn-authorization';
+import {
+  reverseTurnAuthorization,
+  settlePartialOutputAuthorization,
+} from './turn-authorization';
 
 /**
  * Compensation reaper for orphaned turn reservations (T08-U02, FG-ECON):
  * a process that dies between the worst-case reservation and terminal
- * persistence leaves an authorization row in `reserved`. Terminal success is
- * one transaction, so an aged `reserved` row is PROOF the turn never
- * completed — the predeclared rule (MVP-ACCEPTANCE §1.5): an unpersisted turn
- * is a failed turn and refunds in full.
+ * persistence leaves an authorization row in `reserved`. With no durable
+ * usable-output checkpoint it refunds in full. Once a non-whitespace prefix
+ * was durably marked before emission, full-reserve-v1 retains the authorized
+ * max and writes loud error usage truth instead of serving a free prefix.
  *
  * The reaper acts only on `state='reserved'` + age. It never inspects
  * usage-event rows (telemetry must not carry money truth), needs no
@@ -42,6 +45,7 @@ export interface TurnReservationReaperOptions {
 export interface ReapOutcome {
   scanned: number;
   reaped: number;
+  partialSettled: number;
 }
 
 export class TurnReservationReaper {
@@ -80,7 +84,7 @@ export class TurnReservationReaper {
 
   /** One sweep. Safe to call concurrently (state guards); serialized locally. */
   async runOnce(): Promise<ReapOutcome> {
-    if (this.running) return { scanned: 0, reaped: 0 };
+    if (this.running) return { scanned: 0, reaped: 0, partialSettled: 0 };
     this.running = true;
     try {
       const cutoff = new Date(this.now().getTime() - this.ttlMs);
@@ -100,19 +104,41 @@ export class TurnReservationReaper {
         .limit(200);
 
       let reaped = 0;
+      let partialSettled = 0;
       for (const row of stale) {
         try {
+          const partial = await settlePartialOutputAuthorization({
+            turnId: row.turnId,
+            errorCode: 'provider_process_lost_after_output',
+            errorMessage:
+              'Provider process ended after emitting usable output; full authorized reserve retained',
+          });
+          if (partial.eligible) {
+            if (partial.settled) partialSettled += 1;
+            continue;
+          }
           const result = await reverseTurnAuthorization({
             turnId: row.turnId,
             refundType: this.refundType,
             terminalState: 'reaped',
           });
           if (result.reversed) reaped += 1;
+          if (result.partialOutputRequired) {
+            // A first-output promotion raced the initial eligibility check.
+            // Re-enter the row-locked partial settlement; never refund value.
+            const raced = await settlePartialOutputAuthorization({
+              turnId: row.turnId,
+              errorCode: 'provider_process_lost_after_output',
+              errorMessage:
+                'Provider process ended after emitting usable output; full authorized reserve retained',
+            });
+            if (raced.settled) partialSettled += 1;
+          }
         } catch (err) {
           this.onError(err, `turn-reservation reap ${row.turnId}`);
         }
       }
-      return { scanned: stale.length, reaped };
+      return { scanned: stale.length, reaped, partialSettled };
     } finally {
       this.running = false;
     }
