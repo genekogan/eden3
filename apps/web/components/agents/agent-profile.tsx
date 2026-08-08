@@ -640,6 +640,8 @@ export function AgentProfile({ username }: { username: string }) {
   const [exportError, setExportError] = useState<string | null>(null);
   const [repairing, setRepairing] = useState(false);
   const [repairNote, setRepairNote] = useState<string | null>(null);
+  const [retryingProvision, setRetryingProvision] = useState(false);
+  const [retryProvisionError, setRetryProvisionError] = useState<string | null>(null);
   const seq = useRef(0);
 
   // Load profile + current dev user (owner gating) in parallel.
@@ -802,6 +804,27 @@ export function AgentProfile({ username }: { username: string }) {
     }
   };
 
+  const retryProvision = async () => {
+    if (retryingProvision || !isOwner) return;
+    setRetryingProvision(true);
+    setRetryProvisionError(null);
+    try {
+      await api.agents.retryProvision(agent.username);
+      setProfile((current) =>
+        current
+          ? {
+              ...current,
+              agent: { ...current.agent, provisionStatus: "provisioning" },
+            }
+          : current,
+      );
+    } catch (error) {
+      setRetryProvisionError(describeApiFailure(error));
+    } finally {
+      setRetryingProvision(false);
+    }
+  };
+
   // Single-user cockpit: only agents you manage have a surface here.
   if (!canManage) {
     return (
@@ -942,9 +965,21 @@ export function AgentProfile({ username }: { username: string }) {
           Setting up this agent's runtime — chat unlocks the moment it's ready.
         </div>
       ) : failed ? (
-        <div className="mt-8 rounded-xl border border-danger/25 bg-danger/5 px-4 py-3 text-sm text-muted">
-          Provisioning failed. The agent's profile and persona are saved — try
-          again later or contact an admin.
+        <div className="mt-8 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-danger/25 bg-danger/5 px-4 py-3 text-sm text-muted">
+          <span>Provisioning failed. The agent's profile and persona are saved.</span>
+          {isOwner ? (
+            <button
+              type="button"
+              onClick={() => void retryProvision()}
+              disabled={retryingProvision}
+              className={quietButtonClass}
+            >
+              {retryingProvision ? "Retrying…" : "Retry setup"}
+            </button>
+          ) : null}
+          {retryProvisionError ? (
+            <p className="basis-full text-xs text-danger">{retryProvisionError}</p>
+          ) : null}
         </div>
       ) : null}
 

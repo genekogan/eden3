@@ -55,6 +55,7 @@ import {
   shouldRetryAutomaticMemoryDistillation,
 } from '../services/memory-distillation';
 import { runMemoryRetrievalProbe } from '../services/memory-retrieval';
+import { publishNotificationChanged } from '../services/app-notifications';
 
 /**
  * Agents API.
@@ -628,6 +629,136 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         err instanceof Error ? err.message : 'The runtime did not accept the repair',
       );
     }
+  });
+
+  // ---- POST /agents/:username/retry-provision — retry a failed first build
+  // This is deliberately stricter than the general manager gate: an admin may
+  // inspect a failed public profile, but only the human owner can spend another
+  // provisioning attempt. The job and agent rows move together under row locks.
+  app.post('/:username/retry-provision', { preHandler: app.requireAuth }, async (req, reply) => {
+    const viewer = req.account;
+    if (!viewer) return sendError(reply, 401, 'unauthorized', 'Authentication required');
+    const { username } = usernameParamsSchema.parse(req.params);
+
+    const outcome = await pg.begin(async (tx) => {
+      const accountsMatched = await tx<{ account_id: string }[]>`
+        select a.id as account_id
+        from accounts a
+        join agents g on g.account_id = a.id
+        where a.username = ${username}
+          and a.deleted = false
+      `;
+      const accountId = accountsMatched[0]?.account_id;
+      if (!accountId) return { kind: 'not_found' as const };
+
+      // Match the worker's job -> agent lock order. A retry can race the
+      // terminal failure commit without creating an agent/job deadlock.
+      const jobsLocked = await tx<{ state: string }[]>`
+        select state
+        from agent_provision_jobs
+        where agent_account_id = ${accountId}
+        for update
+      `;
+      const rows = await tx<
+        {
+          account_id: string;
+          owner_id: string | null;
+          public: boolean;
+          provision_status: string;
+        }[]
+      >`
+        select a.id as account_id, g.owner_id, g.public,
+               g.provision_status
+        from accounts a
+        join agents g on g.account_id = a.id
+        where a.id = ${accountId}
+          and a.deleted = false
+        for update of g
+      `;
+      const row = rows[0];
+      if (!row) return { kind: 'not_found' as const };
+      if (row.owner_id !== viewer.accountId) {
+        return { kind: row.public ? ('forbidden' as const) : ('not_found' as const) };
+      }
+      // A concurrent retry can replace a failed row while this request waits
+      // on the agent lock. Re-read a previously missing job after that wait so
+      // duplicate retries converge on the new pending/running cycle.
+      const jobsRechecked =
+        jobsLocked.length > 0
+          ? jobsLocked
+          : await tx<{ state: string }[]>`
+              select state
+              from agent_provision_jobs
+              where agent_account_id = ${row.account_id}
+              for update
+            `;
+      const jobState = jobsRechecked[0]?.state ?? null;
+      if (
+        row.provision_status === 'provisioning' &&
+        (jobState === 'pending' || jobState === 'running')
+      ) {
+        return { kind: 'queued' as const, changed: false, accountId: row.account_id };
+      }
+      if (
+        row.provision_status !== 'failed' ||
+        (jobState !== null && jobState !== 'failed')
+      ) {
+        return { kind: 'not_failed' as const };
+      }
+
+      // 0034 makes a terminal job row immutable. A deliberate owner retry is
+      // a new attempt cycle, so replace the locked terminal row atomically
+      // instead of weakening the lifecycle trigger or rewriting its history.
+      // Older import/lazy-provision failure paths have no job row; creating
+      // their first durable cycle makes the same owner action recover them.
+      if (jobState === 'failed') {
+        const jobs = await tx<{ agent_account_id: string }[]>`
+          delete from agent_provision_jobs
+          where agent_account_id = ${row.account_id}
+            and state = 'failed'
+          returning agent_account_id
+        `;
+        if (!jobs[0]) throw new Error('failed provisioning job changed during retry');
+      }
+      await tx`
+        insert into agent_provision_jobs (agent_account_id)
+        values (${row.account_id})
+      `;
+      const agentsUpdated = await tx<{ account_id: string }[]>`
+        update agents
+        set provision_status = 'provisioning', provisioned_at = null,
+            workspace_path = null
+        where account_id = ${row.account_id}
+          and provision_status = 'failed'
+        returning account_id
+      `;
+      if (!agentsUpdated[0]) throw new Error('failed agent changed during retry');
+      await tx`
+        delete from app_notifications
+        where account_id = ${viewer.accountId}
+          and source_agent_id = ${row.account_id}
+          and kind = 'agent_build_failed'
+      `;
+      return { kind: 'queued' as const, changed: true, accountId: row.account_id };
+    });
+
+    if (outcome.kind === 'not_found') {
+      return sendError(reply, 404, 'agent_not_found', `No agent named "${username}"`);
+    }
+    if (outcome.kind === 'forbidden') {
+      return sendError(reply, 403, 'forbidden', 'Only the owner can retry this agent build');
+    }
+    if (outcome.kind === 'not_failed') {
+      return sendError(reply, 409, 'agent_not_failed', 'This agent does not have a failed build');
+    }
+
+    if (outcome.changed) publishNotificationChanged(app.eventsBus, viewer.accountId);
+    app.agentProvisioningWorker.wake();
+    return reply.code(outcome.changed ? 202 : 200).send({
+      ok: true,
+      status: 'provisioning',
+      queued: true,
+    });
   });
 
   // ---- GET /agents/:username/activity — owner logs peek -------------------
