@@ -375,15 +375,13 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
 
   // One process-wide media pipeline/watcher shared by chat and Studio.
   //
-  // Chat media needs the watcher wired to `turnRegistry` and history-sync
-  // attachment sightings; Studio needs the same watcher for claimNext(). A
-  // route-local Studio watcher would see files, but would not know which chat
-  // session was recently active, so async in-chat images would park.
+  // Chat media uses exact history-sync attachment sightings; Studio uses the
+  // same watcher for claimNext(). A raw async file with no exact transcript
+  // sighting parks safely rather than inheriting a merely recent chat turn.
   const mediaPipeline = new MediaPipeline({ bus: app.eventsBus, logger: app.log });
   const mediaWatcher = new MediaWatcher({
     pipeline: mediaPipeline,
     logger: app.log,
-    turnRegistry: app.turnRegistry,
   });
   if (historySync) {
     historySync.setAttachmentCallback(

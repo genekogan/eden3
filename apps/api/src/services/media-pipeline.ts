@@ -41,7 +41,7 @@ import { stripAttachmentLines } from './history-sync';
  *      (user = session owner for in-chat media, the caller for studio),
  *   4. when correlated to a session, appends an assistant `messages` row with
  *      `attachments: [{url, mime, kind, creationId, width?, height?}]` and
- *      publishes `media.attached` (+ `manna.updated` after the debit) on the
+ *      publishes `media.attached` (+ `manna.updated` after settlement) on the
  *      per-session events bus,
  *   5. settles the exact durable chat-media authorization that the gateway's
  *      before_tool_call hook committed before provider execution. Settlement,
@@ -135,15 +135,6 @@ export function pricedActionForTool(
   if (kind === 'video') return 'video';
   if (kind === 'audio') return 'tts';
   return null;
-}
-
-/**
- * Refund-safe idempotency key for the in-chat media debit: one charge per
- * (file content, session) pair no matter how many times the watcher or a
- * history-sync pass re-observes the file.
- */
-export function mediaDebitIdempotencyKey(sha256: string, sessionId: string): string {
-  return `media:${sha256}:${sessionId}`;
 }
 
 // ---------------------------------------------------------------------------
