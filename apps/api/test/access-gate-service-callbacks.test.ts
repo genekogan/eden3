@@ -90,6 +90,14 @@ async function buildAdmissionHarness(): Promise<FastifyInstance> {
     async () => ({ ok: true, accepted: false }),
   );
 
+  app.post(
+    '/media/runtime/authorizations',
+    { config: { edenServiceCallback: true }, preHandler: requireRuntime },
+    async () => ({ ok: true }),
+  );
+  app.get('/media/runtime/authorizations', async () => ({ items: [] }));
+  app.post('/media/runtime/unmarked', { preHandler: requireRuntime }, async () => ({ ok: true }));
+
   app.get('/channels/connections', { preHandler: app.requireAuth }, async () => ({ items: [] }));
   await app.ready();
   return app;
@@ -150,6 +158,60 @@ describe('closed-cohort admission for channel service callbacks', () => {
 
       expect(response.statusCode).toBe(200);
       expect(response.json()).toEqual({ ok: true, accepted: false });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['wrong', 'Bearer wrong-runtime-token'],
+  ])('lets a marked media service callback reach its %s bearer rejection', async (_case, authorization) => {
+    const app = await buildAdmissionHarness();
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/media/runtime/authorizations',
+        headers: authorization ? { authorization } : undefined,
+        payload: {},
+      });
+      expect(response.statusCode).toBe(401);
+      expect(response.json().error.code).toBe('runtime_unauthorized');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('admits a marked media callback only after its route-owned bearer succeeds', async () => {
+    const app = await buildAdmissionHarness();
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/media/runtime/authorizations?source=openclaw',
+        headers: { authorization: `Bearer ${RUNTIME_TOKEN}` },
+        payload: {},
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ ok: true });
+    } finally {
+      await app.close();
+    }
+  });
+
+  it.each([
+    ['GET', '/media/runtime/authorizations'],
+    ['POST', '/media/runtime/unmarked'],
+  ] as const)('keeps %s %s gated without a POST route marker', async (method, path) => {
+    const app = await buildAdmissionHarness();
+    try {
+      const response = await app.inject({
+        method,
+        url: path,
+        headers: { authorization: `Bearer ${RUNTIME_TOKEN}` },
+        payload: method === 'POST' ? {} : undefined,
+      });
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.code).toBe('access_gated');
     } finally {
       await app.close();
     }

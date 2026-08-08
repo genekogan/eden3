@@ -20,6 +20,14 @@ import { sendError } from './errors';
  */
 
 declare module 'fastify' {
+  interface FastifyContextConfig {
+    /**
+     * POST-only cohort admission handoff for an exact service callback.
+     * This never authenticates the request; the route must still enforce its
+     * own bearer/signature credential before executing any work.
+     */
+    edenServiceCallback?: boolean;
+  }
   interface FastifyRequest {
     /** Resolved auth session, or null when the request is anonymous. */
     account: AuthSession | null;
@@ -62,10 +70,11 @@ const SERVICE_AUTH_POST_TURN = new RegExp(
   `^/channels/runtime/turns/${UUID_PATH_PART}/(?:settle|refund|delivery-failed|delivered)$`,
 );
 
-function isGateExempt(method: string, url: string): boolean {
+function isGateExempt(method: string, url: string, serviceCallback: boolean): boolean {
   const path = url.split('?', 1)[0]!;
   return (
     GATE_EXEMPT_EXACT.has(path) ||
+    (method === 'POST' && serviceCallback) ||
     (method === 'POST' &&
       (SERVICE_AUTH_POST_EXACT.has(path) || SERVICE_AUTH_POST_TURN.test(path))) ||
     ((method === 'GET' || method === 'HEAD') &&
@@ -126,7 +135,13 @@ export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {})
 
   if (allowlist.size > 0) {
     app.addHook('onRequest', async (req, reply) => {
-      if (isGateExempt(req.method, req.url)) return;
+      if (
+        isGateExempt(
+          req.method,
+          req.url,
+          req.routeOptions.config.edenServiceCallback === true,
+        )
+      ) return;
       if (isAccessGated(allowlist, req.account)) {
         await sendError(reply, 403, 'access_gated', 'This Eden is in closed alpha');
       }
