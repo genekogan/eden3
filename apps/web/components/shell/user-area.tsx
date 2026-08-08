@@ -18,6 +18,7 @@ import { NotificationCenter } from "@/components/notification-center";
 import { ThemeToggle } from "@/components/theme-provider";
 
 const LINKS: Array<{ href: string; label: string; adminOnly?: boolean }> = [
+  { href: "/help", label: "Help" },
   { href: "/account", label: "Account settings" },
   { href: "/account/manna", label: "Manna" },
   { href: "/operator", label: "Operator", adminOnly: true },

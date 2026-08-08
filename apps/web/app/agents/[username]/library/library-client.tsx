@@ -16,6 +16,7 @@ import { MediaThumb } from "@/components/media";
 import { Skeleton } from "@/components/skeleton";
 import { describeApiFailure } from "@/components/agents/agent-utils";
 import { UploadPanel } from "@/components/uploads/upload-panel";
+import { ContextualHelpLink } from "@/components/help/contextual-help-link";
 
 type Scope = "agent" | "mine";
 
@@ -138,6 +139,7 @@ export function LibraryClient({ username }: { username: string }) {
                 ? "This agent hasn't made anything — start a chat and ask for an image."
                 : "Creations from chats and the Studio land here."
             }
+            action={<ContextualHelpLink topic="library-files">Library help</ContextualHelpLink>}
           />
         ) : (
           <>

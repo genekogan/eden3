@@ -13,6 +13,7 @@ import type {
   XConnectionDto,
 } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
+import { ContextualHelpLink } from "@/components/help/contextual-help-link";
 import { SkeletonRows } from "@/components/skeleton";
 import { formatRelativeTime } from "@/lib/format";
 import {
@@ -946,6 +947,9 @@ export function ChannelsClient({
               <EmptyState
                 title={selectedAgent ? `No bots for @${selectedAgent.username} yet` : "No connections yet"}
                 hint="Add a Discord or Telegram bot with the form on the left."
+                action={
+                  <ContextualHelpLink topic="connect-channel">Channel help</ContextualHelpLink>
+                }
               />
             ) : (
               <ul className="space-y-4">{agentConnections.map(renderConnection)}</ul>

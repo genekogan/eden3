@@ -4,6 +4,7 @@ import {
   primaryButtonClass,
   quietButtonClass,
 } from "@/components/agents/form-fields";
+import { ContextualHelpLink } from "@/components/help/contextual-help-link";
 
 export function EveEmptyState() {
   return (
@@ -40,6 +41,12 @@ export function EveEmptyState() {
       >
         Or start from a template
       </Link>
+      <ContextualHelpLink
+        topic="choose-agent"
+        className="mt-3 text-xs text-faint underline-offset-4 hover:text-muted hover:underline"
+      >
+        Agent setup help
+      </ContextualHelpLink>
     </section>
   );
 }

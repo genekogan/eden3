@@ -33,6 +33,7 @@ import { api, ApiError } from "@/lib/api";
 import type { AccountSummary, MessageDto, SessionDto } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
+import { ContextualHelpLink } from "@/components/help/contextual-help-link";
 import { Skeleton } from "@/components/skeleton";
 import {
   describeSendError,
@@ -661,6 +662,11 @@ export function SessionConversation({
                 readOnlyChannel
                   ? `Messages from ${channelLabel} will appear here.`
                   : "Say something below to get this conversation going."
+              }
+              action={
+                readOnlyChannel ? null : (
+                  <ContextualHelpLink topic="start-chat">Chat help</ContextualHelpLink>
+                )
               }
             />
           ) : null}
