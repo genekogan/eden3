@@ -92,6 +92,7 @@ let invokeError: Error | null = null;
 let invokeHang = false;
 let reversalError: Error | null = null;
 let forcedRequestId: string | null = null;
+let toolsFactoryError: ApiError | null = null;
 let nextTtsFallback: TtsFallbackGenerator | null = null;
 const fakeToolsClient = {
   async invokeTool(params: {
@@ -183,7 +184,10 @@ beforeAll(async () => {
         store: new LocalMediaStore({ mediaDir, baseUrl: 'http://media.test/media' }),
       }),
       watcher: fakeWatcher,
-      getToolsClient: () => fakeToolsClient,
+      getToolsClient: () => {
+        if (toolsFactoryError) throw toolsFactoryError;
+        return fakeToolsClient;
+      },
       agentId: 'main',
       timeoutsMs: { image_generate: 50 },
       reverseDebit: async (params) => {
@@ -711,6 +715,49 @@ describe('POST /studio/generate', () => {
       expect(Number(ledger?.count ?? -1)).toBe(0);
     } finally {
       forcedRequestId = null;
+    }
+  });
+
+  it('immediately refunds and terminalizes when no gateway token can construct a provider client', async () => {
+    toolsFactoryError = new ApiError(
+      503,
+      'gateway_not_configured',
+      'OPENCLAW_GATEWAY_TOKEN is not set — studio generation is unavailable',
+    );
+    invokeCalls = [];
+    nextClaim = claimUnused;
+    const before = await getBalance(richUserId);
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/studio/generate',
+        headers: asUser(richUserId),
+        payload: { tool: 'image_generate', args: { prompt: 'must not run without a token' } },
+      });
+      expect(res.statusCode).toBe(503);
+      expect((res.json() as { error: { code: string } }).error.code).toBe(
+        'gateway_not_configured',
+      );
+      expect(invokeCalls).toHaveLength(0);
+      expect((await getBalance(richUserId)).total).toBe(before.total);
+
+      const [usage] = await pg<
+        { status: string; manna: number; errorCode: string; errorMessage: string }[]
+      >`
+        select status, manna, error_code as "errorCode", error_message as "errorMessage"
+        from usage_events
+        where user_id = ${richUserId}
+          and event_type = 'studio_generation'
+          and error_code = 'gateway_not_configured'
+        order by created_at desc limit 1`;
+      expect(usage).toEqual({
+        status: 'error',
+        manna: 0,
+        errorCode: 'gateway_not_configured',
+        errorMessage: expect.stringContaining('OPENCLAW_GATEWAY_TOKEN is not set'),
+      });
+    } finally {
+      toolsFactoryError = null;
     }
   });
 

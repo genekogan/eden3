@@ -823,7 +823,10 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
             `${body.tool} did not produce a file within ${Math.round(timeoutMs / 1000)}s — manna refunded`,
           );
         }
-        if (err instanceof ApiError) throw err;
+        if (err instanceof ApiError) {
+          await requireReversal(err.code, err.message);
+          throw err;
+        }
         const detail =
           err instanceof GatewayHttpError || err instanceof GatewayToolError
             ? err.message
