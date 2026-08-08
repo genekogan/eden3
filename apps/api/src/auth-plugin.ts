@@ -3,7 +3,6 @@ import type {
   FastifyInstance,
   FastifyReply,
   FastifyRequest,
-  preHandlerHookHandler,
 } from 'fastify';
 
 import { ClerkAuthProvider, FallbackAuthProvider } from './clerk-auth-provider';
@@ -25,10 +24,14 @@ import { sendError } from './errors';
  */
 
 const SERVICE_CALLBACK_GUARD: unique symbol = Symbol('eden.service-callback-guard');
+type ServiceCallbackGuard = (
+  request: FastifyRequest,
+  reply: FastifyReply,
+) => void | Promise<unknown>;
 
 declare module 'fastify' {
   interface FastifyContextConfig {
-    [SERVICE_CALLBACK_GUARD]?: preHandlerHookHandler;
+    [SERVICE_CALLBACK_GUARD]?: ServiceCallbackGuard;
   }
   interface FastifyRequest {
     /** Resolved auth session, or null when the request is anonymous. */
@@ -51,11 +54,10 @@ export interface AuthPluginOptions {
   providerFactory?: (opts: { allowAccountCreation: boolean }) => AuthProvider;
 }
 
-/** Bind an exact POST service callback to the guard that authenticates it. */
-export function serviceAuthenticatedCallback(guard: preHandlerHookHandler) {
+/** Bind an exact POST service callback to the root hook that authenticates it. */
+export function serviceAuthenticatedCallback(guard: ServiceCallbackGuard) {
   return {
     config: { [SERVICE_CALLBACK_GUARD]: guard },
-    preHandler: guard,
   } as const;
 }
 
@@ -148,12 +150,11 @@ export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {})
     if (
       methods.length !== 1 ||
       methods[0] !== 'POST' ||
-      route.preHandler !== guard ||
       route.url.includes('*') ||
       route.url.includes('?')
     ) {
       throw new Error(
-        'serviceAuthenticatedCallback requires one exact POST route with its sole bound pre-handler',
+        'serviceAuthenticatedCallback requires one exact non-wildcard POST route',
       );
     }
   });
@@ -164,8 +165,16 @@ export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {})
     req.account = await provider.getSession(req);
   });
 
+  // Execute the opaque route-bound credential guard at the root, before any
+  // plugin/route lifecycle hook can parse, validate, or mutate service data.
+  app.addHook('onRequest', async (req, reply) => {
+    const guard = req.routeOptions.config[SERVICE_CALLBACK_GUARD];
+    if (guard) await guard(req, reply);
+  });
+
   if (allowlist.size > 0) {
     app.addHook('onRequest', async (req, reply) => {
+      if (reply.sent) return;
       if (
         isGateExempt(
           req.method,
