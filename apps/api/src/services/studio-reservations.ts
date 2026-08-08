@@ -1,5 +1,6 @@
 import {
   debit,
+  numericToNumber,
   reverseReservation,
   type DbHandle,
   type ReverseReservationParams,
@@ -71,11 +72,19 @@ function readReservationMetadata(value: unknown): StudioReservationMetadata {
     throw new Error('studio-reservation: incomplete authorization metadata');
   }
   if (
+    !Number.isFinite(quote.costUsd) ||
+    quote.costUsd < 0 ||
+    !Number.isFinite(quote.manna) ||
+    quote.manna < 0 ||
+    !Number.isFinite(reservation.reservedManna) ||
+    !Number.isFinite(reservation.subscriptionManna) ||
+    !Number.isFinite(reservation.durableManna) ||
     reservation.reservedManna < 0 ||
     reservation.subscriptionManna < 0 ||
     reservation.durableManna < 0 ||
     Number((reservation.subscriptionManna + reservation.durableManna).toFixed(4)) !==
-      reservation.reservedManna
+      reservation.reservedManna ||
+    quote.manna !== reservation.reservedManna
   ) {
     throw new Error('studio-reservation: invalid reservation split');
   }
@@ -129,7 +138,9 @@ export async function reserveStudioGeneration(options: {
         provider: options.quote.provider,
         model: options.quote.model,
         tableVersion: options.quote.tableVersion,
-        costUsd: options.quote.costUsd.toFixed(8),
+        // Authorization truth, not yet a provider-cost event. The quote lives
+        // in metadata; terminal completion materializes cost_usd.
+        costUsd: null,
         manna: options.quote.manna,
         metadata,
       })
@@ -260,7 +271,11 @@ export async function compensateStudioGeneration(options: {
       const metadata = readReservationMetadata(row.metadata);
       if (!row.user_id) throw new Error('studio-reservation: authorization has no payer');
       const [reservationTx] = await tx
-        .select({ id: mannaTransactions.id })
+        .select({
+          id: mannaTransactions.id,
+          amount: mannaTransactions.amount,
+          type: mannaTransactions.type,
+        })
         .from(mannaTransactions)
         .innerJoin(mannaAccounts, eq(mannaAccounts.id, mannaTransactions.mannaAccountId))
         .where(
@@ -273,6 +288,12 @@ export async function compensateStudioGeneration(options: {
         .limit(1);
       if (!reservationTx) {
         throw new Error('studio-reservation: reservation transaction identity mismatch');
+      }
+      if (
+        numericToNumber(reservationTx.amount) !== -metadata.reservation.reservedManna ||
+        reservationTx.type !== `spend:${metadata.quote.action}`
+      ) {
+        throw new Error('studio-reservation: reservation transaction amount/type mismatch');
       }
       await reverse({
         reservationKey: metadata.reservation.idempotencyKey,
