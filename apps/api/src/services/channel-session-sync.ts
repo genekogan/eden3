@@ -13,6 +13,8 @@ export interface ChannelMessageEvent {
   gatewaySessionKey: string;
   /** Provider-native DM/channel/thread id. Falls back to peerId for legacy DMs. */
   conversationId?: string | null;
+  /** Trusted provider conversation scope; group memory never resolves to a sender file. */
+  conversationScope?: 'direct' | 'group';
   peerId: string;
   externalMessageId: string;
   role: ChannelMessageRole;
@@ -48,7 +50,7 @@ export interface ChannelMessagePersistence {
 }
 
 export interface ChannelMemoryContext {
-  linkState: 'linked' | 'pseudonymous';
+  linkState: 'linked' | 'pseudonymous' | 'group';
   /** Agent-workspace-relative path only; never an absolute host path. */
   relativePath: string;
 }
@@ -101,6 +103,39 @@ export function pseudonymousChannelMemoryPath(conversationScopedPeerFingerprint:
     throw new TypeError('invalid channel peer fingerprint');
   }
   return `memory/users/channel-peer-${conversationScopedPeerFingerprint}.md`;
+}
+
+export function channelGroupMemoryPath(conversationFingerprint: string): string {
+  if (!/^[a-f0-9]{64}$/.test(conversationFingerprint)) {
+    throw new TypeError('invalid channel conversation fingerprint');
+  }
+  return `memory/users/channel-group-${conversationFingerprint}.md`;
+}
+
+export function resolveChannelMemoryContext(input: {
+  conversationScope?: 'direct' | 'group';
+  conversationFingerprint: string;
+  peerFingerprint: string;
+  linkedAccount: { id: string; username: string } | null;
+}): ChannelMemoryContext {
+  if (input.conversationScope === 'group') {
+    return {
+      linkState: 'group',
+      relativePath: channelGroupMemoryPath(input.conversationFingerprint),
+    };
+  }
+  return input.linkedAccount
+    ? {
+        linkState: 'linked',
+        relativePath: memoryUserRelativePath(
+          input.linkedAccount.username,
+          input.linkedAccount.id,
+        ),
+      }
+    : {
+        linkState: 'pseudonymous',
+        relativePath: pseudonymousChannelMemoryPath(input.peerFingerprint),
+      };
 }
 
 function sessionExternalId(connectionId: string, fingerprint: string): string {
@@ -215,15 +250,12 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
           `
         : [];
       const linkedAccount = linkedAccounts[0] ?? null;
-      const memoryContext: ChannelMemoryContext = linkedAccount
-        ? {
-            linkState: 'linked',
-            relativePath: memoryUserRelativePath(linkedAccount.username, linkedAccount.id),
-          }
-        : {
-            linkState: 'pseudonymous',
-            relativePath: pseudonymousChannelMemoryPath(input.identity.fingerprint),
-          };
+      const memoryContext = resolveChannelMemoryContext({
+        conversationScope: input.event.conversationScope,
+        conversationFingerprint: input.conversationFingerprint,
+        peerFingerprint: input.identity.fingerprint,
+        linkedAccount,
+      });
 
       let sessionId = session?.id;
       if (!sessionId) {
@@ -235,7 +267,7 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
             gateway_session_key, last_message_at, message_count
           ) values (
             ${sessionId}, ${input.sessionExternalId}, ${input.connection.accountId},
-            ${`${input.connection.channel === 'discord' ? 'Discord' : 'Telegram'} conversation`},
+            ${`${input.connection.channel === 'discord' ? 'Discord' : 'Telegram'} ${input.event.conversationScope === 'group' ? 'group' : 'conversation'}`},
             'active', 'channel', ${input.connection.channel}, true,
             ${tx.json(JSON.stringify(input.safeChannelMetadata))}, ${input.connection.id},
             ${input.conversationFingerprint}, ${input.event.gatewaySessionKey}, null, 0
@@ -354,6 +386,7 @@ export class ChannelSessionSync {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
         conversationFingerprint,
+        conversationScope: event.conversationScope ?? 'direct',
         readOnly: true,
       },
     });
