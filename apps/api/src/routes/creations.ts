@@ -4,7 +4,7 @@ import type { AccountSummary } from '@eden3/shared';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { sendError } from '../errors';
+import { ApiError, sendError } from '../errors';
 import {
   creationDtoFromEntity,
   toAccountSummary,
@@ -42,13 +42,13 @@ function passesPublicModeration(creation: Creation): boolean {
   return score === null || score < PUBLIC_NSFW_THRESHOLD;
 }
 
+function isPubliclyReachableCreation(creation: Creation): boolean {
+  return creation.public && !creation.deleted && passesPublicModeration(creation);
+}
+
 function canViewCreation(creation: Creation, viewer: AuthSession | null): boolean {
   if (viewer !== null && (viewer.isAdmin || viewer.accountId === creation.userId)) return true;
-  return (
-    creation.public &&
-    !creation.deleted &&
-    passesPublicModeration(creation)
-  );
+  return isPubliclyReachableCreation(creation);
 }
 
 /** Batch-fetch account summaries for the embed fields. */
@@ -112,18 +112,57 @@ export const creationsRoutes: FastifyPluginAsync = async (app) => {
     const { idOrExternal } = paramsSchema.parse(req.params);
     const body = reportBodySchema.parse(req.body ?? {});
     const creation = await resolveCreation(idOrExternal);
-    if (!creation || !canViewCreation(creation, req.account)) {
+    // Reports are for content that is actually public. Returning the same 404
+    // for private, deleted, moderated, and missing rows avoids disclosing why
+    // a guessed reference is unavailable.
+    if (!creation || !isPubliclyReachableCreation(creation)) {
       return sendError(reply, 404, 'creation_not_found', `No creation "${idOrExternal}"`);
     }
 
-    const [report] = await pg<
-      { id: string; targetId: string; status: string; reason: string | null; createdAt: string }[]
-    >`
-      insert into content_reports (reporter_id, target_type, target_id, reason)
-      values (${req.account!.accountId}, 'creation', ${creation.id}, ${body.reason ?? null})
-      returning id, target_id as "targetId", status, reason, created_at as "createdAt"
-    `;
-    reply.code(201);
+    const { report, inserted } = await pg.begin(async (sql) => {
+      const lockKey = `content-report:${req.account!.accountId}:creation:${creation.id}`;
+      await sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
+      const [current] = await sql<
+        { public: boolean; deleted: boolean; attributes: unknown }[]
+      >`
+        select public, deleted, attributes
+        from creations
+        where id = ${creation.id}
+        for share
+      `;
+      const currentNsfwScore = current ? nsfwScore(current.attributes) : null;
+      if (
+        !current ||
+        !current.public ||
+        current.deleted ||
+        (currentNsfwScore !== null && currentNsfwScore >= PUBLIC_NSFW_THRESHOLD)
+      ) {
+        throw new ApiError(404, 'creation_not_found', `No creation "${idOrExternal}"`);
+      }
+      const [existing] = await sql<
+        { id: string; targetId: string; status: string; reason: string | null; createdAt: string }[]
+      >`
+        select id, target_id as "targetId", status, reason, created_at as "createdAt"
+        from content_reports
+        where reporter_id = ${req.account!.accountId}
+          and target_type = 'creation'
+          and target_id = ${creation.id}
+          and status = 'open'
+        order by created_at desc, id desc
+        limit 1
+      `;
+      if (existing) return { report: existing, inserted: false };
+
+      const [created] = await sql<
+        { id: string; targetId: string; status: string; reason: string | null; createdAt: string }[]
+      >`
+        insert into content_reports (reporter_id, target_type, target_id, reason)
+        values (${req.account!.accountId}, 'creation', ${creation.id}, ${body.reason ?? null})
+        returning id, target_id as "targetId", status, reason, created_at as "createdAt"
+      `;
+      return { report: created!, inserted: true };
+    });
+    reply.code(inserted ? 201 : 200);
     return { report };
   });
 

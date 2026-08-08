@@ -15,6 +15,7 @@ import { api, ApiError, isApiUnavailable } from "@/lib/api";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import type { AccountSummary, CreationDto } from "@/lib/types";
 import { studioRemixHref } from "@/components/studio/prefill";
+import { ReportCreation } from "@/components/creations/report-creation";
 
 /**
  * /creations/:id — the permalink. Server-rendered (share links get real
@@ -229,6 +230,8 @@ export default async function CreationPage({ params }: Props) {
               <span aria-hidden>→</span>
             </Link>
           ) : null}
+
+          <ReportCreation creationId={creation.id} />
 
           <p className="break-all font-mono text-[10px] leading-relaxed text-faint">
             {creation.id}

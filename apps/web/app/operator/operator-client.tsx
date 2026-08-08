@@ -15,6 +15,7 @@ import type {
 import { EmptyState } from "@/components/empty-state";
 import { Skeleton, SkeletonRows } from "@/components/skeleton";
 import { formatMannaExact } from "@/lib/format";
+import { ContentReportsPanel } from "@/components/operator/content-reports-panel";
 
 type Phase = "loading" | "ready" | "error";
 
@@ -536,6 +537,10 @@ export function OperatorClient() {
           </button>
         </div>
       </header>
+
+      <div className="mt-8">
+        <ContentReportsPanel />
+      </div>
 
       {phase === "loading" ? (
         <div className="mt-8 space-y-6">

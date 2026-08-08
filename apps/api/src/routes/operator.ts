@@ -53,6 +53,51 @@ const modelRuntimeBody = z
   })
   .strict();
 
+const contentReportsQuery = z.object({
+  status: z.enum(['open', 'resolved', 'dismissed']).default('open'),
+  limit: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+const contentReportParams = z.object({ id: z.string().uuid() });
+const contentReportResolutionBody = z
+  .object({ decision: z.enum(['takedown', 'dismiss']) })
+  .strict();
+
+interface ContentReportRow {
+  id: string;
+  target_type: string;
+  target_id: string;
+  reason: string | null;
+  status: string;
+  reporter_id: string;
+  reporter_username: string;
+  reviewer_id: string | null;
+  reviewed_at: Date | string | null;
+  created_at: Date | string;
+  target_exists: boolean;
+  target_public: boolean | null;
+  target_deleted: boolean | null;
+}
+
+function contentReportDto(row: ContentReportRow) {
+  return {
+    id: row.id,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    reason: row.reason,
+    status: row.status,
+    reporter: { id: row.reporter_id, username: row.reporter_username },
+    reviewerId: row.reviewer_id,
+    reviewedAt: row.reviewed_at === null ? null : new Date(row.reviewed_at).toISOString(),
+    createdAt: new Date(row.created_at).toISOString(),
+    target: {
+      exists: row.target_exists,
+      public: row.target_public,
+      deleted: row.target_deleted,
+    },
+  };
+}
+
 interface TotalRow {
   event_count: number;
   total_cost_usd: string;
@@ -121,6 +166,113 @@ function signedDeltaPct(deltaUsd: number, invoiceCostUsd: number, computedCostUs
 }
 
 export const operatorRoutes: FastifyPluginAsync = async (app) => {
+  // ---- Content report queue — closed-cohort operator minimum ------------
+  app.get('/content-reports', { preHandler: app.requireAuth }, async (req) => {
+    if (!req.account?.isAdmin) {
+      throw new ApiError(403, 'forbidden', 'Admin access required');
+    }
+    const query = contentReportsQuery.parse(req.query);
+    const rows = await pg<ContentReportRow[]>`
+      select r.id,
+             r.target_type,
+             r.target_id,
+             r.reason,
+             r.status,
+             r.reporter_id,
+             reporter.username::text as reporter_username,
+             r.reviewer_id,
+             r.reviewed_at,
+             r.created_at,
+             (c.id is not null) as target_exists,
+             c.public as target_public,
+             c.deleted as target_deleted
+      from content_reports r
+      join accounts reporter on reporter.id = r.reporter_id
+      left join creations c on r.target_type = 'creation' and c.id = r.target_id
+      where r.status = ${query.status}
+      order by r.created_at desc, r.id desc
+      limit ${query.limit}
+    `;
+    return { reports: rows.map(contentReportDto) };
+  });
+
+  app.post('/content-reports/:id/resolve', { preHandler: app.requireAuth }, async (req) => {
+    if (!req.account?.isAdmin) {
+      throw new ApiError(403, 'forbidden', 'Admin access required');
+    }
+    const { id } = contentReportParams.parse(req.params);
+    const body = contentReportResolutionBody.parse(req.body);
+
+    const resolved = await pg.begin(async (sql) => {
+      const [report] = await sql<ContentReportRow[]>`
+        select r.id,
+               r.target_type,
+               r.target_id,
+               r.reason,
+               r.status,
+               r.reporter_id,
+               reporter.username::text as reporter_username,
+               r.reviewer_id,
+               r.reviewed_at,
+               r.created_at,
+               (c.id is not null) as target_exists,
+               c.public as target_public,
+               c.deleted as target_deleted
+        from content_reports r
+        join accounts reporter on reporter.id = r.reporter_id
+        left join creations c on r.target_type = 'creation' and c.id = r.target_id
+        where r.id = ${id}
+        for update of r
+      `;
+      if (!report) throw new ApiError(404, 'report_not_found', 'Report not found');
+
+      const expectedStatus = body.decision === 'takedown' ? 'resolved' : 'dismissed';
+      if (report.status !== 'open') {
+        if (report.status !== expectedStatus) {
+          throw new ApiError(409, 'report_already_resolved', 'Report has already been resolved');
+        }
+        return report;
+      }
+
+      if (body.decision === 'takedown') {
+        if (report.target_type !== 'creation') {
+          throw new ApiError(409, 'unsupported_report_target', 'Report target cannot be resolved here');
+        }
+        const updated = await sql`
+          update creations
+          set deleted = true, updated_at = now()
+          where id = ${report.target_id}
+          returning id
+        `;
+        if (updated.length === 0) {
+          throw new ApiError(404, 'report_target_not_found', 'Report target is unavailable');
+        }
+      }
+
+      const [row] = await sql<{
+        status: string;
+        reviewer_id: string;
+        reviewed_at: Date | string;
+      }[]>`
+        update content_reports
+        set status = ${expectedStatus},
+            reviewer_id = ${req.account!.accountId},
+            reviewed_at = now()
+        where id = ${report.id}
+        returning status, reviewer_id, reviewed_at
+      `;
+      return {
+        ...report,
+        status: row!.status,
+        reviewer_id: row!.reviewer_id,
+        reviewed_at: row!.reviewed_at,
+        target_deleted: body.decision === 'takedown' ? true : report.target_deleted,
+      };
+    });
+
+    return { report: contentReportDto(resolved) };
+  });
+
   // ---- GET /operator/health — one-look runtime panel (admin) --------------
   // The 80/20 of "is the appliance healthy": gateway reachability + agent
   // count, egress proxy mode, scheduler state, database label. Exec-approval

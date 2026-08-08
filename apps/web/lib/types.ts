@@ -498,6 +498,23 @@ export interface SkillReviewInput {
   status: "approved" | "rejected";
 }
 
+export interface ContentReportDto {
+  id: string;
+  targetType: string;
+  targetId: string;
+  reason: string | null;
+  status: "open" | "resolved" | "dismissed";
+  reporter: { id: string; username: string };
+  reviewerId: string | null;
+  reviewedAt: string | null;
+  createdAt: string;
+  target: {
+    exists: boolean;
+    public: boolean | null;
+    deleted: boolean | null;
+  };
+}
+
 /** GET /api/operator/usage/summary */
 export interface OperatorUsageBreakdown {
   userId?: string | null;

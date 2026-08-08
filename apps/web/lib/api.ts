@@ -60,6 +60,7 @@ import type {
   ConceptDto,
   ConceptImageUploadInput,
   ConceptUpdateInput,
+  ContentReportDto,
   CreationDto,
   DevUser,
   MannaSummary,
@@ -813,6 +814,14 @@ export const api = {
       );
     },
 
+    /** POST /api/creations/:id/report — idempotent while a report is open. */
+    report(
+      id: string,
+      input: { reason?: string } = {},
+    ): Promise<{ report: Pick<ContentReportDto, "id" | "targetId" | "reason" | "status" | "createdAt"> }> {
+      return post(`/creations/${enc(id)}/report`, input);
+    },
+
   },
 
   collections: {
@@ -1164,6 +1173,21 @@ export const api = {
   },
 
   operator: {
+    /** GET /api/operator/content-reports — admin-only moderation queue. */
+    contentReports(
+      params: { status?: ContentReportDto["status"]; limit?: number } = {},
+    ): Promise<{ reports: ContentReportDto[] }> {
+      return get(`/operator/content-reports${qs(params)}`);
+    },
+
+    /** POST /api/operator/content-reports/:id/resolve — admin-only decision. */
+    resolveContentReport(
+      id: string,
+      decision: "takedown" | "dismiss",
+    ): Promise<{ report: ContentReportDto }> {
+      return post(`/operator/content-reports/${enc(id)}/resolve`, { decision });
+    },
+
     /** GET /api/operator/usage/summary — admin-only usage/spend aggregate. */
     async usageSummary(
       params: { days?: number; limit?: number; userId?: string; agentId?: string } = {},

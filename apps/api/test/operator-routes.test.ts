@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { DevAuthProvider } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import {
@@ -14,6 +16,7 @@ import {
   deleteFixturesByMarker,
   devCookie,
   insertAgentAccount,
+  insertCreation,
   insertUserAccount,
   makeMarker,
 } from './fixtures';
@@ -33,6 +36,10 @@ let adminId = '';
 let userId = '';
 let agentId = '';
 let viewerId = '';
+let reportedCreationId = '';
+let dismissedCreationId = '';
+let takedownReportId = '';
+let dismissReportId = '';
 let app: FastifyInstance;
 const runtimeState = new Map<AgentModel, AgentRuntime>(
   AGENT_MODEL_OPTIONS.map((model) => [model, DEFAULT_AGENT_RUNTIME_BY_MODEL[model]]),
@@ -53,6 +60,22 @@ beforeAll(async () => {
   userId = await insertUserAccount(`${marker}_user`);
   viewerId = await insertUserAccount(`${marker}_viewer`);
   agentId = await insertAgentAccount(`${marker}_agent`, { openclawId: `${marker}_agent` });
+  reportedCreationId = await insertCreation({ userId, agentId, public: true });
+  dismissedCreationId = await insertCreation({ userId, agentId, public: true });
+  takedownReportId = (
+    await pg<{ id: string }[]>`
+      insert into content_reports (reporter_id, target_type, target_id, reason)
+      values (${viewerId}, 'creation', ${reportedCreationId}, 'operator test takedown')
+      returning id
+    `
+  )[0]!.id;
+  dismissReportId = (
+    await pg<{ id: string }[]>`
+      insert into content_reports (reporter_id, target_type, target_id, reason)
+      values (${viewerId}, 'creation', ${dismissedCreationId}, 'operator test dismiss')
+      returning id
+    `
+  )[0]!.id;
 
   await pg`
     insert into usage_events (
@@ -195,6 +218,146 @@ describe('/operator/model-runtimes', () => {
         agentRuntime,
       });
     }
+  });
+});
+
+describe('/operator/content-reports', () => {
+  it('allows only admins to list or resolve reports', async () => {
+    expect((await app.inject({ method: 'GET', url: '/operator/content-reports' })).statusCode).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/operator/content-reports',
+          headers: { cookie: devCookie(viewerId) },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/operator/content-reports/${takedownReportId}/resolve`,
+          headers: { cookie: devCookie(viewerId) },
+          payload: { decision: 'takedown' },
+        })
+      ).statusCode,
+    ).toBe(403);
+
+    const [unchanged] = await pg<{ status: string; deleted: boolean }[]>`
+      select r.status, c.deleted
+      from content_reports r
+      join creations c on c.id = r.target_id
+      where r.id = ${takedownReportId}
+    `;
+    expect(unchanged).toEqual({ status: 'open', deleted: false });
+  });
+
+  it('lists open creation reports with the minimum safe operator context', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/operator/content-reports?status=open',
+      headers: { cookie: devCookie(adminId) },
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as {
+      reports: Array<{
+        id: string;
+        targetId: string;
+        reason: string | null;
+        reporter: { id: string; username: string };
+        target: { exists: boolean; public: boolean; deleted: boolean };
+      }>;
+    };
+    expect(body.reports).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: takedownReportId,
+          targetId: reportedCreationId,
+          reason: 'operator test takedown',
+          reporter: { id: viewerId, username: `${marker}_viewer` },
+          target: { exists: true, public: true, deleted: false },
+        }),
+      ]),
+    );
+    expect(res.payload).not.toContain(`${marker}_user@`);
+  });
+
+  it('atomically resolves a report and removes public reachability without deleting owner data', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/operator/content-reports/${takedownReportId}/resolve`,
+      headers: { cookie: devCookie(adminId) },
+      payload: { decision: 'takedown' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({
+      report: {
+        id: takedownReportId,
+        status: 'resolved',
+        reviewerId: adminId,
+        target: { exists: true, deleted: true },
+      },
+    });
+    expect(
+      (await app.inject({ method: 'GET', url: `/creations/${reportedCreationId}` })).statusCode,
+    ).toBe(404);
+
+    const [retained] = await pg<{
+      creation_id: string;
+      deleted: boolean;
+      status: string;
+      reviewer_id: string | null;
+      reviewed: boolean;
+    }[]>`
+      select c.id as creation_id,
+             c.deleted,
+             r.status,
+             r.reviewer_id,
+             (r.reviewed_at is not null) as reviewed
+      from content_reports r
+      join creations c on c.id = r.target_id
+      where r.id = ${takedownReportId}
+    `;
+    expect(retained).toMatchObject({
+      creation_id: reportedCreationId,
+      deleted: true,
+      status: 'resolved',
+      reviewer_id: adminId,
+      reviewed: true,
+    });
+
+    const repeated = await app.inject({
+      method: 'POST',
+      url: `/operator/content-reports/${takedownReportId}/resolve`,
+      headers: { cookie: devCookie(adminId) },
+      payload: { decision: 'takedown' },
+    });
+    expect(repeated.statusCode).toBe(200);
+    expect(repeated.json()).toMatchObject({ report: { status: 'resolved' } });
+  });
+
+  it('dismisses without taking down and returns generic unknown-report errors', async () => {
+    const dismissed = await app.inject({
+      method: 'POST',
+      url: `/operator/content-reports/${dismissReportId}/resolve`,
+      headers: { cookie: devCookie(adminId) },
+      payload: { decision: 'dismiss' },
+    });
+    expect(dismissed.statusCode).toBe(200);
+    expect(dismissed.json()).toMatchObject({ report: { status: 'dismissed' } });
+    expect(
+      (await app.inject({ method: 'GET', url: `/creations/${dismissedCreationId}` })).statusCode,
+    ).toBe(200);
+
+    const missing = await app.inject({
+      method: 'POST',
+      url: `/operator/content-reports/${randomUUID()}/resolve`,
+      headers: { cookie: devCookie(adminId) },
+      payload: { decision: 'takedown' },
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json()).toMatchObject({ error: { code: 'report_not_found' } });
   });
 });
 
