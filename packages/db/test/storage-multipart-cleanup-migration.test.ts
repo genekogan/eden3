@@ -37,7 +37,7 @@ describe('durable multipart cleanup migration (DEBT-018)', () => {
       entries: Array<{ idx: number; tag: string }>;
     };
     journal.entries.forEach((entry, index) => expect(entry.idx).toBe(index));
-    expect(journal.entries.at(-1)).toMatchObject({ idx: 37, tag: '0037_storage_multipart_cleanup' });
+    expect(journal.entries[37]).toMatchObject({ idx: 37, tag: '0037_storage_multipart_cleanup' });
   });
 
   it('exposes exact bounded cleanup state and due/claim indexes', () => {
