@@ -155,7 +155,17 @@ export class XByoConnectorService {
         retryable: false,
       };
     }
-    const validation = await this.client.validate(credentials);
+    let validation: XConnectorResult<XUserIdentity>;
+    try {
+      validation = await this.client.validate(credentials);
+    } catch {
+      return safeFailure({
+        ok: false,
+        code: 'provider_unavailable',
+        message: '',
+        retryable: true,
+      });
+    }
     if (!validation.ok) return safeFailure(validation);
     if (!validIdentity(validation.value)) {
       return {
@@ -165,13 +175,18 @@ export class XByoConnectorService {
         retryable: true,
       };
     }
-    const returnedHandle = await this.custody.sealScoped({
-      accountId: input.accountId,
-      agentId: input.agentId,
-      channel: 'x',
-      label: input.label?.trim() || null,
-      plaintext: serializeCredentials(credentials),
-    });
+    let returnedHandle: ChannelSecretHandle;
+    try {
+      returnedHandle = await this.custody.sealScoped({
+        accountId: input.accountId,
+        agentId: input.agentId,
+        channel: 'x',
+        label: input.label?.trim() || null,
+        plaintext: serializeCredentials(credentials),
+      });
+    } catch {
+      throw new Error('channel credential custody failed');
+    }
     const handle = {
       connectionId: returnedHandle.connectionId,
       secretRefId: returnedHandle.secretRefId,
@@ -201,9 +216,19 @@ export class XByoConnectorService {
       throw new Error('X post must contain text within the request-size limit');
     }
     assertRequestScopedSecretHandle(handle);
-    const result = await this.custody.withPlaintext(handle, async (plaintext) =>
-      this.client.post(parseCredentials(plaintext), trimmed),
-    );
+    let result: XConnectorResult<{ id: string }>;
+    try {
+      result = await this.custody.withPlaintext(handle, async (plaintext) =>
+        this.client.post(parseCredentials(plaintext), trimmed),
+      );
+    } catch {
+      return safeFailure({
+        ok: false,
+        code: 'provider_unavailable',
+        message: '',
+        retryable: true,
+      });
+    }
     if (!result.ok) return safeFailure(result);
     if (!/^\d{1,25}$/.test(result.value.id)) {
       return {
@@ -218,6 +243,10 @@ export class XByoConnectorService {
 
   async revoke(handle: ChannelSecretHandle): Promise<void> {
     assertRequestScopedSecretHandle(handle);
-    await this.custody.revoke(handle);
+    try {
+      await this.custody.revoke(handle);
+    } catch {
+      throw new Error('channel credential revocation failed');
+    }
   }
 }

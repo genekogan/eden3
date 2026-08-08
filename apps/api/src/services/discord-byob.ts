@@ -169,7 +169,12 @@ export class DiscordByobService {
         retryable: false,
       };
     }
-    const validation = await this.client.getCurrentBot(token);
+    let validation: DiscordTokenValidation;
+    try {
+      validation = await this.client.getCurrentBot(token);
+    } catch {
+      return safeFailure('provider_unavailable');
+    }
     if (!validation.ok) return safeFailure(validation.code);
     if (!/^\d{3,25}$/.test(validation.bot.id)) {
       return {
@@ -179,13 +184,18 @@ export class DiscordByobService {
         retryable: true,
       };
     }
-    const returnedHandle = await this.custody.sealScoped({
-      accountId: input.accountId,
-      agentId: input.agentId,
-      channel: 'discord',
-      label: input.label?.trim() || null,
-      plaintext: token,
-    });
+    let returnedHandle: ChannelSecretHandle;
+    try {
+      returnedHandle = await this.custody.sealScoped({
+        accountId: input.accountId,
+        agentId: input.agentId,
+        channel: 'discord',
+        label: input.label?.trim() || null,
+        plaintext: token,
+      });
+    } catch {
+      throw new Error('channel credential custody failed');
+    }
     const handle = {
       connectionId: returnedHandle.connectionId,
       secretRefId: returnedHandle.secretRefId,
