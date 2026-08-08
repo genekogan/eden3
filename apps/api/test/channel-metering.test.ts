@@ -353,6 +353,17 @@ describe('ChannelTurnMeteringService economic authorization', () => {
     }
   });
 
+  it('keeps failed delivery compensation retryable through the refunding reaper state', () => {
+    expect(REAPABLE_CHANNEL_TURN_STATUSES).toContain('refunding');
+    expect(
+      channelAuthorizationReversalKind({
+        authorizationState: 'settled',
+        channelStatus: 'refunding',
+        channelErrorCode: 'channel_delivery_compensation_pending',
+      }),
+    ).toBe('delivery_compensation');
+  });
+
   it('rejects cross-bot replay attribution before authorization', async () => {
     const record = turn('reserved');
     const persistence = store({ claimTurn: vi.fn(async () => record) });

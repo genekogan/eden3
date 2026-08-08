@@ -219,14 +219,12 @@ export function ChannelsClient() {
         (status) => {
           if (disposed || !alive.current || activeTelegramIntent.current !== intentId) return;
           if (status.connection) {
-            activeTelegramIntent.current = null;
             mergeConnection(status.connection);
-            setTelegramOnboarding(null);
-            setTelegramOwnerBindingUrl(null);
-            setNote("Telegram bot attached. Configure access below, then activate the connection.");
-            return;
           }
           setTelegramOnboarding(status);
+          if (telegramManagedStep(status.intent.state) === "attach") {
+            setNote("Telegram bot stored securely. Attach it to the selected agent to continue.");
+          }
         },
         (error) => {
           if (!disposed && alive.current) setNote(errorCopy(error));

@@ -388,6 +388,9 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
         set status = 'refunding',
             error_code = case
               when t.status = 'delivery_pending' then 'channel_delivery_compensation_pending'
+              when t.status = 'refunding'
+                and t.error_code = 'channel_delivery_compensation_pending'
+                then t.error_code
               else 'stale_channel_turn'
             end,
             updated_at = now()
@@ -661,7 +664,15 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   async markRefundFailed(turnId: string, errorCode: string): Promise<void> {
     await pg`
       update channel_turns
-      set status = 'error', error_code = ${errorCode}, updated_at = now(), completed_at = null
+      set status = case
+            when error_code = 'channel_delivery_compensation_pending' then 'refunding'
+            else 'error'
+          end,
+          error_code = case
+            when error_code = 'channel_delivery_compensation_pending' then error_code
+            else ${errorCode}
+          end,
+          updated_at = now(), completed_at = null
       where turn_id = ${turnId} and status = 'refunding'
     `;
   }
