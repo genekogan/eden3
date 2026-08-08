@@ -36,6 +36,7 @@ let app: FastifyInstance;
 
 let ownerId = '';
 let strangerId = '';
+let agentRaceId = '';
 const agentFiles = `${marker}_files`; // public, provisioned, populated workspace
 const agentGhost = `${marker}_ghost`; // private, provisioned
 const agentBare = `${marker}_bare`; // public, NOT provisioned
@@ -216,7 +217,7 @@ beforeAll(async () => {
     workspacePath: wsBig,
     provisionStatus: 'ready',
   });
-  await insertAgentAccount(agentRace, {
+  agentRaceId = await insertAgentAccount(agentRace, {
     ownerId,
     name: 'Race Agent',
     persona: 'You are the Files Agent.',
@@ -1003,7 +1004,7 @@ describe('PUT /agents/:username/workspace/file', () => {
       return basePersonaUpdate(params);
     };
     const toolSync = makeFakeToolSync();
-    const projector = reconcileAgentRuntime(agentRace, {
+    const projector = reconcileAgentRuntime(agentRaceId, {
       provisioner,
       toolSync,
       dataDir: parentDir,
@@ -1063,7 +1064,7 @@ describe('PUT /agents/:username/workspace/file', () => {
     });
 
     await expect(
-      reconcileAgentRuntime(agentRace, { provisioner, toolSync, dataDir: parentDir }),
+      reconcileAgentRuntime(agentRaceId, { provisioner, toolSync, dataDir: parentDir }),
     ).resolves.toEqual({ status: 'synced', version: saved.doctrineRevision });
     expect(await readFile(path.join(wsRace, 'SOUL.md'), 'utf8')).toBe(winnerPersona);
   });
