@@ -4,6 +4,29 @@ export const DISCORD_DEVELOPER_PORTAL = 'https://discord.com/developers/applicat
 export const X_DEVELOPER_PORTAL = 'https://developer.x.com/en/portal/dashboard';
 export const DISCORD_BOT_PERMISSIONS = 0;
 
+export function parseDiscordGroupCoordinates(
+  value: string,
+): Array<{ guildId: string; channelIds: string[] }> | null {
+  const pairs = [...new Set(value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean))];
+  if (pairs.length > 100) return null;
+  const grouped = new Map<string, string[]>();
+  for (const pair of pairs) {
+    const match = /^(\d{3,25})\/(\d{3,25})$/.exec(pair);
+    if (!match) return null;
+    const channels = grouped.get(match[1]!) ?? [];
+    if (!channels.includes(match[2]!)) channels.push(match[2]!);
+    grouped.set(match[1]!, channels);
+  }
+  return [...grouped].map(([guildId, channelIds]) => ({ guildId, channelIds }));
+}
+
+export function parseTelegramGroupCoordinates(value: string): Array<{ groupId: string }> | null {
+  const ids = [...new Set(value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean))];
+  return ids.length <= 100 && ids.every((id) => /^-\d{3,25}$/.test(id))
+    ? ids.map((groupId) => ({ groupId }))
+    : null;
+}
+
 export type TelegramManagedStep =
   | 'bind_owner'
   | 'choose_bot'

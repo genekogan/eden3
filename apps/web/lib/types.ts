@@ -370,9 +370,9 @@ export interface ChannelConnectionDto {
   config: {
     dmPolicy: "pairing" | "allowlist";
     allowFrom: string[];
-    deliveryScope: "direct_messages_only";
-    /** Always empty for hosted connections; retained for response compatibility. */
+    deliveryScope: "direct_messages_only" | "direct_and_allowlisted_groups";
     discordGuilds: Array<{ guildId: string; channelIds: string[] }>;
+    telegramGroups: Array<{ groupId: string }>;
   };
   createdAt: string;
   updatedAt: string;
