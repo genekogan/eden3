@@ -578,6 +578,21 @@ export async function reconcileEveCollision(
       // Keep the loud handoff payload bounded if concurrent drift prevents a
       // trustworthy post-failure manifest.
     }
+    // An identical concurrent apply may win bootstrap after this run commits
+    // phase 1 but before its preconditioned bootstrap acquires the second
+    // lock. Converge only after independently verifying the exact terminal
+    // identity and every preservation fingerprint; all partial/drifted states
+    // remain loud bootstrap_pending failures.
+    if (manifest?.state === 'bootstrapped') {
+      assertPreserved(phase1.before, manifest);
+      return {
+        dryRun: false,
+        state: 'bootstrapped',
+        action: 'verified',
+        phase1,
+        finalManifest: manifest,
+      };
+    }
     fail('bootstrap_pending', 'Handle reconciliation committed but normal Eve bootstrap is pending', {
       phase1Action: phase1.action,
       state: manifest?.state ?? 'unknown',
