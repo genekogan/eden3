@@ -857,7 +857,11 @@ async function runClaimedTurn(
   // runTurn throws only before the reply is hijacked).
   const refundBeforeStream = async (err: unknown): Promise<never> => {
     try {
-      await reverseTurnAuthorization({ turnId, refundType });
+      await reverseTurnAuthorization({
+        turnId,
+        refundType,
+        ...(params.fundingFence ? { fence: params.fundingFence } : {}),
+      });
     } catch (reverseErr) {
       onError(reverseErr, 'turn reservation reversal (pre-stream)');
     }
