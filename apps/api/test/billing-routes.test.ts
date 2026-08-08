@@ -24,11 +24,15 @@ let otherUserId = '';
 let app: FastifyInstance;
 let testStripeCreated = 10_000;
 const checkoutCalls: Array<{ params: URLSearchParams; secretKey: string }> = [];
+const checkoutLineItems = new Map<string, Array<{ priceId: string; quantity: number }>>();
 
 const fakeStripeClient: StripeCheckoutClient = {
   async createCheckoutSession(params, secretKey) {
     checkoutCalls.push({ params: new URLSearchParams(params), secretKey });
     return { id: `cs_test_${checkoutCalls.length}`, url: `https://checkout.stripe.test/${checkoutCalls.length}` };
+  },
+  async retrieveCheckoutSessionLineItems(sessionId) {
+    return checkoutLineItems.get(sessionId) ?? [];
   },
 };
 
@@ -40,6 +44,8 @@ const envKeys = [
   'STRIPE_MANNA_TOPUP_AMOUNT',
   'STRIPE_SUBSCRIPTION_BASIC_PRICE_ID',
   'STRIPE_SUBSCRIPTION_BASIC_MONTHLY_MANNA',
+  'STRIPE_SUBSCRIPTION_PRO_PRICE_ID',
+  'STRIPE_SUBSCRIPTION_PRO_MONTHLY_MANNA',
   'BILLING_SUCCESS_URL',
   'BILLING_CANCEL_URL',
 ] as const;
@@ -52,13 +58,13 @@ function signPayload(payload: string, timestamp = Math.floor(Date.now() / 1000))
   return `t=${timestamp},v1=${signature}`;
 }
 
-async function postWebhook(event: unknown) {
+async function postWebhookTo(target: FastifyInstance, event: unknown) {
   const payload = JSON.stringify(
     event !== null && typeof event === 'object' && !Array.isArray(event)
       ? { livemode: false, created: testStripeCreated++, ...event }
       : event,
   );
-  return await app.inject({
+  return await target.inject({
     method: 'POST',
     url: '/billing/webhook',
     headers: {
@@ -67,6 +73,10 @@ async function postWebhook(event: unknown) {
     },
     payload,
   });
+}
+
+async function postWebhook(event: unknown) {
+  return await postWebhookTo(app, event);
 }
 
 async function ledgerRows(accountId: string) {
@@ -88,6 +98,8 @@ beforeAll(async () => {
   process.env.STRIPE_MANNA_TOPUP_AMOUNT = '1234';
   process.env.STRIPE_SUBSCRIPTION_BASIC_PRICE_ID = 'price_basic';
   process.env.STRIPE_SUBSCRIPTION_BASIC_MONTHLY_MANNA = '4321';
+  process.env.STRIPE_SUBSCRIPTION_PRO_PRICE_ID = 'price_pro';
+  process.env.STRIPE_SUBSCRIPTION_PRO_MONTHLY_MANNA = '8765';
   process.env.BILLING_SUCCESS_URL = 'http://localhost:4300/manna?checkout=success';
   process.env.BILLING_CANCEL_URL = 'http://localhost:4300/manna?checkout=cancel';
   resetEnvCache();
@@ -221,6 +233,7 @@ describe('GET /billing/subscription', () => {
 
 describe('POST /billing/webhook', () => {
   it('credits checkout manna exactly once on signed checkout.session.completed replay', async () => {
+    checkoutLineItems.set(`${marker}_cs`, [{ priceId: 'price_topup', quantity: 1 }]);
     const event = {
       id: `${marker}_evt_checkout`,
       type: 'checkout.session.completed',
@@ -249,6 +262,7 @@ describe('POST /billing/webhook', () => {
   });
 
   it('credits one checkout object once across concurrent distinct event ids and ignores amount metadata', async () => {
+    checkoutLineItems.set(`${marker}_cs_semantic`, [{ priceId: 'price_topup', quantity: 1 }]);
     const before = await getBalance(userId);
     const object = {
       id: `${marker}_cs_semantic`,
@@ -272,6 +286,46 @@ describe('POST /billing/webhook', () => {
     expect(semanticRows[0]?.amount).toBe('1234.0000');
   });
 
+  it('durably binds a payment-only Stripe customer to one account across sessions', async () => {
+    const customerId = `${marker}_cus_payment_only`;
+    for (const sessionId of [`${marker}_cs_customer_owner`, `${marker}_cs_customer_rebind`]) {
+      checkoutLineItems.set(sessionId, [{ priceId: 'price_topup', quantity: 1 }]);
+    }
+    const first = await postWebhook({
+      id: `${marker}_evt_customer_owner`,
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: `${marker}_cs_customer_owner`,
+          mode: 'payment',
+          payment_status: 'paid',
+          customer: customerId,
+          client_reference_id: userId,
+          metadata: { accountId: userId, kind: 'manna_topup' },
+        },
+      },
+    });
+    expect(first.statusCode).toBe(200);
+    const beforeOther = await getBalance(otherUserId);
+    const conflict = await postWebhook({
+      id: `${marker}_evt_customer_rebind`,
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: `${marker}_cs_customer_rebind`,
+          mode: 'payment',
+          payment_status: 'paid',
+          customer: customerId,
+          client_reference_id: otherUserId,
+          metadata: { accountId: otherUserId, kind: 'manna_topup' },
+        },
+      },
+    });
+    expect(conflict.statusCode).toBe(409);
+    expect((conflict.json() as { error: { code: string } }).error.code).toBe('stripe_binding_mismatch');
+    expect(await getBalance(otherUserId)).toEqual(beforeOther);
+  });
+
   it('rejects conflicting checkout account claims before credit', async () => {
     const before = await getBalance(userId);
     const res = await postWebhook({
@@ -293,6 +347,82 @@ describe('POST /billing/webhook', () => {
     expect(await getBalance(userId)).toEqual(before);
   });
 
+  it('rejects a paid checkout whose authoritative line item is not the configured top-up price', async () => {
+    const sessionId = `${marker}_cs_wrong_price`;
+    checkoutLineItems.set(sessionId, [{ priceId: 'price_unrelated', quantity: 1 }]);
+    const before = await getBalance(userId);
+    const res = await postWebhook({
+      id: `${marker}_evt_checkout_wrong_price`,
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: sessionId,
+          mode: 'payment',
+          payment_status: 'paid',
+          client_reference_id: userId,
+          metadata: { accountId: userId, kind: 'manna_topup' },
+        },
+      },
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('stripe_binding_mismatch');
+    expect(await getBalance(userId)).toEqual(before);
+  });
+
+  it.each([
+    [[{ priceId: 'price_topup', quantity: 2 }], 'wrong quantity'],
+    [[
+      { priceId: 'price_topup', quantity: 1 },
+      { priceId: 'price_unrelated', quantity: 1 },
+    ], 'additional line'],
+  ] as const)('rejects top-up checkout with %s', async (lineItems, suffix) => {
+    const sessionId = `${marker}_cs_${suffix.replaceAll(' ', '_')}`;
+    checkoutLineItems.set(sessionId, [...lineItems]);
+    const before = await getBalance(userId);
+    const res = await postWebhook({
+      id: `${marker}_evt_${suffix.replaceAll(' ', '_')}`,
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: sessionId,
+          mode: 'payment',
+          payment_status: 'paid',
+          customer: `${marker}_cus_topup_shape`,
+          client_reference_id: userId,
+          metadata: { accountId: userId, kind: 'manna_topup' },
+        },
+      },
+    });
+    expect(res.statusCode).toBe(409);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('stripe_binding_mismatch');
+    expect(await getBalance(userId)).toEqual(before);
+  });
+
+  it('leaves subscription checkout completion side-effect-free until an authoritative webhook arrives', async () => {
+    const subscriptionId = `${marker}_sub_checkout_untrusted`;
+    const res = await postWebhook({
+      id: `${marker}_evt_checkout_subscription`,
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: `${marker}_cs_subscription`,
+          mode: 'subscription',
+          customer: `${marker}_cus_checkout_untrusted`,
+          subscription: subscriptionId,
+          client_reference_id: userId,
+          metadata: { accountId: userId, kind: 'subscription', tier: 'pro' },
+        },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ action: 'subscription_checkout_awaiting_provider' });
+    const [row] = await pg<Array<{ count: number }>>`
+      select count(*)::int as count from billing_subscriptions
+      where stripe_subscription_id = ${subscriptionId}
+    `;
+    expect(row?.count).toBe(0);
+  });
+
   it('grants subscription manna to the subscription pot and records subscription state', async () => {
     const event = {
       id: `${marker}_evt_invoice`,
@@ -303,7 +433,7 @@ describe('POST /billing/webhook', () => {
           customer: `${marker}_cus`,
           subscription: `${marker}_sub`,
           billing_reason: 'subscription_cycle',
-          lines: { data: [{ price: { id: 'price_basic' } }] },
+          lines: { data: [{ price: { id: 'price_basic' }, quantity: 1, period: { end: 1_800_000_000 } }] },
           metadata: { accountId: userId, tier: 'basic', monthlyManna: '999999' },
         },
       },
@@ -320,12 +450,43 @@ describe('POST /billing/webhook', () => {
     });
     expect(replay.json()).toMatchObject({ alreadyApplied: true });
     expect(await getBalance(userId)).toMatchObject({ subscriptionBalance: 4321 });
-    const [sub] = await pg<Array<{ status: string; tier: string; monthly_manna: number }>>`
-      select status, tier, monthly_manna
+    const [sub] = await pg<Array<{ status: string; tier: string; monthly_manna: number; current_period_end: Date }>>`
+      select status, tier, monthly_manna, current_period_end
       from billing_subscriptions
       where stripe_subscription_id = ${`${marker}_sub`}
     `;
     expect(sub).toMatchObject({ status: 'active', tier: 'basic', monthly_manna: 4321 });
+    expect(new Date(sub!.current_period_end).toISOString()).toBe('2027-01-15T08:00:00.000Z');
+  });
+
+  it.each([
+    { suffix: 'quantity', data: [{ price: { id: 'price_basic' }, quantity: 2 }] },
+    {
+      suffix: 'extra',
+      data: [
+        { price: { id: 'price_basic' }, quantity: 1 },
+        { price: { id: 'price_unrelated' }, quantity: 1 },
+      ],
+    },
+  ])('rejects an invoice without exactly one configured price at quantity one: $suffix', async ({ suffix, data }) => {
+    const before = await getBalance(userId);
+    const res = await postWebhook({
+      id: `${marker}_evt_invoice_shape_${suffix}`,
+      type: 'invoice.payment_succeeded',
+      data: {
+        object: {
+          id: `${marker}_in_shape_${suffix}`,
+          customer: `${marker}_cus_shape_${suffix}`,
+          subscription: `${marker}_sub_shape_${suffix}`,
+          billing_reason: 'subscription_cycle',
+          lines: { data },
+          metadata: { accountId: userId, tier: 'basic' },
+        },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('bad_event');
+    expect(await getBalance(userId)).toEqual(before);
   });
 
   it('credits one paid invoice once across concurrent distinct event ids', async () => {
@@ -335,7 +496,7 @@ describe('POST /billing/webhook', () => {
       customer: `${marker}_cus_semantic`,
       subscription: `${marker}_sub_semantic`,
       billing_reason: 'subscription_cycle',
-      lines: { data: [{ price: { id: 'price_basic' } }] },
+      lines: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
       metadata: { accountId: userId, tier: 'basic', monthlyManna: '999999' },
     };
     const responses = await Promise.all([
@@ -346,6 +507,96 @@ describe('POST /billing/webhook', () => {
     for (const response of responses) expect(response.statusCode).toBe(200);
     expect(responses.filter((response) => response.json().alreadyApplied === false)).toHaveLength(1);
     expect((await getBalance(userId)).subscriptionBalance - before.subscriptionBalance).toBe(4321);
+
+    const restarted = await buildServer({ billing: { stripeClient: fakeStripeClient } });
+    await restarted.ready();
+    try {
+      const replay = await postWebhookTo(restarted, {
+        id: `${marker}_evt_invoice_semantic_restart`,
+        type: 'invoice.payment_succeeded',
+        data: { object },
+      });
+      expect(replay.statusCode).toBe(200);
+      expect(replay.json()).toMatchObject({ alreadyApplied: true });
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it('rejects a conflicting duplicate invoice before mutating subscription state in both arrival orders', async () => {
+    const invoiceIdA = `${marker}_in_payload_a`;
+    const originalA = {
+      id: invoiceIdA,
+      customer: `${marker}_cus_payload_a`,
+      subscription: `${marker}_sub_payload_a`,
+      billing_reason: 'subscription_cycle',
+      lines: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
+      metadata: { accountId: userId, tier: 'basic' },
+    };
+    expect((await postWebhook({
+      id: `${marker}_evt_payload_a_first`,
+      type: 'invoice.payment_succeeded',
+      data: { object: originalA },
+    })).statusCode).toBe(200);
+    const conflictA = await postWebhook({
+      id: `${marker}_evt_payload_a_conflict`,
+      type: 'invoice.payment_succeeded',
+      data: {
+        object: {
+          ...originalA,
+          customer: `${marker}_cus_payload_a_changed`,
+          subscription: `${marker}_sub_payload_a_changed`,
+        },
+      },
+    });
+    expect(conflictA.statusCode).toBe(409);
+
+    const invoiceIdB = `${marker}_in_payload_b`;
+    const firstB = {
+      id: invoiceIdB,
+      customer: `${marker}_cus_payload_b_changed_first`,
+      subscription: `${marker}_sub_payload_b_changed_first`,
+      billing_reason: 'subscription_cycle',
+      lines: { data: [{ price: { id: 'price_pro' }, quantity: 1 }] },
+      metadata: { accountId: userId, tier: 'pro' },
+    };
+    expect((await postWebhook({
+      id: `${marker}_evt_payload_b_first`,
+      type: 'invoice.payment_succeeded',
+      data: { object: firstB },
+    })).statusCode).toBe(200);
+    const conflictB = await postWebhook({
+      id: `${marker}_evt_payload_b_conflict`,
+      type: 'invoice.payment_succeeded',
+      data: {
+        object: {
+          ...firstB,
+          customer: `${marker}_cus_payload_b`,
+          subscription: `${marker}_sub_payload_b`,
+          lines: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
+          metadata: { accountId: userId, tier: 'basic' },
+        },
+      },
+    });
+    expect(conflictB.statusCode).toBe(409);
+
+    const rows = await pg<Array<{ stripe_subscription_id: string; tier: string; monthly_manna: number }>>`
+      select stripe_subscription_id, tier, monthly_manna from billing_subscriptions
+      where stripe_subscription_id like ${`${marker}_sub_payload_%`}
+      order by stripe_subscription_id
+    `;
+    expect(rows).toEqual([
+      {
+        stripe_subscription_id: `${marker}_sub_payload_a`,
+        tier: 'basic',
+        monthly_manna: 4321,
+      },
+      {
+        stripe_subscription_id: `${marker}_sub_payload_b_changed_first`,
+        tier: 'pro',
+        monthly_manna: 8765,
+      },
+    ]);
   });
 
   it('rejects subscription and customer rebinding across tenants', async () => {
@@ -359,7 +610,7 @@ describe('POST /billing/webhook', () => {
           id: `${marker}_sub`,
           customer: `${marker}_cus`,
           status: 'active',
-          items: { data: [{ price: { id: 'price_basic' } }] },
+          items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
           metadata: { accountId: otherUserId, tier: 'basic' },
         },
       },
@@ -378,7 +629,7 @@ describe('POST /billing/webhook', () => {
           id: `${marker}_sub_other`,
           customer: `${marker}_cus`,
           status: 'active',
-          items: { data: [{ price: { id: 'price_basic' } }] },
+          items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
           metadata: { accountId: otherUserId, tier: 'basic' },
         },
       },
@@ -407,7 +658,7 @@ describe('POST /billing/webhook', () => {
           customer: `${marker}_cus_tier_mismatch`,
           subscription: `${marker}_sub_tier_mismatch`,
           billing_reason: 'subscription_cycle',
-          lines: { data: [{ price: { id: 'price_basic' } }] },
+          lines: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
           metadata: { accountId: userId, tier: 'pro' },
         },
       },
@@ -428,7 +679,7 @@ describe('POST /billing/webhook', () => {
           customer: `${marker}_cus`,
           subscription: `${marker}_sub_proration`,
           billing_reason: 'subscription_update',
-          lines: { data: [{ price: { id: 'price_basic' } }] },
+          lines: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
           metadata: { accountId: userId, tier: 'pro', prorationManna: '321' },
         },
       },
@@ -458,7 +709,7 @@ describe('POST /billing/webhook', () => {
           status: 'active',
           cancel_at_period_end: true,
           current_period_end: 1_800_000_000,
-          items: { data: [{ price: { id: 'price_basic' } }] },
+          items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
           metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
         },
       },
@@ -495,7 +746,7 @@ describe('POST /billing/webhook', () => {
           id: `${marker}_sub`,
           customer: `${marker}_cus`,
           status: 'canceled',
-          items: { data: [{ price: { id: 'price_basic' } }] },
+          items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
           metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
         },
       },
@@ -518,7 +769,7 @@ describe('POST /billing/webhook', () => {
     const subId = `${marker}_sub_order`;
     const base = {
       customer: `${marker}_cus`,
-      items: { data: [{ price: { id: 'price_basic' } }] },
+      items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
       metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
     };
 
@@ -559,13 +810,112 @@ describe('POST /billing/webhook', () => {
     expect(afterNewer?.status).toBe('active');
   });
 
+  it('converges equal-second tier and status ties to the conservative entitlement in both orders', async () => {
+    const sameSecond = 9_000;
+    for (const order of ['high-first', 'low-first'] as const) {
+      const subId = `${marker}_sub_tie_tier_${order}`;
+      const customerId = `${marker}_cus_tie_tier_${order}`;
+      const pro = {
+        id: subId,
+        customer: customerId,
+        status: 'active',
+        items: { data: [{ price: { id: 'price_pro' }, quantity: 1 }] },
+        metadata: { accountId: userId, tier: 'pro' },
+      };
+      const basic = {
+        ...pro,
+        items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
+        metadata: { accountId: userId, tier: 'basic' },
+      };
+      const objects = order === 'high-first' ? [pro, basic] : [basic, pro];
+      for (const [index, object] of objects.entries()) {
+        const response = await postWebhook({
+          id: `${marker}_evt_tie_tier_${order}_${index}`,
+          type: 'customer.subscription.updated',
+          created: sameSecond,
+          data: { object },
+        });
+        expect(response.statusCode).toBe(200);
+      }
+      const [row] = await pg<Array<{ status: string; tier: string; monthly_manna: number }>>`
+        select status, tier, monthly_manna from billing_subscriptions
+        where stripe_subscription_id = ${subId}
+      `;
+      expect(row).toMatchObject({ status: 'active', tier: 'basic', monthly_manna: 4321 });
+    }
+
+    for (const order of ['active-first', 'past-due-first'] as const) {
+      const subId = `${marker}_sub_tie_status_${order}`;
+      const base = {
+        id: subId,
+        customer: `${marker}_cus_tie_status_${order}`,
+        items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
+        metadata: { accountId: userId, tier: 'basic' },
+      };
+      const active = { ...base, status: 'active' };
+      const pastDue = { ...base, status: 'past_due' };
+      const objects = order === 'active-first' ? [active, pastDue] : [pastDue, active];
+      for (const [index, object] of objects.entries()) {
+        const response = await postWebhook({
+          id: `${marker}_evt_tie_status_${order}_${index}`,
+          type: 'customer.subscription.updated',
+          created: sameSecond,
+          data: { object },
+        });
+        expect(response.statusCode).toBe(200);
+      }
+      const [row] = await pg<Array<{ status: string; tier: string }>>`
+        select status, tier from billing_subscriptions where stripe_subscription_id = ${subId}
+      `;
+      expect(row).toMatchObject({ status: 'past_due', tier: 'basic' });
+    }
+  });
+
   it('rejects bad signatures before handling the event', async () => {
     const payload = JSON.stringify({ id: `${marker}_bad`, type: 'checkout.session.completed', data: { object: {} } });
+    const timestamp = Math.floor(Date.now() / 1000);
     const res = await app.inject({
       method: 'POST',
       url: '/billing/webhook',
-      headers: { 'content-type': 'application/json', 'stripe-signature': 't=1,v1=bad' },
+      headers: { 'content-type': 'application/json', 'stripe-signature': `t=${timestamp},v1=${'0'.repeat(64)}` },
       payload,
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('bad_signature');
+  });
+
+  it('accepts any valid v1 signature in a secret-rotation header', async () => {
+    const payload = JSON.stringify({
+      id: `${marker}_rotation`,
+      type: 'unhandled.test.event',
+      livemode: false,
+      created: testStripeCreated++,
+      data: { object: {} },
+    });
+    const validHeader = signPayload(payload);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/billing/webhook',
+      headers: {
+        'content-type': 'application/json',
+        'stripe-signature': `${validHeader},v1=${'0'.repeat(64)}`,
+      },
+      payload,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ received: true, action: 'ignored' });
+  });
+
+  it('rejects an in-window bad MAC before parsing malformed JSON', async () => {
+    const timestamp = Math.floor(Date.now() / 1000);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/billing/webhook',
+      headers: {
+        'content-type': 'application/json',
+        'stripe-signature': `t=${timestamp},v1=${'0'.repeat(64)}`,
+      },
+      payload: '{not-json',
     });
     expect(res.statusCode).toBe(400);
     expect((res.json() as { error: { code: string } }).error.code).toBe('bad_signature');

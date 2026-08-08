@@ -22,8 +22,17 @@ interface StripeCheckoutSession {
   url: string | null;
 }
 
+interface StripeCheckoutLineItem {
+  priceId: string;
+  quantity: number;
+}
+
 export interface StripeCheckoutClient {
   createCheckoutSession(params: URLSearchParams, secretKey: string): Promise<StripeCheckoutSession>;
+  retrieveCheckoutSessionLineItems(
+    sessionId: string,
+    secretKey: string,
+  ): Promise<StripeCheckoutLineItem[]>;
 }
 
 export interface BillingRoutesOptions {
@@ -46,6 +55,36 @@ const defaultStripeClient: StripeCheckoutClient = {
     if (!res.ok) throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout is unavailable');
     if (!body.id) throw new ApiError(502, 'stripe_checkout_failed', 'Stripe response missing session id');
     return { id: body.id, url: body.url ?? null };
+  },
+  async retrieveCheckoutSessionLineItems(sessionId, secretKey) {
+    let res: Response;
+    try {
+      res = await fetch(
+        `https://api.stripe.com/v1/checkout/sessions/${encodeURIComponent(sessionId)}/line_items?limit=10`,
+        {
+          headers: { authorization: `Bearer ${secretKey}` },
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+    } catch {
+      throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout is unavailable');
+    }
+    const body = (await res.json().catch(() => null)) as unknown;
+    if (!res.ok) throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout is unavailable');
+    const record = asRecord(body);
+    const data = Array.isArray(record?.data) ? record.data : null;
+    if (!data || data.length > 10) {
+      throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout line items are invalid');
+    }
+    return data.map((value) => {
+      const line = asRecord(value);
+      const priceId = asString(asRecord(line?.price)?.id);
+      const quantity = asNumber(line?.quantity);
+      if (!priceId || !quantity || !Number.isSafeInteger(quantity) || quantity <= 0) {
+        throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout line items are invalid');
+      }
+      return { priceId, quantity };
+    });
   },
 };
 
@@ -126,6 +165,18 @@ function asBoolean(value: unknown): boolean {
 function asNumber(value: unknown): number | null {
   const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
   return Number.isFinite(number) ? number : null;
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const record = asRecord(value);
+  if (record) {
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
 }
 
 function metadataFrom(value: unknown): Record<string, string> {
@@ -219,33 +270,48 @@ function configuredTierForPrice(priceId: string): SubscriptionTier | null {
   return null;
 }
 
-function stripePriceIds(object: Record<string, unknown>): string[] {
+interface StripeSubscriptionLineEvidence {
+  priceId: string;
+  quantity: number;
+  periodEnd: Date | null;
+}
+
+function stripeSubscriptionLines(object: Record<string, unknown>): StripeSubscriptionLineEvidence[] {
   const lines = asRecord(object.lines) ?? asRecord(object.items);
   const data = Array.isArray(lines?.data) ? lines.data : [];
-  return data.flatMap((item) => {
+  return data.map((item) => {
     const line = asRecord(item);
-    const legacy = asString(asRecord(line?.price)?.id);
-    const modern = asString(asRecord(asRecord(line?.pricing)?.price_details)?.price);
-    return [legacy, modern].filter((value): value is string => value !== null);
+    const priceId = consistentStripeValue('price', [
+      asString(asRecord(line?.price)?.id),
+      asString(asRecord(asRecord(line?.pricing)?.price_details)?.price),
+    ]);
+    const quantity = asNumber(line?.quantity);
+    if (!priceId || quantity !== 1 || !Number.isSafeInteger(quantity)) {
+      throw new ApiError(400, 'bad_event', 'Stripe event must contain one configured price at quantity one');
+    }
+    return {
+      priceId,
+      quantity,
+      periodEnd: currentPeriodEndFrom(asRecord(line?.period)?.end),
+    };
   });
 }
 
-function configuredTierFromStripeObject(object: Record<string, unknown>): SubscriptionTier {
-  const tiers = [
-    ...new Set(
-      stripePriceIds(object)
-        .map(configuredTierForPrice)
-        .filter((tier): tier is SubscriptionTier => tier !== null),
-    ),
-  ];
-  if (tiers.length !== 1) {
+function configuredSubscriptionFromStripeObject(
+  object: Record<string, unknown>,
+): StripeSubscriptionLineEvidence & { tier: SubscriptionTier } {
+  const lines = stripeSubscriptionLines(object);
+  if (lines.length !== 1) {
     throw new ApiError(400, 'bad_event', 'Stripe event does not identify one configured tier');
   }
+  const line = lines[0]!;
+  const tier = configuredTierForPrice(line.priceId);
+  if (!tier) throw new ApiError(400, 'bad_event', 'Stripe event does not identify one configured tier');
   const claimed = metadataTier(object);
-  if (claimed !== null && claimed !== tiers[0]) {
+  if (claimed !== null && claimed !== tier) {
     throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe tier does not match its configured price');
   }
-  return tiers[0]!;
+  return { ...line, tier };
 }
 
 function subscriptionIdFromInvoice(object: Record<string, unknown>): string | null {
@@ -262,6 +328,7 @@ function currentPeriodEndFrom(value: unknown): Date | null {
 }
 
 function compareHex(left: string, right: string): boolean {
+  if (!/^[0-9a-f]{64}$/i.test(left) || !/^[0-9a-f]{64}$/i.test(right)) return false;
   const a = Buffer.from(left, 'hex');
   const b = Buffer.from(right, 'hex');
   return a.length === b.length && timingSafeEqual(a, b);
@@ -274,15 +341,16 @@ export function verifyStripeWebhookSignature(
   opts: { nowMs?: number; toleranceSeconds?: number } = {},
 ): void {
   if (!signatureHeader) throw new ApiError(400, 'bad_signature', 'Missing Stripe-Signature header');
-  const parts = Object.fromEntries(
-    signatureHeader.split(',').map((part) => {
-      const [key, ...rest] = part.split('=');
-      return [key, rest.join('=')];
-    }),
-  );
-  const timestamp = Number(parts.t);
-  const signature = parts.v1;
-  if (!Number.isFinite(timestamp) || !signature) {
+  let timestampValue: string | null = null;
+  const signatures: string[] = [];
+  for (const part of signatureHeader.split(',')) {
+    const [key, ...rest] = part.split('=');
+    const value = rest.join('=');
+    if (key === 't') timestampValue = value;
+    if (key === 'v1') signatures.push(value);
+  }
+  const timestamp = Number(timestampValue);
+  if (!Number.isFinite(timestamp) || signatures.length === 0) {
     throw new ApiError(400, 'bad_signature', 'Malformed Stripe-Signature header');
   }
   const nowMs = opts.nowMs ?? Date.now();
@@ -293,7 +361,7 @@ export function verifyStripeWebhookSignature(
   const expected = createHmac('sha256', secret)
     .update(`${timestamp}.${rawBody.toString('utf8')}`)
     .digest('hex');
-  if (!compareHex(expected, signature)) {
+  if (!signatures.some((signature) => compareHex(expected, signature))) {
     throw new ApiError(400, 'bad_signature', 'Stripe webhook signature verification failed');
   }
 }
@@ -344,19 +412,79 @@ async function assertStripeBindings(
       throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe customer binding cannot change');
     }
   }
+  if (params.stripeCustomerId) {
+    const paymentOwners = await dbc
+      .select({ accountId: mannaAccounts.accountId })
+      .from(mannaTransactions)
+      .innerJoin(mannaAccounts, eq(mannaAccounts.id, mannaTransactions.mannaAccountId))
+      .where(sql`${mannaTransactions.stripeEventData}->>'customerId' = ${params.stripeCustomerId}`);
+    if (paymentOwners.some((row) => row.accountId !== params.accountId)) {
+      throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe billing identity belongs to another account');
+    }
+  }
 }
 
-async function assertCreditBinding(dbc: DbHandle, idempotencyKey: string, accountId: string): Promise<void> {
+async function assertCreditBinding(
+  dbc: DbHandle,
+  idempotencyKey: string,
+  accountId: string,
+  evidence: Record<string, unknown>,
+): Promise<void> {
   const [existing] = await dbc
-    .select({ accountId: mannaAccounts.accountId })
+    .select({
+      accountId: mannaAccounts.accountId,
+      stripeEventData: mannaTransactions.stripeEventData,
+    })
     .from(mannaTransactions)
     .innerJoin(mannaAccounts, eq(mannaAccounts.id, mannaTransactions.mannaAccountId))
     .where(eq(mannaTransactions.idempotencyKey, idempotencyKey))
     .limit(1);
-  if (existing && existing.accountId !== accountId) {
-    throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe credit object belongs to another account');
+  if (
+    existing &&
+    (existing.accountId !== accountId || stableJson(existing.stripeEventData) !== stableJson(evidence))
+  ) {
+    throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe credit object binding cannot change');
   }
 }
+
+function subscriptionEntitlementRank(status: string, tier: string | null): number {
+  const statusRank =
+    status === 'canceled' || status === 'incomplete_expired'
+      ? 0
+      : status === 'unpaid' || status === 'incomplete' || status === 'unknown'
+        ? 1
+        : status === 'past_due' || status === 'paused'
+          ? 2
+          : status === 'trialing'
+            ? 3
+            : status === 'active' || status === 'checkout_completed'
+              ? 4
+              : 1;
+  const tierRank = tier === 'believer' ? 3 : tier === 'pro' ? 2 : tier === 'basic' ? 1 : 0;
+  return statusRank * 10 + tierRank;
+}
+
+const storedSubscriptionEntitlementRank = sql<number>`(
+  case ${billingSubscriptions.status}
+    when 'canceled' then 0
+    when 'incomplete_expired' then 0
+    when 'unpaid' then 1
+    when 'incomplete' then 1
+    when 'unknown' then 1
+    when 'past_due' then 2
+    when 'paused' then 2
+    when 'trialing' then 3
+    when 'active' then 4
+    when 'checkout_completed' then 4
+    else 1
+  end * 10
+  + case ${billingSubscriptions.tier}
+      when 'believer' then 3
+      when 'pro' then 2
+      when 'basic' then 1
+      else 0
+    end
+)`;
 
 async function upsertSubscription(params: {
   db: DbHandle;
@@ -417,7 +545,7 @@ async function upsertSubscription(params: {
               or ${billingSubscriptions.lastStripeEventAt} < ${eventAt.toISOString()}::timestamptz
               or (
                 ${billingSubscriptions.lastStripeEventAt} = ${eventAt.toISOString()}::timestamptz
-                and (${params.status} = 'canceled' or ${billingSubscriptions.status} <> 'canceled')
+                and ${subscriptionEntitlementRank(params.status, params.tier)} <= ${storedSubscriptionEntitlementRank}
               )`,
         ),
     });
@@ -428,7 +556,10 @@ function eventCreatedAtOf(event: StripeEvent): Date | null {
   return new Date(event.created * 1000);
 }
 
-async function handleCheckoutCompleted(event: StripeEvent): Promise<{ action: string; alreadyApplied?: boolean }> {
+async function handleCheckoutCompleted(
+  event: StripeEvent,
+  stripeClient: StripeCheckoutClient,
+): Promise<{ action: string; alreadyApplied?: boolean }> {
   const session = event.data.object;
   const accountId = accountIdFromStripeObject(session);
   if (!accountId) throw new ApiError(400, 'missing_account', 'Checkout session missing account metadata');
@@ -436,44 +567,39 @@ async function handleCheckoutCompleted(event: StripeEvent): Promise<{ action: st
   if (!sessionId) throw new ApiError(400, 'bad_event', 'Checkout session is missing its id');
   const mode = asString(session.mode);
   if (mode === 'subscription') {
-    const subscriptionId = asString(session.subscription);
-    const customerId = asString(session.customer);
-    const tier = metadataTier(session);
-    if (!subscriptionId || !customerId || !tier || !subscriptionPrice(tier).priceId) {
-      throw new ApiError(400, 'bad_event', 'Subscription checkout is missing configured billing identity');
-    }
-    await db.transaction(async (tx) => {
-      await lockStripeScopes(tx, [
-        `stripe-customer:${customerId}`,
-        `stripe-subscription:${subscriptionId}`,
-      ]);
-      await assertStripeBindings(tx, {
-        accountId,
-        stripeCustomerId: customerId,
-        stripeSubscriptionId: subscriptionId,
-      });
-      await upsertSubscription({
-        db: tx,
-        accountId,
-        stripeCustomerId: customerId,
-        stripeSubscriptionId: subscriptionId,
-        status: 'checkout_completed',
-        tier,
-        monthlyManna: tierAmount(tier) ?? 0,
-        currentPeriodEnd: null,
-        cancelAtPeriodEnd: false,
-        eventCreatedAt: eventCreatedAtOf(event),
-      });
-    });
-    return { action: 'subscription_recorded' };
+    // Checkout completion metadata is user-writable and cannot establish an
+    // entitlement. Authoritative subscription/invoice webhooks own state.
+    return { action: 'subscription_checkout_awaiting_provider' };
   }
 
   if (mode !== 'payment' || metadataValue(session, 'kind') !== 'manna_topup') {
     throw new ApiError(400, 'bad_event', 'Checkout session is not an Eden manna purchase');
   }
   if (asString(session.payment_status) !== 'paid') return { action: 'payment_not_paid' };
+  const env = getEnv();
+  if (!env.STRIPE_SECRET_KEY || !env.STRIPE_MANNA_TOPUP_PRICE_ID) {
+    throw new ApiError(503, 'stripe_not_configured', 'Stripe top-up verification is not configured');
+  }
+  const lineItems = await stripeClient.retrieveCheckoutSessionLineItems(sessionId, env.STRIPE_SECRET_KEY);
+  if (
+    lineItems.length !== 1 ||
+    lineItems[0]?.priceId !== env.STRIPE_MANNA_TOPUP_PRICE_ID ||
+    lineItems[0]?.quantity !== 1
+  ) {
+    throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe top-up does not match the configured price');
+  }
   const customerId = asString(session.customer);
   const idempotencyKey = `stripe:checkout:${sessionId}`;
+  const evidence = {
+    kind: 'manna_topup',
+    objectId: sessionId,
+    accountId,
+    customerId,
+    priceId: env.STRIPE_MANNA_TOPUP_PRICE_ID,
+    quantity: 1,
+    amount: env.STRIPE_MANNA_TOPUP_AMOUNT,
+    livemode: false,
+  };
   return await db.transaction(async (tx) => {
     await lockStripeScopes(tx, [
       `stripe-credit:${idempotencyKey}`,
@@ -484,15 +610,15 @@ async function handleCheckoutCompleted(event: StripeEvent): Promise<{ action: st
       stripeCustomerId: customerId,
       stripeSubscriptionId: null,
     });
-    await assertCreditBinding(tx, idempotencyKey, accountId);
+    await assertCreditBinding(tx, idempotencyKey, accountId, evidence);
     const result = await credit({
       accountId,
-      amount: getEnv().STRIPE_MANNA_TOPUP_AMOUNT,
+      amount: env.STRIPE_MANNA_TOPUP_AMOUNT,
       type: 'credit:stripe',
       idempotencyKey,
       stripeEventId: event.id,
       stripeEventType: event.type,
-      stripeEventData: { objectId: sessionId, livemode: false },
+      stripeEventData: evidence,
       db: tx,
     });
     return { action: 'manna_credited', alreadyApplied: result.alreadyApplied };
@@ -510,7 +636,8 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
   }
   const accountId = accountIdFromStripeObject(invoice);
   if (!accountId) throw new ApiError(400, 'missing_account', 'Invoice missing account metadata');
-  const tier = configuredTierFromStripeObject(invoice);
+  const configured = configuredSubscriptionFromStripeObject(invoice);
+  const tier = configured.tier;
   const monthlyManna = tierAmount(tier);
   if (!monthlyManna || monthlyManna <= 0) return { action: 'no_subscription_manna' };
   const subscriptionId = subscriptionIdFromInvoice(invoice);
@@ -519,6 +646,19 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
     throw new ApiError(400, 'bad_event', 'Invoice is missing subscription billing identity');
   }
   const idempotencyKey = `stripe:invoice:${invoiceId}`;
+  const evidence = {
+    kind: 'subscription_invoice',
+    objectId: invoiceId,
+    accountId,
+    customerId,
+    subscriptionId,
+    priceId: configured.priceId,
+    quantity: configured.quantity,
+    tier,
+    amount: monthlyManna,
+    billingReason,
+    livemode: false,
+  };
   return await db.transaction(async (tx) => {
     await lockStripeScopes(tx, [
       `stripe-credit:${idempotencyKey}`,
@@ -530,7 +670,7 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
       stripeCustomerId: customerId,
       stripeSubscriptionId: subscriptionId,
     });
-    await assertCreditBinding(tx, idempotencyKey, accountId);
+    await assertCreditBinding(tx, idempotencyKey, accountId, evidence);
     await upsertSubscription({
       db: tx,
       accountId,
@@ -539,7 +679,7 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
       status: 'active',
       tier,
       monthlyManna,
-      currentPeriodEnd: currentPeriodEndFrom(metadataValue(invoice, 'currentPeriodEnd')),
+      currentPeriodEnd: configured.periodEnd,
       cancelAtPeriodEnd: false,
       eventCreatedAt: eventCreatedAtOf(event),
     });
@@ -550,14 +690,7 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
       idempotencyKey,
       stripeEventId: event.id,
       stripeEventType: event.type,
-      stripeEventData: {
-        objectId: invoiceId,
-        customerId,
-        subscriptionId,
-        tier,
-        billingReason,
-        livemode: false,
-      },
+      stripeEventData: evidence,
       toSubscriptionBalance: true,
       db: tx,
     });
@@ -571,7 +704,7 @@ async function handleSubscriptionChanged(event: StripeEvent): Promise<{ action: 
   const subscriptionId = asString(subscription.id);
   const customerId = asString(subscription.customer);
   if (!accountId || !subscriptionId || !customerId) return { action: 'subscription_ignored' };
-  const tier = configuredTierFromStripeObject(subscription);
+  const tier = configuredSubscriptionFromStripeObject(subscription).tier;
   await db.transaction(async (tx) => {
     await lockStripeScopes(tx, [
       `stripe-customer:${customerId}`,
@@ -598,10 +731,13 @@ async function handleSubscriptionChanged(event: StripeEvent): Promise<{ action: 
   return { action: 'subscription_updated' };
 }
 
-async function handleStripeEvent(event: StripeEvent): Promise<{ action: string; alreadyApplied?: boolean }> {
+async function handleStripeEvent(
+  event: StripeEvent,
+  stripeClient: StripeCheckoutClient,
+): Promise<{ action: string; alreadyApplied?: boolean }> {
   switch (event.type) {
     case 'checkout.session.completed':
-      return await handleCheckoutCompleted(event);
+      return await handleCheckoutCompleted(event, stripeClient);
     case 'invoice.payment_succeeded':
       return await handleInvoicePaymentSucceeded(event);
     case 'customer.subscription.created':
@@ -748,7 +884,7 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
         created: record.created,
         data: { object },
       } as StripeEvent;
-      const result = await handleStripeEvent(event);
+      const result = await handleStripeEvent(event, stripeClient);
       return { received: true, ...result };
     });
   });
