@@ -8,8 +8,6 @@ import {
   InsufficientMannaError,
   CostTableError,
   costFromParams,
-  credit,
-  debit,
   getEnv,
   mannaForEstimate,
   reverseReservation,
@@ -18,7 +16,6 @@ import {
   type CostUnit,
   type PricedAction,
 } from '@eden3/core';
-import { db, usageEvents } from '@eden3/db';
 import {
   GatewayHttpError,
   GatewayToolError,
@@ -32,6 +29,11 @@ import { z } from 'zod';
 import { ApiError, sendError } from '../errors';
 import { MediaPipeline, type AttachmentKind } from '../services/media-pipeline';
 import {
+  compensateStudioGeneration,
+  completeStudioGeneration,
+  reserveStudioGeneration,
+} from '../services/studio-reservations';
+import {
   MediaClaimTimeoutError,
   MediaWatcher,
   type MediaClaim,
@@ -44,13 +46,14 @@ import {
  *   GET  /studio/tools     — the four media tools + manna pricing.
  *   POST /studio/generate  — {tool, args:{prompt|text, …}} → {creationId, url}.
  *
- * Generation flow: requireAuth → debit the caller up front (refund-safe key
- * `studio:<uuid>`) → register a media claim on the watcher (the "dir
+ * Generation flow: requireAuth → atomically debit + persist a pending
+ * authorization (`studio:<uuid>:reserve`) → register a media claim (the "dir
  * snapshot": only files that land AFTER the claim can match) → invoke the
  * tool via the gateway tools client as agent "main" in a per-request gateway
  * session → await BOTH the invocation and claimed file under the same
  * wall-clock budget → ingest WITHOUT a session (creation belongs to the
- * caller) → {creationId, url}. Any failure after the debit refunds it;
+ * caller) while atomically completing the authorization → {creationId, url}.
+ * Any failure after the debit enters durable refund_pending compensation;
  * gateway errors map to 502, a missing/late file to 504.
  *
  * Known correlation limit (same as the watcher's): the gateway gives no
@@ -501,6 +504,8 @@ export interface StudioDeps {
   timeoutsMs?: Partial<Record<StudioToolName, number>>;
   /** TEST SEAM: exact-pot reversal; production uses the core ledger primitive. */
   reverseDebit?: typeof reverseReservation;
+  /** TEST SEAM: deterministic authorization-key collision coverage. */
+  requestId?: () => string;
   /**
    * OpenClaw 2026.6.10 exposes TTS as a chat/control command, not as a direct
    * `/tools/invoke` media tool. Studio keeps the OpenClaw path first, then
@@ -578,6 +583,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
   const pipeline = deps.pipeline ?? new MediaPipeline({ bus, logger: app.log });
   const agentId = deps.agentId ?? 'main';
   const reverseDebit = deps.reverseDebit ?? reverseReservation;
+  const nextRequestId = deps.requestId ?? randomUUID;
   const ttsFallback = deps.ttsFallback === undefined ? elevenLabsTtsFallback : deps.ttsFallback;
 
   // The process should run exactly ONE watcher. Until the chat pipeline
@@ -655,26 +661,23 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
     const action = quote.action;
     const timeoutMs = deps.timeoutsMs?.[body.tool] ?? GENERATION_TIMEOUTS_MS[body.tool];
     const startedAtMs = Date.now();
-    const requestId = randomUUID();
+    const requestId = nextRequestId();
     const idempotencyKey = `studio:${requestId}:reserve`;
     const gatewaySessionKey = `eden3:studio:${requestId}`;
 
     // 1. Debit up front — refunded on any downstream failure. Studio spends
     // count toward the same Q7 daily ceiling as chat turns (checked inside
     // the debit transaction, race-free) — previously studio bypassed the cap.
-    let reservedSubscriptionManna = 0;
+    let reservation;
     try {
-      const debited = await debit({
+      reservation = await reserveStudioGeneration({
+        turnId: requestId,
         accountId: account.accountId,
-        amount: quote.manna,
-        type: `spend:${action}`,
-        idempotencyKey,
-        dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
+        tool: body.tool,
+        quote,
+        reservationKey: idempotencyKey,
+        dailyCap: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER,
       });
-      // Preserve the debit's exact pot split for any downstream reversal.
-      // The reservation key is request-unique, while reverseReservation's
-      // refund leg is idempotent if an in-process retry reaches it twice.
-      reservedSubscriptionManna = debited.subscriptionDrawn ?? 0;
     } catch (err) {
       if (err instanceof InsufficientMannaError) {
         return sendError(
@@ -695,7 +698,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       throw err;
     }
 
-    const settleReserve = async (): Promise<{
+    const settlement: {
       status: 'settled' | 'failed';
       reservedManna: number;
       meteredManna: number;
@@ -704,138 +707,27 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       transactionId: string | null;
       alreadyApplied: boolean;
       error?: string;
-    }> => {
-      const adjustmentManna = quote.manna - quote.manna;
-      if (adjustmentManna === 0) {
-        return {
-          status: 'settled',
-          reservedManna: quote.manna,
-          meteredManna: quote.manna,
-          adjustmentManna,
-          chargedManna: quote.manna,
-          transactionId: null,
-          alreadyApplied: false,
-        };
-      }
-      try {
-        if (adjustmentManna > 0) {
-          const adjusted = await debit({
-            accountId: account.accountId,
-            amount: adjustmentManna,
-            type: `spend:${action}:settle`,
-            idempotencyKey: `${idempotencyKey}:settle`,
-          });
-          return {
-            status: 'settled',
-            reservedManna: quote.manna,
-            meteredManna: quote.manna,
-            adjustmentManna,
-            chargedManna: quote.manna,
-            transactionId: adjusted.transaction.id,
-            alreadyApplied: adjusted.alreadyApplied,
-          };
-        }
-        const adjusted = await credit({
-          accountId: account.accountId,
-          amount: Math.abs(adjustmentManna),
-          type: `refund:${action}:settle`,
-          idempotencyKey: `${idempotencyKey}:settle:refund`,
-        });
-        return {
-          status: 'settled',
-          reservedManna: quote.manna,
-          meteredManna: quote.manna,
-          adjustmentManna,
-          chargedManna: quote.manna,
-          transactionId: adjusted.transaction.id,
-          alreadyApplied: adjusted.alreadyApplied,
-        };
-      } catch (err) {
-        return {
-          status: 'failed',
-          reservedManna: quote.manna,
-          meteredManna: quote.manna,
-          adjustmentManna,
-          chargedManna: quote.manna - adjustmentManna,
-          transactionId: null,
-          alreadyApplied: false,
-          error: err instanceof Error ? err.message : String(err),
-        };
-      }
+    } = {
+      status: 'settled',
+      reservedManna: quote.manna,
+      meteredManna: quote.manna,
+      adjustmentManna: 0,
+      chargedManna: quote.manna,
+      transactionId: null,
+      alreadyApplied: false,
     };
 
-    let usageEventRecorded = false;
-    const recordUsageEvent = async (record: {
-      status: 'completed' | 'error';
-      creationId?: string | null;
-      chargedManna: number;
-      costUsd: number;
-      settlement?: Awaited<ReturnType<typeof settleReserve>> | null;
-      errorCode?: string | null;
-      errorMessage?: string | null;
-    }): Promise<void> => {
-      if (usageEventRecorded) return;
-      usageEventRecorded = true;
-      try {
-        await db.insert(usageEvents).values({
-          eventType: 'studio_generation',
-          status: record.status,
-          userId: account.accountId,
-          agentId: null,
-          sessionId: null,
-          messageId: null,
-          turnId: null,
-          provider: quote.provider,
-          model: quote.model,
-          tableVersion: quote.tableVersion,
-          promptTokens: null,
-          completionTokens: null,
-          cachedTokens: null,
-          totalTokens: null,
-          costUsd: record.costUsd.toFixed(8),
-          manna: record.chargedManna,
-          latencyMs: Date.now() - startedAtMs,
-          errorCode: record.errorCode ?? null,
-          errorMessage: record.errorMessage ?? null,
-          metadata: {
-            tool: body.tool,
-            args: body.args,
-            quote,
-            settlement: record.settlement ?? null,
-            reserveIdempotencyKey: idempotencyKey,
-            creationId: record.creationId ?? null,
-          },
-        });
-      } catch (err) {
-        req.log.error(`studio: usage event insert failed for ${idempotencyKey}: ${String(err)}`);
-      }
-    };
-
-    type RefundOutcome = { status: 'refunded' } | { status: 'refund_pending' };
-    const reverseFailedGeneration = async (): Promise<RefundOutcome> => {
-      try {
-        await reverseDebit({
-          reservationKey: idempotencyKey,
-          reservedSubscriptionManna,
-          type: `refund:${action}`,
-        });
-        return { status: 'refunded' };
-      } catch (refundErr) {
-        req.log.error(`studio: refund of ${idempotencyKey} failed: ${String(refundErr)}`);
-        return { status: 'refund_pending' };
-      }
-    };
-
-    const requireReversal = async (): Promise<void> => {
-      const outcome = await reverseFailedGeneration();
-      if (outcome.status === 'refunded') return;
-      await recordUsageEvent({
-        status: 'error',
-        chargedManna: quote.manna,
-        costUsd: quote.costUsd,
-        errorCode: 'refund_pending',
-        errorMessage: 'Studio generation failed and its manna reversal requires retry',
+    const requireReversal = async (errorCode: string, errorMessage: string): Promise<void> => {
+      const outcome = await compensateStudioGeneration({
+        turnId: requestId,
+        errorCode,
+        errorMessage,
+        latencyMs: Date.now() - startedAtMs,
+        refundType: `refund:${action}`,
+        reverse: reverseDebit,
       });
+      if (outcome !== 'refund_pending') return;
+      req.log.error(`studio: refund of ${idempotencyKey} remains pending`);
       throw new ApiError(
         503,
         'refund_pending',
@@ -853,14 +745,10 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       await claimSource.start();
       claim = claimSource.claimNext({ kinds: TOOL_CLAIM_KINDS[body.tool], timeoutMs });
     } catch (err) {
-      await requireReversal();
-      await recordUsageEvent({
-        status: 'error',
-        chargedManna: 0,
-        costUsd: 0,
-        errorCode: 'watcher_start_failed',
-        errorMessage: err instanceof Error ? err.message : String(err),
-      });
+      await requireReversal(
+        'watcher_start_failed',
+        err instanceof Error ? err.message : String(err),
+      );
       throw err;
     }
 
@@ -906,20 +794,16 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
         try {
           file = await ttsFallback({ args: body.args, requestId, timeoutMs });
         } catch (fallbackErr) {
-          await requireReversal();
           const detail =
             fallbackErr instanceof ApiError
               ? fallbackErr.message
               : fallbackErr instanceof Error
                 ? fallbackErr.message
                 : 'tts provider failed';
-          await recordUsageEvent({
-            status: 'error',
-            chargedManna: 0,
-            costUsd: 0,
-            errorCode: fallbackErr instanceof ApiError ? fallbackErr.code : 'provider_error',
-            errorMessage: detail,
-          });
+          await requireReversal(
+            fallbackErr instanceof ApiError ? fallbackErr.code : 'provider_error',
+            detail,
+          );
           if (fallbackErr instanceof ApiError) {
             return sendError(reply, fallbackErr.statusCode, fallbackErr.code, detail);
           }
@@ -927,36 +811,26 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           return sendError(reply, 502, 'provider_error', `tts failed: ${detail}`);
         }
       } else {
-      await requireReversal();
-      if (timedOut || err instanceof MediaClaimTimeoutError) {
-        await recordUsageEvent({
-          status: 'error',
-          chargedManna: 0,
-          costUsd: 0,
-          errorCode: 'generation_timeout',
-          errorMessage: `${body.tool} did not produce a file within ${Math.round(timeoutMs / 1000)}s`,
-        });
-        return sendError(
-          reply,
-          504,
-          'generation_timeout',
-          `${body.tool} did not produce a file within ${Math.round(timeoutMs / 1000)}s — manna refunded`,
-        );
-      }
-      if (err instanceof ApiError) throw err;
-      const detail =
-        err instanceof GatewayHttpError || err instanceof GatewayToolError
-          ? err.message
-          : 'gateway invocation failed';
-      req.log.error(`studio: ${body.tool} invoke failed: ${String(err)}`);
-      await recordUsageEvent({
-        status: 'error',
-        chargedManna: 0,
-        costUsd: 0,
-        errorCode: 'gateway_error',
-        errorMessage: detail,
-      });
-      return sendError(reply, 502, 'gateway_error', `${body.tool} failed: ${detail}`);
+        if (timedOut || err instanceof MediaClaimTimeoutError) {
+          await requireReversal(
+            'generation_timeout',
+            `${body.tool} did not produce a file within ${Math.round(timeoutMs / 1000)}s`,
+          );
+          return sendError(
+            reply,
+            504,
+            'generation_timeout',
+            `${body.tool} did not produce a file within ${Math.round(timeoutMs / 1000)}s — manna refunded`,
+          );
+        }
+        if (err instanceof ApiError) throw err;
+        const detail =
+          err instanceof GatewayHttpError || err instanceof GatewayToolError
+            ? err.message
+            : 'gateway invocation failed';
+        req.log.error(`studio: ${body.tool} invoke failed: ${String(err)}`);
+        await requireReversal('gateway_error', detail);
+        return sendError(reply, 502, 'gateway_error', `${body.tool} failed: ${detail}`);
       }
     } finally {
       if (timeout) clearTimeout(timeout);
@@ -968,18 +842,18 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
         userId: account.accountId,
         tool: body.tool,
         args: body.args,
+        finalizeTransaction: async (tx, ingested) => {
+          if (!ingested.creation) throw new Error('studio: ingest produced no creation row');
+          await completeStudioGeneration(tx, {
+            reservation,
+            creationId: ingested.creation.id,
+            latencyMs: Date.now() - startedAtMs,
+          });
+        },
       });
       if (!result.creation) {
         throw new Error('studio: ingest produced no creation row');
       }
-      const settlement = await settleReserve();
-      await recordUsageEvent({
-        status: 'completed',
-        creationId: result.creation.id,
-        chargedManna: settlement.chargedManna,
-        costUsd: quote.costUsd,
-        settlement,
-      });
       return {
         creationId: result.creation.id,
         url: result.url,
@@ -988,14 +862,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
         settlement,
       };
     } catch (err) {
-      await requireReversal();
-      await recordUsageEvent({
-        status: 'error',
-        chargedManna: 0,
-        costUsd: quote.costUsd,
-        errorCode: 'ingest_failed',
-        errorMessage: err instanceof Error ? err.message : String(err),
-      });
+      await requireReversal('ingest_failed', err instanceof Error ? err.message : String(err));
       throw err;
     }
   });

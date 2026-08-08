@@ -193,6 +193,16 @@ export interface IngestFileOptions {
   tool?: string | null;
   /** Generation args, stored verbatim on the creation row. */
   args?: Record<string, unknown> | null;
+  /**
+   * Optional durable finalize fence. It runs inside the same DB transaction
+   * that commits the creation/message/asset correlation. Throwing rolls all
+   * of those rows back. Studio uses this to make creation + billing terminal
+   * truth atomic; other ingest callers pay no extra abstraction cost.
+   */
+  finalizeTransaction?: (
+    tx: DbHandle,
+    result: { asset: MediaAsset; creation: Creation | null; message: Message | null },
+  ) => Promise<void>;
 }
 
 export interface IngestFileResult {
@@ -344,7 +354,7 @@ export class MediaPipeline {
             .limit(1);
           creation = row ?? null;
         }
-        return {
+        const result = {
           asset: existing,
           creation,
           message: null,
@@ -357,6 +367,16 @@ export class MediaPipeline {
           debitError: null,
           deduped: true,
         };
+        if (opts.finalizeTransaction) {
+          await this.db.transaction(async (tx) => {
+            await opts.finalizeTransaction?.(tx, {
+              asset: existing,
+              creation,
+              message: null,
+            });
+          });
+        }
+        return result;
       }
     }
 
@@ -412,12 +432,14 @@ export class MediaPipeline {
           .from(creations)
           .where(eq(creations.id, claimed.creationId))
           .limit(1);
-        return {
+        const result = {
           asset: claimed,
           creation: existingCreation ?? null,
           message: null,
           raced: true as const,
         };
+        await opts.finalizeTransaction?.(tx, result);
+        return result;
       }
 
       let creationRow: Creation | null = null;
@@ -504,7 +526,14 @@ export class MediaPipeline {
         .returning();
       if (!assetRow) throw new Error('media-pipeline: media_assets update returned no row');
 
-      return { asset: assetRow, creation: creationRow, message: messageRow, raced: false as const };
+      const result = {
+        asset: assetRow,
+        creation: creationRow,
+        message: messageRow,
+        raced: false as const,
+      };
+      await opts.finalizeTransaction?.(tx, result);
+      return result;
     });
     const { asset, creation, message } = txResult;
 

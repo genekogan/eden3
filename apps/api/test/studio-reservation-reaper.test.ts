@@ -9,6 +9,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { MediaPipeline } from '../src/services/media-pipeline';
 import {
+  compensateStudioGeneration,
   completeStudioGeneration,
   reserveStudioGeneration,
   StudioReservationReaper,
@@ -104,6 +105,11 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
       dailyCap: 10_000,
     });
     expect(await getBalance(accountId)).toMatchObject({ balance: 86, subscriptionBalance: 0 });
+    const [pending] = await pg<{ metadataText: string }[]>`
+      select metadata::text as "metadataText" from usage_events
+      where event_type = 'studio_generation' and turn_id = ${turnId}`;
+    expect(pending?.metadataText).toContain(reservationKey);
+    expect(pending?.metadataText).not.toContain('prompt');
     await pg`update usage_events set created_at = now() - interval '2 hours'
              where event_type = 'studio_generation' and turn_id = ${turnId}`;
 
@@ -127,6 +133,50 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
     const restarted = new StudioReservationReaper({ accountScope: [accountId] });
     expect((await restarted.runOnce()).reaped).toBe(0);
     expect((await getBalance(accountId)).total).toBe(120);
+  });
+
+  it('keeps refund_pending durable and preserves the original failure truth when retry succeeds', async () => {
+    const accountId = await fundedAccount();
+    const turnId = randomUUID();
+    await reserveStudioGeneration({
+      turnId,
+      accountId,
+      tool: 'image_generate',
+      quote,
+      reservationKey: `studio:${turnId}:reserve`,
+      dailyCap: 10_000,
+    });
+    const first = await compensateStudioGeneration({
+      turnId,
+      errorCode: 'provider_error',
+      errorMessage: 'provider failed before producing a file',
+      latencyMs: 17,
+      reverse: async () => {
+        throw new Error('simulated ledger outage');
+      },
+    });
+    expect(first).toBe('refund_pending');
+    const [pending] = await pg<{ status: string; manna: number; errorCode: string }[]>`
+      select status, manna, error_code as "errorCode" from usage_events
+      where event_type = 'studio_generation' and turn_id = ${turnId}`;
+    expect(pending).toEqual({ status: 'refund_pending', manna: 34, errorCode: 'refund_pending' });
+
+    const restarted = new StudioReservationReaper({ accountScope: [accountId] });
+    expect((await restarted.runOnce()).reaped).toBe(1);
+    expect(await getBalance(accountId)).toMatchObject({ balance: 100, subscriptionBalance: 20 });
+    const [terminal] = await pg<
+      { status: string; errorCode: string; errorMessage: string; latencyMs: number }[]
+    >`
+      select status, error_code as "errorCode", error_message as "errorMessage",
+             latency_ms as "latencyMs"
+      from usage_events
+      where event_type = 'studio_generation' and turn_id = ${turnId}`;
+    expect(terminal).toEqual({
+      status: 'error',
+      errorCode: 'provider_error',
+      errorMessage: 'provider failed before producing a file',
+      latencyMs: 17,
+    });
   });
 
   it('rolls creation and completed state back together, then reaps the surviving pending debit', async () => {

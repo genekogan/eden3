@@ -38,6 +38,7 @@ import {
 } from './services/task-scheduler';
 import { TurnRegistry } from './services/turn-registry';
 import { TurnReservationReaper } from './services/turn-reservation-reaper';
+import { StudioReservationReaper } from './services/studio-reservations';
 import type { SessionShareRepository } from './services/session-shares';
 import { PostgresSessionShareRepository } from './services/session-shares-postgres';
 import type { CompatClientLike } from './services/turns';
@@ -153,6 +154,8 @@ declare module 'fastify' {
     taskScheduler: TaskScheduler | null;
     /** Orphaned turn-reservation compensation loop (T08-U02). */
     turnReservationReaper: TurnReservationReaper;
+    /** Orphaned Studio generation compensation loop (DEBT-010). */
+    studioReservationReaper: StudioReservationReaper;
     /** Eden-managed, activity-gated native deep + metered REM loop. */
     memoryDreamScheduler: MemoryDreamScheduler | null;
     /** Durable, fenced async agent-build worker (tests may drive tick()). */
@@ -489,6 +492,18 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     turnReservationReaper.stop();
   });
   if (opts.scheduler?.autoStart === true) turnReservationReaper.start();
+
+  // Studio uses usage_events as a durable authorization row. This independent,
+  // provider-free loop reverses stale pending/refund_pending reservations even
+  // when the gateway is absent or normal scheduled firing is disabled.
+  const studioReservationReaper = new StudioReservationReaper({
+    onError: (err, context) => app.log.error({ err, context }, 'studio-reservation reaper side-error'),
+  });
+  app.decorate('studioReservationReaper', studioReservationReaper);
+  app.addHook('onClose', async () => {
+    studioReservationReaper.stop();
+  });
+  if (opts.scheduler?.autoStart === true) studioReservationReaper.start();
 
   const memoryDreamScheduler =
     gatewayClients && historySync
