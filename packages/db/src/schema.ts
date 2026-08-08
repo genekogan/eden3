@@ -1490,6 +1490,120 @@ export const storageUploadParts = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// storage_upload_part_authorizations — durable capability claims, never raw
+// bearer material. Migration 0032 validates exact part geometry against the
+// parent upload/object and fences refreshes once the parent becomes terminal.
+// ---------------------------------------------------------------------------
+export const storageUploadPartAuthorizations = pgTable(
+  'storage_upload_part_authorizations',
+  {
+    uploadId: uuid('upload_id')
+      .notNull()
+      .references(() => storageUploads.id, { onDelete: 'cascade' }),
+    partNumber: integer('part_number').notNull(),
+    checksumSha256: text('checksum_sha256').notNull(),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
+    expiresAt: timestamptz('expires_at').notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.uploadId, t.partNumber] }),
+    check(
+      'storage_upload_part_authorizations_number_check',
+      sql`${t.partNumber} between 1 and 10000`,
+    ),
+    check(
+      'storage_upload_part_authorizations_checksum_check',
+      sql`${t.checksumSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check('storage_upload_part_authorizations_size_check', sql`${t.sizeBytes} > 0`),
+    check(
+      'storage_upload_part_authorizations_expiry_check',
+      sql`${t.expiresAt} > ${t.createdAt}`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// storage_policy_events — minimal durable quarantine notification outbox. The
+// event UUID is the delivery idempotency key; detector text/content/payloads
+// are deliberately excluded.
+// ---------------------------------------------------------------------------
+export const storagePolicyEvents = pgTable(
+  'storage_policy_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    objectId: uuid('object_id')
+      .notNull()
+      .references(() => storageObjects.id, { onDelete: 'restrict' }),
+    ownerAccountId: uuid('owner_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'restrict' }),
+    eventType: text('event_type', { enum: ['quarantine_required'] }).notNull(),
+    policyCode: text('policy_code').notNull(),
+    state: text('state', { enum: ['pending', 'delivering', 'delivered', 'failed'] })
+      .notNull()
+      .default('pending'),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    nextAttemptAt: timestamptz('next_attempt_at'),
+    claimToken: uuid('claim_token'),
+    claimExpiresAt: timestamptz('claim_expires_at'),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+    deliveredAt: timestamptz('delivered_at'),
+  },
+  (t) => [
+    uniqueIndex('storage_policy_events_object_type_policy_uq').on(
+      t.objectId,
+      t.eventType,
+      t.policyCode,
+    ),
+    index('storage_policy_events_due_idx')
+      .on(t.nextAttemptAt)
+      .where(sql`${t.state} = 'pending'`),
+    index('storage_policy_events_claim_expiry_idx')
+      .on(t.claimExpiresAt)
+      .where(sql`${t.state} = 'delivering'`),
+    foreignKey({
+      name: 'storage_policy_events_object_owner_fk',
+      columns: [t.objectId, t.ownerAccountId],
+      foreignColumns: [storageObjects.id, storageObjects.ownerAccountId],
+    }).onDelete('restrict'),
+    check(
+      'storage_policy_events_event_type_check',
+      sql`${t.eventType} = 'quarantine_required'`,
+    ),
+    check(
+      'storage_policy_events_policy_code_check',
+      sql`${t.policyCode} ~ '^[a-z0-9_:-]{1,100}$'`,
+    ),
+    check(
+      'storage_policy_events_state_check',
+      sql`${t.state} in ('pending', 'delivering', 'delivered', 'failed')`,
+    ),
+    check('storage_policy_events_attempt_count_check', sql`${t.attemptCount} >= 0`),
+    check(
+      'storage_policy_events_last_error_code_check',
+      sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z0-9_:-]{1,100}$'`,
+    ),
+    check(
+      'storage_policy_events_claim_shape_check',
+      sql`(${t.state} = 'delivering' and ${t.claimToken} is not null and ${t.claimExpiresAt} is not null) or (${t.state} <> 'delivering' and ${t.claimToken} is null and ${t.claimExpiresAt} is null)`,
+    ),
+    check(
+      'storage_policy_events_schedule_shape_check',
+      sql`(${t.state} = 'pending' and ${t.nextAttemptAt} is not null) or (${t.state} <> 'pending' and ${t.nextAttemptAt} is null)`,
+    ),
+    check(
+      'storage_policy_events_delivery_shape_check',
+      sql`(${t.state} = 'delivered' and ${t.deliveredAt} is not null) or (${t.state} <> 'delivered' and ${t.deliveredAt} is null)`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // etl_runs — immutable source boundaries for one bounded ETL attempt.
 //
 // Every canonical Mongo collection receives one identical prior-whole-second
@@ -1629,6 +1743,10 @@ export type StorageUpload = typeof storageUploads.$inferSelect;
 export type NewStorageUpload = typeof storageUploads.$inferInsert;
 export type StorageUploadPart = typeof storageUploadParts.$inferSelect;
 export type NewStorageUploadPart = typeof storageUploadParts.$inferInsert;
+export type StorageUploadPartAuthorization = typeof storageUploadPartAuthorizations.$inferSelect;
+export type NewStorageUploadPartAuthorization = typeof storageUploadPartAuthorizations.$inferInsert;
+export type StoragePolicyEvent = typeof storagePolicyEvents.$inferSelect;
+export type NewStoragePolicyEvent = typeof storagePolicyEvents.$inferInsert;
 export type EtlRun = typeof etlRuns.$inferSelect;
 export type NewEtlRun = typeof etlRuns.$inferInsert;
 export type EtlState = typeof etlState.$inferSelect;
