@@ -482,4 +482,26 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     expect(first.values[id]).toBe(tokensById.get(row.id));
     expect(replay.values[id]).toBe(tokensById.get(row.id));
   });
+
+  it('KNOWN RESIDUAL (DEBT-012): a c1 capability follows token rotation until remint/epoch lands', async () => {
+    const row = connectionRow();
+    rows = [row];
+    await start();
+    const id = capIdFor(row);
+    const before = await callBridge([id]);
+    const replacement = `rotated-${randomUUID()}`;
+    Object.assign(
+      row,
+      connectionRow({
+        id: row.id,
+        account_id: row.account_id,
+        channel: row.channel,
+        runtime_account_id: row.runtime_account_id,
+        token: replacement,
+      }),
+    );
+    const after = await callBridge([id]);
+    expect(before.values[id]).not.toBe(replacement);
+    expect(after.values[id]).toBe(replacement);
+  });
 });
