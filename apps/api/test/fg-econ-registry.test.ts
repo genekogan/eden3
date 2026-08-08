@@ -123,12 +123,10 @@ describe('FG-ECON registry integrity (MVP-ACCEPTANCE §1.7)', () => {
     }
   });
 
-  it('defect-evidence entries are flagged so they are never counted as positive FG-ECON coverage', () => {
-    // Some registered ids document a KNOWN defect executably (e.g. the studio
-    // sub->durable laundering vector). They must carry `defect: true` so the
-    // generated evidence separates them from positive coverage.
+  it('the closed Studio laundering case is positive FG-ECON coverage', () => {
     const launder = entries.find((e) => e.id === 'FG-ECON-STUDIO-LAUNDER') as (RegistryEntry & { defect?: boolean }) | undefined;
-    expect(launder?.defect).toBe(true);
+    expect(launder).toBeDefined();
+    expect(launder?.defect).not.toBe(true);
   });
 
   it('the execution-binding generator exists and targets the battery', () => {

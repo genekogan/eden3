@@ -230,15 +230,10 @@ describe('FG-ECON studio battery (quote == settle, T-BILL deterministic media)',
     }
   });
 
-  // FG-ECON-STUDIO-LAUNDER: DEBT EVIDENCE (checkpoint-#1 finding 5). Studio
-  // debits subscription-first but refunds on failure via the generic durable
-  // refund path — converting expiring subscription manna into permanent durable
-  // manna. Aggregate is net-zero (no value created), so this is not a red gate;
-  // it DOCUMENTS the laundering vector for the owner unit (T08-U04 pot lots /
-  // studio settle path). When U04 lands split-exact studio refunds, the pot
-  // assertions below flip to "subscription restored" and this becomes a
-  // regression guard.
-  it('FG-ECON-STUDIO-LAUNDER: a failed subscription-funded studio op refunds to DURABLE (documents the sub→durable laundering vector)', async () => {
+  // FG-ECON-STUDIO-LAUNDER: a failed Studio generation must reverse the exact
+  // pots drawn by its upfront debit. Aggregate-only conservation would miss a
+  // subscription→durable conversion, so keep both pot assertions explicit.
+  it('FG-ECON-STUDIO-LAUNDER: a failed subscription-funded studio op restores subscription without minting durable manna', async () => {
     const quote = oracleStudioQuote('image_generate', { prompt: 'x' }).manna;
     const userId = await makeUser({ subscription: quote }); // subscription-only funding
     invokeCalls = [];
@@ -252,12 +247,10 @@ describe('FG-ECON studio battery (quote == settle, T-BILL deterministic media)',
     expect(res.statusCode).toBeGreaterThanOrEqual(500); // provider/timeout failure
 
     const after = await getBalance(userId);
-    // Aggregate net-zero (no value created or destroyed) — the money invariant
-    // that DOES hold today.
+    // Exact-pot conservation: no value is created or destroyed, and expiring
+    // subscription manna cannot be converted into durable manna.
     expect(after.total).toBe(before.total);
-    // The laundering vector: subscription manna was debited, then refunded to
-    // DURABLE. Documented; owned by T08-U04. (DEBT filed in orchestration/DEBT.md.)
-    expect(after.subscriptionBalance).toBe(0);
-    expect(after.balance).toBe(quote);
+    expect(after.subscriptionBalance).toBe(quote);
+    expect(after.balance).toBe(0);
   });
 });

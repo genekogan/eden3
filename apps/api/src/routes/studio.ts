@@ -12,7 +12,7 @@ import {
   debit,
   getEnv,
   mannaForEstimate,
-  refund,
+  reverseReservation,
   type CostEstimate,
   type CostProvider,
   type CostUnit,
@@ -567,14 +567,19 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
     // 1. Debit up front — refunded on any downstream failure. Studio spends
     // count toward the same Q7 daily ceiling as chat turns (checked inside
     // the debit transaction, race-free) — previously studio bypassed the cap.
+    let reservedSubscriptionManna = 0;
     try {
-      await debit({
+      const debited = await debit({
         accountId: account.accountId,
         amount: quote.manna,
         type: `spend:${action}`,
         idempotencyKey,
         dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
       });
+      // Preserve the debit's exact pot split for any downstream reversal.
+      // The reservation key is request-unique, while reverseReservation's
+      // refund leg is idempotent if an in-process retry reaches it twice.
+      reservedSubscriptionManna = debited.subscriptionDrawn ?? 0;
     } catch (err) {
       if (err instanceof InsufficientMannaError) {
         return sendError(
@@ -597,7 +602,11 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
 
     const refundQuietly = async (): Promise<void> => {
       try {
-        await refund({ originalIdempotencyKey: idempotencyKey, type: `refund:${action}` });
+        await reverseReservation({
+          reservationKey: idempotencyKey,
+          reservedSubscriptionManna,
+          type: `refund:${action}`,
+        });
       } catch (refundErr) {
         req.log.error(`studio: refund of ${idempotencyKey} failed: ${String(refundErr)}`);
       }
