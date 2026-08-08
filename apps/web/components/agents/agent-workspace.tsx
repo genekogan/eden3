@@ -29,6 +29,11 @@ import {
   type WorkspaceTreeNode,
 } from "@/components/agents/workspace-tree";
 import { formatRelativeTime } from "@/lib/format";
+import { DoctrineOwnershipNotice } from "@/components/agents/doctrine-ownership-notice";
+import {
+  doctrineFileOwnership,
+  type DoctrineSyncState,
+} from "@/lib/doctrine-file-ownership";
 
 // ---------------------------------------------------------------------------
 // Small pieces
@@ -261,7 +266,11 @@ export function AgentWorkspacePanel({
         mtime: file.mtime,
       });
       setConflict(null);
-      setNote("Saved.");
+      setNote(
+        viewer.path === "SOUL.md"
+          ? "Saved and synced with Settings → Persona."
+          : "Saved.",
+      );
       void loadTree();
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
@@ -361,6 +370,21 @@ export function AgentWorkspacePanel({
 
   const tree = buildWorkspaceTree(entries);
   const dirty = viewer.kind === "text" && viewer.draft !== viewer.loadedContent;
+  const ownership =
+    viewer.kind === "idle" || viewer.kind === "loading" || viewer.kind === "error"
+      ? null
+      : doctrineFileOwnership(viewer.path, username);
+  const workspaceEditable = ownership?.editableInWorkspace ?? true;
+  const syncState: DoctrineSyncState | undefined =
+    ownership?.kind !== "two-way-settings"
+      ? undefined
+      : conflict
+        ? "conflict"
+        : saving
+          ? "saving"
+          : dirty
+            ? "unsaved"
+            : "synced";
 
   return (
     <div className="min-w-0">
@@ -454,6 +478,10 @@ export function AgentWorkspacePanel({
                 </p>
               ) : null}
 
+              {ownership ? (
+                <DoctrineOwnershipNotice ownership={ownership} syncState={syncState} />
+              ) : null}
+
               {conflict ? (
                 <div className="rounded-xl border border-warning/25 bg-warning/5 px-4 py-3 text-sm">
                   <p className="font-medium text-warning-soft">
@@ -499,23 +527,35 @@ export function AgentWorkspacePanel({
                 <>
                   <textarea
                     value={viewer.draft}
-                    onChange={(event) => setViewer({ ...viewer, draft: event.target.value })}
+                    onChange={(event) =>
+                      workspaceEditable
+                        ? setViewer({ ...viewer, draft: event.target.value })
+                        : undefined
+                    }
+                    readOnly={!workspaceEditable}
+                    aria-readonly={!workspaceEditable}
                     spellCheck={false}
-                    className="min-h-[360px] w-full max-w-full resize-y rounded-lg border border-edge bg-black/20 p-4 font-mono text-[13px] leading-relaxed text-muted outline-none transition-colors focus:border-accent/60"
+                    className={`min-h-[360px] w-full max-w-full resize-y rounded-lg border border-edge p-4 font-mono text-[13px] leading-relaxed text-muted outline-none transition-colors ${
+                      workspaceEditable
+                        ? "bg-black/20 focus:border-accent/60"
+                        : "cursor-default bg-surface/70"
+                    }`}
                   />
-                  <div className="flex items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => void save()}
-                      disabled={saving || !dirty || conflict !== null}
-                      className={primaryButtonClass}
-                    >
-                      {saving ? "Saving…" : "Save"}
-                    </button>
-                    {dirty && !saving ? (
-                      <span className="text-xs text-faint">Unsaved changes</span>
-                    ) : null}
-                  </div>
+                  {workspaceEditable ? (
+                    <div className="flex items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => void save()}
+                        disabled={saving || !dirty || conflict !== null}
+                        className={primaryButtonClass}
+                      >
+                        {saving ? "Saving…" : "Save"}
+                      </button>
+                      {dirty && !saving ? (
+                        <span className="text-xs text-faint">Unsaved changes</span>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </>
               )}
             </div>

@@ -204,7 +204,15 @@ export function PersonaEditor({ username }: { username: string }) {
       ) : null}
 
       <div className="flex items-center justify-between gap-2.5 border-t border-edge pt-4">
-        <p className="text-xs text-faint">{dirty ? "Unsaved changes" : "All changes saved"}</p>
+        <p role="status" className={conflict ? "text-xs text-warning-soft" : "text-xs text-faint"}>
+          {conflict
+            ? "Conflict — choose which version to keep"
+            : saving
+              ? "Saving to Workspace…"
+              : dirty
+                ? "Unsaved changes"
+                : "Synced with Workspace"}
+        </p>
         <button
           type="button"
           onClick={() => void save()}
@@ -217,14 +225,15 @@ export function PersonaEditor({ username }: { username: string }) {
       </div>
 
       <p className="text-xs leading-relaxed text-faint">
-        The rest of the persona doctrine ({SIBLING_FILES.join(", ")}) lives in{" "}
+        The rest of the persona doctrine ({SIBLING_FILES.join(", ")}) is visible in{" "}
         <Link
           href={`/agents/${encodeURIComponent(username)}/workspace`}
           className="text-accent-soft transition-colors hover:text-accent"
         >
           Workspace
         </Link>
-        , where every file is edited with the same conflict-checked flow.
+        . Generated files are labeled by their real owner and remain read-only there;
+        use the linked Settings surface when one exists.
       </p>
 
       {toast ? <Toast message={toast} onDismiss={() => setToast(null)} /> : null}
