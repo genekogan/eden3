@@ -1493,6 +1493,18 @@ export const storageUploads = pgTable(
     expiresAt: timestamptz('expires_at').notNull(),
     capabilityExpiresAt: timestamptz('capability_expires_at').notNull(),
     completedAt: timestamptz('completed_at'),
+    cleanupState: text('cleanup_state', {
+      enum: ['not_required', 'pending', 'claimed', 'succeeded', 'failed'],
+    })
+      .notNull()
+      .default('not_required'),
+    cleanupAttemptCount: integer('cleanup_attempt_count').notNull().default(0),
+    cleanupNextAttemptAt: timestamptz('cleanup_next_attempt_at'),
+    cleanupClaimToken: uuid('cleanup_claim_token'),
+    cleanupClaimExpiresAt: timestamptz('cleanup_claim_expires_at'),
+    cleanupEnqueuedAt: timestamptz('cleanup_enqueued_at'),
+    cleanupSucceededAt: timestamptz('cleanup_succeeded_at'),
+    cleanupLastErrorCode: text('cleanup_last_error_code'),
     createdAt: timestamptz('created_at').notNull().defaultNow(),
     updatedAt: timestamptz('updated_at').notNull().defaultNow(),
   },
@@ -1501,6 +1513,12 @@ export const storageUploads = pgTable(
     index('storage_uploads_owner_state_idx').on(t.ownerAccountId, t.state, t.createdAt),
     index('storage_uploads_expiry_idx').on(t.expiresAt).where(
       sql`${t.state} in ('initiated', 'uploading')`,
+    ),
+    index('storage_uploads_cleanup_due_idx').on(t.cleanupNextAttemptAt, t.id).where(
+      sql`${t.cleanupState} = 'pending'`,
+    ),
+    index('storage_uploads_cleanup_claim_expiry_idx').on(t.cleanupClaimExpiresAt, t.id).where(
+      sql`${t.cleanupState} = 'claimed'`,
     ),
     foreignKey({
       name: 'storage_uploads_object_owner_fk',
@@ -1524,6 +1542,22 @@ export const storageUploads = pgTable(
       sql`(${t.state} = 'completed' and ${t.completedAt} is not null) or (${t.state} <> 'completed' and ${t.completedAt} is null)`,
     ),
     check('storage_uploads_backend_id_check', sql`length(${t.backendMultipartId}) > 0`),
+    check(
+      'storage_uploads_cleanup_state_check',
+      sql`${t.cleanupState} in ('not_required', 'pending', 'claimed', 'succeeded', 'failed')`,
+    ),
+    check(
+      'storage_uploads_cleanup_attempt_bounds_check',
+      sql`${t.cleanupAttemptCount} between 0 and 100`,
+    ),
+    check(
+      'storage_uploads_cleanup_error_code_check',
+      sql`${t.cleanupLastErrorCode} is null or ${t.cleanupLastErrorCode} ~ '^[a-z][a-z0-9_]{0,99}$'`,
+    ),
+    check(
+      'storage_uploads_cleanup_shape_check',
+      sql`(${t.state} in ('initiated', 'uploading', 'completed') and ${t.cleanupState} = 'not_required' and ${t.cleanupAttemptCount} = 0 and ${t.cleanupNextAttemptAt} is null and ${t.cleanupClaimToken} is null and ${t.cleanupClaimExpiresAt} is null and ${t.cleanupEnqueuedAt} is null and ${t.cleanupSucceededAt} is null and ${t.cleanupLastErrorCode} is null) or (${t.state} in ('aborted', 'expired') and ${t.cleanupEnqueuedAt} is not null and ${t.cleanupSucceededAt} is null and ((${t.cleanupState} = 'pending' and ${t.cleanupNextAttemptAt} is not null and ${t.cleanupClaimToken} is null and ${t.cleanupClaimExpiresAt} is null) or (${t.cleanupState} = 'claimed' and ${t.cleanupNextAttemptAt} is null and ${t.cleanupClaimToken} is not null and ${t.cleanupClaimExpiresAt} is not null) or (${t.cleanupState} = 'failed' and ${t.cleanupNextAttemptAt} is null and ${t.cleanupClaimToken} is null and ${t.cleanupClaimExpiresAt} is null and ${t.cleanupLastErrorCode} is not null))) or (${t.state} in ('aborted', 'expired') and ${t.cleanupState} = 'succeeded' and ${t.cleanupEnqueuedAt} is not null and ${t.cleanupSucceededAt} is not null and ${t.cleanupSucceededAt} >= ${t.cleanupEnqueuedAt} and ${t.cleanupNextAttemptAt} is null and ${t.cleanupClaimToken} is null and ${t.cleanupClaimExpiresAt} is null and ${t.cleanupLastErrorCode} is null)`,
+    ),
   ],
 );
 
