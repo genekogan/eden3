@@ -106,6 +106,12 @@ export const notificationCreatedEventSchema = z.object({
 });
 export type NotificationCreatedEvent = z.infer<typeof notificationCreatedEventSchema>;
 
+/** A notification read/dismiss mutation committed; subscribers re-read authority. */
+export const notificationChangedEventSchema = z.object({
+  type: z.literal('notification.changed'),
+});
+export type NotificationChangedEvent = z.infer<typeof notificationChangedEventSchema>;
+
 // ---------------------------------------------------------------------------
 // Discriminated union
 // ---------------------------------------------------------------------------
@@ -118,6 +124,7 @@ export const sessionEventSchema = z.discriminatedUnion('type', [
   mediaAttachedEventSchema,
   mannaUpdatedEventSchema,
   notificationCreatedEventSchema,
+  notificationChangedEventSchema,
   errorEventSchema,
 ]);
 export type SessionEvent = z.infer<typeof sessionEventSchema>;
@@ -131,6 +138,7 @@ export const SESSION_EVENT_TYPES = [
   'media.attached',
   'manna.updated',
   'notification.created',
+  'notification.changed',
   'error',
 ] as const satisfies readonly SessionEventType[];
 

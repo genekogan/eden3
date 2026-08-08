@@ -7,34 +7,47 @@ export interface NotificationCenterState {
 
 /** Monotonic fence for account-scoped async loads across direct A→B switches. */
 export class NotificationLoadFence {
-  private generation = 0;
+  private accountGeneration = 0;
+  private requestGeneration = 0;
 
-  begin(): number {
-    this.generation += 1;
-    return this.generation;
+  beginAccount(): number {
+    this.accountGeneration += 1;
+    this.requestGeneration = 0;
+    return this.accountGeneration;
   }
 
-  current(): number {
-    return this.generation;
+  currentAccount(): number {
+    return this.accountGeneration;
   }
 
-  invalidate(generation: number): void {
-    if (this.generation === generation) this.generation += 1;
+  beginRequest(accountGeneration: number): { account: number; request: number } | null {
+    if (this.accountGeneration !== accountGeneration) return null;
+    this.requestGeneration += 1;
+    return { account: accountGeneration, request: this.requestGeneration };
   }
 
-  isCurrent(generation: number): boolean {
-    return this.generation === generation;
+  invalidateAccount(accountGeneration: number): void {
+    if (this.accountGeneration === accountGeneration) {
+      this.accountGeneration += 1;
+      this.requestGeneration = 0;
+    }
+  }
+
+  isCurrent(token: { account: number; request: number }): boolean {
+    return (
+      this.accountGeneration === token.account && this.requestGeneration === token.request
+    );
   }
 }
 
 export async function applyLatestNotificationLoad(
   fence: NotificationLoadFence,
-  generation: number,
+  token: { account: number; request: number },
   load: () => Promise<NotificationCenterState>,
   apply: (state: NotificationCenterState) => void,
 ): Promise<void> {
   const state = await load();
-  if (fence.isCurrent(generation)) apply(state);
+  if (fence.isCurrent(token)) apply(state);
 }
 
 export function notificationCopy(item: AppNotificationDto): string {

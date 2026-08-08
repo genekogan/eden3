@@ -786,11 +786,16 @@ export class AgentProvisioner {
     let visibleSince: number | undefined;
     for (;;) {
       try {
-        const res = await this.fetchImpl(`${baseUrl}/v1/models`, {
-          headers: { authorization: `Bearer ${this.gateway.token}` },
+        const remainingMs = Math.max(1, deadline - Date.now());
+        const { res, json } = await withAbortableTimeout(remainingMs, async (signal) => {
+          const response = await this.fetchImpl(`${baseUrl}/v1/models`, {
+            headers: { authorization: `Bearer ${this.gateway.token}` },
+            signal,
+          });
+          return { res: response, json: response.ok ? await response.json() : null };
         });
         if (res.ok) {
-          const body = modelsResponseSchema.safeParse(await res.json());
+          const body = modelsResponseSchema.safeParse(json);
           const ids = body.success ? (body.data.data ?? []).map((m) => m.id) : [];
           if (ids.includes(modelId)) {
             visibleSince ??= Date.now();
@@ -815,6 +820,25 @@ export class AgentProvisioner {
       }
       await sleep(this.routablePollIntervalMs);
     }
+  }
+}
+
+async function withAbortableTimeout<T>(
+  timeoutMs: number,
+  run: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`gateway request timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([run(controller.signal), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

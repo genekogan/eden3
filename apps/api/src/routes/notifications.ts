@@ -7,6 +7,7 @@ import { sendError } from '../errors';
 import {
   type AppNotificationStore,
   notificationChannel,
+  publishNotificationChanged,
   PostgresAppNotificationStore,
 } from '../services/app-notifications';
 
@@ -37,12 +38,15 @@ export const notificationsRoutes: FastifyPluginAsync<NotificationsRoutesOptions>
     if (!(await store.markRead(req.account.accountId, id))) {
       return sendError(reply, 404, 'not_found', 'Notification not found');
     }
+    publishNotificationChanged(app.eventsBus, req.account.accountId);
     return { ok: true };
   });
 
   app.post('/read-all', { preHandler: app.requireAuth }, async (req, reply) => {
     if (!req.account) return sendError(reply, 401, 'unauthorized', 'Authentication required');
-    return { ok: true, updated: await store.markAllRead(req.account.accountId) };
+    const updated = await store.markAllRead(req.account.accountId);
+    publishNotificationChanged(app.eventsBus, req.account.accountId);
+    return { ok: true, updated };
   });
 
   app.delete('/:id', { preHandler: app.requireAuth }, async (req, reply) => {
@@ -51,6 +55,7 @@ export const notificationsRoutes: FastifyPluginAsync<NotificationsRoutesOptions>
     if (!(await store.dismiss(req.account.accountId, id))) {
       return sendError(reply, 404, 'not_found', 'Notification not found');
     }
+    publishNotificationChanged(app.eventsBus, req.account.accountId);
     return reply.code(204).send();
   });
 

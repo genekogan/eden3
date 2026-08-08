@@ -427,7 +427,9 @@ export function subscribeNotifications(
   source.onopen = () => onCreated();
   source.onmessage = (message: MessageEvent<string>) => {
     const event = decodeSessionEventData(message.data);
-    if (event?.type === "notification.created") onCreated();
+    if (event?.type === "notification.created" || event?.type === "notification.changed") {
+      onCreated();
+    }
   };
   if (options.onConnectionError) source.onerror = options.onConnectionError;
   return () => source.close();

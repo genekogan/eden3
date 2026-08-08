@@ -47,6 +47,7 @@ const fixtures: SessionEvent[] = [
     notificationId: ids.message,
     kind: 'agent_build_ready',
   },
+  { type: 'notification.changed' },
   { type: 'error', turnId: ids.turn, code: 'gateway_error', message: 'upstream 502' },
   { type: 'error', code: 'insufficient_manna', message: 'balance is 0' },
 ];

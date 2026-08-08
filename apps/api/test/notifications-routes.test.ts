@@ -112,6 +112,14 @@ describe('notifications routes', () => {
   });
 
   it('marks all read and dismisses through tenant-scoped mutations', async () => {
+    const ownerFrames: string[] = [];
+    const strangerFrames: string[] = [];
+    app.eventsBus.subscribe(`account:${OWNER}`, {
+      write: (frame: string) => ownerFrames.push(frame),
+    });
+    app.eventsBus.subscribe(`account:${STRANGER}`, {
+      write: (frame: string) => strangerFrames.push(frame),
+    });
     const all = await app.inject({
       method: 'POST',
       url: '/notifications/read-all',
@@ -129,5 +137,8 @@ describe('notifications routes', () => {
       { op: 'read-all', accountId: OWNER },
       { op: 'dismiss', accountId: OWNER, id: NOTICE },
     ]);
+    expect(ownerFrames).toHaveLength(2);
+    expect(ownerFrames.every((frame) => frame.includes('notification.changed'))).toBe(true);
+    expect(strangerFrames).toEqual([]);
   });
 });

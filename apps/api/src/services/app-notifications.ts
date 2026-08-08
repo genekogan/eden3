@@ -121,3 +121,7 @@ export async function publishBuildNotification(
     kind,
   });
 }
+
+export function publishNotificationChanged(bus: EventsBus, accountId: string): void {
+  bus.publish(notificationChannel(accountId), { type: 'notification.changed' });
+}

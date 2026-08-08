@@ -606,6 +606,19 @@ describe('AgentProvisioner.provisionAgent', () => {
     ).rejects.toThrow(/not routable within 60ms/);
   });
 
+  it('bounds a fetch implementation that never settles or observes abort', async () => {
+    const neverSettles = (async () => new Promise<Response>(() => {})) as typeof fetch;
+    const startedAt = Date.now();
+    await expect(
+      makeProvisioner({ fetchImpl: neverSettles, routableTimeoutMs: 60 }).provisionAgent({
+        ...PARAMS,
+        openclawId: 'banny3',
+        username: 'banny3',
+      }),
+    ).rejects.toThrow(/not routable within 60ms/);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
   it('rejects path-hostile openclaw ids', async () => {
     const provisioner = makeProvisioner({});
     for (const bad of ['../evil', 'UPPER', 'has space', '', 'dot.dot']) {

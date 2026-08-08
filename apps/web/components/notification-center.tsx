@@ -47,11 +47,13 @@ export function NotificationCenter({
   const root = useRef<HTMLDivElement>(null);
   const loadFence = useRef(new NotificationLoadFence());
 
-  const refresh = useCallback(async (generation: number) => {
+  const refresh = useCallback(async (accountGeneration: number) => {
+    const token = loadFence.current.beginRequest(accountGeneration);
+    if (!token) return;
     try {
       await applyLatestNotificationLoad(
         loadFence.current,
-        generation,
+        token,
         () => api.notifications.list(),
         setState,
       );
@@ -61,16 +63,16 @@ export function NotificationCenter({
   }, []);
 
   useEffect(() => {
-    const generation = loadFence.current.begin();
+    const accountGeneration = loadFence.current.beginAccount();
     setOpen(false);
     setState({ items: [], unreadCount: 0 });
     if (!accountKey) {
       return;
     }
-    void refresh(generation);
-    const unsubscribe = api.notifications.subscribe(() => void refresh(generation));
+    void refresh(accountGeneration);
+    const unsubscribe = api.notifications.subscribe(() => void refresh(accountGeneration));
     return () => {
-      loadFence.current.invalidate(generation);
+      loadFence.current.invalidateAccount(accountGeneration);
       unsubscribe();
     };
   }, [accountKey, refresh]);
@@ -93,19 +95,26 @@ export function NotificationCenter({
 
   const markRead = (id: string) => {
     setState((current) => markNotificationRead(current, id, new Date().toISOString()));
-    void api.notifications.markRead(id).catch(() => void refresh(loadFence.current.current()));
+    void api.notifications
+      .markRead(id)
+      .then(() => void refresh(loadFence.current.currentAccount()))
+      .catch(() => void refresh(loadFence.current.currentAccount()));
   };
 
   const markAllRead = () => {
     setState((current) => markEveryNotificationRead(current, new Date().toISOString()));
     void api.notifications
       .markAllRead()
-      .catch(() => void refresh(loadFence.current.current()));
+      .then(() => void refresh(loadFence.current.currentAccount()))
+      .catch(() => void refresh(loadFence.current.currentAccount()));
   };
 
   const dismiss = (id: string) => {
     setState((current) => dismissNotification(current, id));
-    void api.notifications.dismiss(id).catch(() => void refresh(loadFence.current.current()));
+    void api.notifications
+      .dismiss(id)
+      .then(() => void refresh(loadFence.current.currentAccount()))
+      .catch(() => void refresh(loadFence.current.currentAccount()));
   };
 
   return (

@@ -66,19 +66,21 @@ describe("notification center model", () => {
       },
     );
     const applied: string[][] = [];
-    const aGeneration = fence.begin();
+    const aGeneration = fence.beginAccount();
+    const aToken = fence.beginRequest(aGeneration)!;
     const aLoad = applyLatestNotificationLoad(
       fence,
-      aGeneration,
+      aToken,
       () => delayedA,
       (state) => applied.push(state.items.map((item) => item.sourceAgent.username)),
     );
 
-    fence.invalidate(aGeneration);
-    const bGeneration = fence.begin();
+    fence.invalidateAccount(aGeneration);
+    const bGeneration = fence.beginAccount();
+    const bToken = fence.beginRequest(bGeneration)!;
     await applyLatestNotificationLoad(
       fence,
-      bGeneration,
+      bToken,
       async () => ({
         items: [{ ...ready, sourceAgent: { ...ready.sourceAgent, username: "tenant-b" } }],
         unreadCount: 1,
@@ -88,5 +90,32 @@ describe("notification center model", () => {
     releaseA({ items: [ready], unreadCount: 1 });
     await aLoad;
     expect(applied).toEqual([["tenant-b"]]);
+  });
+
+  it("rejects an older same-tenant snapshot that resolves after a newer one", async () => {
+    const fence = new NotificationLoadFence();
+    const account = fence.beginAccount();
+    let releaseOld!: (state: { items: AppNotificationDto[]; unreadCount: number }) => void;
+    const oldResponse = new Promise<{ items: AppNotificationDto[]; unreadCount: number }>(
+      (resolve) => {
+        releaseOld = resolve;
+      },
+    );
+    const applied: number[] = [];
+    const oldLoad = applyLatestNotificationLoad(
+      fence,
+      fence.beginRequest(account)!,
+      () => oldResponse,
+      (state) => applied.push(state.unreadCount),
+    );
+    await applyLatestNotificationLoad(
+      fence,
+      fence.beginRequest(account)!,
+      async () => ({ items: [ready], unreadCount: 1 }),
+      (state) => applied.push(state.unreadCount),
+    );
+    releaseOld({ items: [], unreadCount: 0 });
+    await oldLoad;
+    expect(applied).toEqual([1]);
   });
 });
