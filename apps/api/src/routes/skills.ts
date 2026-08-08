@@ -17,17 +17,11 @@ import { isPlatformEve } from '../services/default-assistant';
 
 const skillSlugSchema = z
   .string()
-  .trim()
-  .transform((value) => value.toLowerCase())
-  .pipe(
-    z
-      .string()
-      .min(2)
-      .max(64)
-      .regex(
-        /^[a-z0-9][a-z0-9_-]*$/,
-        'slug must be path-safe lowercase letters, digits, "-", "_" and start alphanumeric',
-      ),
+  .min(2)
+  .max(64)
+  .regex(
+    /^[a-z0-9][a-z0-9_-]*$/,
+    'slug must be canonical lowercase letters, digits, "-", "_" and start alphanumeric',
   );
 
 const skillParamsSchema = z.object({ slug: skillSlugSchema });
@@ -173,7 +167,7 @@ export const skillsRoutes: FastifyPluginAsync = async (app) => {
         select distinct aks.agent_id, g.provision_status, g.openclaw_id, g.workspace_path
         from agent_skills aks
         join agents g on g.account_id = aks.agent_id
-        where aks.skill_id = ${row.id}
+        where aks.skill_id = ${row.id} and aks.enabled = true
         order by aks.agent_id
       `;
       const affectedAgentIds = affected.map((agent) => agent.agent_id);
@@ -190,7 +184,11 @@ export const skillsRoutes: FastifyPluginAsync = async (app) => {
       for (const agentId of affectedAgentIds) {
         await sql`select pg_advisory_xact_lock(hashtextextended(${agentId}::text, 91))`;
       }
-      await sql`delete from agent_skills where skill_id = ${row.id}`;
+      await sql`
+        update agent_skills
+        set enabled = false
+        where skill_id = ${row.id} and enabled = true
+      `;
       if (affectedAgentIds.length > 0) {
         await sql`
           update agents
@@ -231,7 +229,7 @@ export const skillsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const attached = (await attachedSkillRows(account.id))
-      .filter((row) => manager || (row.enabled && row.status === 'approved'))
+      .filter((row) => row.enabled && (manager || row.status === 'approved'))
       .map((row) => ({ ...skillDto(row), enabled: row.enabled }));
 
     const available = manager
