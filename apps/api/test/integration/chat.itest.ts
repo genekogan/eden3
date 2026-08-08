@@ -73,6 +73,8 @@ async function scrubStaleChatFixtures(): Promise<void> {
 
   await pg`delete from usage_events where user_id = any(${accountIds}::uuid[]) or agent_id = any(${accountIds}::uuid[])`;
   await pg`
+    delete from turn_authorizations where account_id = any(${accountIds}::uuid[])`;
+  await pg`
     delete from manna_transactions where manna_account_id in
       (select id from manna_accounts where account_id = any(${accountIds}::uuid[]))`;
   await pg`delete from manna_accounts where account_id = any(${accountIds}::uuid[])`;
@@ -186,7 +188,8 @@ beforeAll(async () => {
   const [owner] = await pg<{ id: string }[]>`
     insert into accounts (type, username) values ('user', ${usernames.owner}) returning id`;
   ownerId = owner!.id;
-  await pg`insert into manna_accounts (account_id, balance) values (${ownerId}, '100.0000')`;
+  // Fund several worst-case reservations (haiku authorized-max 61, T08-U02).
+  await pg`insert into manna_accounts (account_id, balance) values (${ownerId}, '500.0000')`;
 
   const [broke] = await pg<{ id: string }[]>`
     insert into accounts (type, username) values ('user', ${usernames.broke}) returning id`;
@@ -248,6 +251,8 @@ afterAll(async () => {
     await pg`delete from sessions where id = any(${sessionIds}::uuid[])`;
   }
   await pg`
+    delete from turn_authorizations where account_id in (${ownerId}, ${brokeId})`;
+  await pg`
     delete from manna_transactions where manna_account_id in
       (select id from manna_accounts where account_id in (${ownerId}, ${brokeId}))`;
   await pg`delete from manna_accounts where account_id in (${ownerId}, ${brokeId})`;
@@ -283,13 +288,15 @@ describe('POST /sessions/new/messages (live gateway + postgres)', () => {
     expect(started.sessionId).toBe(sessionId);
     turnIds.push(started.turnId);
 
-    // manna debited: 100 -> 99, broadcast on the same stream.
+    // The worst-case reservation (haiku authorized-max 61, T08-U02) is
+    // debited up front and broadcast on the same stream: 500 -> 439. Unused
+    // reserve returns at settlement (asserted on the ledger below).
     const manna = res.events.find(
       (e): e is Extract<SessionEvent, { type: 'manna.updated' }> => e.type === 'manna.updated',
     );
     expect(manna).toBeDefined();
     expect(manna!.accountId).toBe(ownerId);
-    expect(manna!.balance).toBe(99);
+    expect(manna!.balance).toBe(500 - 61);
 
     // Real streamed tokens and a completed turn with usage from the gateway tail.
     expect(res.events.some((e) => e.type === 'token')).toBe(true);
@@ -454,7 +461,8 @@ describe('POST /sessions/new/messages (live gateway + postgres)', () => {
     expect(usage.every((row) => row.status === 'completed' && row.manna !== null)).toBe(true);
     const meteredManna = usage.reduce((sum, row) => sum + (row.manna ?? 0), 0);
 
-    // Manna: each turn reserves 1 upfront, then settles to usage_events.manna.
+    // Manna: each turn reserves the authorized max (61) upfront, then settles
+    // actual ≤ authorized-max, refunding the unused reserve (T08-U02).
     const ledger = await pg<{ amount: string; type: string; idempotencyKey: string }[]>`
       select mt.amount, mt.type, mt.idempotency_key as "idempotencyKey"
       from manna_transactions mt
@@ -462,14 +470,14 @@ describe('POST /sessions/new/messages (live gateway + postgres)', () => {
       where ma.account_id = ${ownerId} order by mt.created_at asc`;
     const reserves = ledger.filter((tx) => tx.type === 'spend:chat');
     expect(reserves.map((tx) => [Number(tx.amount), tx.idempotencyKey])).toEqual(
-      turnIds.map((id) => [-1, id]),
+      turnIds.map((id) => [-61, id]),
     );
     const netMannaCharged = -ledger.reduce((sum, tx) => sum + Number(tx.amount), 0);
     expect(netMannaCharged).toBe(meteredManna);
     const [balance] = await pg<{ balance: string; subscriptionBalance: string }[]>`
       select balance, subscription_balance as "subscriptionBalance"
       from manna_accounts where account_id = ${ownerId}`;
-    expect(Number(balance!.balance) + Number(balance!.subscriptionBalance)).toBe(100 - meteredManna);
+    expect(Number(balance!.balance) + Number(balance!.subscriptionBalance)).toBe(500 - meteredManna);
   });
 
   it('trailing history-sync backfills gateway message ids onto streamed rows', async () => {
