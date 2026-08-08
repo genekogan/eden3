@@ -14,46 +14,37 @@ import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { StudioTool } from "@/lib/types";
-import { fuzzyFilter } from "@/lib/fuzzy";
+import { createOntologyRegistry, resolveOntologyRegistry } from "@/lib/ontology";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { sortTools, toolLabel, FALLBACK_TOOLS } from "@/components/studio/catalog";
+import { useTheme, type ThemePreference } from "@/components/theme-provider";
+import {
+  buildPaletteCommands,
+  clampPaletteIndex,
+  dispatchPaletteCommand,
+  filterPaletteCommands,
+  movePaletteIndex,
+  type PaletteCommand,
+  type PaletteMoveKey,
+} from "./command-palette-model";
 import {
   agentSubPathFromPathname,
   useMyAgents,
   useSelectedAgent,
 } from "./selected-agent-context";
 
-interface Command {
-  id: string;
-  label: string;
-  /** Extra text the fuzzy matcher also sees (e.g. @handle, synonyms). */
-  keywords?: string;
-  hint?: string;
-  href: string;
-  avatar?: { username: string; userImage?: string | null };
-}
-
-const AGENT_SECTIONS = [
-  ["chats", "Chats"],
-  ["chats/new", "New Chat"],
-  ["schedule", "Schedule"],
-  ["workspace", "Workspace"],
-  ["library", "Library"],
-  ["gateway", "Gateway"],
-  ["log", "Log"],
-  ["settings/identity", "Settings · Identity"],
-  ["settings/persona", "Settings · Persona"],
-  ["settings/tools", "Settings · Tools"],
-  ["settings/skills", "Settings · Skills"],
-  ["settings/memory", "Settings · Memory"],
-  ["settings/concepts", "Settings · Concepts"],
-] as const;
+const NEXT_THEME: Record<ThemePreference, ThemePreference> = {
+  system: "light",
+  light: "dark",
+  dark: "system",
+};
 
 export function CommandPalette() {
   const router = useRouter();
   const pathname = usePathname();
-  const { username, viewer } = useSelectedAgent();
+  const { username, viewer, canManage } = useSelectedAgent();
   const { agents } = useMyAgents();
+  const { preference: themePreference, setPreference: setThemePreference } = useTheme();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
@@ -90,85 +81,78 @@ export function CommandPalette() {
     return () => window.clearTimeout(timer);
   }, [open]);
 
-  const commands = useMemo<Command[]>(() => {
-    const out: Command[] = [];
-    const subPath = agentSubPathFromPathname(pathname);
-
-    if (username) {
-      const base = `/agents/${encodeURIComponent(username)}`;
-      for (const [sub, label] of AGENT_SECTIONS) {
-        out.push({
-          id: `section:${sub}`,
-          label,
-          keywords: `@${username} ${sub}`,
-          hint: `@${username}`,
-          href: `${base}/${sub}`,
-        });
-      }
-    }
-
-    for (const agent of agents ?? []) {
-      if (agent.username === username) continue;
-      out.push({
-        id: `agent:${agent.username}`,
-        label: `Switch to ${agent.name?.trim() || agent.username}`,
-        keywords: `@${agent.username} agent switch`,
-        hint: `@${agent.username}`,
-        href: `/agents/${encodeURIComponent(agent.username)}/${subPath ?? "chats"}`,
-        avatar: agent,
-      });
-    }
-
-    for (const tool of tools) {
-      out.push({
-        id: `tool:${tool.name}`,
-        label: `Studio · ${toolLabel(tool)}`,
-        keywords: `${tool.name} generate create studio`,
-        href: `/studio/${encodeURIComponent(tool.name)}`,
-      });
-    }
-
-    out.push(
-      { id: "agents", label: "All agents", keywords: "directory list", href: "/agents" },
-      { id: "new-agent", label: "New agent", keywords: "create agent template", href: "/agents/new" },
-      { id: "builder", label: "Agent builder", keywords: "conversational create", href: "/agents/builder" },
-      { id: "account", label: "Account settings", keywords: "user profile billing export", href: "/account" },
-      { id: "manna", label: "Manna", keywords: "balance credits billing top up", href: "/account/manna" },
+  const commands = useMemo<PaletteCommand[]>(() => {
+    const registry = createOntologyRegistry({
+      tools: tools.map((tool) => ({
+        name: tool.name,
+        label: toolLabel(tool),
+        description: tool.description ?? undefined,
+      })),
+    });
+    const ontology = resolveOntologyRegistry(
+      {
+        authenticated: viewer !== null,
+        isAdmin: viewer?.isAdmin === true,
+        isAgentOwner: canManage,
+        agentUsername: username,
+      },
+      registry,
     );
-    if (viewer?.isAdmin) {
-      out.push({
-        id: "operator",
-        label: "Operator",
-        keywords: "admin health runtime",
-        href: "/operator",
-      });
-    }
-    return out;
-  }, [pathname, username, agents, tools, viewer]);
+    return buildPaletteCommands({
+      ontology,
+      agents: agents ?? [],
+      selectedUsername: username,
+      selectedSubPath: agentSubPathFromPathname(pathname),
+    });
+  }, [pathname, username, agents, tools, viewer, canManage]);
 
   const results = useMemo(() => {
-    const trimmed = query.trim();
-    if (!trimmed) return commands.map((item) => ({ item, score: 0 }));
-    return fuzzyFilter(trimmed, commands, (c) => `${c.label} ${c.keywords ?? ""}`);
+    return filterPaletteCommands(commands, query);
   }, [query, commands]);
 
-  const clamped = Math.min(activeIndex, Math.max(0, results.length - 1));
+  const clamped = clampPaletteIndex(activeIndex, results.length);
 
   const run = useCallback(
-    (command: Command) => {
+    (command: PaletteCommand) => {
       setOpen(false);
-      router.push(command.href);
+      dispatchPaletteCommand(command, {
+        navigate: (href) => router.push(href),
+        execute: (action) => {
+          if (action === "theme.toggle") {
+            setThemePreference(NEXT_THEME[themePreference]);
+            return;
+          }
+          if (action === "account.export" && viewer) {
+            void api.account
+              .exportBundle()
+              .then((blob) => {
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.href = url;
+                link.download = `${viewer.username}-eden3-account.zip`;
+                link.click();
+                URL.revokeObjectURL(url);
+              })
+              // The account page owns retry/error UX for this existing action.
+              .catch(() => router.push("/account"));
+          }
+        },
+      });
     },
-    [router],
+    [router, setThemePreference, themePreference, viewer],
   );
 
   const onInputKey = (event: React.KeyboardEvent) => {
-    if (event.key === "ArrowDown") {
+    if (
+      event.key === "ArrowDown" ||
+      event.key === "ArrowUp" ||
+      event.key === "Home" ||
+      event.key === "End"
+    ) {
       event.preventDefault();
-      setActiveIndex((i) => Math.min(i + 1, results.length - 1));
-    } else if (event.key === "ArrowUp") {
-      event.preventDefault();
-      setActiveIndex((i) => Math.max(i - 1, 0));
+      setActiveIndex((index) =>
+        movePaletteIndex(index, event.key as PaletteMoveKey, results.length),
+      );
     } else if (event.key === "Enter" || event.key === "Return") {
       event.preventDefault();
       const chosen = results[clamped]?.item;

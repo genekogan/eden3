@@ -17,7 +17,6 @@ export type OntologyScope = "global" | "account" | "agent";
 export type OntologyActionKey =
   | "agent.new"
   | "agent.builder"
-  | "agent.edit"
   | "chat.new"
   | "account.export"
   | "theme.toggle";
@@ -213,16 +212,6 @@ const PAGE_ENTRIES = [
     target: { type: "navigate", hrefTemplate: "/account/manna" },
   },
   {
-    id: "page.usage",
-    kind: "page",
-    label: "Usage",
-    description: "Inspect account usage and costs.",
-    keywords: ["spend", "cost", "history", "metrics"],
-    visibility: "authenticated",
-    scope: "account",
-    target: { type: "navigate", hrefTemplate: "/usage" },
-  },
-  {
     id: "page.operator",
     kind: "page",
     label: "Operator",
@@ -390,20 +379,6 @@ const ACTION_ENTRIES = [
     target: { type: "navigate", hrefTemplate: "/agents/builder" },
   },
   {
-    id: "action.agent.edit",
-    kind: "action",
-    actionKey: "agent.edit",
-    label: "Edit agent",
-    description: "Open the selected agent's edit surface.",
-    keywords: ["change", "configure", "profile"],
-    visibility: "agent-owner",
-    scope: "agent",
-    target: {
-      type: "navigate",
-      hrefTemplate: "/agents/:agentUsername/edit",
-    },
-  },
-  {
     id: "action.account.export",
     kind: "action",
     actionKey: "account.export",
@@ -440,6 +415,7 @@ export function createToolOntologyEntries(
   tools: readonly StudioToolOntologyInput[],
 ): readonly OntologyToolEntry[] {
   const seen = new Set<string>();
+  const canonicalByName = new Map(CANONICAL_STUDIO_TOOLS.map((tool) => [tool.name, tool]));
   return [...tools]
     .sort((left, right) => left.name.localeCompare(right.name))
     .map((tool) => {
@@ -450,13 +426,23 @@ export function createToolOntologyEntries(
         throw new Error(`Duplicate Studio tool name: ${tool.name}`);
       }
       seen.add(tool.name);
+      const canonical = canonicalByName.get(tool.name);
       return {
         id: `tool.${tool.name}`,
         kind: "tool",
         toolName: tool.name,
         label: `Studio · ${tool.label.trim() || tool.name}`,
-        description: tool.description,
-        keywords: [tool.name, "studio", "generate", "create", ...(tool.keywords ?? [])],
+        description: tool.description ?? canonical?.description,
+        keywords: [
+          ...new Set([
+            tool.name,
+            "studio",
+            "generate",
+            "create",
+            ...(canonical?.keywords ?? []),
+            ...(tool.keywords ?? []),
+          ]),
+        ],
         visibility: "authenticated",
         scope: "global",
         target: {

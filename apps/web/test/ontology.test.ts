@@ -1,3 +1,6 @@
+import { readdirSync } from "node:fs";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FALLBACK_TOOLS } from "../components/studio/catalog";
 import {
@@ -15,10 +18,9 @@ import {
 } from "../lib/ontology";
 
 /*
- * Independent cockpit inventories. Route values were transcribed from the
- * forward cockpit Next page tree and its navigable shell actions, not
- * generated from STATIC_ONTOLOGY_REGISTRY. Once the cockpit branch is merged,
- * an integration test can replace this fixture with a filesystem walk.
+ * Independent cockpit inventory. This curated searchable subset is maintained
+ * separately from STATIC_ONTOLOGY_REGISTRY; a filesystem walk below proves
+ * that every target is backed by the live Next page tree.
  */
 const COCKPIT_ROUTE_INVENTORY = [
   "/account",
@@ -26,7 +28,6 @@ const COCKPIT_ROUTE_INVENTORY = [
   "/agents",
   "/agents/:agentUsername/chats",
   "/agents/:agentUsername/chats/new",
-  "/agents/:agentUsername/edit",
   "/agents/:agentUsername/gateway",
   "/agents/:agentUsername/library",
   "/agents/:agentUsername/log",
@@ -49,17 +50,50 @@ const COCKPIT_ROUTE_INVENTORY = [
   "/studio/music_generate",
   "/studio/tts",
   "/studio/video_generate",
-  "/usage",
 ] as const satisfies readonly OntologyHrefTemplate[];
 
-const SETTINGS_DIRECTORY_INVENTORY = [
-  "identity",
-  "persona",
-  "tools",
-  "skills",
-  "memory",
-  "concepts",
-] as const satisfies readonly AgentSettingsPanelKey[];
+const APP_ROOT = fileURLToPath(new URL("../app", import.meta.url));
+
+function findPageRoutes(directory = APP_ROOT): string[] {
+  const routes: string[] = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isDirectory()) routes.push(...findPageRoutes(path));
+    else if (entry.name === "page.tsx") {
+      const segments = relative(APP_ROOT, directory).split(sep).filter(Boolean);
+      routes.push(
+        `/${segments
+          .map((segment) => {
+            const dynamic = segment.match(/^\[([^\]]+)\]$/)?.[1];
+            if (!dynamic) return segment;
+            return dynamic === "username" ? ":agentUsername" : `:${dynamic}`;
+          })
+          .join("/")}`,
+      );
+    }
+  }
+  return routes;
+}
+
+function routePatternMatchesTarget(pattern: string, target: string): boolean {
+  const patternSegments = pattern.split("/");
+  const targetSegments = target.split("/");
+  return (
+    patternSegments.length === targetSegments.length &&
+    patternSegments.every(
+      (segment, index) => segment.startsWith(":") || segment === targetSegments[index],
+    )
+  );
+}
+
+function settingsDirectoryInventory(): AgentSettingsPanelKey[] {
+  const root = join(APP_ROOT, "agents", "[username]", "settings");
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .filter((entry) => readdirSync(join(root, entry.name)).includes("page.tsx"))
+    .map((entry) => entry.name as AgentSettingsPanelKey)
+    .sort();
+}
 
 const EXECUTION_HANDLER_INVENTORY = ["account.export", "theme.toggle"] as const;
 
@@ -88,7 +122,7 @@ describe("cockpit ontology registry", () => {
     const diff = diffOntologyInventory(STATIC_ONTOLOGY_REGISTRY, {
       routes: COCKPIT_ROUTE_INVENTORY,
       tools: toolInventory,
-      settingsPanels: SETTINGS_DIRECTORY_INVENTORY,
+      settingsPanels: settingsDirectoryInventory(),
       executableActions: EXECUTION_HANDLER_INVENTORY,
     });
     expect(diff).toEqual({
@@ -102,6 +136,20 @@ describe("cockpit ontology registry", () => {
       unusedActionHandlers: [],
     });
     expect(isEmptyOntologyInventoryDiff(diff)).toBe(true);
+  });
+
+  it("backs every navigation target with a real cockpit page route", () => {
+    const pageRoutes = findPageRoutes();
+    const missing = STATIC_ONTOLOGY_REGISTRY.flatMap((entry) => {
+      const target = entry.target;
+      if (target.type !== "navigate") return [];
+      return pageRoutes.some((route) =>
+        routePatternMatchesTarget(route, target.hrefTemplate),
+      )
+        ? []
+        : [target.hrefTemplate];
+    });
+    expect(missing).toEqual([]);
   });
 
   it("keeps the static tool contract in sync with the Studio fallback catalog", () => {
