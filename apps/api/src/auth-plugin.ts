@@ -49,11 +49,25 @@ const GATE_EXEMPT_PREFIXES = ['/auth/', '/dev/'] as const;
 const PUBLIC_SHARE_PATH = /^\/shares\/[^/]+$/;
 const PUBLIC_SHARE_MEDIA_PATH =
   /^\/media\/share\/[^/]+\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+const UUID_PATH_PART =
+  '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}';
+const SERVICE_AUTH_POST_EXACT = new Set([
+  '/channels/telegram/managed-bots/webhook',
+  '/channels/runtime/messages',
+  '/channels/runtime/pairing',
+  '/channels/runtime/status',
+  '/channels/runtime/turns/reserve',
+]);
+const SERVICE_AUTH_POST_TURN = new RegExp(
+  `^/channels/runtime/turns/${UUID_PATH_PART}/(?:settle|refund|delivery-failed|delivered)$`,
+);
 
 function isGateExempt(method: string, url: string): boolean {
   const path = url.split('?', 1)[0]!;
   return (
     GATE_EXEMPT_EXACT.has(path) ||
+    (method === 'POST' &&
+      (SERVICE_AUTH_POST_EXACT.has(path) || SERVICE_AUTH_POST_TURN.test(path))) ||
     ((method === 'GET' || method === 'HEAD') &&
       (PUBLIC_SHARE_PATH.test(path) || PUBLIC_SHARE_MEDIA_PATH.test(path))) ||
     GATE_EXEMPT_PREFIXES.some((prefix) =>
@@ -71,13 +85,14 @@ export function isAccessGated(
   return session === null || !allowlist.has(session.username.toLowerCase());
 }
 
-function defaultAuthProvider(): AuthProvider {
+function defaultAuthProvider(allowAccountCreation: boolean): AuthProvider {
   const env = getEnv();
   const dev = new DevAuthProvider({ adminUsernames: env.ADMIN_USERNAMES });
   if (env.AUTH_PROVIDER === 'dev') return dev;
 
   const clerk = new ClerkAuthProvider({
     adminUsernames: env.ADMIN_USERNAMES,
+    allowAccountCreation,
     authorizedParties: env.CLERK_AUTHORIZED_PARTIES,
     jwtKey: env.CLERK_JWT_KEY,
     seedManna: env.CLERK_NEW_USER_SEED_MANNA,
@@ -93,10 +108,10 @@ export async function requireAuth(req: FastifyRequest, reply: FastifyReply): Pro
 }
 
 export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {}): void {
-  const provider = opts.provider ?? defaultAuthProvider();
   const allowlist = new Set(
     (opts.accessAllowlist ?? getEnv().ACCESS_ALLOWLIST).map((u) => u.toLowerCase()),
   );
+  const provider = opts.provider ?? defaultAuthProvider(allowlist.size === 0);
 
   app.decorateRequest('account', null);
   app.decorate('authProvider', provider);

@@ -8,7 +8,8 @@ import {
   type AuthRequestLike,
   type AuthSession,
 } from '@eden3/core';
-import { pg } from '@eden3/db';
+import { db, pg } from '@eden3/db';
+import { sql } from 'drizzle-orm';
 
 interface ClerkJwtPayload {
   sub?: unknown;
@@ -42,11 +43,17 @@ export type ClerkTokenVerifier = (token: string) => Promise<ClerkJwtPayload>;
 
 export interface ClerkAuthProviderOptions {
   adminUsernames?: string[];
+  /** Closed-cohort mode: authenticate existing Clerk links, but never provision an unknown subject. */
+  allowAccountCreation?: boolean;
   authorizedParties?: string[];
   jwtKey?: string;
   seedManna?: number;
   verifyToken?: ClerkTokenVerifier;
   now?: () => Date;
+  /** Deterministic crash-injection seam; production leaves this unset. */
+  afterAccountCreatedBeforeSeed?: (
+    account: { id: string; username: string },
+  ) => void | Promise<void>;
 }
 
 interface AccountRow {
@@ -199,38 +206,82 @@ async function findByClerkUserId(clerkUserId: string): Promise<AccountRow | null
   return rows[0] ?? null;
 }
 
-async function createClerkAccount(clerkUserId: string): Promise<AccountRow> {
-  const base = defaultClerkUsername(clerkUserId);
-  for (let i = 0; i < 10; i += 1) {
-    const username = i === 0 ? base : `${base}_${i + 1}`;
-    try {
-      const rows = await pg<AccountRow[]>`
+async function createClerkAccountWithSeed(
+  clerkUserId: string,
+  seedManna: number,
+  afterAccountCreatedBeforeSeed?: ClerkAuthProviderOptions['afterAccountCreatedBeforeSeed'],
+): Promise<AccountRow> {
+  return await db.transaction(async (tx) => {
+    // Serialize first-session account creation and its signup grant across API
+    // processes. The account row and ledger leg share this transaction, so a
+    // process fault at either boundary leaves neither visible.
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtextextended(${`clerk-signup:${clerkUserId}`}, 0))`,
+    );
+
+    const existingRows = (await tx.execute(sql`
+      select id, username::text as username, deleted
+      from accounts
+      where clerk_user_id = ${clerkUserId} and type = 'user'
+      limit 1
+    `)) as unknown as AccountRow[];
+    const existing = existingRows[0];
+    if (existing) return existing;
+
+    const base = defaultClerkUsername(clerkUserId);
+    for (let i = 0; i < 10; i += 1) {
+      const username = i === 0 ? base : `${base}_${i + 1}`;
+      const rows = (await tx.execute(sql`
         insert into accounts (type, username, clerk_user_id)
         values ('user', ${username}, ${clerkUserId})
-        on conflict (clerk_user_id) where clerk_user_id is not null
-        do update set updated_at = accounts.updated_at
+        on conflict do nothing
         returning id, username::text as username, deleted
-      `;
+      `)) as unknown as AccountRow[];
       const row = rows[0];
-      if (!row) throw new Error('account_insert_returned_no_row');
+      if (!row) {
+        // A mixed-version process may have won the unique Clerk identity
+        // constraint without taking this advisory lock. Re-read the identity
+        // before trying a username suffix so we never misclassify that race as
+        // username exhaustion.
+        const racedRows = (await tx.execute(sql`
+          select id, username::text as username, deleted
+          from accounts
+          where clerk_user_id = ${clerkUserId} and type = 'user'
+          limit 1
+        `)) as unknown as AccountRow[];
+        const raced = racedRows[0];
+        if (raced) return raced;
+        continue;
+      }
+
+      await afterAccountCreatedBeforeSeed?.({ id: row.id, username: row.username });
+      if (seedManna > 0) {
+        await credit({
+          accountId: row.id,
+          amount: seedManna,
+          type: 'credit:signup',
+          idempotencyKey: `clerk-signup:${clerkUserId}`,
+          db: tx,
+        });
+      }
       return row;
-    } catch (err) {
-      const code = (err as { code?: string }).code;
-      if (code === '23505') continue;
-      throw err;
     }
-  }
-  throw new Error('could_not_allocate_clerk_username');
+    throw new Error('could_not_allocate_clerk_username');
+  });
 }
 
 export class ClerkAuthProvider implements AuthProvider {
   private readonly adminUsernames: Set<string>;
+  private readonly allowAccountCreation: boolean;
   private readonly seedManna: number;
   private readonly verifyToken: ClerkTokenVerifier;
+  private readonly afterAccountCreatedBeforeSeed?: ClerkAuthProviderOptions['afterAccountCreatedBeforeSeed'];
 
   constructor(opts: ClerkAuthProviderOptions = {}) {
     this.adminUsernames = new Set((opts.adminUsernames ?? []).map((u) => u.toLowerCase()));
+    this.allowAccountCreation = opts.allowAccountCreation ?? true;
     this.seedManna = opts.seedManna ?? DEFAULT_CLERK_NEW_USER_SEED_MANNA;
+    this.afterAccountCreatedBeforeSeed = opts.afterAccountCreatedBeforeSeed;
     this.verifyToken =
       opts.verifyToken ??
       createClerkJwtVerifier({
@@ -256,17 +307,15 @@ export class ClerkAuthProvider implements AuthProvider {
 
     const existing = await findByClerkUserId(clerkUserId);
     if (existing?.deleted) return null;
-    const account = existing ?? (await createClerkAccount(clerkUserId));
+    if (!existing && !this.allowAccountCreation) return null;
+    const account =
+      existing ??
+      (await createClerkAccountWithSeed(
+        clerkUserId,
+        this.seedManna,
+        this.afterAccountCreatedBeforeSeed,
+      ));
     if (account.deleted) return null;
-
-    if (!existing && this.seedManna > 0) {
-      await credit({
-        accountId: account.id,
-        amount: this.seedManna,
-        type: 'credit:signup',
-        idempotencyKey: `clerk-signup:${clerkUserId}`,
-      });
-    }
 
     return {
       accountId: account.id,
