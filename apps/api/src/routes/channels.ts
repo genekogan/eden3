@@ -1,4 +1,4 @@
-import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 
 import {
   DailyCapExceededError,
@@ -11,6 +11,7 @@ import { channelConnections, db, pg, secretAccessAuditEvents } from '@eden3/db';
 import {
   ensureHostedChannelAccount,
   removeHostedChannelAccount,
+  deriveCapabilityKey,
   type HostedChannelAccountOptions,
   type RemoveHostedChannelAccountOptions,
 } from '@eden3/gateway';
@@ -44,6 +45,25 @@ import {
   defaultSecretVault,
   type SecretVaultLike,
 } from '../services/secret-vault';
+import {
+  ChannelCredentialConflictError,
+  PostgresChannelCredentialCustody,
+  xChannelSecretHandle,
+} from '../services/postgres-channel-connector-custody';
+import {
+  FetchXUserClient,
+  XByoConnectorService,
+  type XConnectorFailureCode,
+} from '../services/x-byo-connector';
+import {
+  createTelegramManagedBotDeepLink,
+  FetchTelegramManagedBotApiClient,
+  normalizeTelegramManagedBotUpdate,
+  TelegramManagedBotError,
+  TelegramManagedBotsService,
+  type TelegramManagedBotApiClientLike,
+} from '../services/telegram-managed-bots';
+import { PostgresTelegramManagedBotCustody } from '../services/postgres-telegram-managed-bot-custody';
 
 export interface ChannelRuntimeSyncLike {
   ensureHostedChannelAccount?(
@@ -71,6 +91,12 @@ export interface ChannelsRoutesOptions {
   > &
     Partial<Pick<ChannelTurnMeteringService, 'refundStale'>>;
   runtimeToken?: string;
+  xConnector?: Pick<XByoConnectorService, 'connect' | 'post' | 'revoke'>;
+  telegramManager?: {
+    username: string;
+    webhookSecret: string;
+    botApiClient: TelegramManagedBotApiClientLike;
+  };
 }
 
 const channelSchema = z.enum(['discord', 'telegram']);
@@ -91,10 +117,15 @@ const guildSelectionSchema = z.object({
   channelIds: z.array(z.string().regex(/^\d{3,25}$/)).max(100),
 });
 
+const telegramGroupSelectionSchema = z.object({
+  groupId: z.string().regex(/^-\d{3,25}$/),
+});
+
 const connectionConfigSchema = z.object({
   dmPolicy: z.enum(['pairing', 'allowlist']).default('pairing'),
   allowFrom: z.array(externalIdSchema).max(100).default([]),
   discordGuilds: z.array(guildSelectionSchema).max(100).default([]),
+  telegramGroups: z.array(telegramGroupSelectionSchema).max(100).default([]),
 });
 
 const activationBodySchema = connectionConfigSchema
@@ -106,12 +137,11 @@ const activationBodySchema = connectionConfigSchema
         message: 'allowlist policy requires at least one external user id',
       });
     }
-    if (value.discordGuilds.length > 0) {
+    if ((value.discordGuilds.length > 0 || value.telegramGroups.length > 0) && value.allowFrom.length === 0) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['discordGuilds'],
-        message:
-          'Discord guild/channel activation is disabled so shared transcripts cannot access private user memory',
+        path: ['allowFrom'],
+        message: 'group delivery requires at least one allowlisted sender id',
       });
     }
   });
@@ -122,11 +152,39 @@ const retryBodySchema = z.object({
 
 const mockMessageBodySchema = z.object({ message: z.string().trim().min(1).max(4_000) });
 
+const xCredentialsSchema = z.object({
+  apiKey: z.string().trim().min(1).max(10_000),
+  apiSecret: z.string().trim().min(1).max(10_000),
+  accessToken: z.string().trim().min(1).max(10_000),
+  accessTokenSecret: z.string().trim().min(1).max(10_000),
+});
+
+const xConnectionBodySchema = z.object({
+  credentials: xCredentialsSchema,
+  label: z.string().trim().max(120).optional(),
+  agentUsername: z.string().trim().min(1).max(200).optional(),
+});
+
+const xPostBodySchema = z.object({ text: z.string().trim().min(1).max(280) });
+
+const telegramManagedSetupSchema = z.object({
+  suggestedBotUsername: z.string().trim().min(5).max(32).optional(),
+});
+
+const telegramManagedAttachSchema = z.object({
+  agentUsername: z.string().trim().min(1).max(200),
+  label: z.string().trim().max(120).optional(),
+});
+
+const onboardingParamsSchema = z.object({ intentId: z.string().uuid() });
+
 const runtimeMessageSchema = z.object({
   connectionId: z.string().uuid(),
   runtimeAccountId: z.string().min(1).max(128),
   gatewaySessionKey: z.string().min(1).max(1_000),
   conversationId: z.string().trim().min(1).max(500).optional(),
+  conversationScope: z.enum(['direct', 'group']).default('direct'),
+  guildId: externalIdSchema.nullable().optional(),
   peerId: externalIdSchema,
   externalMessageId: z.string().min(1).max(500),
   role: z.enum(['user', 'assistant']),
@@ -181,6 +239,7 @@ const usageSchema = z
     cachedTokens: z.number().int().nonnegative().optional(),
     cacheWriteTokens: z.number().int().nonnegative().optional(),
     totalTokens: z.number().int().nonnegative().optional(),
+    providerCostUsd: z.number().nonnegative().finite().optional(),
   })
   .optional();
 
@@ -217,10 +276,41 @@ interface ChannelConnectionRow {
   updated_at: string;
 }
 
+interface XConnectionRow {
+  id: string;
+  account_id: string;
+  agent_id: string | null;
+  channel: 'x';
+  label: string | null;
+  runtime_account_id: string;
+  desired_state: 'inactive' | 'active';
+  status: string;
+  last_error_code: string | null;
+  last_error_message: string | null;
+  last_validated_at: string | null;
+  metadata: unknown;
+  created_at: string;
+  updated_at: string;
+}
+
+interface TelegramOnboardingIntentRow {
+  id: string;
+  account_id: string;
+  provider_owner_id_hash: string | null;
+  suggested_bot_username: string | null;
+  state: 'pending_owner' | 'awaiting_bot' | 'exchanging' | 'stored' | 'expired' | 'failed';
+  expires_at: string;
+  connection_id: string | null;
+  last_error_code: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface ConnectionConfig {
   dmPolicy: 'pairing' | 'allowlist';
   allowFrom: string[];
   discordGuilds: Array<{ guildId: string; channelIds: string[] }>;
+  telegramGroups: Array<{ groupId: string }>;
 }
 
 interface EncryptedPairingCode {
@@ -312,13 +402,10 @@ function samePairingDecisionMarker(
 function connectionConfig(input: unknown): ConnectionConfig {
   const metadata = metadataRecord(input);
   const raw = metadata.config;
-  // Read legacy metadata tolerantly, but never project a stored guild
-  // selection back into the hosted runtime. Hosted delivery is DM-only until
-  // group-scoped memory and identity isolation exist end to end.
   const parsed = connectionConfigSchema.safeParse(raw);
   return parsed.success
-    ? { ...parsed.data, discordGuilds: [] }
-    : { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] };
+    ? parsed.data
+    : { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] };
 }
 
 function safeMetadata(input: unknown): {
@@ -363,7 +450,47 @@ function dto(row: ChannelConnectionRow) {
     nextRetryAt: row.next_retry_at ? new Date(row.next_retry_at).toISOString() : null,
     activatedAt: row.activated_at ? new Date(row.activated_at).toISOString() : null,
     bot: safe.bot,
-    config: { ...safe.config, deliveryScope: 'direct_messages_only' as const },
+    config: {
+      ...safe.config,
+      deliveryScope:
+        safe.config.discordGuilds.length > 0 || safe.config.telegramGroups.length > 0
+          ? ('direct_and_allowlisted_groups' as const)
+          : ('direct_messages_only' as const),
+    },
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+function xDto(row: XConnectionRow) {
+  const metadata = metadataRecord(row.metadata);
+  const rawUser = metadata.user;
+  const user =
+    rawUser && typeof rawUser === 'object' && !Array.isArray(rawUser)
+      ? (rawUser as Record<string, unknown>)
+      : null;
+  return {
+    id: row.id,
+    accountId: row.account_id,
+    agentId: row.agent_id,
+    channel: 'x' as const,
+    label: row.label,
+    status: row.status,
+    user:
+      user && typeof user.id === 'string' && typeof user.username === 'string'
+        ? {
+            id: user.id,
+            username: user.username,
+            name: typeof user.name === 'string' ? user.name : null,
+          }
+        : null,
+    lastError:
+      row.last_error_code
+        ? { code: row.last_error_code, message: row.last_error_message ?? 'X connector error' }
+        : null,
+    lastValidatedAt: row.last_validated_at
+      ? new Date(row.last_validated_at).toISOString()
+      : null,
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
   };
@@ -376,6 +503,85 @@ const CONNECTION_COLUMNS = pg`
   last_error_code, last_error_message, last_validated_at, retry_count,
   next_retry_at, activated_at, metadata, created_at, updated_at
 `;
+
+const X_CONNECTION_COLUMNS = pg`
+  id, account_id, agent_id, channel, label, runtime_account_id,
+  desired_state, status, last_error_code, last_error_message,
+  last_validated_at, metadata, created_at, updated_at
+`;
+
+function xFailureStatus(code: XConnectorFailureCode): number {
+  if (code === 'invalid_credentials') return 400;
+  if (code === 'revoked') return 409;
+  if (code === 'rate_limited') return 429;
+  return 503;
+}
+
+function telegramManagedErrorStatus(code: TelegramManagedBotError['code']): number {
+  if (code === 'managed_bot_owner_mismatch') return 403;
+  if (code === 'managed_bot_not_found' || code === 'managed_bot_connection_not_found') return 404;
+  if (code === 'managed_bot_state_conflict') return 409;
+  if (code === 'telegram_rate_limited') return 429;
+  if (
+    code === 'telegram_unavailable' ||
+    code === 'telegram_response_invalid' ||
+    code === 'channel_custody_unavailable' ||
+    code === 'managed_bot_state_unavailable'
+  ) {
+    return 503;
+  }
+  if (code === 'managed_bot_activation_failed' || code === 'managed_bot_revocation_failed') {
+    return 502;
+  }
+  return 400;
+}
+
+function telegramManagerConfig(opts: ChannelsRoutesOptions): ChannelsRoutesOptions['telegramManager'] | null {
+  if (opts.telegramManager) return opts.telegramManager;
+  const username = process.env.TELEGRAM_MANAGER_BOT_USERNAME?.trim();
+  const token = process.env.TELEGRAM_MANAGER_BOT_TOKEN?.trim();
+  const webhookSecret = process.env.TELEGRAM_MANAGER_WEBHOOK_SECRET?.trim();
+  if (!username || !token || !webhookSecret) return null;
+  return {
+    username,
+    webhookSecret,
+    botApiClient: new FetchTelegramManagedBotApiClient({ managerBotToken: token }),
+  };
+}
+
+function intentSecretHash(nonce: string): string {
+  return createHash('sha256').update(nonce, 'utf8').digest('hex');
+}
+
+function telegramOwnerHash(ownerId: string): string {
+  const raw = getEnv().CHANNEL_TOKEN_ENCRYPTION_KEY;
+  if (!raw) throw new Error('CHANNEL_TOKEN_ENCRYPTION_KEY is not configured');
+  return createHmac('sha256', deriveCapabilityKey(raw))
+    .update(`telegram-managed-owner\0${ownerId}`, 'utf8')
+    .digest('hex');
+}
+
+function secretsEqual(expected: string, actual: string | undefined): boolean {
+  if (!actual) return false;
+  const left = Buffer.from(expected, 'utf8');
+  const right = Buffer.from(actual, 'utf8');
+  return left.length === right.length && timingSafeEqual(left, right);
+}
+
+function telegramStartBinding(input: unknown): { nonce: string; ownerId: string } | null {
+  const update = metadataRecord(input);
+  const message = metadataRecord(update.message);
+  const from = metadataRecord(message.from);
+  const text = typeof message.text === 'string' ? message.text.trim() : '';
+  const match = /^\/start(?:@[A-Za-z0-9_]{5,32})?\s+([A-Za-z0-9_-]{43})$/.exec(text);
+  const ownerId =
+    typeof from.id === 'number' && Number.isSafeInteger(from.id) && from.id > 0
+      ? String(from.id)
+      : typeof from.id === 'string' && /^\d{1,20}$/.test(from.id) && from.id !== '0'
+        ? from.id
+        : null;
+  return match && ownerId ? { nonce: match[1]!, ownerId } : null;
+}
 
 async function getOwnedConnection(
   id: string,
@@ -499,6 +705,13 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   const sessionSync =
     opts.sessionSync ?? new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault);
   const turnMetering = opts.turnMetering ?? new ChannelTurnMeteringService();
+  const xConnector =
+    opts.xConnector ??
+    new XByoConnectorService(
+      new FetchXUserClient(),
+      new PostgresChannelCredentialCustody(vault),
+    );
+  const telegramManager = telegramManagerConfig(opts);
   const expectedRuntimeToken = opts.runtimeToken ?? getEnv().OPENCLAW_GATEWAY_TOKEN;
 
   const requireRuntime = async (req: FastifyRequest, reply: FastifyReply) => {
@@ -516,6 +729,365 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       order by updated_at desc, id desc
     `;
     return { items: rows.map(dto) };
+  });
+
+  app.get('/x/connections', { preHandler: app.requireAuth }, async (req) => {
+    const account = req.account!;
+    const rows = await pg<XConnectionRow[]>`
+      select ${X_CONNECTION_COLUMNS}
+      from channel_connections
+      where channel = 'x'
+        and ${account.isAdmin ? pg`true` : pg`account_id = ${account.accountId}`}
+      order by updated_at desc, id desc
+    `;
+    return { items: rows.map(xDto) };
+  });
+
+  app.post('/x/connections', { preHandler: app.requireAuth }, async (req, reply) => {
+    const account = req.account!;
+    const body = xConnectionBodySchema.parse(req.body);
+    if (await quotaExceeded(account.accountId, account.isAdmin)) {
+      return sendError(
+        reply,
+        429,
+        'channel_quota_exceeded',
+        `Channel connection limit reached (${getEnv().MAX_CHANNEL_CONNECTIONS_PER_USER} connections)`,
+      );
+    }
+
+    let agentId: string | null = null;
+    if (body.agentUsername) {
+      const resolved = await resolveAgentByUsername(body.agentUsername);
+      if (!resolved) {
+        return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
+      }
+      if (!account.isAdmin && resolved.agent.ownerId !== account.accountId) {
+        return sendError(reply, 403, 'forbidden', 'Only the owner can attach this agent');
+      }
+      agentId = resolved.account.id;
+    }
+
+    let result: Awaited<ReturnType<XByoConnectorService['connect']>>;
+    try {
+      result = await xConnector.connect({
+        accountId: account.accountId,
+        agentId,
+        label: body.label,
+        credentials: body.credentials,
+      });
+    } catch (error) {
+      if (error instanceof ChannelCredentialConflictError) {
+        return sendError(reply, 409, 'channel_credential_in_use', error.message);
+      }
+      throw error;
+    }
+    if (!result.ok) {
+      return sendError(reply, xFailureStatus(result.code), result.code, result.message);
+    }
+
+    try {
+      const rows = await pg<XConnectionRow[]>`
+        update channel_connections
+        set metadata = ${pg.json(JSON.stringify({ user: result.value.user }))},
+            last_error_code = null, last_error_message = null,
+            last_validated_at = now(), updated_at = now()
+        where id = ${result.value.handle.connectionId}
+          and account_id = ${account.accountId} and channel = 'x'
+        returning ${X_CONNECTION_COLUMNS}
+      `;
+      if (!rows[0]) throw new Error('X connector custody row unavailable');
+      return reply.code(201).send({ connection: xDto(rows[0]) });
+    } catch (error) {
+      await xConnector.revoke(result.value.handle).catch(() => undefined);
+      throw error;
+    }
+  });
+
+  app.post('/x/connections/:id/posts', { preHandler: app.requireAuth }, async (req, reply) => {
+    const account = req.account!;
+    const { id } = paramsSchema.parse(req.params);
+    const body = xPostBodySchema.parse(req.body);
+    const rows = await pg<XConnectionRow[]>`
+      select ${X_CONNECTION_COLUMNS}
+      from channel_connections
+      where id = ${id} and channel = 'x'
+        and desired_state = 'active'
+        and account_id = ${account.accountId}
+      limit 1
+    `;
+    const row = rows[0];
+    if (!row) return sendError(reply, 404, 'x_connection_not_found', 'X connection not found');
+    const result = await xConnector.post(xChannelSecretHandle(row), body.text);
+    if (!result.ok) {
+      if (result.code === 'revoked') {
+        await xConnector.revoke(xChannelSecretHandle(row));
+      }
+      await pg`
+        update channel_connections
+        set last_error_code = ${result.code}, last_error_message = ${result.message},
+            status = ${result.code === 'revoked' ? 'revoked' : row.status}, updated_at = now()
+        where id = ${row.id}
+      `;
+      return sendError(reply, xFailureStatus(result.code), result.code, result.message);
+    }
+    await pg`
+      update channel_connections
+      set last_error_code = null, last_error_message = null, status = 'active', updated_at = now()
+      where id = ${row.id}
+    `;
+    return reply.code(201).send({ ok: true, post: result.value });
+  });
+
+  app.post('/x/connections/:id/revoke', { preHandler: app.requireAuth }, async (req, reply) => {
+    const account = req.account!;
+    const { id } = paramsSchema.parse(req.params);
+    const rows = await pg<XConnectionRow[]>`
+      select ${X_CONNECTION_COLUMNS}
+      from channel_connections
+      where id = ${id} and channel = 'x'
+        and account_id = ${account.accountId}
+      limit 1
+    `;
+    const row = rows[0];
+    if (!row) return sendError(reply, 404, 'x_connection_not_found', 'X connection not found');
+    if (row.desired_state === 'active') {
+      await xConnector.revoke(xChannelSecretHandle(row));
+    }
+    return { ok: true };
+  });
+
+  app.post('/telegram/managed-bots/onboarding', { preHandler: app.requireAuth }, async (req, reply) => {
+    if (!telegramManager) {
+      return sendError(
+        reply,
+        503,
+        'telegram_manager_not_configured',
+        'Telegram managed-bot onboarding is not configured',
+      );
+    }
+    const account = req.account!;
+    const body = telegramManagedSetupSchema.parse(req.body ?? {});
+    // Validate the manager and suggested usernames before allocating an intent.
+    createTelegramManagedBotDeepLink({
+      managerBotUsername: telegramManager.username,
+      ...(body.suggestedBotUsername
+        ? { suggestedBotUsername: body.suggestedBotUsername }
+        : {}),
+    });
+    await pg`
+      update channel_onboarding_intents
+      set state = 'expired', last_error_code = 'intent_expired', updated_at = now()
+      where account_id = ${account.accountId} and channel = 'telegram'
+        and state in ('pending_owner', 'awaiting_bot', 'exchanging')
+        and expires_at <= now()
+    `;
+    const id = randomUUID();
+    const nonce = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + 15 * 60_000);
+    try {
+      await pg`
+        insert into channel_onboarding_intents (
+          id, account_id, channel, intent_secret_hash, suggested_bot_username,
+          state, expires_at
+        ) values (
+          ${id}, ${account.accountId}, 'telegram', ${intentSecretHash(nonce)},
+          ${body.suggestedBotUsername ?? null}, 'pending_owner', ${expiresAt.toISOString()}
+        )
+      `;
+    } catch (error) {
+      if ((error as { code?: string }).code === '23505') {
+        return sendError(
+          reply,
+          409,
+          'telegram_onboarding_in_progress',
+          'Finish or cancel the current Telegram bot setup before starting another',
+        );
+      }
+      throw error;
+    }
+    const manager = telegramManager.username.replace(/^@/, '');
+    return reply.code(201).send({
+      intent: { id, state: 'pending_owner', expiresAt: expiresAt.toISOString() },
+      ownerBindingUrl: `https://t.me/${encodeURIComponent(manager)}?start=${encodeURIComponent(nonce)}`,
+    });
+  });
+
+  app.get('/telegram/managed-bots/onboarding/:intentId', { preHandler: app.requireAuth }, async (req, reply) => {
+    const account = req.account!;
+    const { intentId } = onboardingParamsSchema.parse(req.params);
+    const rows = await pg<TelegramOnboardingIntentRow[]>`
+      select id, account_id, provider_owner_id_hash, suggested_bot_username, state,
+             expires_at, connection_id, last_error_code, created_at, updated_at
+      from channel_onboarding_intents
+      where id = ${intentId} and account_id = ${account.accountId}
+      limit 1
+    `;
+    const intent = rows[0];
+    if (!intent) return sendError(reply, 404, 'telegram_onboarding_not_found', 'Onboarding intent not found');
+    if (
+      new Date(intent.expires_at).getTime() <= Date.now() &&
+      ['pending_owner', 'awaiting_bot', 'exchanging'].includes(intent.state)
+    ) {
+      await pg`
+        update channel_onboarding_intents
+        set state = 'expired', last_error_code = 'intent_expired', updated_at = now()
+        where id = ${intent.id} and state = ${intent.state}
+      `;
+      intent.state = 'expired';
+      intent.last_error_code = 'intent_expired';
+    }
+    const connectionRows = intent.connection_id
+      ? await pg<ChannelConnectionRow[]>`
+          select ${CONNECTION_COLUMNS}
+          from channel_connections
+          where id = ${intent.connection_id} and account_id = ${account.accountId}
+            and channel = 'telegram'
+          limit 1
+        `
+      : [];
+    return {
+      intent: {
+        id: intent.id,
+        state: intent.state,
+        expiresAt: new Date(intent.expires_at).toISOString(),
+        lastErrorCode: intent.last_error_code,
+      },
+      managedBotUrl:
+        intent.state === 'awaiting_bot' && telegramManager
+          ? createTelegramManagedBotDeepLink({
+              managerBotUsername: telegramManager.username,
+              ...(intent.suggested_bot_username
+                ? { suggestedBotUsername: intent.suggested_bot_username }
+                : {}),
+            })
+          : null,
+      connection: connectionRows[0] ? dto(connectionRows[0]) : null,
+    };
+  });
+
+  app.post('/telegram/managed-bots/onboarding/:intentId/cancel', { preHandler: app.requireAuth }, async (req, reply) => {
+    const account = req.account!;
+    const { intentId } = onboardingParamsSchema.parse(req.params);
+    const rows = await pg<{ id: string }[]>`
+      update channel_onboarding_intents
+      set state = 'failed', last_error_code = 'cancelled', updated_at = now()
+      where id = ${intentId} and account_id = ${account.accountId}
+        and state in ('pending_owner', 'awaiting_bot', 'exchanging')
+      returning id
+    `;
+    if (!rows[0]) return sendError(reply, 409, 'telegram_onboarding_not_cancellable', 'Onboarding is already complete');
+    return { ok: true };
+  });
+
+  app.post('/telegram/managed-bots/onboarding/:intentId/attach', { preHandler: app.requireAuth }, async (req, reply) => {
+    const account = req.account!;
+    const { intentId } = onboardingParamsSchema.parse(req.params);
+    const body = telegramManagedAttachSchema.parse(req.body);
+    const resolved = await resolveAgentByUsername(body.agentUsername);
+    if (!resolved) return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
+    if (resolved.agent.ownerId !== account.accountId) {
+      return sendError(reply, 403, 'forbidden', 'Only the owner can attach this agent');
+    }
+    const rows = await pg<ChannelConnectionRow[]>`
+      update channel_connections c
+      set agent_id = ${resolved.account.id},
+          label = coalesce(${body.label ?? null}, c.label), updated_at = now()
+      from channel_onboarding_intents i
+      where i.id = ${intentId} and i.account_id = ${account.accountId}
+        and i.state = 'stored' and i.connection_id = c.id
+        and c.account_id = ${account.accountId} and c.channel = 'telegram'
+      returning ${CONNECTION_COLUMNS}
+    `;
+    if (!rows[0]) return sendError(reply, 404, 'telegram_onboarding_not_found', 'Stored managed bot not found');
+    return { connection: dto(rows[0]) };
+  });
+
+  app.post('/telegram/managed-bots/webhook', async (req, reply) => {
+    if (!telegramManager) {
+      return sendError(reply, 503, 'telegram_manager_not_configured', 'Telegram manager is not configured');
+    }
+    const presented = Array.isArray(req.headers['x-telegram-bot-api-secret-token'])
+      ? req.headers['x-telegram-bot-api-secret-token'][0]
+      : req.headers['x-telegram-bot-api-secret-token'];
+    if (!secretsEqual(telegramManager.webhookSecret, presented)) {
+      return sendError(reply, 401, 'telegram_webhook_unauthorized', 'Webhook authorization required');
+    }
+
+    const start = telegramStartBinding(req.body);
+    if (start) {
+      const rows = await pg<{ id: string }[]>`
+        update channel_onboarding_intents
+        set provider_owner_id_hash = ${telegramOwnerHash(start.ownerId)},
+            state = 'awaiting_bot', last_error_code = null, updated_at = now()
+        where channel = 'telegram' and intent_secret_hash = ${intentSecretHash(start.nonce)}
+          and state = 'pending_owner' and expires_at > now()
+        returning id
+      `;
+      return { ok: true, accepted: Boolean(rows[0]) };
+    }
+
+    const raw = metadataRecord(req.body).managed_bot;
+    if (!raw) return { ok: true, accepted: false };
+    let managed;
+    try {
+      managed = normalizeTelegramManagedBotUpdate(raw);
+    } catch {
+      return { ok: true, accepted: false };
+    }
+    const ownerHash = telegramOwnerHash(managed.owner.id);
+    const intent = await pg.begin(async (tx) => {
+      const rows = await tx<TelegramOnboardingIntentRow[]>`
+        select id, account_id, provider_owner_id_hash, suggested_bot_username, state,
+               expires_at, connection_id, last_error_code, created_at, updated_at
+        from channel_onboarding_intents
+        where channel = 'telegram' and provider_owner_id_hash = ${ownerHash}
+          and state = 'awaiting_bot' and expires_at > now()
+        for update
+      `;
+      const row = rows[0];
+      if (!row) return null;
+      await tx`
+        update channel_onboarding_intents
+        set state = 'exchanging', updated_at = now()
+        where id = ${row.id} and state = 'awaiting_bot'
+      `;
+      return { ...row, state: 'exchanging' as const };
+    });
+    if (!intent) return { ok: true, accepted: false };
+    if (await quotaExceeded(intent.account_id, false)) {
+      await pg`
+        update channel_onboarding_intents
+        set state = 'failed', last_error_code = 'channel_quota_exceeded', updated_at = now()
+        where id = ${intent.id} and state = 'exchanging'
+      `;
+      return { ok: true, accepted: false };
+    }
+
+    try {
+      const service = new TelegramManagedBotsService(
+        telegramManager.botApiClient,
+        new PostgresTelegramManagedBotCustody(
+          { id: intent.id, accountId: intent.account_id },
+          vault,
+        ),
+      );
+      await service.exchangeAndStore({
+        ownerAccountId: intent.account_id,
+        expectedTelegramOwnerId: managed.owner.id,
+        update: raw,
+      });
+      return { ok: true, accepted: true };
+    } catch (error) {
+      const code = error instanceof TelegramManagedBotError ? error.code : 'channel_custody_unavailable';
+      await pg`
+        update channel_onboarding_intents
+        set state = 'failed', last_error_code = ${code}, updated_at = now()
+        where id = ${intent.id} and state = 'exchanging'
+      `;
+      // Telegram webhooks must acknowledge terminally recorded failures to
+      // avoid replay storms. The authenticated user sees the safe code while polling.
+      return reply.code(200).send({ ok: true, accepted: false });
+    }
   });
 
   app.post('/connections', { preHandler: app.requireAuth }, async (req, reply) => {
@@ -556,7 +1128,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const state = validationState(validation);
     const metadata = {
       bot: validation.ok ? validation.bot : null,
-      config: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
+      config: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
     };
     const botId = validation.ok ? validation.bot.id : null;
     const rows = await pg.begin(async (tx) => {
@@ -780,6 +1352,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           dmPolicy: config.dmPolicy,
           allowFrom: config.allowFrom,
           discordGuilds: fresh.channel === 'discord' ? config.discordGuilds : [],
+          telegramGroups: fresh.channel === 'telegram' ? config.telegramGroups : [],
         });
         const restarted = await pg<ChannelConnectionRow[]>`
           update channel_connections
@@ -852,6 +1425,12 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const body = activationBodySchema.parse(req.body ?? {});
     const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
+    if (row.channel === 'discord' && body.telegramGroups.length > 0) {
+      return sendError(reply, 400, 'invalid_channel_group_config', 'Telegram groups cannot be attached to Discord');
+    }
+    if (row.channel === 'telegram' && body.discordGuilds.length > 0) {
+      return sendError(reply, 400, 'invalid_channel_group_config', 'Discord guilds cannot be attached to Telegram');
+    }
     if (!row.agent_id || !row.runtime_account_id) {
       return sendError(reply, 409, 'channel_agent_required', 'Attach an agent before activation');
     }
@@ -961,6 +1540,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         dmPolicy: body.dmPolicy,
         allowFrom: body.allowFrom,
         discordGuilds: row.channel === 'discord' ? body.discordGuilds : [],
+        telegramGroups: row.channel === 'telegram' ? body.telegramGroups : [],
       });
     } catch {
       const configurationErrorMessage = SAFE_RUNTIME_ERRORS.configuration_error!;
@@ -999,7 +1579,10 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         agentOpenclawId: agent.openclawId,
         dmPolicy: body.dmPolicy,
         allowFromCount: body.allowFrom.length,
-        deliveryScope: 'direct_messages_only',
+        deliveryScope:
+          body.discordGuilds.length > 0 || body.telegramGroups.length > 0
+            ? 'direct_and_allowlisted_groups'
+            : 'direct_messages_only',
       },
     });
     return {
@@ -1177,6 +1760,86 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       }
       const agent = await provisionedAgent(connection.agent_id);
       if (!agent) return sendError(reply, 409, 'agent_not_provisioned', 'Agent has no runtime');
+      const resumeRows = await pg<Array<{
+        status: string;
+        request_metadata: unknown;
+        linked_account_id: string | null;
+      }>>`
+        select p.status, p.metadata as request_metadata, i.linked_account_id
+        from channel_pairing_requests p
+        join channel_external_identities i on i.id = p.identity_id
+        where p.id = ${requestId} and p.connection_id = ${connection.id}
+        limit 1
+      `;
+      const resume = resumeRows[0];
+      if (resume?.status === 'approved') {
+        const marker = pairingDecisionMarker(connection.metadata);
+        const decisionNonce = metadataRecord(resume.request_metadata)._decisionNonce;
+        if (!marker || marker.requestId !== requestId || decisionNonce !== marker.nonce) {
+          return sendError(reply, 409, 'pairing_request_already_decided', 'Pairing request is already approved');
+        }
+        const config = connectionConfig(connection.metadata);
+        try {
+          await sync.ensureHostedChannelAccount({
+            channel: connection.channel,
+            runtimeAccountId: connection.runtime_account_id,
+            connectionId: connection.id,
+            accountId: connection.account_id,
+            label: connection.label,
+            bindAgentId: agent.openclawId,
+            dmPolicy: config.dmPolicy,
+            allowFrom: config.allowFrom,
+            discordGuilds: connection.channel === 'discord' ? config.discordGuilds : [],
+            telegramGroups: connection.channel === 'telegram' ? config.telegramGroups : [],
+          });
+        } catch (error) {
+          app.log.warn({ err: error, requestId }, 'channel pairing resume apply failed');
+          throw new ApiError(502, 'configuration_error', SAFE_RUNTIME_ERRORS.configuration_error!);
+        }
+        const cleaned = await pg.begin(async (tx) => {
+          const currentConnections = await tx<{ metadata: unknown }[]>`
+            select metadata from channel_connections where id = ${connection.id} for update
+          `;
+          const currentRequests = await tx<{ status: string; metadata: unknown }[]>`
+            select status, metadata from channel_pairing_requests where id = ${requestId} for update
+          `;
+          if (
+            currentRequests[0]?.status !== 'approved' ||
+            metadataRecord(currentRequests[0].metadata)._decisionNonce !== marker.nonce ||
+            !samePairingDecisionMarker(currentConnections[0]?.metadata, marker)
+          ) {
+            return false;
+          }
+          const connectionMetadata = { ...metadataRecord(currentConnections[0]!.metadata) };
+          delete connectionMetadata._pairingDecision;
+          const requestMetadata = { ...metadataRecord(currentRequests[0]!.metadata) };
+          delete requestMetadata._decisionNonce;
+          delete requestMetadata.pairingCode;
+          await tx`
+            update channel_connections
+            set metadata = ${tx.json(JSON.stringify(connectionMetadata))}, updated_at = now()
+            where id = ${connection.id}
+          `;
+          await tx`
+            update channel_pairing_requests
+            set metadata = ${tx.json(JSON.stringify(requestMetadata))}, updated_at = now()
+            where id = ${requestId} and status = 'approved'
+          `;
+          return true;
+        });
+        if (!cleaned) {
+          throw new ApiError(409, 'pairing_request_changed', 'Pairing request changed; refresh and retry');
+        }
+        await audit({
+          actorAccountId: account.accountId,
+          ownerAccountId: connection.account_id,
+          secretId: requestId,
+          secretKind: 'channel_peer',
+          action: 'pairing_approve_resume',
+          metadata: { channel: connection.channel, requestId },
+        });
+        return { ok: true, linkedToMyAccount: resume.linked_account_id === account.accountId };
+      }
       const auditTargets = await pg<{ identity_id: string }[]>`
         select identity_id
         from channel_pairing_requests
@@ -1393,6 +2056,10 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             prepared.connection.channel === 'discord'
               ? prepared.newConfig.discordGuilds
               : [],
+          telegramGroups:
+            prepared.connection.channel === 'telegram'
+              ? prepared.newConfig.telegramGroups
+              : [],
         });
       } catch (error) {
         let runtimeRestored = true;
@@ -1409,6 +2076,10 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             discordGuilds:
               prepared.connection.channel === 'discord'
                 ? prepared.oldConfig.discordGuilds
+                : [],
+            telegramGroups:
+              prepared.connection.channel === 'telegram'
+                ? prepared.oldConfig.telegramGroups
                 : [],
           });
         } catch {

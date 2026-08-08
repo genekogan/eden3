@@ -1,5 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
+import { DevAuthProvider } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -11,6 +12,9 @@ import {
   AesGcmSecretVault,
   channelTokenSecretContext,
 } from '../src/services/secret-vault';
+import { PostgresChannelCredentialCustody } from '../src/services/postgres-channel-connector-custody';
+import { XByoConnectorService, type XUserClientLike } from '../src/services/x-byo-connector';
+import type { TelegramManagedBotApiClientLike } from '../src/services/telegram-managed-bots';
 import {
   deleteFixturesByMarker,
   devCookie,
@@ -26,9 +30,11 @@ const vault = new AesGcmSecretVault({ key: randomBytes(32).toString('base64') })
 const runtimeToken = 'channel-runtime-test-credential';
 let ownerId = '';
 let strangerId = '';
+let adminId = '';
 let firstAgentId = '';
 let firstAgentUsername = '';
 let secondAgentUsername = '';
+let adminAgentUsername = '';
 let app: FastifyInstance;
 
 const ensureCalls: Array<Record<string, unknown>> = [];
@@ -139,6 +145,41 @@ const turnMetering = {
   markDelivered: vi.fn(async () => {}),
 };
 
+let xPostMode: 'ok' | 'revoked' | 'rate_limited' = 'ok';
+const xPostCalls: string[] = [];
+const xClient: XUserClientLike = {
+  async validate() {
+    return {
+      ok: true,
+      value: { id: '2244994945', username: 'eden_fixture', name: 'Eden Fixture' },
+    };
+  },
+  async post(_credentials, text) {
+    xPostCalls.push(text);
+    if (xPostMode === 'ok') return { ok: true, value: { id: '1900000000000000000' } };
+    if (xPostMode === 'revoked') {
+      return {
+        ok: false,
+        code: 'revoked',
+        message: 'X rejected the saved access token. Replace or revoke it.',
+        retryable: false,
+      };
+    }
+    return {
+      ok: false,
+      code: 'rate_limited',
+      message: 'X rate-limited this account. Wait for the limit to reset.',
+      retryable: true,
+      retryAfterSeconds: 17,
+    };
+  },
+};
+
+const managedBotToken = '987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd';
+const telegramManagedBotApi: TelegramManagedBotApiClientLike = {
+  getManagedBotToken: vi.fn(async () => managedBotToken),
+};
+
 interface ConnectionDto {
   id: string;
   accountId: string;
@@ -176,6 +217,7 @@ async function createConnection(params: {
 beforeAll(async () => {
   ownerId = await insertUserAccount(`${marker}_owner`);
   strangerId = await insertUserAccount(`${marker}_stranger`);
+  adminId = await insertUserAccount(`${marker}_admin`);
   firstAgentUsername = `${marker}-first`;
   secondAgentUsername = `${marker}-second`;
   firstAgentId = await insertAgentAccount(firstAgentUsername, {
@@ -190,7 +232,15 @@ beforeAll(async () => {
     openclawId: secondAgentUsername,
     provisionStatus: 'ready',
   });
+  adminAgentUsername = `${marker}-admin-agent`;
+  await insertAgentAccount(adminAgentUsername, {
+    ownerId: adminId,
+    public: true,
+    openclawId: adminAgentUsername,
+    provisionStatus: 'ready',
+  });
   app = await buildServer({
+    auth: { provider: new DevAuthProvider({ adminUsernames: [`${marker}_admin`] }) },
     gateway: null,
     channels: {
       vault,
@@ -199,6 +249,15 @@ beforeAll(async () => {
       sessionSync,
       turnMetering,
       runtimeToken,
+      xConnector: new XByoConnectorService(
+        xClient,
+        new PostgresChannelCredentialCustody(vault),
+      ),
+      telegramManager: {
+        username: 'eden_manager_bot',
+        webhookSecret: 'synthetic-telegram-webhook-secret',
+        botApiClient: telegramManagedBotApi,
+      },
     },
   });
   await app.ready();
@@ -345,6 +404,293 @@ describe('channel custody and validation', () => {
     });
     expect(duplicateRotation.statusCode).toBe(409);
     expect(duplicateRotation.body).not.toContain(first.id);
+  });
+});
+
+describe('X BYO-app custody and posting', () => {
+  it('vaults all four credentials, exposes only identity metadata, posts, and revokes', async () => {
+    const credentials = {
+      apiKey: `x-api-key-${marker}`,
+      apiSecret: `x-api-secret-${marker}`,
+      accessToken: `x-access-token-${marker}`,
+      accessTokenSecret: `x-access-secret-${marker}`,
+    };
+    const connected = await app.inject({
+      method: 'POST',
+      url: '/channels/x/connections',
+      headers: { cookie: devCookie(ownerId) },
+      payload: { credentials, agentUsername: firstAgentUsername, label: 'X fixture' },
+    });
+    expect(connected.statusCode).toBe(201);
+    expect(connected.json().connection).toMatchObject({
+      accountId: ownerId,
+      agentId: firstAgentId,
+      channel: 'x',
+      status: 'active',
+      user: { id: '2244994945', username: 'eden_fixture', name: 'Eden Fixture' },
+    });
+    for (const secret of Object.values(credentials)) expect(connected.body).not.toContain(secret);
+    const connectionId = connected.json().connection.id as string;
+
+    const stored = await pg<Array<{
+      token_ciphertext: string;
+      token_preview: string | null;
+      metadata: Record<string, unknown>;
+    }>>`
+      select token_ciphertext, token_preview, metadata
+      from channel_connections where id = ${connectionId}
+    `;
+    expect(stored[0]?.token_ciphertext).not.toContain(marker);
+    expect(stored[0]?.token_preview).toBeNull();
+    expect(JSON.stringify(stored[0]?.metadata)).not.toContain('apiSecret');
+
+    const auditsBeforeAdmin = await pg<{ count: number }[]>`
+      select count(*)::int as count from secret_access_audit_events
+      where secret_id = ${connectionId}
+    `;
+    const postCallsBeforeAdmin = xPostCalls.length;
+    const adminPost = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${connectionId}/posts`,
+      headers: { cookie: devCookie(adminId) },
+      payload: { text: 'admin must not post through owner custody' },
+    });
+    const adminRevoke = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${connectionId}/revoke`,
+      headers: { cookie: devCookie(adminId) },
+      payload: {},
+    });
+    expect(adminPost.statusCode).toBe(404);
+    expect(adminRevoke.statusCode).toBe(404);
+    expect(xPostCalls).toHaveLength(postCallsBeforeAdmin);
+    const auditsAfterAdmin = await pg<{ count: number }[]>`
+      select count(*)::int as count from secret_access_audit_events
+      where secret_id = ${connectionId}
+    `;
+    expect(auditsAfterAdmin[0]?.count).toBe(auditsBeforeAdmin[0]?.count);
+    const stillActive = await pg<{ desired_state: string }[]>`
+      select desired_state from channel_connections where id = ${connectionId}
+    `;
+    expect(stillActive[0]?.desired_state).toBe('active');
+
+    xPostMode = 'ok';
+    const posted = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${connectionId}/posts`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { text: 'deterministic X connector proof' },
+    });
+    expect(posted.statusCode).toBe(201);
+    expect(posted.json()).toEqual({ ok: true, post: { id: '1900000000000000000' } });
+
+    const strangerPost = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${connectionId}/posts`,
+      headers: { cookie: devCookie(strangerId) },
+      payload: { text: 'must not post' },
+    });
+    expect(strangerPost.statusCode).toBe(404);
+
+    const revoked = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${connectionId}/revoke`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: {},
+    });
+    expect(revoked.statusCode).toBe(200);
+    const deniedAfterRevoke = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${connectionId}/posts`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { text: 'must remain revoked' },
+    });
+    expect(deniedAfterRevoke.statusCode).toBe(404);
+  });
+
+  it('surfaces revoked and rate-limited posting states without exposing credentials', async () => {
+    const connect = async (suffix: string) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/channels/x/connections',
+        headers: { cookie: devCookie(ownerId) },
+        payload: {
+          credentials: {
+            apiKey: `key-${marker}-${suffix}`,
+            apiSecret: `secret-${marker}-${suffix}`,
+            accessToken: `token-${marker}-${suffix}`,
+            accessTokenSecret: `token-secret-${marker}-${suffix}`,
+          },
+        },
+      });
+      expect(response.statusCode).toBe(201);
+      return response.json().connection.id as string;
+    };
+
+    const revokedId = await connect('revoked');
+    xPostMode = 'revoked';
+    const revoked = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${revokedId}/posts`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { text: 'revoked case' },
+    });
+    expect(revoked.statusCode).toBe(409);
+    expect(revoked.json()).toMatchObject({ error: { code: 'revoked' } });
+    expect(revoked.body).not.toContain(marker);
+
+    const limitedId = await connect('limited');
+    xPostMode = 'rate_limited';
+    const limited = await app.inject({
+      method: 'POST',
+      url: `/channels/x/connections/${limitedId}/posts`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { text: 'limited case' },
+    });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.json()).toMatchObject({ error: { code: 'rate_limited' } });
+  });
+});
+
+describe('Telegram Managed Bots onboarding', () => {
+  it('binds the Telegram owner through a one-time nonce, stores atomically, and attaches an owned agent', async () => {
+    const setup = await app.inject({
+      method: 'POST',
+      url: '/channels/telegram/managed-bots/onboarding',
+      headers: { cookie: devCookie(ownerId) },
+      payload: { suggestedBotUsername: 'edenfixturebot' },
+    });
+    expect(setup.statusCode).toBe(201);
+    const created = setup.json() as {
+      intent: { id: string; state: string };
+      ownerBindingUrl: string;
+    };
+    expect(created.intent.state).toBe('pending_owner');
+    const nonce = new URL(created.ownerBindingUrl).searchParams.get('start');
+    expect(nonce).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    const rawIntent = await pg<Array<{
+      intent_secret_hash: string;
+      provider_owner_id_hash: string | null;
+    }>>`
+      select intent_secret_hash, provider_owner_id_hash
+      from channel_onboarding_intents where id = ${created.intent.id}
+    `;
+    expect(rawIntent[0]?.intent_secret_hash).not.toBe(nonce);
+    expect(rawIntent[0]?.provider_owner_id_hash).toBeNull();
+
+    const unauthorized = await app.inject({
+      method: 'POST',
+      url: '/channels/telegram/managed-bots/webhook',
+      headers: { 'x-telegram-bot-api-secret-token': 'wrong-secret' },
+      payload: { message: { text: `/start ${nonce}`, from: { id: 42424242 } } },
+    });
+    expect(unauthorized.statusCode).toBe(401);
+
+    const bound = await app.inject({
+      method: 'POST',
+      url: '/channels/telegram/managed-bots/webhook',
+      headers: { 'x-telegram-bot-api-secret-token': 'synthetic-telegram-webhook-secret' },
+      payload: { message: { text: `/start ${nonce}`, from: { id: 42424242 } } },
+    });
+    expect(bound.statusCode).toBe(200);
+    expect(bound.json()).toEqual({ ok: true, accepted: true });
+
+    const awaiting = await app.inject({
+      method: 'GET',
+      url: `/channels/telegram/managed-bots/onboarding/${created.intent.id}`,
+      headers: { cookie: devCookie(ownerId) },
+    });
+    expect(awaiting.statusCode).toBe(200);
+    expect(awaiting.json()).toMatchObject({
+      intent: { state: 'awaiting_bot' },
+      managedBotUrl: expect.stringContaining('https://t.me/newbot/eden_manager_bot/edenfixturebot'),
+      connection: null,
+    });
+
+    const managedUpdate = {
+      managed_bot: {
+        user: { id: 42424242, first_name: 'Telegram', last_name: 'Owner', username: 'owner_name' },
+        bot: { id: 52525252, is_bot: true, first_name: 'Eden', last_name: 'Managed', username: 'edenfixturebot' },
+      },
+    };
+    const stored = await app.inject({
+      method: 'POST',
+      url: '/channels/telegram/managed-bots/webhook',
+      headers: { 'x-telegram-bot-api-secret-token': 'synthetic-telegram-webhook-secret' },
+      payload: managedUpdate,
+    });
+    expect(stored.statusCode).toBe(200);
+    expect(stored.json()).toEqual({ ok: true, accepted: true });
+
+    const completed = await app.inject({
+      method: 'GET',
+      url: `/channels/telegram/managed-bots/onboarding/${created.intent.id}`,
+      headers: { cookie: devCookie(ownerId) },
+    });
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json()).toMatchObject({
+      intent: { state: 'stored', lastErrorCode: null },
+      managedBotUrl: null,
+      connection: {
+        channel: 'telegram',
+        desiredState: 'inactive',
+        observedState: 'verified',
+        bot: { username: 'edenfixturebot' },
+      },
+    });
+    expect(completed.body).not.toContain(managedBotToken);
+    expect(completed.body).not.toContain('42424242');
+    const connectionId = completed.json().connection.id as string;
+
+    const persisted = await pg<Array<{
+      token_ciphertext: string;
+      token_preview: string | null;
+      metadata: Record<string, unknown>;
+    }>>`
+      select token_ciphertext, token_preview, metadata
+      from channel_connections where id = ${connectionId}
+    `;
+    expect(persisted[0]?.token_ciphertext).not.toContain(managedBotToken);
+    expect(persisted[0]?.token_preview).toBeNull();
+    expect(JSON.stringify(persisted[0]?.metadata)).not.toContain('42424242');
+
+    const adminAttach = await app.inject({
+      method: 'POST',
+      url: `/channels/telegram/managed-bots/onboarding/${created.intent.id}/attach`,
+      headers: { cookie: devCookie(adminId) },
+      payload: { agentUsername: adminAgentUsername },
+    });
+    expect(adminAttach.statusCode).toBe(403);
+    const unattached = await pg<{ agent_id: string | null }[]>`
+      select agent_id from channel_connections where id = ${connectionId}
+    `;
+    expect(unattached[0]?.agent_id).toBeNull();
+
+    const attached = await app.inject({
+      method: 'POST',
+      url: `/channels/telegram/managed-bots/onboarding/${created.intent.id}/attach`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { agentUsername: firstAgentUsername, label: 'Managed fixture' },
+    });
+    expect(attached.statusCode).toBe(200);
+    expect(attached.json().connection).toMatchObject({ agentId: firstAgentId, label: 'Managed fixture' });
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/channels/telegram/managed-bots/webhook',
+      headers: { 'x-telegram-bot-api-secret-token': 'synthetic-telegram-webhook-secret' },
+      payload: managedUpdate,
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toEqual({ ok: true, accepted: false });
+
+    const crossAccount = await app.inject({
+      method: 'GET',
+      url: `/channels/telegram/managed-bots/onboarding/${created.intent.id}`,
+      headers: { cookie: devCookie(strangerId) },
+    });
+    expect(crossAccount.statusCode).toBe(404);
   });
 });
 
@@ -616,6 +962,74 @@ describe('pairing claim and verified identity linkage', () => {
     expect((rows[0]?.metadata as { config?: { allowFrom?: string[] } }).config?.allowFrom).not.toContain(
       peerId,
     );
+  });
+
+  it('resumes an approved pairing marker after a crash before runtime config application', async () => {
+    const connection = await activePairingConnection('pairing_resume');
+    const peerId = '77449955';
+    const paired = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/pairing',
+      headers: { authorization: `Bearer ${runtimeToken}` },
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        peerId,
+        code: 'EDEN-3311',
+      },
+    });
+    const requestId = (paired.json() as { requestId: string }).requestId;
+    const marker = { requestId, nonce: randomUUID() };
+    await pg.begin(async (tx) => {
+      const connectionRows = await tx<{ metadata: unknown }[]>`
+        select metadata from channel_connections where id = ${connection.id} for update
+      `;
+      const requestRows = await tx<{ metadata: unknown }[]>`
+        select metadata from channel_pairing_requests where id = ${requestId} for update
+      `;
+      const connectionMetadata = connectionRows[0]?.metadata as Record<string, unknown>;
+      const config = connectionMetadata.config as Record<string, unknown>;
+      await tx`
+        update channel_connections
+        set metadata = ${tx.json(JSON.stringify({
+          ...connectionMetadata,
+          config: { ...config, allowFrom: [peerId] },
+          _pairingDecision: marker,
+        }))}
+        where id = ${connection.id}
+      `;
+      await tx`
+        update channel_pairing_requests
+        set status = 'approved', decided_at = now(), decided_by_account_id = ${ownerId},
+            metadata = ${tx.json(JSON.stringify({
+              ...(requestRows[0]?.metadata as Record<string, unknown>),
+              _decisionNonce: marker.nonce,
+            }))}
+        where id = ${requestId}
+      `;
+    });
+
+    const callsBefore = ensureCalls.length;
+    const resumed = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/pairing/${requestId}/approve`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: {},
+    });
+    expect(resumed.statusCode).toBe(200);
+    expect(resumed.json()).toEqual({ ok: true, linkedToMyAccount: false });
+    expect(ensureCalls).toHaveLength(callsBefore + 1);
+    expect(ensureCalls.at(-1)).toMatchObject({ allowFrom: [peerId] });
+
+    const rows = await pg<Array<{ connection_metadata: unknown; request_metadata: unknown }>>`
+      select c.metadata as connection_metadata, p.metadata as request_metadata
+      from channel_pairing_requests p
+      join channel_connections c on c.id = p.connection_id
+      where p.id = ${requestId}
+    `;
+    expect(JSON.stringify(rows[0]?.connection_metadata)).not.toContain('_pairingDecision');
+    expect(JSON.stringify(rows[0]?.request_metadata)).not.toContain('_decisionNonce');
+    expect(JSON.stringify(rows[0]?.request_metadata)).not.toContain('pairingCode');
   });
 });
 

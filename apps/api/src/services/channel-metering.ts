@@ -98,6 +98,7 @@ export interface ChannelRefundClaim {
   turnId: string;
   status: ChannelTurnStatus;
   claimed: boolean;
+  errorCode?: string | null;
 }
 
 export interface ChannelTurnStoreLike {
@@ -324,30 +325,47 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     allowSettled = false,
   ): Promise<ChannelRefundClaim | null> {
     return pg.begin(async (tx) => {
-      const rows = await tx<{ turn_id: string; status: ChannelTurnStatus }[]>`
-        select turn_id, status
+      const rows = await tx<{ turn_id: string; status: ChannelTurnStatus; error_code: string | null }[]>`
+        select turn_id, status, error_code
         from channel_turns
         where turn_id = ${turnId}
         for update
       `;
       if (!rows[0]) return null;
-      const turn = { turnId: rows[0].turn_id, status: rows[0].status };
+      const turn = {
+        turnId: rows[0].turn_id,
+        status: rows[0].status,
+        errorCode: rows[0].error_code,
+      };
       if (
         ['reserving', 'reserved', 'error'].includes(turn.status) ||
         (allowSettling && turn.status === 'settling') ||
-        (allowSettled && ['settled', 'delivery_pending'].includes(turn.status))
+        (allowSettled && turn.status === 'delivery_pending')
       ) {
         await tx`
           update channel_turns
-          set status = 'refunding', updated_at = now()
+          set status = 'refunding',
+              error_code = case
+                when status = 'delivery_pending' then 'channel_delivery_compensation_pending'
+                else error_code
+              end,
+              updated_at = now()
           where turn_id = ${turnId}
             and (
               status in ('reserving', 'reserved', 'error')
               or (${allowSettling} and status = 'settling')
-              or (${allowSettled} and status in ('settled', 'delivery_pending'))
+              or (${allowSettled} and status = 'delivery_pending')
             )
         `;
-        return { turnId: turn.turnId, status: 'refunding', claimed: true };
+        return {
+          turnId: turn.turnId,
+          status: 'refunding',
+          claimed: true,
+          errorCode:
+            turn.status === 'delivery_pending'
+              ? 'channel_delivery_compensation_pending'
+              : turn.errorCode,
+        };
       }
       return { ...turn, claimed: false };
     });
@@ -367,7 +385,12 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
           limit ${boundedLimit}
         )
         update channel_turns t
-        set status = 'refunding', error_code = 'stale_channel_turn', updated_at = now()
+        set status = 'refunding',
+            error_code = case
+              when t.status = 'delivery_pending' then 'channel_delivery_compensation_pending'
+              else 'stale_channel_turn'
+            end,
+            updated_at = now()
         from stale
         where t.turn_id = stale.turn_id
         returning t.turn_id
@@ -561,24 +584,38 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   async reverseAuthorized(turnId: string, errorCode: string): Promise<void> {
     await db.transaction(async (tx) => {
       const authRows = (await tx.execute(sql`
-        select state, reserved_subscription_manna
-        from turn_authorizations
-        where turn_id = ${turnId}
+        select a.state, a.reserved_subscription_manna,
+               t.status as channel_status, t.error_code as channel_error_code
+        from turn_authorizations a
+        join channel_turns t on t.turn_id = a.turn_id
+        where a.turn_id = ${turnId}
         for update
-      `)) as unknown as Array<{ state: string; reserved_subscription_manna: string }>;
+      `)) as unknown as Array<{
+        state: string;
+        reserved_subscription_manna: string;
+        channel_status: string;
+        channel_error_code: string | null;
+      }>;
       const auth = authRows[0];
       if (auth && (auth.state === 'reserved' || auth.state === 'settled')) {
+        const reversalKind = channelAuthorizationReversalKind({
+          authorizationState: auth.state,
+          channelStatus: auth.channel_status,
+          channelErrorCode: auth.channel_error_code,
+        });
         await reverseReservation({
           reservationKey: channelTurnLedgerKey(turnId),
           reservedSubscriptionManna: numericToNumber(auth.reserved_subscription_manna),
           type: 'refund:chat:channel',
           db: tx,
         });
-        await tx.execute(sql`
-          update turn_authorizations
-          set state = 'reversed', charged_manna = 0, updated_at = now()
-          where turn_id = ${turnId} and state in ('reserved', 'settled')
-        `);
+        if (reversalKind === 'pre_settlement') {
+          await tx.execute(sql`
+            update turn_authorizations
+            set state = 'reversed', charged_manna = 0, updated_at = now()
+            where turn_id = ${turnId} and state = 'reserved'
+          `);
+        }
       } else if (!auth) {
         // Pre-kernel recovery only. New channel reservations always carry an
         // authorization row; a historical flat reservation must still not be
@@ -652,6 +689,22 @@ export function assertChannelReservationReplay(input: {
   ) {
     throw new Error('channel turn reservation replay conflict');
   }
+}
+
+export function channelAuthorizationReversalKind(input: {
+  authorizationState: string;
+  channelStatus: string;
+  channelErrorCode: string | null;
+}): 'pre_settlement' | 'delivery_compensation' {
+  if (input.authorizationState === 'reserved') return 'pre_settlement';
+  if (
+    input.authorizationState === 'settled' &&
+    input.channelStatus === 'refunding' &&
+    input.channelErrorCode === 'channel_delivery_compensation_pending'
+  ) {
+    return 'delivery_compensation';
+  }
+  throw new Error('authorization is not reversible for this channel state');
 }
 
 export class ChannelExecutionMismatchError extends Error {
@@ -874,15 +927,16 @@ export class ChannelTurnMeteringService {
   }
 
   /**
-   * Compensate a provider-complete turn whose reply could not be synchronized
-   * or delivered. The runtime calls this before suppressing outward output.
-   * Unlike the ordinary pre-settlement refund path, this method may claim a
-   * settled turn and reverses both reservation and adjustment ledger entries.
+    * Compensate a provider-complete turn whose reply could not be synchronized
+    * or delivered. The runtime calls this before suppressing outward output.
+   * Unlike the ordinary pre-settlement refund path, this method may claim only
+   * the channel consumer's `delivery_pending` state. The authorization row
+   * remains terminal at `settled`; its exact ledger charge is compensated once.
    */
   async refundDeliveryFailure(turnId: string): Promise<void> {
     const claim = await this.store.claimRefund(turnId, false, true);
     if (!claim) throw new Error('channel turn unavailable');
-    if (claim.status === 'refunded') return;
+    if (claim.status === 'refunded' && claim.errorCode === 'channel_delivery_failed') return;
     if (claim.claimed && claim.status === 'refunding') {
       await this.refundClaimedTurn(turnId, 'channel_delivery_failed');
       return;

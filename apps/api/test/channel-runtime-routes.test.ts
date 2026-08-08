@@ -72,6 +72,11 @@ beforeAll(async () => {
         decrypt: vi.fn(() => 'secret'),
       },
       sessionSync: { syncMessage },
+      xConnector: {
+        connect: vi.fn(),
+        post: vi.fn(),
+        revoke: vi.fn(),
+      },
       turnMetering: {
         reserve,
         settle,
@@ -115,7 +120,11 @@ describe('private channel runtime routes', () => {
       payload,
     });
     expect(accepted.statusCode).toBe(200);
-    expect(syncMessage).toHaveBeenCalledWith({ ...payload, createdAt: new Date(payload.createdAt) });
+    expect(syncMessage).toHaveBeenCalledWith({
+      ...payload,
+      conversationScope: 'direct',
+      createdAt: new Date(payload.createdAt),
+    });
     expect(accepted.json()).toMatchObject({
       ok: true,
       memoryContext: {
