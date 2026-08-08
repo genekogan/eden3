@@ -94,6 +94,7 @@ describe('FG-ECON registry integrity (MVP-ACCEPTANCE §1.7)', () => {
       'test/fg-econ-crash-reaper.test.ts',
       'test/econ-oracle.independence.test.ts',
       'test/fg-econ-registry.test.ts',
+      'test/channel-metering.test.ts',
     ];
     for (const file of batteryFiles) {
       expect(noSkipConstructs(readTestFile(file)), `${file} has a skip/only/todo construct`).toBe(true);
@@ -105,6 +106,7 @@ describe('FG-ECON registry integrity (MVP-ACCEPTANCE §1.7)', () => {
       'test/fg-econ-battery.test.ts',
       'test/fg-econ-studio.test.ts',
       'test/fg-econ-crash-reaper.test.ts',
+      'test/channel-metering.test.ts',
     ];
     // Registered id "cores" (a match may carry an it.each bracket suffix like
     // `FG-ECON-STUDIO-01[`; the token regex is uppercase-only so `STUDIO-01b`
