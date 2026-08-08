@@ -36,6 +36,8 @@ import {
 } from './services/task-scheduler';
 import { TurnRegistry } from './services/turn-registry';
 import { TurnReservationReaper } from './services/turn-reservation-reaper';
+import type { SessionShareRepository } from './services/session-shares';
+import { PostgresSessionShareRepository } from './services/session-shares-postgres';
 import type { CompatClientLike } from './services/turns';
 import { createAttachmentSightingHandler, MediaWatcher } from './workers/media-watcher';
 import { accountRoutes } from './routes/account';
@@ -53,6 +55,7 @@ import { mannaRoutes } from './routes/manna';
 import { mediaObjectRoutes } from './routes/media-objects';
 import { operatorRoutes } from './routes/operator';
 import { searchRoutes } from './routes/search';
+import { sessionShareRoutes } from './routes/session-shares';
 import { sessionsRoutes } from './routes/sessions';
 import { skillsRoutes } from './routes/skills';
 import { studioRoutes } from './routes/studio';
@@ -117,6 +120,7 @@ export interface BuildServerOptions {
      */
     autoStart?: boolean;
   };
+  shares?: { repository: SessionShareRepository };
 }
 
 declare module 'fastify' {
@@ -174,7 +178,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         {
           requestId: req.id,
           method: req.method,
-          url: req.url,
+          url: req.url.startsWith('/shares/') ? '/shares/[redacted]' : req.url,
           statusCode: reply.statusCode,
           elapsedMs: Number(reply.elapsedTime.toFixed(1)),
           ...(sessionId ? { sessionId } : {}),
@@ -469,6 +473,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(usageRoutes, { prefix: '/usage' });
   await app.register(operatorRoutes, { prefix: '/operator' });
   await app.register(searchRoutes, { prefix: '/search' });
+  await app.register(sessionShareRoutes, {
+    repository: opts.shares?.repository ?? new PostgresSessionShareRepository(),
+  });
   const storageRuntime =
     opts.storage?.runtime ??
     (opts.storage?.enabled === true

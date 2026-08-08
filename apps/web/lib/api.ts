@@ -66,6 +66,11 @@ import type {
   OperatorHealth,
   OperatorUsageSummary,
   OwnedSearchResponseDto,
+  PublicSessionShareDto,
+  SessionShareCreateInputDto,
+  SessionShareCreateResponseDto,
+  SessionShareListResponseDto,
+  SessionShareSummaryDto,
   UserUsageSummary,
   AgentSkillsResponse,
   SessionDetail,
@@ -505,6 +510,33 @@ export const api = {
         `/search${qs({ q, limit: options.limit })}`,
         { signal: options.signal },
       );
+    },
+  },
+
+  shares: {
+    list(sessionId: string): Promise<SessionShareListResponseDto> {
+      return get<SessionShareListResponseDto>(`/sessions/${enc(sessionId)}/shares`);
+    },
+
+    create(
+      sessionId: string,
+      input: SessionShareCreateInputDto,
+    ): Promise<SessionShareCreateResponseDto> {
+      return post<SessionShareCreateResponseDto>(`/sessions/${enc(sessionId)}/shares`, input);
+    },
+
+    async revoke(sessionId: string, shareId: string): Promise<SessionShareSummaryDto> {
+      return unwrap<SessionShareSummaryDto>(
+        await apiFetch<unknown>(`/sessions/${enc(sessionId)}/shares/${enc(shareId)}`, {
+          method: "DELETE",
+        }),
+        "share",
+      );
+    },
+
+    /** Unauthenticated, unlisted token lookup used by the public SSR page. */
+    public(token: string): Promise<PublicSessionShareDto> {
+      return get<PublicSessionShareDto>(`/shares/${enc(token)}`);
     },
   },
 

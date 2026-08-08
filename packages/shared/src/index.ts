@@ -4,3 +4,4 @@ export * from './dto';
 export * from './events';
 export * from './persona-doctrine';
 export * from './search';
+export * from './session-shares';
