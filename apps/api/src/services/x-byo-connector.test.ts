@@ -29,7 +29,7 @@ function fixtures(plaintext = JSON.stringify(CREDENTIALS)): {
 } {
   return {
     custody: {
-      seal: vi.fn(async () => HANDLE),
+      sealScoped: vi.fn(async () => HANDLE),
       withPlaintext: vi.fn(async (_handle, operation) => operation(plaintext)),
       revoke: vi.fn(async () => undefined),
     },
@@ -38,7 +38,7 @@ function fixtures(plaintext = JSON.stringify(CREDENTIALS)): {
         ok: true,
         value: { id: '12345', username: 'eden', name: 'Eden' },
       }) as const),
-      post: vi.fn(async () => ({ ok: true, value: { id: 'post-1' } }) as const),
+      post: vi.fn(async () => ({ ok: true, value: { id: '987654321' } }) as const),
     },
   };
 }
@@ -51,7 +51,7 @@ describe('XByoConnectorService', () => {
       order.push('validate');
       return { ok: true, value: { id: '12345', username: 'eden', name: null } };
     });
-    vi.mocked(custody.seal).mockImplementation(async () => {
+    vi.mocked(custody.sealScoped).mockImplementation(async () => {
       order.push('seal');
       return HANDLE;
     });
@@ -64,7 +64,7 @@ describe('XByoConnectorService', () => {
     });
 
     expect(order).toEqual(['validate', 'seal']);
-    expect(custody.seal).toHaveBeenCalledWith(
+    expect(custody.sealScoped).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'x', plaintext: JSON.stringify(CREDENTIALS) }),
     );
     for (const secret of Object.values(CREDENTIALS)) {
@@ -92,7 +92,7 @@ describe('XByoConnectorService', () => {
       credentials: CREDENTIALS,
     });
     expect(result).toMatchObject({ ok: false, code, retryable });
-    expect(custody.seal).not.toHaveBeenCalled();
+    expect(custody.sealScoped).not.toHaveBeenCalled();
   });
 
   it('resolves the vaulted payload only inside the posting callback', async () => {
@@ -100,14 +100,14 @@ describe('XByoConnectorService', () => {
     const result = await new XByoConnectorService(client, custody).post(HANDLE, ' hello ');
     expect(custody.withPlaintext).toHaveBeenCalledWith(HANDLE, expect.any(Function));
     expect(client.post).toHaveBeenCalledWith(CREDENTIALS, 'hello');
-    expect(result).toEqual({ ok: true, value: { id: 'post-1' } });
+    expect(result).toEqual({ ok: true, value: { id: '987654321' } });
   });
 
-  it('rejects over-length posts before touching custody', async () => {
+  it('rejects empty posts before touching custody', async () => {
     const { custody, client } = fixtures();
     await expect(
-      new XByoConnectorService(client, custody).post(HANDLE, 'x'.repeat(281)),
-    ).rejects.toThrow('between 1 and 280');
+      new XByoConnectorService(client, custody).post(HANDLE, '   '),
+    ).rejects.toThrow('request-size limit');
     expect(custody.withPlaintext).not.toHaveBeenCalled();
   });
 
@@ -130,7 +130,47 @@ describe('XByoConnectorService', () => {
       credentials: CREDENTIALS,
     });
     expect(result).toMatchObject({ ok: false, code: 'provider_unavailable' });
-    expect(custody.seal).not.toHaveBeenCalled();
+    expect(custody.sealScoped).not.toHaveBeenCalled();
+  });
+
+  it('allowlists provider and custody results so extra secret fields cannot escape', async () => {
+    const { custody, client } = fixtures();
+    vi.mocked(custody.sealScoped).mockResolvedValue({
+      ...HANDLE,
+      plaintext: 'synthetic-api-secret',
+    } as never);
+    vi.mocked(client.validate).mockResolvedValue({
+      ok: true,
+      value: {
+        id: '12345',
+        username: 'eden',
+        name: null,
+        apiSecret: 'synthetic-api-secret',
+      },
+    } as never);
+    const result = await new XByoConnectorService(client, custody).connect({
+      accountId: 'account-1',
+      agentId: null,
+      credentials: CREDENTIALS,
+    });
+    expect(JSON.stringify(result)).not.toContain('synthetic-api-secret');
+  });
+
+  it('maps provider failures to service-owned messages', async () => {
+    const { custody, client } = fixtures();
+    vi.mocked(client.validate).mockResolvedValue({
+      ok: false,
+      code: 'invalid_credentials',
+      message: 'synthetic-api-secret',
+      retryable: true,
+      credentials: CREDENTIALS,
+    } as never);
+    const result = await new XByoConnectorService(client, custody).connect({
+      accountId: 'account-1',
+      agentId: null,
+      credentials: CREDENTIALS,
+    });
+    expect(JSON.stringify(result)).not.toContain('synthetic-api-secret');
   });
 });
 

@@ -7,7 +7,7 @@ import {
   sessionEventsUrl,
   streamSseBody,
 } from "../lib/sse";
-import { api, toPaginated } from "../lib/api";
+import { api, ApiError, toPaginated } from "../lib/api";
 import { formatManna, formatRelativeTime } from "../lib/format";
 import { decodeBlurhash } from "../lib/blurhash";
 
@@ -277,6 +277,37 @@ describe("lib/api browser transport", () => {
     expect(init).toBeDefined();
     expect(url).toBe("/api/studio/quote");
     expect(init).toMatchObject({ method: "POST", credentials: "include" });
+  });
+
+  it("surfaces the canonical nested API error message", async () => {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: "rate_limited",
+              message: "Wait for the provider limit to reset.",
+              statusCode: 429,
+            },
+          }),
+          { status: 429, headers: { "content-type": "application/json" } },
+        ),
+      ),
+    );
+
+    const error = await api.channels.connectX({
+      credentials: {
+        apiKey: "synthetic",
+        apiSecret: "synthetic",
+        accessToken: "synthetic",
+        accessTokenSecret: "synthetic",
+      },
+    }).catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error.message).toContain("Wait for the provider limit to reset.");
   });
 
   it("normalizes the auth settings payload", async () => {
