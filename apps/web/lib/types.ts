@@ -296,6 +296,8 @@ export interface MannaSummary {
 export interface AuthMeResponse {
   user: DevUser | null;
   manna: MannaSummary | null;
+  /** True when the closed-alpha gate blocks this visitor (absent = gate off). */
+  accessGated?: boolean;
 }
 
 export interface BillingCheckoutSession {

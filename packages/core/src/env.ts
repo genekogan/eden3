@@ -73,6 +73,16 @@ export const envSchema = z.object({
   WEB_PORT: portSchema.default(4300),
   /** Comma-separated dev/operator admin usernames. */
   ADMIN_USERNAMES: csvSchema,
+  /**
+   * Closed-alpha access gate: comma-separated usernames allowed to use the
+   * deployment. Empty (the default) disables the gate entirely — every
+   * signed-in account passes. When set, ALL routes 403 with code
+   * `access_gated` for anonymous or non-listed accounts, except the paths a
+   * gated visitor needs to identify themselves (/health, /auth/*) and
+   * signature-authenticated service calls (/billing/webhook). Matching is
+   * case-insensitive; admins get no implicit bypass — list them explicitly.
+   */
+  ACCESS_ALLOWLIST: csvSchema,
   /** Auth mode: dev impersonation, Clerk, or Clerk with dev fallback for localhost. */
   AUTH_PROVIDER: authProviderSchema,
   /**

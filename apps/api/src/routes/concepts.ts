@@ -3,7 +3,6 @@ import {
   normalizeMime,
   probeImageSize,
   resolveAgentByUsername,
-  type AuthSession,
   type MediaStore,
 } from '@eden3/core';
 import { pg, type Account, type Agent } from '@eden3/db';
@@ -19,6 +18,7 @@ import {
   type ConceptImageRow,
   type ConceptRow,
 } from '../services/concepts';
+import { canManage } from './agents';
 
 /**
  * Concepts API — per-agent reference-image aesthetics. Mounted under the
@@ -147,12 +147,6 @@ function conceptDto(row: ConceptRow, images: ConceptImageRow[]): ConceptDto {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function canManage(viewer: AuthSession | null, account: Account, agent: Agent): boolean {
-  if (!viewer) return false;
-  if (viewer.isAdmin) return true;
-  return viewer.accountId === agent.ownerId || viewer.accountId === account.id;
-}
 
 interface ResolvedAgent {
   account: Account;

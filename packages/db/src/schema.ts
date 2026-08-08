@@ -5,6 +5,7 @@ import {
   boolean,
   check,
   customType,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -734,6 +735,87 @@ export const channelConnections = pgTable(
   ],
 );
 
+// ---------------------------------------------------------------------------
+// channel_onboarding_intents — short-lived, hashed-only state for the managed
+// Telegram bot handoff. Provider ids and intent secrets are never persisted in
+// raw form. Migration 0031 owns the state/connection binding trigger.
+// ---------------------------------------------------------------------------
+export const channelOnboardingIntents = pgTable(
+  'channel_onboarding_intents',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    channel: text('channel').notNull().default('telegram'),
+    intentSecretHash: text('intent_secret_hash').notNull(),
+    providerOwnerIdHash: text('provider_owner_id_hash'),
+    suggestedBotUsername: text('suggested_bot_username'),
+    state: text('state', {
+      enum: ['pending_owner', 'awaiting_bot', 'exchanging', 'stored', 'expired', 'failed'],
+    })
+      .notNull()
+      .default('pending_owner'),
+    expiresAt: timestamptz('expires_at').notNull(),
+    connectionId: uuid('connection_id').references(() => channelConnections.id, {
+      onDelete: 'set null',
+    }),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('channel_onboarding_intents_secret_uq').on(t.intentSecretHash),
+    uniqueIndex('channel_onboarding_intents_active_account_uq')
+      .on(t.accountId, t.channel)
+      .where(sql`${t.state} in ('pending_owner', 'awaiting_bot', 'exchanging')`),
+    uniqueIndex('channel_onboarding_intents_active_owner_uq')
+      .on(t.channel, t.providerOwnerIdHash)
+      .where(
+        sql`${t.providerOwnerIdHash} is not null and ${t.state} in ('awaiting_bot', 'exchanging')`,
+      ),
+    index('channel_onboarding_intents_active_expiry_idx')
+      .on(t.state, t.expiresAt)
+      .where(sql`${t.state} in ('pending_owner', 'awaiting_bot', 'exchanging')`),
+    index('channel_onboarding_intents_connection_idx')
+      .on(t.connectionId)
+      .where(sql`${t.connectionId} is not null`),
+    check('channel_onboarding_intents_channel_check', sql`${t.channel} = 'telegram'`),
+    check(
+      'channel_onboarding_intents_state_check',
+      sql`${t.state} in ('pending_owner', 'awaiting_bot', 'exchanging', 'stored', 'expired', 'failed')`,
+    ),
+    check(
+      'channel_onboarding_intents_intent_hash_check',
+      sql`${t.intentSecretHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      'channel_onboarding_intents_owner_hash_check',
+      sql`${t.providerOwnerIdHash} is null or ${t.providerOwnerIdHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      'channel_onboarding_intents_expiry_check',
+      sql`${t.expiresAt} > ${t.createdAt}`,
+    ),
+    check(
+      'channel_onboarding_intents_username_check',
+      sql`${t.suggestedBotUsername} is null or char_length(${t.suggestedBotUsername}) <= 32`,
+    ),
+    check(
+      'channel_onboarding_intents_error_code_check',
+      sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z0-9_:-]{1,64}$'`,
+    ),
+    check(
+      'channel_onboarding_intents_owner_state_check',
+      sql`(${t.state} = 'pending_owner' and ${t.providerOwnerIdHash} is null) or (${t.state} in ('awaiting_bot', 'exchanging', 'stored') and ${t.providerOwnerIdHash} is not null) or ${t.state} in ('expired', 'failed')`,
+    ),
+    check(
+      'channel_onboarding_intents_connection_state_check',
+      sql`${t.connectionId} is null or ${t.state} = 'stored'`,
+    ),
+  ],
+);
+
 /**
  * External identities are connection-scoped: the same provider peer talking
  * to two Eden bots is deliberately two principals. Raw peer ids are encrypted;
@@ -1239,6 +1321,289 @@ export const mediaAssets = pgTable('media_assets', {
 });
 
 // ---------------------------------------------------------------------------
+// storage_objects — immutable tenant-owned object identity and backing
+// indirection. The 0030 trigger enforces lifecycle and field immutability;
+// display_name is deliberately the only editable identity-adjacent field.
+// ---------------------------------------------------------------------------
+export const storageObjects = pgTable(
+  'storage_objects',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    ownerAccountId: uuid('owner_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    purpose: text('purpose', {
+      enum: [
+        'chat',
+        'training-set',
+        'skill-asset',
+        'voice-clip',
+        'concept-reference',
+        'generated',
+        'account-export',
+      ],
+    }).notNull(),
+    displayName: text('display_name'),
+    declaredMime: text('declared_mime').notNull(),
+    declaredSizeBytes: bigint('declared_size_bytes', { mode: 'number' }).notNull(),
+    declaredSha256: text('declared_sha256').notNull(),
+    verifiedMime: text('verified_mime'),
+    verifiedSizeBytes: bigint('verified_size_bytes', { mode: 'number' }),
+    verifiedSha256: text('verified_sha256'),
+    state: text('state', {
+      enum: ['pending', 'uploaded', 'verified', 'available', 'quarantined', 'failed'],
+    })
+      .notNull()
+      .default('pending'),
+    backingStore: text('backing_store', { enum: ['local', 'r2', 'legacy'] }).notNull(),
+    backingKey: text('backing_key').notNull(),
+    legacySourceUrl: text('legacy_source_url'),
+    quarantineReason: text('quarantine_reason'),
+    availableAt: timestamptz('available_at'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('storage_objects_id_owner_uq').on(t.id, t.ownerAccountId),
+    index('storage_objects_owner_state_idx').on(t.ownerAccountId, t.state, t.createdAt),
+    check(
+      'storage_objects_state_check',
+      sql`${t.state} in ('pending', 'uploaded', 'verified', 'available', 'quarantined', 'failed')`,
+    ),
+    check(
+      'storage_objects_purpose_check',
+      sql`${t.purpose} in ('chat', 'training-set', 'skill-asset', 'voice-clip', 'concept-reference', 'generated', 'account-export')`,
+    ),
+    check(
+      'storage_objects_backing_check',
+      sql`(${t.backingStore} = 'legacy' and ${t.legacySourceUrl} is not null and ${t.legacySourceUrl} ~ '^https://[^[:space:]]+$') or (${t.backingStore} in ('local', 'r2') and ${t.legacySourceUrl} is null)`,
+    ),
+    check(
+      'storage_objects_key_check',
+      sql`${t.backingKey} = 'objects/' || left(${t.id}::text, 2) || '/' || ${t.id}::text`,
+    ),
+    check(
+      'storage_objects_checksum_check',
+      sql`${t.declaredSha256} ~ '^[0-9a-f]{64}$' and (${t.verifiedSha256} is null or ${t.verifiedSha256} ~ '^[0-9a-f]{64}$')`,
+    ),
+    check(
+      'storage_objects_metadata_check',
+      sql`length(${t.declaredMime}) > 0 and ${t.declaredSizeBytes} >= 0 and ((${t.verifiedMime} is null and ${t.verifiedSizeBytes} is null and ${t.verifiedSha256} is null) or (${t.verifiedMime} is not null and length(${t.verifiedMime}) > 0 and ${t.verifiedSizeBytes} is not null and ${t.verifiedSizeBytes} >= 0 and ${t.verifiedSha256} is not null))`,
+    ),
+    check(
+      'storage_objects_lifecycle_shape_check',
+      sql`(${t.state} in ('pending', 'uploaded') and ${t.verifiedMime} is null and ${t.verifiedSizeBytes} is null and ${t.verifiedSha256} is null and ${t.availableAt} is null) or (${t.state} = 'verified' and ${t.verifiedMime} = ${t.declaredMime} and ${t.verifiedSizeBytes} = ${t.declaredSizeBytes} and ${t.verifiedSha256} = ${t.declaredSha256} and ${t.availableAt} is null) or (${t.state} = 'available' and ${t.verifiedMime} = ${t.declaredMime} and ${t.verifiedSizeBytes} = ${t.declaredSizeBytes} and ${t.verifiedSha256} = ${t.declaredSha256} and ${t.availableAt} is not null) or (${t.state} in ('quarantined', 'failed') and ${t.availableAt} is null)`,
+    ),
+    check(
+      'storage_objects_quarantine_reason_check',
+      sql`(${t.state} = 'quarantined' and ${t.quarantineReason} is not null and length(${t.quarantineReason}) > 0) or (${t.state} <> 'quarantined' and ${t.quarantineReason} is null)`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// storage_uploads — a durable resumable multipart session. The composite FK
+// binds its redundant owner to the object's owner at the database boundary.
+// Raw bearer/capability tokens are intentionally never persisted.
+// ---------------------------------------------------------------------------
+export const storageUploads = pgTable(
+  'storage_uploads',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    objectId: uuid('object_id').notNull(),
+    ownerAccountId: uuid('owner_account_id').notNull(),
+    backendMultipartId: text('backend_multipart_id').notNull(),
+    state: text('state', {
+      enum: ['initiated', 'uploading', 'completed', 'aborted', 'expired'],
+    })
+      .notNull()
+      .default('initiated'),
+    partSizeBytes: bigint('part_size_bytes', { mode: 'number' }).notNull(),
+    maxParts: integer('max_parts').notNull().default(10_000),
+    expiresAt: timestamptz('expires_at').notNull(),
+    capabilityExpiresAt: timestamptz('capability_expires_at').notNull(),
+    completedAt: timestamptz('completed_at'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('storage_uploads_object_uq').on(t.objectId),
+    index('storage_uploads_owner_state_idx').on(t.ownerAccountId, t.state, t.createdAt),
+    index('storage_uploads_expiry_idx').on(t.expiresAt).where(
+      sql`${t.state} in ('initiated', 'uploading')`,
+    ),
+    foreignKey({
+      name: 'storage_uploads_object_owner_fk',
+      columns: [t.objectId, t.ownerAccountId],
+      foreignColumns: [storageObjects.id, storageObjects.ownerAccountId],
+    }).onDelete('cascade'),
+    check(
+      'storage_uploads_state_check',
+      sql`${t.state} in ('initiated', 'uploading', 'completed', 'aborted', 'expired')`,
+    ),
+    check(
+      'storage_uploads_part_bounds_check',
+      sql`${t.partSizeBytes} > 0 and ${t.partSizeBytes} <= 5368709120 and ${t.maxParts} between 1 and 10000`,
+    ),
+    check(
+      'storage_uploads_expiry_check',
+      sql`${t.capabilityExpiresAt} > ${t.createdAt} and ${t.capabilityExpiresAt} <= ${t.expiresAt}`,
+    ),
+    check(
+      'storage_uploads_terminal_shape_check',
+      sql`(${t.state} = 'completed' and ${t.completedAt} is not null) or (${t.state} <> 'completed' and ${t.completedAt} is null)`,
+    ),
+    check('storage_uploads_backend_id_check', sql`length(${t.backendMultipartId}) > 0`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// storage_upload_parts — durable completed-part state for nonzero-offset
+// resumption. The migration trigger locks/checks the parent before any insert,
+// replacement, or delete so terminal sessions cannot be mutated.
+// ---------------------------------------------------------------------------
+export const storageUploadParts = pgTable(
+  'storage_upload_parts',
+  {
+    uploadId: uuid('upload_id')
+      .notNull()
+      .references(() => storageUploads.id, { onDelete: 'cascade' }),
+    partNumber: integer('part_number').notNull(),
+    backendEtag: text('backend_etag').notNull(),
+    checksumSha256: text('checksum_sha256').notNull(),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.uploadId, t.partNumber] }),
+    check('storage_upload_parts_number_check', sql`${t.partNumber} between 1 and 10000`),
+    check(
+      'storage_upload_parts_size_check',
+      sql`${t.sizeBytes} > 0 and ${t.sizeBytes} <= 5368709120`,
+    ),
+    check(
+      'storage_upload_parts_checksum_check',
+      sql`${t.checksumSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check('storage_upload_parts_etag_check', sql`length(${t.backendEtag}) > 0`),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// storage_upload_part_authorizations — durable capability claims, never raw
+// bearer material. Migration 0032 validates exact part geometry against the
+// parent upload/object and fences refreshes once the parent becomes terminal.
+// ---------------------------------------------------------------------------
+export const storageUploadPartAuthorizations = pgTable(
+  'storage_upload_part_authorizations',
+  {
+    uploadId: uuid('upload_id')
+      .notNull()
+      .references(() => storageUploads.id, { onDelete: 'cascade' }),
+    partNumber: integer('part_number').notNull(),
+    checksumSha256: text('checksum_sha256').notNull(),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
+    expiresAt: timestamptz('expires_at').notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.uploadId, t.partNumber] }),
+    check(
+      'storage_upload_part_authorizations_number_check',
+      sql`${t.partNumber} between 1 and 10000`,
+    ),
+    check(
+      'storage_upload_part_authorizations_checksum_check',
+      sql`${t.checksumSha256} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check('storage_upload_part_authorizations_size_check', sql`${t.sizeBytes} > 0`),
+    check(
+      'storage_upload_part_authorizations_expiry_check',
+      sql`${t.expiresAt} > ${t.createdAt}`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// storage_policy_events — minimal durable quarantine notification outbox. The
+// event UUID is the delivery idempotency key; detector text/content/payloads
+// are deliberately excluded.
+// ---------------------------------------------------------------------------
+export const storagePolicyEvents = pgTable(
+  'storage_policy_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    objectId: uuid('object_id')
+      .notNull()
+      .references(() => storageObjects.id, { onDelete: 'restrict' }),
+    ownerAccountId: uuid('owner_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'restrict' }),
+    eventType: text('event_type', { enum: ['quarantine_required'] }).notNull(),
+    policyCode: text('policy_code').notNull(),
+    state: text('state', { enum: ['pending', 'delivering', 'delivered', 'failed'] })
+      .notNull()
+      .default('pending'),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    nextAttemptAt: timestamptz('next_attempt_at'),
+    claimToken: uuid('claim_token'),
+    claimExpiresAt: timestamptz('claim_expires_at'),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+    deliveredAt: timestamptz('delivered_at'),
+  },
+  (t) => [
+    uniqueIndex('storage_policy_events_object_type_policy_uq').on(
+      t.objectId,
+      t.eventType,
+      t.policyCode,
+    ),
+    index('storage_policy_events_due_idx')
+      .on(t.nextAttemptAt)
+      .where(sql`${t.state} = 'pending'`),
+    index('storage_policy_events_claim_expiry_idx')
+      .on(t.claimExpiresAt)
+      .where(sql`${t.state} = 'delivering'`),
+    foreignKey({
+      name: 'storage_policy_events_object_owner_fk',
+      columns: [t.objectId, t.ownerAccountId],
+      foreignColumns: [storageObjects.id, storageObjects.ownerAccountId],
+    }).onDelete('restrict'),
+    check(
+      'storage_policy_events_event_type_check',
+      sql`${t.eventType} = 'quarantine_required'`,
+    ),
+    check(
+      'storage_policy_events_policy_code_check',
+      sql`${t.policyCode} ~ '^[a-z0-9_:-]{1,100}$'`,
+    ),
+    check(
+      'storage_policy_events_state_check',
+      sql`${t.state} in ('pending', 'delivering', 'delivered', 'failed')`,
+    ),
+    check('storage_policy_events_attempt_count_check', sql`${t.attemptCount} >= 0`),
+    check(
+      'storage_policy_events_last_error_code_check',
+      sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z0-9_:-]{1,100}$'`,
+    ),
+    check(
+      'storage_policy_events_claim_shape_check',
+      sql`(${t.state} = 'delivering' and ${t.claimToken} is not null and ${t.claimExpiresAt} is not null) or (${t.state} <> 'delivering' and ${t.claimToken} is null and ${t.claimExpiresAt} is null)`,
+    ),
+    check(
+      'storage_policy_events_schedule_shape_check',
+      sql`(${t.state} = 'pending' and ${t.nextAttemptAt} is not null) or (${t.state} <> 'pending' and ${t.nextAttemptAt} is null)`,
+    ),
+    check(
+      'storage_policy_events_delivery_shape_check',
+      sql`(${t.state} = 'delivered' and ${t.deliveredAt} is not null) or (${t.state} <> 'delivered' and ${t.deliveredAt} is null)`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // etl_runs — immutable source boundaries for one bounded ETL attempt.
 //
 // Every canonical Mongo collection receives one identical prior-whole-second
@@ -1340,6 +1705,8 @@ export type MannaVoucher = typeof mannaVouchers.$inferSelect;
 export type NewMannaVoucher = typeof mannaVouchers.$inferInsert;
 export type ChannelConnection = typeof channelConnections.$inferSelect;
 export type NewChannelConnection = typeof channelConnections.$inferInsert;
+export type ChannelOnboardingIntent = typeof channelOnboardingIntents.$inferSelect;
+export type NewChannelOnboardingIntent = typeof channelOnboardingIntents.$inferInsert;
 export type ChannelExternalIdentity = typeof channelExternalIdentities.$inferSelect;
 export type NewChannelExternalIdentity = typeof channelExternalIdentities.$inferInsert;
 export type ChannelPairingRequest = typeof channelPairingRequests.$inferSelect;
@@ -1370,6 +1737,16 @@ export type Trigger = typeof triggers.$inferSelect;
 export type NewTrigger = typeof triggers.$inferInsert;
 export type MediaAsset = typeof mediaAssets.$inferSelect;
 export type NewMediaAsset = typeof mediaAssets.$inferInsert;
+export type StorageObject = typeof storageObjects.$inferSelect;
+export type NewStorageObject = typeof storageObjects.$inferInsert;
+export type StorageUpload = typeof storageUploads.$inferSelect;
+export type NewStorageUpload = typeof storageUploads.$inferInsert;
+export type StorageUploadPart = typeof storageUploadParts.$inferSelect;
+export type NewStorageUploadPart = typeof storageUploadParts.$inferInsert;
+export type StorageUploadPartAuthorization = typeof storageUploadPartAuthorizations.$inferSelect;
+export type NewStorageUploadPartAuthorization = typeof storageUploadPartAuthorizations.$inferInsert;
+export type StoragePolicyEvent = typeof storagePolicyEvents.$inferSelect;
+export type NewStoragePolicyEvent = typeof storagePolicyEvents.$inferInsert;
 export type EtlRun = typeof etlRuns.$inferSelect;
 export type NewEtlRun = typeof etlRuns.$inferInsert;
 export type EtlState = typeof etlState.$inferSelect;

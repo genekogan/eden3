@@ -18,7 +18,7 @@ import { EventsBus, sessionEventsRoutes } from './events-bus';
 import { GatewayGlue, defaultOpenclawDataDir, type GatewayGlueOptions } from './gateway-glue';
 import { TurnConcurrencyLimiter } from './services/chat-limits';
 import { ensureBuiltinSkills } from './services/agent-skills';
-import { ensureDefaultEdenAssistant } from './services/default-assistant';
+import { ensureEveAssistant } from './services/default-assistant';
 import { registerHttpHardening } from './services/http-hardening';
 import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './services/history-sync';
 import { AgentRuntimeSyncScheduler } from './services/agent-runtime-sync';
@@ -51,6 +51,7 @@ import { devRoutes } from './routes/dev';
 import { feedRoutes } from './routes/feed';
 import { mannaRoutes } from './routes/manna';
 import { operatorRoutes } from './routes/operator';
+import { searchRoutes } from './routes/search';
 import { sessionsRoutes } from './routes/sessions';
 import { skillsRoutes } from './routes/skills';
 import { studioRoutes } from './routes/studio';
@@ -429,9 +430,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   });
   if (opts.scheduler?.autoStart === true) memoryDreamScheduler?.start();
   await ensureBuiltinSkills();
-  await ensureDefaultEdenAssistant({
+  await ensureEveAssistant({
     // The real API entrypoint starts the media watcher and talks to the live
-    // gateway. In that mode @eden must also sync OpenClaw's default workspace;
+    // gateway. In that mode @eve must also sync OpenClaw's default workspace;
     // route tests can still bootstrap the DB row without touching live gateway
     // state.
     syncWorkspace: opts.media?.autoStartWatcher === true && gatewayClients !== null,
@@ -460,6 +461,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Distinct from /operator (admin platform view); never exposes cost_usd.
   await app.register(usageRoutes, { prefix: '/usage' });
   await app.register(operatorRoutes, { prefix: '/operator' });
+  await app.register(searchRoutes, { prefix: '/search' });
   // Trigger routes live at /tasks on the wire (web contract).
   await app.register(triggersRoutes, { prefix: '/tasks' });
   await app.register(studioRoutes, {
