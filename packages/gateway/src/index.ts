@@ -13,6 +13,7 @@ export * from './claude-transcript';
 export * from './tools-client';
 export * from './docker';
 export * from './config-gen';
+export * from './channel-secret-capability';
 export * from './channel-sync';
 export * from './provisioner';
 export * from './cron-sync';

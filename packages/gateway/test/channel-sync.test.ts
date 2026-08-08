@@ -11,6 +11,9 @@ import {
   openclawConfigPath,
   readOpenClawConfig,
 } from '../src/config-gen';
+import { randomBytes } from 'node:crypto';
+
+import { deriveCapabilityKey } from '../src/channel-secret-capability';
 import {
   EDEN_CHANNEL_SECRET_PROVIDER_ID,
   disableDiscordChannel,
@@ -22,11 +25,20 @@ import {
 
 let dataDir: string;
 
+// Hosted-account minting requires the vault key; capability ids are derived
+// from it. Fix a synthetic key for the whole suite so expected == actual.
+const TEST_VAULT_KEY = randomBytes(32).toString('base64');
+const TEST_CAP_KEY = deriveCapabilityKey(TEST_VAULT_KEY);
+const priorVaultKey = process.env.CHANNEL_TOKEN_ENCRYPTION_KEY;
+
 beforeEach(async () => {
+  process.env.CHANNEL_TOKEN_ENCRYPTION_KEY = TEST_VAULT_KEY;
   dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'eden3-channel-sync-'));
 });
 
 afterEach(async () => {
+  if (priorVaultKey === undefined) delete process.env.CHANNEL_TOKEN_ENCRYPTION_KEY;
+  else process.env.CHANNEL_TOKEN_ENCRYPTION_KEY = priorVaultKey;
   await fs.rm(dataDir, { recursive: true, force: true });
 });
 
@@ -323,7 +335,10 @@ describe('hosted named channel accounts', () => {
     expect(accounts['agent-one']).toMatchObject({
       enabled: true,
       name: 'First bot',
-      token: hostedChannelSecretRef(connectionA),
+      token: hostedChannelSecretRef(
+        { connectionId: connectionA, channel: 'discord', runtimeAccountId: 'agent-one' },
+        TEST_CAP_KEY,
+      ),
       dmPolicy: 'allowlist',
       allowFrom: ['404322488215142410'],
       groupPolicy: 'disabled',
@@ -331,7 +346,10 @@ describe('hosted named channel accounts', () => {
     expect(accounts['agent-one']).not.toHaveProperty('guilds');
     expect(accounts['agent-two']).toMatchObject({
       enabled: true,
-      token: hostedChannelSecretRef(connectionB),
+      token: hostedChannelSecretRef(
+        { connectionId: connectionB, channel: 'discord', runtimeAccountId: 'agent-two' },
+        TEST_CAP_KEY,
+      ),
       dmPolicy: 'pairing',
       allowFrom: [],
       groupPolicy: 'disabled',
@@ -410,7 +428,10 @@ describe('hosted named channel accounts', () => {
     expect(
       (telegram.accounts as Record<string, Record<string, unknown>>)['telegram-agent'],
     ).toMatchObject({
-      botToken: hostedChannelSecretRef(connectionA),
+      botToken: hostedChannelSecretRef(
+        { connectionId: connectionA, channel: 'telegram', runtimeAccountId: 'telegram-agent' },
+        TEST_CAP_KEY,
+      ),
       dmPolicy: 'pairing',
       allowFrom: [],
       enabled: true,

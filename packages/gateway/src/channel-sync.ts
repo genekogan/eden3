@@ -10,6 +10,12 @@ import {
   type ConfigGenOptions,
   type OpenClawConfig,
 } from './config-gen';
+import {
+  CAPABILITY_EPOCH_DEFAULT,
+  deriveCapabilityKey,
+  mintCapabilityId,
+  type CapabilityScope,
+} from './channel-secret-capability';
 
 /**
  * Channel runtime wiring — projects eden3 channel connections into
@@ -286,14 +292,52 @@ function validateHostedAccountIdentity(runtimeAccountId: string, connectionId: s
   }
 }
 
-export function hostedChannelSecretRef(connectionId: string): OpenClawExecSecretRef {
-  if (!CONNECTION_UUID.test(connectionId)) {
+/**
+ * Mint the capability-bound exec SecretRef for a hosted channel account
+ * (T12-U01). The id carries an HMAC over the connection's routing scope keyed
+ * by a secret derived from CHANNEL_TOKEN_ENCRYPTION_KEY, so the resolver only
+ * releases the token to a request bearing this exact capability — a caller in a
+ * sandbox/compromised-agent position cannot forge, cross-scope-replay, or
+ * enumerate. `epoch` defaults to c1; T12-U02 rotation bumps it to revoke.
+ */
+export function hostedChannelSecretRef(
+  scope: Omit<CapabilityScope, 'epoch'> & { epoch?: string },
+  capKey: Buffer,
+): OpenClawExecSecretRef {
+  if (!CONNECTION_UUID.test(scope.connectionId)) {
     throw new ConfigGenError('hosted channel SecretRef connection id must be a UUID');
   }
   return {
     source: 'exec',
     provider: EDEN_CHANNEL_SECRET_PROVIDER_ID,
-    id: `channel/${connectionId}`,
+    id: mintCapabilityId(capKey, {
+      connectionId: scope.connectionId,
+      channel: scope.channel,
+      runtimeAccountId: scope.runtimeAccountId,
+      epoch: scope.epoch ?? CAPABILITY_EPOCH_DEFAULT,
+    }),
+  };
+}
+
+/**
+ * Derive the capability key from the configured vault key. Fail closed if the
+ * key is absent — a hosted account cannot exist without it (the token was
+ * encrypted with the same key upstream).
+ */
+function hostedCapabilityKey(): Buffer {
+  const raw = process.env.CHANNEL_TOKEN_ENCRYPTION_KEY;
+  if (!raw) {
+    throw new ConfigGenError('CHANNEL_TOKEN_ENCRYPTION_KEY is required to mint a hosted channel');
+  }
+  return deriveCapabilityKey(raw);
+}
+
+/** The capability scope for a hosted account, drawn from the connection row. */
+function scopeOf(options: HostedChannelAccountOptions): Omit<CapabilityScope, 'epoch'> {
+  return {
+    connectionId: options.connectionId,
+    channel: options.channel,
+    runtimeAccountId: options.runtimeAccountId,
   };
 }
 
@@ -411,6 +455,7 @@ export async function ensureHostedChannelAccount(
   }
   if (options.channel === 'discord') validateDiscordGuildSelections(options.discordGuilds);
 
+  const capKey = hostedCapabilityKey();
   const dataDir = options.dataDir ?? resolveDataDir();
   const mutation = await mutateOpenClawConfig(dataDir, (config) => {
     let changed = false;
@@ -451,8 +496,8 @@ export async function ensureHostedChannelAccount(
       enabled: true,
       name: options.label?.trim() || options.runtimeAccountId,
       ...(options.channel === 'discord'
-        ? { token: hostedChannelSecretRef(options.connectionId) }
-        : { botToken: hostedChannelSecretRef(options.connectionId) }),
+        ? { token: hostedChannelSecretRef(scopeOf(options), capKey) }
+        : { botToken: hostedChannelSecretRef(scopeOf(options), capKey) }),
       dmPolicy: options.dmPolicy,
       allowFrom,
       // Shared group/guild transcripts cannot safely receive one DM sender's
