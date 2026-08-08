@@ -205,7 +205,7 @@ describe('skills routes', () => {
       select sd.slug
       from agent_skills aks
       join skill_definitions sd on sd.id = aks.skill_id
-      where aks.agent_id = ${agentId}
+      where aks.agent_id = ${agentId} and aks.enabled = true
       order by sd.slug asc
     `;
     expect(rows.map((row) => row.slug)).toEqual([allowed]);
@@ -358,7 +358,7 @@ describe('skills routes', () => {
         select sd.slug
         from agent_skills aks
         join skill_definitions sd on sd.id = aks.skill_id
-        where aks.agent_id = ${agentId}
+        where aks.agent_id = ${agentId} and aks.enabled = true
       `;
       expect(desired.map((row) => row.slug)).toEqual([slug]);
 
@@ -597,7 +597,7 @@ describe('skills routes', () => {
           select sd.slug
           from agent_skills aks
           join skill_definitions sd on sd.id = aks.skill_id
-          where aks.agent_id = ${agentId}
+          where aks.agent_id = ${agentId} and aks.enabled = true
         `;
         expect(desired.map((row) => row.slug)).toEqual([winnerSlug]);
       });
