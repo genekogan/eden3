@@ -521,6 +521,41 @@ describe('POST /billing/webhook', () => {
     } finally {
       await restarted.close();
     }
+
+    const cancel = await postWebhook({
+      id: `${marker}_evt_invoice_semantic_cancel`,
+      type: 'customer.subscription.deleted',
+      created: 50_000,
+      data: {
+        object: {
+          id: object.subscription,
+          customer: object.customer,
+          status: 'canceled',
+          items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
+          metadata: { accountId: userId, tier: 'basic' },
+        },
+      },
+    });
+    expect(cancel.statusCode).toBe(200);
+
+    const afterCancelRestart = await buildServer({ billing: { stripeClient: fakeStripeClient } });
+    await afterCancelRestart.ready();
+    try {
+      const replay = await postWebhookTo(afterCancelRestart, {
+        id: `${marker}_evt_invoice_semantic_after_cancel`,
+        type: 'invoice.payment_succeeded',
+        created: 60_000,
+        data: { object },
+      });
+      expect(replay.statusCode).toBe(200);
+      expect(replay.json()).toMatchObject({ alreadyApplied: true });
+    } finally {
+      await afterCancelRestart.close();
+    }
+    const [afterReplay] = await pg<Array<{ status: string }>>`
+      select status from billing_subscriptions where stripe_subscription_id = ${object.subscription}
+    `;
+    expect(afterReplay?.status).toBe('canceled');
   });
 
   it('rejects a conflicting duplicate invoice before mutating subscription state in both arrival orders', async () => {
@@ -597,6 +632,50 @@ describe('POST /billing/webhook', () => {
         monthly_manna: 8765,
       },
     ]);
+  });
+
+  it('binds provider period end into invoice identity in both arrival orders', async () => {
+    const periods = [1_800_000_000, 1_900_000_000] as const;
+    for (const [order, firstPeriod, conflictingPeriod] of [
+      ['early-first', periods[0], periods[1]],
+      ['late-first', periods[1], periods[0]],
+    ] as const) {
+      const invoiceId = `${marker}_in_period_${order}`;
+      const subscriptionId = `${marker}_sub_period_${order}`;
+      const base = {
+        id: invoiceId,
+        customer: `${marker}_cus_period_${order}`,
+        subscription: subscriptionId,
+        billing_reason: 'subscription_cycle',
+        metadata: { accountId: userId, tier: 'basic' },
+      };
+      const first = await postWebhook({
+        id: `${marker}_evt_period_${order}_first`,
+        type: 'invoice.payment_succeeded',
+        data: {
+          object: {
+            ...base,
+            lines: { data: [{ price: { id: 'price_basic' }, quantity: 1, period: { end: firstPeriod } }] },
+          },
+        },
+      });
+      expect(first.statusCode).toBe(200);
+      const conflict = await postWebhook({
+        id: `${marker}_evt_period_${order}_conflict`,
+        type: 'invoice.payment_succeeded',
+        data: {
+          object: {
+            ...base,
+            lines: { data: [{ price: { id: 'price_basic' }, quantity: 1, period: { end: conflictingPeriod } }] },
+          },
+        },
+      });
+      expect(conflict.statusCode).toBe(409);
+      const [row] = await pg<Array<{ current_period_end: Date }>>`
+        select current_period_end from billing_subscriptions where stripe_subscription_id = ${subscriptionId}
+      `;
+      expect(new Date(row!.current_period_end).getTime()).toBe(firstPeriod * 1000);
+    }
   });
 
   it('rejects subscription and customer rebinding across tenants', async () => {
@@ -868,6 +947,41 @@ describe('POST /billing/webhook', () => {
         select status, tier from billing_subscriptions where stripe_subscription_id = ${subId}
       `;
       expect(row).toMatchObject({ status: 'past_due', tier: 'basic' });
+    }
+
+    for (const order of ['pro-first', 'basic-first'] as const) {
+      const subId = `${marker}_sub_tie_cross_${order}`;
+      const base = {
+        id: subId,
+        customer: `${marker}_cus_tie_cross_${order}`,
+      };
+      const pro = {
+        ...base,
+        status: 'trialing',
+        items: { data: [{ price: { id: 'price_pro' }, quantity: 1 }] },
+        metadata: { accountId: userId, tier: 'pro' },
+      };
+      const basic = {
+        ...base,
+        status: 'active',
+        items: { data: [{ price: { id: 'price_basic' }, quantity: 1 }] },
+        metadata: { accountId: userId, tier: 'basic' },
+      };
+      const objects = order === 'pro-first' ? [pro, basic] : [basic, pro];
+      for (const [index, object] of objects.entries()) {
+        const response = await postWebhook({
+          id: `${marker}_evt_tie_cross_${order}_${index}`,
+          type: 'customer.subscription.updated',
+          created: sameSecond,
+          data: { object },
+        });
+        expect(response.statusCode).toBe(200);
+      }
+      const [row] = await pg<Array<{ status: string; tier: string; monthly_manna: number }>>`
+        select status, tier, monthly_manna from billing_subscriptions
+        where stripe_subscription_id = ${subId}
+      `;
+      expect(row).toMatchObject({ status: 'active', tier: 'basic', monthly_manna: 4321 });
     }
   });
 

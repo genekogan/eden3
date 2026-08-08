@@ -429,7 +429,7 @@ async function assertCreditBinding(
   idempotencyKey: string,
   accountId: string,
   evidence: Record<string, unknown>,
-): Promise<void> {
+): Promise<boolean> {
   const [existing] = await dbc
     .select({
       accountId: mannaAccounts.accountId,
@@ -445,44 +445,71 @@ async function assertCreditBinding(
   ) {
     throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe credit object binding cannot change');
   }
+  return existing !== undefined;
 }
 
-function subscriptionEntitlementRank(status: string, tier: string | null): number {
-  const statusRank =
+function subscriptionCapabilityRank(
+  status: string,
+  tier: string | null,
+  monthlyManna: number,
+): number {
+  const entitlementClass =
     status === 'canceled' || status === 'incomplete_expired'
       ? 0
-      : status === 'unpaid' || status === 'incomplete' || status === 'unknown'
+      : status === 'unpaid' || status === 'incomplete' || status === 'unknown' || status === 'past_due' || status === 'paused'
         ? 1
-        : status === 'past_due' || status === 'paused'
+        : status === 'trialing' || status === 'active' || status === 'checkout_completed'
           ? 2
-          : status === 'trialing'
-            ? 3
-            : status === 'active' || status === 'checkout_completed'
-              ? 4
-              : 1;
+          : 1;
   const tierRank = tier === 'believer' ? 3 : tier === 'pro' ? 2 : tier === 'basic' ? 1 : 0;
-  return statusRank * 10 + tierRank;
+  const statusTieRank =
+    status === 'canceled' || status === 'unpaid' || status === 'trialing'
+      ? 0
+      : status === 'incomplete_expired' || status === 'incomplete' || status === 'checkout_completed'
+        ? 1
+        : status === 'unknown' || status === 'active'
+          ? 2
+          : status === 'past_due'
+            ? 3
+            : status === 'paused'
+              ? 4
+              : 5;
+  return entitlementClass * 1_000_000_000 + monthlyManna * 100 + tierRank * 10 + statusTieRank;
 }
 
-const storedSubscriptionEntitlementRank = sql<number>`(
+const storedSubscriptionCapabilityRank = sql<number>`(
   case ${billingSubscriptions.status}
     when 'canceled' then 0
     when 'incomplete_expired' then 0
     when 'unpaid' then 1
     when 'incomplete' then 1
     when 'unknown' then 1
-    when 'past_due' then 2
-    when 'paused' then 2
-    when 'trialing' then 3
-    when 'active' then 4
-    when 'checkout_completed' then 4
+    when 'past_due' then 1
+    when 'paused' then 1
+    when 'trialing' then 2
+    when 'active' then 2
+    when 'checkout_completed' then 2
     else 1
-  end * 10
+  end * 1000000000
+  + ${billingSubscriptions.monthlyManna} * 100
   + case ${billingSubscriptions.tier}
-      when 'believer' then 3
-      when 'pro' then 2
-      when 'basic' then 1
+      when 'believer' then 30
+      when 'pro' then 20
+      when 'basic' then 10
       else 0
+    end
+  + case ${billingSubscriptions.status}
+      when 'canceled' then 0
+      when 'unpaid' then 0
+      when 'trialing' then 0
+      when 'incomplete_expired' then 1
+      when 'incomplete' then 1
+      when 'checkout_completed' then 1
+      when 'unknown' then 2
+      when 'active' then 2
+      when 'past_due' then 3
+      when 'paused' then 4
+      else 5
     end
 )`;
 
@@ -545,7 +572,7 @@ async function upsertSubscription(params: {
               or ${billingSubscriptions.lastStripeEventAt} < ${eventAt.toISOString()}::timestamptz
               or (
                 ${billingSubscriptions.lastStripeEventAt} = ${eventAt.toISOString()}::timestamptz
-                and ${subscriptionEntitlementRank(params.status, params.tier)} <= ${storedSubscriptionEntitlementRank}
+                and ${subscriptionCapabilityRank(params.status, params.tier, params.monthlyManna)} <= ${storedSubscriptionCapabilityRank}
               )`,
         ),
     });
@@ -610,7 +637,9 @@ async function handleCheckoutCompleted(
       stripeCustomerId: customerId,
       stripeSubscriptionId: null,
     });
-    await assertCreditBinding(tx, idempotencyKey, accountId, evidence);
+    if (await assertCreditBinding(tx, idempotencyKey, accountId, evidence)) {
+      return { action: 'manna_credited', alreadyApplied: true };
+    }
     const result = await credit({
       accountId,
       amount: env.STRIPE_MANNA_TOPUP_AMOUNT,
@@ -657,6 +686,7 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
     tier,
     amount: monthlyManna,
     billingReason,
+    periodEnd: configured.periodEnd?.toISOString() ?? null,
     livemode: false,
   };
   return await db.transaction(async (tx) => {
@@ -670,7 +700,9 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
       stripeCustomerId: customerId,
       stripeSubscriptionId: subscriptionId,
     });
-    await assertCreditBinding(tx, idempotencyKey, accountId, evidence);
+    if (await assertCreditBinding(tx, idempotencyKey, accountId, evidence)) {
+      return { action: 'subscription_manna_credited', alreadyApplied: true };
+    }
     await upsertSubscription({
       db: tx,
       accountId,
