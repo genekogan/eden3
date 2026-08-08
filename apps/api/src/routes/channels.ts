@@ -1410,7 +1410,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             ${encrypted
               ? tx`, token_ciphertext = ${encrypted.tokenCiphertext}, token_iv = ${encrypted.tokenIv},
                     token_auth_tag = ${encrypted.tokenAuthTag}, token_sha256 = ${encrypted.tokenSha256},
-                    token_preview = null, key_version = ${encrypted.keyVersion}`
+                    key_version = ${encrypted.keyVersion}`
               : tx``}
         where id = ${row.id}
         returning ${CONNECTION_COLUMNS}

@@ -33,6 +33,7 @@ const BILLING_SECRET = `${marker}_billing-secret`;
 const VOUCHER_SECRET = `${marker}_voucher-secret`;
 const IDEMPOTENCY_SECRET = `${marker}_idempotency-secret`;
 const CHANNEL_SECRET = `${marker}_channel-ciphertext-secret`;
+const CHANNEL_PREVIEW = `${marker}_credential-preview`;
 const AUDIT_SECRET = `${marker}_audit-secret`;
 const UNAUTHORIZED_MESSAGE = `${marker}_unauthorized-session-message`;
 const HIDDEN_MESSAGE = `${marker}_hidden-session-message`;
@@ -263,9 +264,10 @@ beforeAll(async () => {
   const [connection] = await pg<{ id: string }[]>`
     insert into channel_connections (
       account_id, agent_id, channel, token_ciphertext, token_iv,
-      token_auth_tag, token_sha256, token_preview
+      token_auth_tag, token_sha256, metadata
     ) values (
-      ${ownerId}, ${agentId}, 'discord', ${CHANNEL_SECRET}, 'iv', 'tag', 'hash', 'last4'
+      ${ownerId}, ${agentId}, 'discord', ${CHANNEL_SECRET}, 'iv', 'tag', 'hash',
+      ${JSON.stringify({ legacyCredentialPreview: CHANNEL_PREVIEW })}::jsonb
     )
     returning id
   `;
@@ -440,6 +442,7 @@ describe('GET /account/export', () => {
       VOUCHER_SECRET,
       IDEMPOTENCY_SECRET,
       CHANNEL_SECRET,
+      CHANNEL_PREVIEW,
       AUDIT_SECRET,
       UNAUTHORIZED_MESSAGE,
     ]) {
