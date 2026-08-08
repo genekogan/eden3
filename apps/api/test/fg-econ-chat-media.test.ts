@@ -471,6 +471,15 @@ describe('FG-ECON in-chat media authorization', () => {
           args: { prompt: 'late Studio image' },
         },
       });
+      await expect(reserve(secondTurnId, second.userId)).rejects.toMatchObject({
+        code: 'studio_generation_busy',
+        outputKind: 'image',
+      });
+      expect((await getBalance(second.userId)).total).toBe(secondBefore.total);
+      const [preQuarantineLoserRows] = await pg<{ count: string }[]>`
+        select count(*) from usage_events where turn_id = ${secondTurnId}`;
+      expect(Number(preQuarantineLoserRows?.count ?? -1)).toBe(0);
+
       expect(
         await compensateStudioGeneration({
           turnId: firstTurnId,

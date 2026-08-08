@@ -599,6 +599,8 @@ export interface AttachmentSightingHandlerOptions {
   watcher?: MediaWatcher | null;
   dirs?: OpenclawDirs;
   logger?: MediaLogger;
+  /** Same durable late-output fence used by the polling watcher. */
+  isStudioKindQuarantined?: (kind: AttachmentKind) => Promise<boolean>;
   /** stat() retries while waiting for the file to be host-visible. */
   statRetries?: number;
   statRetryDelayMs?: number;
@@ -656,6 +658,20 @@ export function createAttachmentSightingHandler(opts: AttachmentSightingHandlerO
 
     opts.watcher?.markProcessed(hostPath);
     const kind = attachmentKindForMime(mimeForPath(hostPath));
+    if (opts.isStudioKindQuarantined) {
+      let quarantined = true;
+      try {
+        quarantined = await opts.isStudioKindQuarantined(kind);
+      } catch (err) {
+        log.warn(`media-sighting: Studio quarantine check failed closed: ${String(err)}`);
+      }
+      if (quarantined) {
+        await opts.pipeline.ingestFile(hostPath, {
+          tool: toolFromPath(hostPath, kind),
+        });
+        return;
+      }
+    }
     await opts.pipeline.ingestFile(hostPath, {
       sessionId: sighting.sessionId,
       messageId: sighting.messageId,

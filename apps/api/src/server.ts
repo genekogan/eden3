@@ -25,7 +25,7 @@ import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './se
 import { AgentProvisioningWorker } from './services/agent-provisioning';
 import { AgentRuntimeSyncScheduler } from './services/agent-runtime-sync';
 import { startBackgroundWorkerLoop } from './services/background-worker-loop';
-import { MediaPipeline } from './services/media-pipeline';
+import { MediaPipeline, type AttachmentKind } from './services/media-pipeline';
 import {
   EdenMemoryDreamAgentRunner,
   MemoryDreamOrchestrator,
@@ -382,13 +382,14 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // same watcher for claimNext(). A raw async file with no exact transcript
   // sighting parks safely rather than inheriting a merely recent chat turn.
   const mediaPipeline = new MediaPipeline({ bus: app.eventsBus, logger: app.log });
+  const isStudioKindQuarantined = (outputKind: AttachmentKind) =>
+    outputKind === 'file'
+      ? Promise.resolve(false)
+      : isStudioOutputKindQuarantined({ outputKind });
   const mediaWatcher = new MediaWatcher({
     pipeline: mediaPipeline,
     logger: app.log,
-    isStudioKindQuarantined: (outputKind) =>
-      outputKind === 'file'
-        ? Promise.resolve(false)
-        : isStudioOutputKindQuarantined({ outputKind }),
+    isStudioKindQuarantined,
   });
   if (historySync) {
     historySync.setAttachmentCallback(
@@ -397,6 +398,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
           pipeline: mediaPipeline,
           watcher: mediaWatcher,
           logger: app.log,
+          isStudioKindQuarantined,
         }),
     );
   }
