@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { pathToFileURL } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
 
@@ -41,6 +42,17 @@ describe('Discord reconnect-retention guard', () => {
     await Promise.all(generations.map(({ drain }) => drain));
 
     expect(generations.every(({ tracker }) => tracker.pendingCount() === 0)).toBe(true);
+  });
+
+  it('bounds a stuck generation and leaves its tracker observable until late settlement', async () => {
+    const tracker = createEdenDiscordDrainTracker();
+    const admission = tracker.reserve();
+    tracker.stopAccepting();
+    const result = await tracker.drain(5);
+    expect(result).toEqual({ timedOut: true, pendingCount: 1 });
+    expect(tracker.pendingCount()).toBe(1);
+    admission.settle();
+    expect(tracker.pendingCount()).toBe(0);
   });
 
   it('patches only the pinned Discord handler/provider bundles and makes teardown await drain', async () => {
@@ -82,12 +94,70 @@ describe('Discord reconnect-retention guard', () => {
       const handler = await fs.readFile(path.join(fixtureDir, 'message-handler-pinned.js'), 'utf8');
       const provider = await fs.readFile(path.join(fixtureDir, 'provider-pinned.js'), 'utf8');
       expect(handler).toContain('const pendingTasks = createEdenDiscordDrainTracker();');
-      expect(handler).toContain('await pendingTasks.drain();');
+      expect(handler).toContain('await pendingTasks.drain(25_000);');
+      expect(handler).toContain('discord message enqueue failed');
+      expect(handler).toContain('cleanupSkipped();');
       expect(handler).toContain('const activeAdmissions = createEdenDiscordDrainTracker();');
-      expect(handler).toContain('await activeAdmissions.drain();');
+      expect(handler).toContain('await activeAdmissions.drain(5_000);');
       expect(provider).toContain('async function cleanupDiscordProviderStartup(params)');
       expect(provider).toContain('await params.deactivateMessageHandler?.();');
       expect(provider).toContain('await cleanupDiscordProviderStartup({');
+      expect(provider).toContain('this.handler(data, client).catch');
+      expect(provider).not.toContain(
+        'Promise.resolve().then(() => this.handler(data, client))',
+      );
+      expect(handler).toContain('debounceMsOverride: 0');
+      expect(handler).toContain('abortSignal: drainController.signal');
+      expect(handler).toContain('abortSignal: messageRunQueue.lifecycleSignal');
+      expect(handler).toContain('terminating stale generation');
+      expect(handler).toContain('process.exit(1)');
+
+      const patchedFixture = await import(
+        `${pathToFileURL(path.join(fixtureDir, 'message-handler-pinned.js')).href}?test=${Date.now()}`
+      );
+      patchedFixture.fixtureControl.throwOnEnqueue = true;
+      patchedFixture.fixtureControl.throwOnSkip = true;
+      const queue = patchedFixture.createDiscordMessageRunQueue({
+        runtime: { error: (error) => patchedFixture.fixtureControl.errors.push(String(error)) },
+      });
+      queue.enqueue({ queueKey: 'session-a' });
+      expect(patchedFixture.fixtureControl.skipped).toBe(1);
+      expect(patchedFixture.fixtureControl.errors).toEqual([
+        'discord skipped message cleanup failed: Error: synthetic skip cleanup failure',
+        'discord message enqueue failed: Error: synthetic enqueue failure',
+      ]);
+      await expect(queue.deactivate()).resolves.toBeUndefined();
+
+      patchedFixture.fixtureControl.throwOnEnqueue = false;
+      patchedFixture.fixtureControl.throwOnSkip = false;
+      const first = deferred();
+      const second = deferred();
+      patchedFixture.fixtureControl.taskGates.push(first.promise, second.promise);
+      const drainingQueue = patchedFixture.createDiscordMessageRunQueue({
+        runtime: { error: (error) => patchedFixture.fixtureControl.errors.push(String(error)) },
+      });
+      drainingQueue.enqueue({ queueKey: 'session-a' });
+      drainingQueue.enqueue({ queueKey: 'session-a' });
+      let drained = false;
+      const drain = drainingQueue.deactivate().then(() => {
+        drained = true;
+      });
+      await Promise.resolve();
+      expect(drained).toBe(false);
+      first.resolve();
+      second.resolve();
+      await drain;
+      expect(drained).toBe(true);
+
+      const patchedProvider = await import(
+        `${pathToFileURL(path.join(fixtureDir, 'provider-pinned.js')).href}?test=${Date.now()}`
+      );
+      let listenerAdmissionStarted = false;
+      const listener = new patchedProvider.DiscordMessageListener(async () => {
+        listenerAdmissionStarted = true;
+      });
+      void listener.handle({}, {});
+      expect(listenerAdmissionStarted).toBe(true);
     } finally {
       await fs.rm(fixtureDir, { recursive: true, force: true });
     }

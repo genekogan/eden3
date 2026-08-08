@@ -531,6 +531,14 @@ export async function ensureHostedChannelAccount(
     if (setHostedValue(channelConfig, 'enabled', true)) changed = true;
     if (setHostedValue(channelConfig, 'configWrites', false)) changed = true;
     if (
+      options.channel === 'discord' &&
+      setHostedValue(channelConfig, 'healthMonitor', { enabled: false })
+    ) {
+      // Native Discord gateway resume owns transient reconnects. The upstream
+      // outer monitor replaces the provider and recreated the R3.8 storm.
+      changed = true;
+    }
+    if (
       options.channel === 'telegram' &&
       setHostedValue(channelConfig, 'streaming', { mode: 'off' })
     ) {
