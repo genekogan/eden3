@@ -22,6 +22,7 @@ const RUNTIME_ROUTE_PATTERNS = [
 ] as const;
 
 const TURN_ID = '00000000-0000-4000-8000-000000000001';
+const MEDIA_AUTHORIZATION_ID = '00000000-0000-4000-8000-000000000002';
 const RUNTIME_REQUEST_PATHS = [
   '/channels/runtime/messages',
   '/channels/runtime/pairing',
@@ -93,6 +94,11 @@ async function buildAdmissionHarness(): Promise<FastifyInstance> {
 
   app.post(
     '/media/runtime/authorizations',
+    serviceAuthenticatedCallback(requireRuntime),
+    async () => ({ ok: true }),
+  );
+  app.post(
+    '/media/runtime/authorizations/:authorizationId/fail',
     serviceAuthenticatedCallback(requireRuntime),
     async () => ({ ok: true }),
   );
@@ -297,17 +303,23 @@ describe('closed-cohort admission for channel service callbacks', () => {
   it.each([
     ['missing', undefined],
     ['wrong', 'Bearer wrong-runtime-token'],
-  ])('lets a marked media service callback reach its %s bearer rejection', async (_case, authorization) => {
+  ])('lets marked media service callbacks reach their %s bearer rejection', async (_case, authorization) => {
     const app = await buildAdmissionHarness();
     try {
-      const response = await app.inject({
-        method: 'POST',
-        url: '/media/runtime/authorizations',
-        headers: authorization ? { authorization } : undefined,
-        payload: {},
-      });
-      expect(response.statusCode).toBe(401);
-      expect(response.json().error.code).toBe('runtime_unauthorized');
+      for (const url of [
+        '/media/runtime/authorizations',
+        `/media/runtime/authorizations/${MEDIA_AUTHORIZATION_ID}/fail`,
+        '/media/runtime/authorizations/extra/fail',
+      ]) {
+        const response = await app.inject({
+          method: 'POST',
+          url,
+          headers: authorization ? { authorization } : undefined,
+          payload: {},
+        });
+        expect(response.statusCode).toBe(401);
+        expect(response.json().error.code).toBe('runtime_unauthorized');
+      }
     } finally {
       await app.close();
     }
@@ -366,6 +378,7 @@ describe('closed-cohort admission for channel service callbacks', () => {
     `/channels/runtime/turns/${TURN_ID}/settle/extra`,
     '/channels/telegram/managed-bots/webhook/extra',
     '/channels/telegram/managed-bots/webhookevil',
+    `/media/runtime/authorizations/${MEDIA_AUTHORIZATION_ID}/fail/extra`,
   ])('keeps callback lookalike %s cohort-gated', async (path) => {
     const app = await buildAdmissionHarness();
     try {
