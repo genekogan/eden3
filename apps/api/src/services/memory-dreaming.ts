@@ -1011,6 +1011,9 @@ export interface MemoryDreamTerminalUsage {
   sessionId: string | null;
   agentId: string | null;
   messageId?: string | null;
+  manna?: number | null;
+  errorCode?: string | null;
+  metadata?: unknown;
 }
 
 export interface MemoryDreamDurableEvidence {
@@ -1018,6 +1021,11 @@ export interface MemoryDreamDurableEvidence {
   providerStatus: 'not_started' | 'started' | 'terminal' | 'indeterminate';
   usage: MemoryDreamTerminalUsage | null;
   debitKeys: string[];
+  authorization?: {
+    state: string;
+    authorizedMaxManna: number;
+    chargedManna: number | null;
+  } | null;
 }
 
 export interface MemoryDreamDurability {
@@ -1033,6 +1041,29 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+/** Exact fail-closed classifier for a charged partial-output dream failure. */
+export function isSettledPartialOutputDreamFailure(
+  evidence: MemoryDreamDurableEvidence,
+): boolean {
+  const usage = evidence.usage;
+  const authorization = evidence.authorization;
+  const metadata = asRecord(usage?.metadata);
+  const partial = asRecord(metadata?.['partialOutputSettlement']);
+  return (
+    usage?.status === 'error' &&
+    usage.messageId == null &&
+    typeof usage.errorCode === 'string' &&
+    usage.errorCode.length > 0 &&
+    typeof usage.manna === 'number' &&
+    Number.isFinite(usage.manna) &&
+    partial?.['rule'] === 'full-reserve-v1' &&
+    partial['chargedManna'] === usage.manna &&
+    authorization?.state === 'settled' &&
+    authorization.chargedManna === usage.manna &&
+    authorization.authorizedMaxManna === usage.manna
+  );
 }
 
 function isAgentRuntime(value: unknown): value is AgentRuntime {
@@ -1191,8 +1222,12 @@ export class PostgresMemoryDreamDurability implements MemoryDreamDurability {
       session_id: string | null;
       agent_id: string | null;
       message_id: string | null;
+      manna: number | null;
+      error_code: string | null;
+      metadata: unknown;
     }[]>`
-      select id, status, pricing_basis, session_id, agent_id, message_id
+      select id, status, pricing_basis, session_id, agent_id, message_id,
+             manna, error_code, metadata
       from usage_events
       where event_type = 'memory_dream' and turn_id = ${runId}
       order by created_at desc
@@ -1203,6 +1238,14 @@ export class PostgresMemoryDreamDurability implements MemoryDreamDurability {
       from manna_transactions
       where idempotency_key in (${runId}, ${`${runId}:settle`})
         and amount < 0
+    `;
+    const [authorization] = await pg<{
+      state: string;
+      authorized_max_manna: string;
+      charged_manna: string | null;
+    }[]>`
+      select state, authorized_max_manna, charged_manna
+      from turn_authorizations where turn_id = ${runId}
     `;
     return {
       checkpoint: parseMemoryDreamCheckpoint(run.provenance),
@@ -1215,9 +1258,22 @@ export class PostgresMemoryDreamDurability implements MemoryDreamDurability {
             sessionId: usage.session_id,
             agentId: usage.agent_id,
             messageId: usage.message_id,
+            manna: usage.manna,
+            errorCode: usage.error_code,
+            metadata: usage.metadata,
           }
         : null,
       debitKeys: debits.map((row) => row.idempotency_key),
+      authorization: authorization
+        ? {
+            state: authorization.state,
+            authorizedMaxManna: Number(authorization.authorized_max_manna),
+            chargedManna:
+              authorization.charged_manna === null
+                ? null
+                : Number(authorization.charged_manna),
+          }
+        : null,
     };
   }
 
@@ -1604,6 +1660,21 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
     if (usage.pricingBasis !== 'provider-api' && usage.pricingBasis !== 'notional-subscription') {
       throw new MemoryDreamRecoveryResolvedError(
         `memory dream run ${run.id} usage event has invalid pricing provenance`,
+      );
+    }
+    if (isSettledPartialOutputDreamFailure(evidence)) {
+      if (!checkpoint) {
+        throw new MemoryDreamRecoveryPendingError(
+          `memory dream run ${run.id} has charged partial-output truth without a recovery checkpoint`,
+        );
+      }
+      await this.durability.saveCheckpoint(
+        run,
+        { ...checkpoint, phase: 'provider_terminal' },
+        'terminal',
+      );
+      throw new MemoryDreamRecoveryResolvedError(
+        `memory dream run ${run.id} failed after usable output; full authorized reserve remains charged`,
       );
     }
     if (!['completed', 'missing_usage', 'unmetered'].includes(usage.status)) {
