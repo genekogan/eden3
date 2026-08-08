@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { pg } from '@eden3/db';
+import { pg, type Account, type Agent } from '@eden3/db';
 import {
   BOOTSTRAP_FILENAME,
   WORKSPACE_STATE_FILENAME,
@@ -12,15 +12,38 @@ import {
   workspaceBootstrapStatus,
 } from '@eden3/gateway';
 
-export const DEFAULT_EDEN_USERNAME = 'eden';
-export const DEFAULT_EDEN_OPENCLAW_ID = 'main';
+/**
+ * Eve is the one platform-owned assistant. Her database account may be
+ * renamed during upgrades, but the shared-gateway identity must never move.
+ */
+export const DEFAULT_EVE_USERNAME = 'eve';
+export const DEFAULT_EVE_OPENCLAW_ID = 'main';
 
-const DEFAULT_EDEN_PROFILE = {
-  name: 'Eden',
+export function isPlatformEve(_account: Account, agent: Agent): boolean {
+  // The runtime binding is the durable identity. Keep the guard closed even
+  // if a damaged/manual database edit temporarily drifts the display handle.
+  return agent.openclawId === DEFAULT_EVE_OPENCLAW_ID && agent.ownerId === null;
+}
+
+export async function isPlatformEveAccountId(accountId: string | null): Promise<boolean> {
+  if (accountId === null) return false;
+  const [row] = await pg<{ isEve: boolean }[]>`
+    select exists(
+      select 1 from agents
+      where account_id = ${accountId}
+        and openclaw_id = ${DEFAULT_EVE_OPENCLAW_ID}
+        and owner_id is null
+    ) as "isEve"
+  `;
+  return row?.isEve ?? false;
+}
+
+const DEFAULT_EVE_PROFILE = {
+  name: 'Eve',
   description:
-    'The default Eden assistant for learning the platform, exploring tools, and shaping new agents.',
+    'The platform-owned Eden assistant for learning the platform, exploring tools, and shaping new agents.',
   persona: [
-    'You are Eden, the default assistant inside Eden3.',
+    'You are Eve, the singular platform-owned assistant inside Eden3.',
     'Help users understand the platform, create and refine agents, choose tools, and troubleshoot their workflows.',
     'When users ask how to create an agent in Eden3, guide them to the Eden3 web UI: use Create agent at /agents/new for templates, or Agent builder at /agents/builder for an interview-driven draft.',
     'Do not tell Eden3 users to run command-line provisioning tools; those are internal implementation details, not the hosted product workflow.',
@@ -31,16 +54,16 @@ const DEFAULT_EDEN_PROFILE = {
     'I can help you explore Eden, generate media, configure agents, and turn an idea into a working assistant.',
 };
 
-export interface DefaultEdenAssistantResult {
+export interface EveAssistantResult {
   accountId: string;
-  username: typeof DEFAULT_EDEN_USERNAME;
-  openclawId: typeof DEFAULT_EDEN_OPENCLAW_ID;
+  username: typeof DEFAULT_EVE_USERNAME;
+  openclawId: typeof DEFAULT_EVE_OPENCLAW_ID;
 }
 
-export interface EnsureDefaultEdenAssistantOptions {
+export interface EnsureEveAssistantOptions {
   /**
    * Also render the OpenClaw default workspace used by agent "main". This is
-   * enabled only by the real API entrypoint so route tests can bootstrap @eden
+   * enabled only by the real API entrypoint so route tests can bootstrap @eve
    * without mutating the live OpenClaw data directory.
    */
   syncWorkspace?: boolean;
@@ -51,19 +74,67 @@ export interface EnsureDefaultEdenAssistantOptions {
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const WORKSPACE_TEMPLATES_DIR = path.join(REPO_ROOT, 'packages', 'gateway', 'workspace-templates');
 
-export async function ensureDefaultEdenAssistant(
-  options: EnsureDefaultEdenAssistantOptions = {},
-): Promise<DefaultEdenAssistantResult> {
-  const result: DefaultEdenAssistantResult = await pg.begin(async (sql) => {
-    const [account] = await sql<{ id: string; type: 'user' | 'agent' }[]>`
-      insert into accounts (type, username, updated_at)
-      values ('agent', ${DEFAULT_EDEN_USERNAME}, now())
-      on conflict (username) do update set updated_at = now()
-      returning id, type
+export async function ensureEveAssistant(
+  options: EnsureEveAssistantOptions = {},
+): Promise<EveAssistantResult> {
+  const result: EveAssistantResult = await pg.begin(async (sql) => {
+    // A transaction-scoped lock makes concurrent API starts converge on one
+    // account/runtime identity instead of briefly creating competing rows.
+    await sql`select pg_advisory_xact_lock(hashtextextended('eden3:platform:eve', 0))`;
+
+    const [existingRuntime] = await sql<
+      { id: string; type: 'user' | 'agent'; username: string; ownerId: string | null }[]
+    >`
+      select a.id, a.type, a.username::text as username, g.owner_id as "ownerId"
+      from agents g
+      join accounts a on a.id = g.account_id
+      where g.openclaw_id = ${DEFAULT_EVE_OPENCLAW_ID}
+      for update of a, g
     `;
-    if (!account) throw new Error('default Eden account upsert returned no row');
-    if (account.type !== 'agent') {
-      throw new Error(`default Eden username "${DEFAULT_EDEN_USERNAME}" is not an agent account`);
+
+    let account = existingRuntime;
+    if (account) {
+      if (account.type !== 'agent' || account.ownerId !== null) {
+        throw new Error('OpenClaw main is not a platform-owned agent; refusing to replace it with Eve');
+      }
+      if (account.username.toLowerCase() !== DEFAULT_EVE_USERNAME) {
+        const [collision] = await sql<{ id: string }[]>`
+          select id from accounts where username = ${DEFAULT_EVE_USERNAME} for update
+        `;
+        if (collision && collision.id !== account.id) {
+          throw new Error(`reserved username "${DEFAULT_EVE_USERNAME}" belongs to another account`);
+        }
+        await sql`
+          update accounts
+          set username = ${DEFAULT_EVE_USERNAME}, updated_at = now()
+          where id = ${account.id}
+        `;
+        account = { ...account, username: DEFAULT_EVE_USERNAME };
+      }
+    } else {
+      const [candidate] = await sql<{ id: string; type: 'user' | 'agent'; username: string }[]>`
+        insert into accounts (type, username, updated_at)
+        values ('agent', ${DEFAULT_EVE_USERNAME}, now())
+        on conflict (username) do update set updated_at = now()
+        returning id, type, username::text as username
+      `;
+      if (!candidate) throw new Error('Eve account upsert returned no row');
+      if (candidate.type !== 'agent') {
+        throw new Error(`reserved username "${DEFAULT_EVE_USERNAME}" is not an agent account`);
+      }
+      const [candidateAgent] = await sql<{ ownerId: string | null; openclawId: string | null }[]>`
+        select owner_id as "ownerId", openclaw_id as "openclawId"
+        from agents where account_id = ${candidate.id} for update
+      `;
+      if (
+        candidateAgent &&
+        (candidateAgent.ownerId !== null ||
+          (candidateAgent.openclawId !== null &&
+            candidateAgent.openclawId !== DEFAULT_EVE_OPENCLAW_ID))
+      ) {
+        throw new Error('reserved Eve account is not platform-owned; refusing to repurpose it');
+      }
+      account = { ...candidate, ownerId: null };
     }
 
     await sql`
@@ -73,9 +144,9 @@ export async function ensureDefaultEdenAssistant(
         provisioned_at
       )
       values (
-        ${account.id}, null, ${DEFAULT_EDEN_PROFILE.name},
-        ${DEFAULT_EDEN_PROFILE.description}, ${DEFAULT_EDEN_PROFILE.persona},
-        true, ${DEFAULT_EDEN_PROFILE.greeting}, true, ${DEFAULT_EDEN_OPENCLAW_ID},
+        ${account.id}, null, ${DEFAULT_EVE_PROFILE.name},
+        ${DEFAULT_EVE_PROFILE.description}, ${DEFAULT_EVE_PROFILE.persona},
+        true, ${DEFAULT_EVE_PROFILE.greeting}, true, ${DEFAULT_EVE_OPENCLAW_ID},
         true, false, 'ready', now()
       )
       on conflict (account_id) do update set
@@ -95,12 +166,12 @@ export async function ensureDefaultEdenAssistant(
 
     return {
       accountId: account.id,
-      username: DEFAULT_EDEN_USERNAME,
-      openclawId: DEFAULT_EDEN_OPENCLAW_ID,
-    } satisfies DefaultEdenAssistantResult;
+      username: DEFAULT_EVE_USERNAME,
+      openclawId: DEFAULT_EVE_OPENCLAW_ID,
+    } satisfies EveAssistantResult;
   });
   if (options.syncWorkspace === true) {
-    await syncDefaultEdenWorkspace({
+    await syncEveWorkspace({
       dataDir: options.dataDir,
       now: options.now,
     });
@@ -108,23 +179,23 @@ export async function ensureDefaultEdenAssistant(
   return result;
 }
 
-export interface SyncDefaultEdenWorkspaceOptions {
+export interface SyncEveWorkspaceOptions {
   dataDir?: string;
   now?: () => Date;
 }
 
-export async function syncDefaultEdenWorkspace(
-  options: SyncDefaultEdenWorkspaceOptions = {},
+export async function syncEveWorkspace(
+  options: SyncEveWorkspaceOptions = {},
 ): Promise<{ workspaceDir: string; filesWritten: string[] }> {
   const dataDir = options.dataDir ?? path.join(REPO_ROOT, 'infra', 'openclaw', 'data');
   const workspaceDir = path.join(dataDir, 'workspace');
   const now = options.now ?? (() => new Date());
   const vars = {
-    NAME: DEFAULT_EDEN_PROFILE.name,
-    USERNAME: DEFAULT_EDEN_USERNAME,
-    DESCRIPTION: DEFAULT_EDEN_PROFILE.description,
-    PERSONA: DEFAULT_EDEN_PROFILE.persona,
-    GREETING: DEFAULT_EDEN_PROFILE.greeting,
+    NAME: DEFAULT_EVE_PROFILE.name,
+    USERNAME: DEFAULT_EVE_USERNAME,
+    DESCRIPTION: DEFAULT_EVE_PROFILE.description,
+    PERSONA: DEFAULT_EVE_PROFILE.persona,
+    GREETING: DEFAULT_EVE_PROFILE.greeting,
     VOICE: 'clear, practical, product-native',
     THINKING_LEVEL: 'balanced',
     MEMORY_SEED: '',
@@ -132,8 +203,19 @@ export async function syncDefaultEdenWorkspace(
   };
 
   await fs.mkdir(workspaceDir, { recursive: true });
+  await fs.mkdir(path.join(workspaceDir, 'memory', 'users'), { recursive: true });
   const filesWritten: string[] = [];
-  for (const relPath of ['SOUL.md', 'IDENTITY.md'] as const) {
+  // The platform assistant owns a complete doctrine set. Per-user memories
+  // live below memory/users/ and are deliberately not part of these files.
+  for (const relPath of [
+    'AGENTS.md',
+    'HEARTBEAT.md',
+    'IDENTITY.md',
+    'MEMORY.md',
+    'SOUL.md',
+    'TOOLS.md',
+    'USER.md',
+  ] as const) {
     const raw = await fs.readFile(path.join(WORKSPACE_TEMPLATES_DIR, relPath), 'utf8');
     const rendered = renderTemplate(raw, vars);
     await fs.writeFile(path.join(workspaceDir, relPath), rendered, 'utf8');
@@ -155,7 +237,7 @@ export async function syncDefaultEdenWorkspace(
   const status = await workspaceBootstrapStatus(workspaceDir);
   if (status !== 'complete') {
     throw new Error(
-      `default Eden workspace bootstrap suppression failed for ${workspaceDir}: ${status}`,
+      `Eve workspace bootstrap suppression failed for ${workspaceDir}: ${status}`,
     );
   }
 
@@ -180,11 +262,11 @@ async function ensureMainAgentUsesDefaultWorkspace(dataDir: string): Promise<voi
     if (!Array.isArray(list)) return;
     const entry = list.find(
       (item): item is Record<string, unknown> =>
-        typeof item === 'object' && item !== null && item.id === DEFAULT_EDEN_OPENCLAW_ID,
+        typeof item === 'object' && item !== null && item.id === DEFAULT_EVE_OPENCLAW_ID,
     );
     if (!entry) return;
     const workspace = path.join(dataDir, 'workspace');
-    entry.name = DEFAULT_EDEN_PROFILE.name;
+    entry.name = DEFAULT_EVE_PROFILE.name;
     entry.workspace = workspace;
   });
 }
