@@ -1,5 +1,10 @@
 import { DevAuthProvider, getEnv, type AuthProvider, type AuthSession } from '@eden3/core';
-import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import type {
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+  preHandlerHookHandler,
+} from 'fastify';
 
 import { ClerkAuthProvider, FallbackAuthProvider } from './clerk-auth-provider';
 import { sendError } from './errors';
@@ -19,14 +24,11 @@ import { sendError } from './errors';
  * without needing fastify-plugin.
  */
 
+const SERVICE_CALLBACK_GUARD: unique symbol = Symbol('eden.service-callback-guard');
+
 declare module 'fastify' {
   interface FastifyContextConfig {
-    /**
-     * POST-only cohort admission handoff for an exact service callback.
-     * This never authenticates the request; the route must still enforce its
-     * own bearer/signature credential before executing any work.
-     */
-    edenServiceCallback?: boolean;
+    [SERVICE_CALLBACK_GUARD]?: preHandlerHookHandler;
   }
   interface FastifyRequest {
     /** Resolved auth session, or null when the request is anonymous. */
@@ -45,6 +47,16 @@ export interface AuthPluginOptions {
   provider?: AuthProvider;
   /** Override the closed-alpha allowlist (tests). Defaults to env.ACCESS_ALLOWLIST. */
   accessAllowlist?: string[];
+  /** Test/future composition seam; production uses the Clerk/dev factory. */
+  providerFactory?: (opts: { allowAccountCreation: boolean }) => AuthProvider;
+}
+
+/** Bind an exact POST service callback to the guard that authenticates it. */
+export function serviceAuthenticatedCallback(guard: preHandlerHookHandler) {
+  return {
+    config: { [SERVICE_CALLBACK_GUARD]: guard },
+    preHandler: guard,
+  } as const;
 }
 
 /**
@@ -94,14 +106,14 @@ export function isAccessGated(
   return session === null || !allowlist.has(session.username.toLowerCase());
 }
 
-function defaultAuthProvider(allowAccountCreation: boolean): AuthProvider {
+function defaultAuthProvider(opts: { allowAccountCreation: boolean }): AuthProvider {
   const env = getEnv();
   const dev = new DevAuthProvider({ adminUsernames: env.ADMIN_USERNAMES });
   if (env.AUTH_PROVIDER === 'dev') return dev;
 
   const clerk = new ClerkAuthProvider({
     adminUsernames: env.ADMIN_USERNAMES,
-    allowAccountCreation,
+    allowAccountCreation: opts.allowAccountCreation,
     authorizedParties: env.CLERK_AUTHORIZED_PARTIES,
     jwtKey: env.CLERK_JWT_KEY,
     seedManna: env.CLERK_NEW_USER_SEED_MANNA,
@@ -120,12 +132,30 @@ export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {})
   const allowlist = new Set(
     (opts.accessAllowlist ?? getEnv().ACCESS_ALLOWLIST).map((u) => u.toLowerCase()),
   );
-  const provider = opts.provider ?? defaultAuthProvider(allowlist.size === 0);
+  const provider =
+    opts.provider ??
+    (opts.providerFactory ?? defaultAuthProvider)({ allowAccountCreation: allowlist.size === 0 });
 
   app.decorateRequest('account', null);
   app.decorate('authProvider', provider);
   app.decorate('requireAuth', requireAuth);
   app.decorate('accessAllowlist', allowlist);
+
+  app.addHook('onRoute', (route) => {
+    const guard = route.config?.[SERVICE_CALLBACK_GUARD];
+    if (!guard) return;
+    const methods = Array.isArray(route.method) ? route.method : [route.method];
+    const handlers = Array.isArray(route.preHandler)
+      ? route.preHandler
+      : route.preHandler
+        ? [route.preHandler]
+        : [];
+    if (methods.length !== 1 || methods[0] !== 'POST' || !handlers.includes(guard)) {
+      throw new Error(
+        'serviceAuthenticatedCallback requires one exact POST route with its bound pre-handler',
+      );
+    }
+  });
 
   // DevAuthProvider short-circuits (no DB query) when the cookie is absent,
   // so anonymous traffic pays nothing here.
@@ -139,7 +169,7 @@ export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {})
         isGateExempt(
           req.method,
           req.url,
-          req.routeOptions.config.edenServiceCallback === true,
+          typeof req.routeOptions.config[SERVICE_CALLBACK_GUARD] === 'function',
         )
       ) return;
       if (isAccessGated(allowlist, req.account)) {

@@ -41,13 +41,14 @@ const NON_POST_CALLBACKS = [
 ] as const;
 
 let registerAuth: typeof import('../src/auth-plugin').registerAuth;
+let serviceAuthenticatedCallback: typeof import('../src/auth-plugin').serviceAuthenticatedCallback;
 
 beforeAll(async () => {
   // @eden3/core's public index includes DB-backed modules. Give that lazy
   // client an unreachable synthetic URL before importing the auth plugin;
   // this battery performs no query and needs no real environment or database.
   vi.stubEnv('DATABASE_URL', SYNTHETIC_DATABASE_URL);
-  ({ registerAuth } = await import('../src/auth-plugin'));
+  ({ registerAuth, serviceAuthenticatedCallback } = await import('../src/auth-plugin'));
 });
 
 afterAll(() => {
@@ -92,7 +93,7 @@ async function buildAdmissionHarness(): Promise<FastifyInstance> {
 
   app.post(
     '/media/runtime/authorizations',
-    { config: { edenServiceCallback: true }, preHandler: requireRuntime },
+    serviceAuthenticatedCallback(requireRuntime),
     async () => ({ ok: true }),
   );
   app.get('/media/runtime/authorizations', async () => ({ items: [] }));
@@ -104,6 +105,72 @@ async function buildAdmissionHarness(): Promise<FastifyInstance> {
 }
 
 describe('closed-cohort admission for channel service callbacks', () => {
+  it.each([
+    [['gene'], false],
+    [[], true],
+  ] as const)(
+    'derives account creation=%s from allowlist %j through the production provider factory',
+    async (accessAllowlist, expected) => {
+      const observed: boolean[] = [];
+      const app = Fastify();
+      registerAuth(app, {
+        accessAllowlist: [...accessAllowlist],
+        providerFactory: ({ allowAccountCreation }) => {
+          observed.push(allowAccountCreation);
+          return { async getSession() { return null; } };
+        },
+      });
+      await app.ready();
+      try {
+        expect(observed).toEqual([expected]);
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
+  it('does not let a nonallowlisted admin bypass cohort admission', async () => {
+    const app = Fastify();
+    registerAuth(app, {
+      accessAllowlist: ['gene'],
+      provider: {
+        async getSession() {
+          return {
+            accountId: '00000000-0000-4000-8000-000000000001',
+            username: 'operator',
+            isAdmin: true,
+          };
+        },
+      },
+    });
+    app.get('/protected', async () => ({ mutated: true }));
+    await app.ready();
+    try {
+      const response = await app.inject({ method: 'GET', url: '/protected' });
+      expect(response.statusCode).toBe(403);
+      expect(response.json().error.code).toBe('access_gated');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('refuses registration when a service callback replaces its bound auth guard', async () => {
+    const app = Fastify();
+    registerAuth(app, {
+      accessAllowlist: ['gene'],
+      provider: { async getSession() { return null; } },
+    });
+    const guard = async (_request: FastifyRequest, _reply: FastifyReply) => undefined;
+    expect(() => {
+      app.post(
+        '/unsafe',
+        { ...serviceAuthenticatedCallback(guard), preHandler: async () => undefined },
+        async () => ({ mutated: true }),
+      );
+    }).toThrow('serviceAuthenticatedCallback requires one exact POST route');
+    await app.close();
+  });
+
   for (const path of RUNTIME_REQUEST_PATHS) {
     it.each([
       ['missing', undefined],
