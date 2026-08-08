@@ -923,27 +923,32 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.get('/telegram/managed-bots/onboarding/:intentId', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
     const { intentId } = onboardingParamsSchema.parse(req.params);
-    const rows = await pg<TelegramOnboardingIntentRow[]>`
-      select id, account_id, provider_owner_id_hash, suggested_bot_username, state,
-             expires_at, connection_id, last_error_code, created_at, updated_at
-      from channel_onboarding_intents
-      where id = ${intentId} and account_id = ${account.accountId}
-      limit 1
-    `;
-    const intent = rows[0];
-    if (!intent) return sendError(reply, 404, 'telegram_onboarding_not_found', 'Onboarding intent not found');
-    if (
-      new Date(intent.expires_at).getTime() <= Date.now() &&
-      ['pending_owner', 'awaiting_bot', 'exchanging'].includes(intent.state)
-    ) {
-      await pg`
-        update channel_onboarding_intents
-        set state = 'expired', last_error_code = 'intent_expired', updated_at = now()
-        where id = ${intent.id} and state = ${intent.state}
+    const intent = await pg.begin(async (tx) => {
+      const rows = await tx<TelegramOnboardingIntentRow[]>`
+        select id, account_id, provider_owner_id_hash, suggested_bot_username, state,
+               expires_at, connection_id, last_error_code, created_at, updated_at
+        from channel_onboarding_intents
+        where id = ${intentId} and account_id = ${account.accountId}
+        for update
       `;
-      intent.state = 'expired';
-      intent.last_error_code = 'intent_expired';
-    }
+      const current = rows[0];
+      if (
+        current &&
+        new Date(current.expires_at).getTime() <= Date.now() &&
+        ['pending_owner', 'awaiting_bot', 'exchanging'].includes(current.state)
+      ) {
+        const expired = await tx<TelegramOnboardingIntentRow[]>`
+          update channel_onboarding_intents
+          set state = 'expired', last_error_code = 'intent_expired', updated_at = now()
+          where id = ${current.id} and state = ${current.state}
+          returning id, account_id, provider_owner_id_hash, suggested_bot_username, state,
+                    expires_at, connection_id, last_error_code, created_at, updated_at
+        `;
+        return expired[0] ?? null;
+      }
+      return current ?? null;
+    });
+    if (!intent) return sendError(reply, 404, 'telegram_onboarding_not_found', 'Onboarding intent not found');
     const connectionRows = intent.connection_id
       ? await pg<ChannelConnectionRow[]>`
           select ${CONNECTION_COLUMNS}
@@ -996,18 +1001,36 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     if (resolved.agent.ownerId !== account.accountId) {
       return sendError(reply, 403, 'forbidden', 'Only the owner can attach this agent');
     }
-    const rows = await pg<ChannelConnectionRow[]>`
-      update channel_connections c
-      set agent_id = ${resolved.account.id},
-          label = coalesce(${body.label ?? null}, c.label), updated_at = now()
-      from channel_onboarding_intents i
-      where i.id = ${intentId} and i.account_id = ${account.accountId}
-        and i.state = 'stored' and i.connection_id = c.id
-        and c.account_id = ${account.accountId} and c.channel = 'telegram'
-      returning ${CONNECTION_COLUMNS}
-    `;
-    if (!rows[0]) return sendError(reply, 404, 'telegram_onboarding_not_found', 'Stored managed bot not found');
-    return { connection: dto(rows[0]) };
+    const connection = await pg.begin(async (tx) => {
+      const rows = await tx<ChannelConnectionRow[]>`
+        select c.*
+        from channel_onboarding_intents i
+        join channel_connections c on c.id = i.connection_id
+        where i.id = ${intentId} and i.account_id = ${account.accountId}
+          and i.state = 'stored'
+          and c.account_id = ${account.accountId} and c.channel = 'telegram'
+        for update of c
+      `;
+      const current = rows[0];
+      if (!current) return null;
+      if (current.desired_state !== 'inactive') {
+        throw new ApiError(
+          409,
+          'telegram_managed_bot_active',
+          'Deactivate this managed bot before changing its agent',
+        );
+      }
+      const updated = await tx<ChannelConnectionRow[]>`
+        update channel_connections
+        set agent_id = ${resolved.account.id},
+            label = coalesce(${body.label ?? null}, label), updated_at = now()
+        where id = ${current.id} and desired_state = 'inactive'
+        returning ${CONNECTION_COLUMNS}
+      `;
+      return updated[0] ?? null;
+    });
+    if (!connection) return sendError(reply, 404, 'telegram_onboarding_not_found', 'Stored managed bot not found');
+    return { connection: dto(connection) };
   });
 
   app.post('/telegram/managed-bots/webhook', async (req, reply) => {
@@ -1500,14 +1523,33 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       })) {
         await tx`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
       }
-      const current = await tx<{ token_sha256: string }[]>`
-        select token_sha256
+      const current = await tx<
+        Array<{
+          token_sha256: string;
+          account_id: string;
+          channel: 'discord' | 'telegram';
+          agent_id: string | null;
+          runtime_account_id: string | null;
+          desired_state: 'inactive' | 'active';
+          updated_at: string;
+        }>
+      >`
+        select token_sha256, account_id, channel, agent_id, runtime_account_id,
+               desired_state, updated_at
         from channel_connections
         where id = ${row.id}
         for update
       `;
       if (!current[0]) throw new ApiError(404, 'channel_connection_not_found', 'Connection not found');
-      if (current[0].token_sha256 !== row.token_sha256) {
+      if (
+        current[0].token_sha256 !== row.token_sha256 ||
+        current[0].account_id !== row.account_id ||
+        current[0].channel !== row.channel ||
+        current[0].agent_id !== row.agent_id ||
+        current[0].runtime_account_id !== row.runtime_account_id ||
+        current[0].desired_state !== row.desired_state ||
+        current[0].updated_at !== row.updated_at
+      ) {
         throw new ApiError(409, 'channel_connection_changed', 'Connection changed; retry activation');
       }
       const conflicts = await tx<{ id: string }[]>`
@@ -2408,6 +2450,9 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             else 'error'
           end,
           last_error_code = case
+            when ${body.state} <> 'error'
+              and last_error_code = 'delivery_ack_lost'
+              then last_error_code
             when ${body.state} = 'stopped'
               and desired_state = 'inactive'
               and last_error_code is not null
@@ -2415,6 +2460,9 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             else ${errorCode}
           end,
           last_error_message = case
+            when ${body.state} <> 'error'
+              and last_error_code = 'delivery_ack_lost'
+              then last_error_message
             when ${body.state} = 'stopped'
               and desired_state = 'inactive'
               and last_error_code is not null

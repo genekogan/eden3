@@ -131,29 +131,41 @@ function telegramHostedConfig() {
 
 function groupHostedConfig() {
   const config = hostedConfig();
+  config.agents.list[0].model = 'anthropic/claude-haiku-4-5';
   config.channels.discord.accounts['account-a'].groupPolicy = 'allowlist';
-  config.plugins.entries['eden3-channel-runtime'].config.accounts[0].groups = [
+  config.plugins.entries['eden3-channel-runtime'].config.accounts[0] = {
+    ...config.plugins.entries['eden3-channel-runtime'].config.accounts[0],
+    model: 'anthropic/claude-haiku-4-5',
+    agentRuntime: 'openclaw',
+    groups: [
     {
       conversationId: '758719600895590444',
       guildId: '758719600895590441',
       allowFrom: [PEER_A],
       mentionRequired: true,
     },
-  ];
+    ],
+  };
   return config;
 }
 
 function telegramGroupHostedConfig() {
   const config = telegramHostedConfig();
+  config.agents.list[0].model = 'anthropic/claude-haiku-4-5';
   config.channels.telegram.accounts['account-a'].groupPolicy = 'allowlist';
-  config.plugins.entries['eden3-channel-runtime'].config.accounts[0].groups = [
+  config.plugins.entries['eden3-channel-runtime'].config.accounts[0] = {
+    ...config.plugins.entries['eden3-channel-runtime'].config.accounts[0],
+    model: 'anthropic/claude-haiku-4-5',
+    agentRuntime: 'openclaw',
+    groups: [
     {
       conversationId: '-1001234567890',
       guildId: null,
       allowFrom: [PEER_A],
       mentionRequired: true,
     },
-  ];
+    ],
+  };
   return config;
 }
 
@@ -190,13 +202,15 @@ function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) 
         };
       }
       if (path === '/channels/runtime/turns/reserve') {
-        const isA = body.runtimeAccountId === 'account-a';
+        const mapping = config.plugins.entries['eden3-channel-runtime'].config.accounts.find(
+          (candidate) => candidate.accountId === body.runtimeAccountId,
+        );
         return {
           ok: true,
           turnId: body.turnId,
-          model: isA ? 'anthropic/claude-sonnet-4-6' : 'anthropic/claude-haiku-4-5',
-          agentRuntime: isA ? 'claude-cli' : 'openclaw',
-          pricingBasis: isA ? 'notional-subscription' : 'provider-api',
+          model: mapping.model,
+          agentRuntime: mapping.agentRuntime,
+          pricingBasis: mapping.agentRuntime === 'claude-cli' ? 'notional-subscription' : 'provider-api',
         };
       }
       return { ok: true };
@@ -404,6 +418,12 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(promptResult.prependSystemContext).toContain('Identity link state: linked.');
     expect(promptResult.prependSystemContext).not.toContain(CONNECTION_A);
     expect(promptResult.prependSystemContext).not.toContain(PEER_A);
+    expect(
+      bridge.onBeforeToolCall(
+        { toolName: 'memory_search', params: { query: 'direct context' }, runId: RUN_A },
+        { runId: RUN_A, sessionKey: SESSION_A, agentId: 'agent-a' },
+      ),
+    ).toBeUndefined();
 
     await expect(
       bridge.onBeforeAgentRun(
@@ -863,7 +883,8 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
           { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord' },
         ),
       ).resolves.toEqual({
-        prependSystemContext: expect.stringContaining('Never read or write any participant private-memory file'),
+        systemPrompt: expect.stringContaining('never read or write any participant private-memory file'),
+        toolsAllow: [],
       });
       await expect(
         first.bridge.onBeforeAgentRun(
@@ -871,6 +892,17 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
           { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord', agentId: 'agent-a' },
         ),
       ).resolves.toEqual({ outcome: 'pass' });
+      for (const toolName of ['memory_search', 'memory_get', 'read', 'write', 'exec']) {
+        expect(
+          first.bridge.onBeforeToolCall(
+            { toolName, params: { path: MEMORY_A }, runId: RUN_A },
+            { runId: RUN_A, sessionKey: groupSession, agentId: 'agent-a' },
+          ),
+        ).toEqual({
+          block: true,
+          blockReason: 'Hosted channel group turns cannot invoke tools.',
+        });
+      }
       expect(first.calls.find((call) => call.path === '/channels/runtime/messages').body).toMatchObject({
         conversationId: '758719600895590444',
         conversationScope: 'group',
@@ -909,6 +941,47 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     } finally {
       rmSync(tempDir, { recursive: true, force: true });
     }
+  });
+
+  it('fails a group turn closed when its agent uses a runtime without turn-scoped tool narrowing', async () => {
+    const config = groupHostedConfig();
+    config.agents.list[0].model = 'anthropic/claude-sonnet-4-6';
+    config.plugins.entries['eden3-channel-runtime'].config.accounts[0].model =
+      'anthropic/claude-sonnet-4-6';
+    config.plugins.entries['eden3-channel-runtime'].config.accounts[0].agentRuntime = 'claude-cli';
+    const current = mockBridge(config);
+    const groupSession = 'agent:agent-a:discord:channel:758719600895590444';
+    current.bridge.onMessageReceived(
+      {
+        content: 'group message',
+        messageId: '1532630091471786299',
+        senderId: PEER_A,
+        from: 'discord:channel:758719600895590444',
+        metadata: {
+          chatType: 'channel',
+          guildId: '758719600895590441',
+          senderId: PEER_A,
+          wasMentioned: true,
+        },
+      },
+      {
+        channelId: 'discord',
+        accountId: 'account-a',
+        conversationId: '758719600895590444',
+        guildId: '758719600895590441',
+        sessionKey: groupSession,
+        messageId: '1532630091471786299',
+        senderId: PEER_A,
+        wasMentioned: true,
+      },
+    );
+    await expect(
+      current.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'group message', messages: [] },
+        { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block', category: 'policy' });
+    expect(current.calls.some((call) => call.path.endsWith('/reserve'))).toBe(false);
   });
 
   it('blocks malformed hosted mappings or missing inbound sync before provider work', async () => {
@@ -1347,6 +1420,106 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       restarted.calls.filter((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivered`),
     ).toHaveLength(1);
     rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('retries a transient delivery-success replay without requiring another restart', async () => {
+    vi.useFakeTimers();
+    const tempDir = mkdtempSync(join(tmpdir(), 'eden3-delivery-retry-'));
+    try {
+      const outbox = createDurableDeliverySuccessOutbox({
+        filePath: join(tempDir, 'delivery-success.json'),
+      });
+      outbox.record({
+        connectionId: CONNECTION_A,
+        runtimeAccountId: 'account-a',
+        channel: 'telegram',
+        turnId: RUN_A,
+        messageId: '9003',
+      });
+      let deliveryAttempts = 0;
+      const replay = mockBridge(
+        telegramHostedConfig(),
+        {
+          [`/channels/runtime/turns/${RUN_A}/delivered`]: async () => {
+            deliveryAttempts += 1;
+            if (deliveryAttempts === 1) throw new Error('temporary API outage');
+            return { ok: true };
+          },
+        },
+        { deliverySuccessOutbox: outbox },
+      );
+      await replay.bridge.onGatewayStart();
+      expect(deliveryAttempts).toBe(1);
+      expect(outbox.list()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(
+        channelRuntimeBridgeInternals.DELIVERY_SUCCESS_REPLAY_BASE_MS,
+      );
+      expect(deliveryAttempts).toBe(2);
+      expect(outbox.list()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps retrying a live native-success acknowledgement after its first POST fails', async () => {
+    vi.useFakeTimers();
+    const tempDir = mkdtempSync(join(tmpdir(), 'eden3-delivery-live-retry-'));
+    try {
+      const outbox = createDurableDeliverySuccessOutbox({
+        filePath: join(tempDir, 'delivery-success.json'),
+      });
+      let deliveryAttempts = 0;
+      const current = mockBridge(
+        telegramHostedConfig(),
+        {
+          [`/channels/runtime/turns/${RUN_A}/delivered`]: async () => {
+            deliveryAttempts += 1;
+            if (deliveryAttempts === 1) throw new Error('temporary API outage');
+            return { ok: true };
+          },
+        },
+        { deliverySuccessOutbox: outbox },
+      );
+      receiveTelegramA(current.bridge);
+      await current.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+        { runId: RUN_A, sessionKey: TELEGRAM_SESSION_A, messageProvider: 'telegram', agentId: 'agent-a' },
+      );
+      await current.bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'assistant answer' },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+          },
+        },
+        {
+          runId: RUN_A,
+          sessionKey: TELEGRAM_SESSION_A,
+          channelId: 'telegram',
+          accountId: 'account-a',
+          messageId: '42',
+        },
+      );
+      await current.bridge.onMessageSent(
+        { to: PEER_A, content: 'assistant answer', runId: RUN_A, success: true, messageId: '9004' },
+        { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_A },
+      );
+      expect(deliveryAttempts).toBe(1);
+      expect(outbox.list()).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(
+        channelRuntimeBridgeInternals.DELIVERY_SUCCESS_REPLAY_BASE_MS,
+      );
+      expect(deliveryAttempts).toBe(2);
+      expect(outbox.list()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('quarantines a replay marker when terminal compensation already won', async () => {
