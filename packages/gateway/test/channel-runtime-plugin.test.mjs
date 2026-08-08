@@ -825,6 +825,27 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       contextAttachment.calls.some((call) => call.path.endsWith('/reserve')),
     ).toBe(false);
 
+    const mixedMedia = mockBridge();
+    receiveA(mixedMedia.bridge, {
+      event: {
+        metadata: {
+          mediaUrls: ['https://provider.invalid/safe.png', 'https://provider.invalid/payload.sh'],
+          mediaPaths: ['/staged/safe.png', '/staged/payload.sh'],
+          mediaTypes: ['image/png', 'application/x-sh'],
+          mediaUrl: 'https://provider.invalid/safe.png',
+          mediaType: 'image/png',
+        },
+      },
+    });
+    await expect(
+      mixedMedia.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'open both', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block', category: 'policy' });
+    expect(mixedMedia.calls.some((call) => call.path === '/channels/runtime/messages')).toBe(false);
+    expect(mixedMedia.calls.some((call) => call.path.endsWith('/reserve'))).toBe(false);
+
     const allowed = mockBridge();
     receiveA(allowed.bridge, {
       event: { attachments: [{ contentType: 'image/png', name: 'safe.png' }] },
@@ -1516,6 +1537,78 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       );
       expect(deliveryAttempts).toBe(2);
       expect(outbox.list()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a loud in-memory retry when marker persistence and first ack both fail', async () => {
+    vi.useFakeTimers();
+    const tempDir = mkdtempSync(join(tmpdir(), 'eden3-delivery-volatile-retry-'));
+    try {
+      const durable = createDurableDeliverySuccessOutbox({
+        filePath: join(tempDir, 'delivery-success.json'),
+      });
+      const outbox = {
+        ...durable,
+        record() {
+          throw new Error('simulated fsync failure');
+        },
+      };
+      let deliveryAttempts = 0;
+      const current = mockBridge(
+        telegramHostedConfig(),
+        {
+          [`/channels/runtime/turns/${RUN_A}/delivered`]: async () => {
+            deliveryAttempts += 1;
+            if (deliveryAttempts === 1) throw new Error('temporary API outage');
+            return { ok: true };
+          },
+        },
+        { deliverySuccessOutbox: outbox },
+      );
+      receiveTelegramA(current.bridge);
+      await current.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+        { runId: RUN_A, sessionKey: TELEGRAM_SESSION_A, messageProvider: 'telegram', agentId: 'agent-a' },
+      );
+      await current.bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'assistant answer' },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+          },
+        },
+        { runId: RUN_A, sessionKey: TELEGRAM_SESSION_A, channelId: 'telegram', accountId: 'account-a', messageId: '42' },
+      );
+      const callsBeforeDelivery = current.calls.length;
+      await current.bridge.onMessageSent(
+        { to: PEER_A, content: 'assistant answer', runId: RUN_A, success: true, messageId: '9005' },
+        { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_A },
+      );
+      expect(deliveryAttempts).toBe(1);
+      expect(
+        current.calls.slice(callsBeforeDelivery).some(
+          (call) =>
+            call.path === '/channels/runtime/status' &&
+            call.body.state === 'error' &&
+            call.body.errorCode === 'delivery_ack_lost',
+        ),
+      ).toBe(true);
+      expect(
+        current.calls.slice(callsBeforeDelivery).some(
+          (call) => call.path === '/channels/runtime/status' && call.body.state === 'live',
+        ),
+      ).toBe(false);
+      await vi.advanceTimersByTimeAsync(
+        channelRuntimeBridgeInternals.DELIVERY_SUCCESS_REPLAY_BASE_MS,
+      );
+      expect(deliveryAttempts).toBe(2);
     } finally {
       vi.useRealTimers();
       rmSync(tempDir, { recursive: true, force: true });

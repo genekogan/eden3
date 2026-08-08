@@ -52,6 +52,11 @@ export interface EncryptedChannelPeer {
 export interface ChannelMessagePersistence {
   connection: ChannelSyncConnection;
   event: Omit<ChannelMessageEvent, 'peerId' | 'conversationId'>;
+  /** Ephemeral authorization coordinates; revalidated under the connection row lock. */
+  authorization: Pick<
+    ChannelMessageEvent,
+    'peerId' | 'conversationId' | 'conversationScope' | 'guildId'
+  >;
   identity: EncryptedChannelPeer;
   conversationFingerprint: string;
   sessionExternalId: string;
@@ -261,6 +266,36 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
 
   async persistMessage(input: ChannelMessagePersistence): Promise<ChannelMessageSyncResult> {
     return pg.begin(async (tx) => {
+      const connectionRows = await tx<ConnectionRow[]>`
+        select id, account_id, agent_id, channel, runtime_account_id, metadata
+        from channel_connections
+        where id = ${input.connection.id} and desired_state = 'active'
+          and channel in ('discord', 'telegram')
+        for update
+      `;
+      const row = connectionRows[0];
+      if (
+        !row ||
+        !row.agent_id ||
+        !row.runtime_account_id ||
+        (row.channel !== 'discord' && row.channel !== 'telegram') ||
+        row.account_id !== input.connection.accountId ||
+        row.agent_id !== input.connection.agentId ||
+        row.channel !== input.connection.channel ||
+        row.runtime_account_id !== input.connection.runtimeAccountId
+      ) {
+        throw new Error('channel connection unavailable');
+      }
+      const currentConnection: ChannelSyncConnection = {
+        id: row.id,
+        accountId: row.account_id,
+        agentId: row.agent_id,
+        channel: row.channel,
+        runtimeAccountId: row.runtime_account_id,
+        allowedGroups: configuredChannelGroups(row.channel, row.metadata),
+      };
+      assertChannelConversationAuthorized(currentConnection, input.authorization);
+
       // A SELECT ... FOR UPDATE cannot lock a row that does not exist. Lock
       // both uniqueness dimensions first so two first messages cannot race to
       // create conflicting sessions (or cross-wire a gateway key).
@@ -330,7 +365,11 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
         returning id, linked_account_id
       `;
       const identity = identityRows[0]!;
-      const linkedAccounts = identity.linked_account_id
+      // Group participation is intentionally pseudonymous at the Eden account
+      // boundary. A peer may be linked for direct messages, but a group turn
+      // must never grant that private account session membership or authorship.
+      const linkedAccounts =
+        input.event.conversationScope !== 'group' && identity.linked_account_id
         ? await tx<{ id: string; username: string }[]>`
             select id, username::text as username
             from accounts
@@ -465,6 +504,12 @@ export class ChannelSessionSync {
     return this.store.persistMessage({
       connection,
       event: persistedEvent,
+      authorization: {
+        peerId: event.peerId,
+        conversationId: event.conversationId,
+        conversationScope: event.conversationScope,
+        guildId: event.guildId,
+      },
       identity: {
         fingerprint: peerFingerprint,
         ciphertext: encrypted.tokenCiphertext,

@@ -332,6 +332,11 @@ interface PairingDecisionMarker {
   nonce: string;
 }
 
+interface ChannelRuntimeOperationMarker {
+  kind: 'activate' | 'retry';
+  nonce: string;
+}
+
 const SAFE_RUNTIME_ERRORS: Record<string, string> = {
   invalid_token: 'The provider rejected this bot token.',
   provider_unavailable: 'The channel provider is temporarily unavailable.',
@@ -405,6 +410,23 @@ function samePairingDecisionMarker(
 ): boolean {
   const actual = pairingDecisionMarker(input);
   return actual?.requestId === expected.requestId && actual.nonce === expected.nonce;
+}
+
+function channelRuntimeOperationMarker(input: unknown): ChannelRuntimeOperationMarker | null {
+  const marker = metadataRecord(input)._runtimeOperation;
+  if (!marker || typeof marker !== 'object' || Array.isArray(marker)) return null;
+  const value = marker as Record<string, unknown>;
+  return (value.kind === 'activate' || value.kind === 'retry') && typeof value.nonce === 'string'
+    ? { kind: value.kind, nonce: value.nonce }
+    : null;
+}
+
+function sameChannelRuntimeOperation(
+  input: unknown,
+  expected: ChannelRuntimeOperationMarker,
+): boolean {
+  const actual = channelRuntimeOperationMarker(input);
+  return actual?.kind === expected.kind && actual.nonce === expected.nonce;
 }
 
 function connectionConfig(input: unknown): ConnectionConfig {
@@ -632,6 +654,46 @@ async function quotaExceeded(accountId: string, isAdmin: boolean): Promise<boole
   return (rows[0]?.count ?? 0) >= getEnv().MAX_CHANNEL_CONNECTIONS_PER_USER;
 }
 
+const acquireChannelLifecycleAdmission = (() => {
+  const waiters: Array<() => void> = [];
+  let active = 0;
+  const limit = 4;
+  return async (): Promise<() => void> => {
+    if (active >= limit) {
+      await new Promise<void>((resolve) => waiters.push(resolve));
+    }
+    active += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      active -= 1;
+      waiters.shift()?.();
+    };
+  };
+})();
+
+async function withChannelLifecycleLease<T>(connectionId: string, work: () => Promise<T>): Promise<T> {
+  // postgres.js has a ten-connection application pool. Admission happens
+  // before reserving a cross-process advisory-lock session so waiters can
+  // never consume the entire pool and deadlock the lock holder's DB work.
+  const releaseAdmission = await acquireChannelLifecycleAdmission();
+  let reserved: Awaited<ReturnType<typeof pg.reserve>> | undefined;
+  try {
+    reserved = await pg.reserve();
+    const key = `channel-lifecycle:${connectionId}`;
+    await reserved`select pg_advisory_lock(hashtextextended(${key}, 0))`;
+    try {
+      return await work();
+    } finally {
+      await reserved`select pg_advisory_unlock(hashtextextended(${key}, 0))`;
+    }
+  } finally {
+    reserved?.release();
+    releaseAdmission();
+  }
+}
+
 function runtimeSync(opts: ChannelsRoutesOptions): Required<
   Pick<ChannelRuntimeSyncLike, 'ensureHostedChannelAccount' | 'removeHostedChannelAccount'>
 > {
@@ -710,6 +772,12 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     };
   const providerClient = opts.providerClient ?? new FetchChannelProviderClient();
   const sync = runtimeSync(opts);
+  const lifecycleHandler = (
+    handler: (req: FastifyRequest, reply: FastifyReply) => Promise<unknown>,
+  ) => async (req: FastifyRequest, reply: FastifyReply) => {
+    const { id } = paramsSchema.parse(req.params);
+    return withChannelLifecycleLease(id, () => handler(req, reply));
+  };
   const sessionSync =
     opts.sessionSync ?? new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault);
   const turnMetering = opts.turnMetering ?? new ChannelTurnMeteringService();
@@ -1238,7 +1306,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     return reply.code(201).send({ connection: dto(row) });
   });
 
-  app.post('/connections/:id/retry', { preHandler: app.requireAuth }, async (req, reply) => {
+  app.post('/connections/:id/retry', { preHandler: app.requireAuth }, lifecycleHandler(async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = retryBodySchema.parse(req.body ?? {});
@@ -1278,6 +1346,10 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const state = validationState(validation);
     const nextTokenSha256 = encrypted?.tokenSha256 ?? row.token_sha256;
     const nextBotId = validation.ok ? validation.bot.id : null;
+    const retryOperation: ChannelRuntimeOperationMarker = {
+      kind: 'retry',
+      nonce: randomUUID(),
+    };
     let wasActive = row.desired_state === 'active';
     let metadata: Record<string, unknown> = metadataRecord(row.metadata);
     const rows = await pg.begin(async (tx) => {
@@ -1324,6 +1396,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       metadata = {
         ...metadataRecord(current.metadata),
         bot: validation.ok ? validation.bot : null,
+        ...(validation.ok && wasActive ? { _runtimeOperation: retryOperation } : {}),
       };
       return tx<ChannelConnectionRow[]>`
         update channel_connections
@@ -1385,14 +1458,41 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           discordGuilds: fresh.channel === 'discord' ? config.discordGuilds : [],
           telegramGroups: fresh.channel === 'telegram' ? config.telegramGroups : [],
         });
-        const restarted = await pg<ChannelConnectionRow[]>`
-          update channel_connections
-          set observed_state = 'starting', status = 'active', updated_at = now()
-          where id = ${fresh.id}
-          returning ${CONNECTION_COLUMNS}
-        `;
-        fresh = restarted[0] ?? fresh;
-      } catch {
+        const restarted: ChannelConnectionRow[] = await pg.begin(async (tx) => {
+          const currentRows = await tx<ChannelConnectionRow[]>`
+            select ${CONNECTION_COLUMNS}
+            from channel_connections where id = ${fresh.id}
+            for update
+          `;
+          const current = currentRows[0];
+          if (
+            !current ||
+            current.desired_state !== 'active' ||
+            current.agent_id !== fresh.agent_id ||
+            current.runtime_account_id !== fresh.runtime_account_id ||
+            !sameChannelRuntimeOperation(current.metadata, retryOperation)
+          ) {
+            return [] as ChannelConnectionRow[];
+          }
+          const cleanMetadata = { ...metadataRecord(current.metadata) };
+          delete cleanMetadata._runtimeOperation;
+          return tx<ChannelConnectionRow[]>`
+            update channel_connections
+            set observed_state = 'starting', status = 'active',
+                metadata = ${tx.json(JSON.stringify(cleanMetadata))}, updated_at = now()
+            where id = ${fresh.id} and desired_state = 'active'
+            returning ${CONNECTION_COLUMNS}
+          `;
+        });
+        if (!restarted[0]) {
+          throw new ApiError(
+            409,
+            'channel_connection_changed',
+            'Connection changed during runtime restart',
+          );
+        }
+        fresh = restarted[0];
+      } catch (error) {
         const configurationErrorMessage = SAFE_RUNTIME_ERRORS.configuration_error!;
         try {
           await sync.removeHostedChannelAccount({
@@ -1403,12 +1503,16 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         } catch {
           // Revoking desired_state below keeps the SecretRef fail-closed.
         }
+        if (error instanceof ApiError && error.code === 'channel_connection_changed') {
+          throw error;
+        }
         await pg`
           update channel_connections
           set desired_state = 'inactive', observed_state = 'error', status = 'error',
               last_error_code = 'configuration_error',
               last_error_message = ${configurationErrorMessage}, updated_at = now()
-          where id = ${fresh.id}
+          where id = ${fresh.id} and desired_state = 'active'
+            and metadata -> '_runtimeOperation' ->> 'nonce' = ${retryOperation.nonce}
         `;
         throw new ApiError(502, 'configuration_error', configurationErrorMessage);
       }
@@ -1421,7 +1525,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       metadata: { channel: row.channel, result: validation.ok ? 'valid' : validation.code },
     });
     return { ok: validation.ok, connection: dto(fresh) };
-  });
+  }));
 
   app.get('/connections/:id/destinations', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
@@ -1450,7 +1554,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     }
   });
 
-  app.post('/connections/:id/activate', { preHandler: app.requireAuth }, async (req, reply) => {
+  app.post('/connections/:id/activate', { preHandler: app.requireAuth }, lifecycleHandler(async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = activationBodySchema.parse(req.body ?? {});
@@ -1511,7 +1615,11 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       return sendError(reply, 400, validation.code, validation.message);
     }
 
-    const metadata = { bot: validation.bot, config: body };
+    const runtimeOperation: ChannelRuntimeOperationMarker = {
+      kind: 'activate',
+      nonce: randomUUID(),
+    };
+    const metadata = { bot: validation.bot, config: body, _runtimeOperation: runtimeOperation };
     // Make the resolver record eligible immediately before publishing its
     // SecretRef. Otherwise a fast config watcher can ask the sidecar while the
     // row is still inactive and turn a valid activation into a crash loop.
@@ -1608,16 +1716,50 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         set desired_state = 'inactive', observed_state = 'error', status = 'error',
             last_error_code = 'configuration_error',
             last_error_message = ${configurationErrorMessage}, updated_at = now()
-        where id = ${row.id}
+        where id = ${row.id} and desired_state = 'active'
+          and metadata -> '_runtimeOperation' ->> 'nonce' = ${runtimeOperation.nonce}
       `;
       throw new ApiError(502, 'configuration_error', configurationErrorMessage);
     }
-    const rows = await pg<ChannelConnectionRow[]>`
-      update channel_connections
-      set activated_at = now(), updated_at = now()
-      where id = ${row.id}
-      returning ${CONNECTION_COLUMNS}
-    `;
+    const rows: ChannelConnectionRow[] = await pg.begin(async (tx) => {
+      const currentRows = await tx<ChannelConnectionRow[]>`
+        select ${CONNECTION_COLUMNS}
+        from channel_connections
+        where id = ${row.id}
+        for update
+      `;
+      const current = currentRows[0];
+      if (
+        !current ||
+        current.desired_state !== 'active' ||
+        current.agent_id !== row.agent_id ||
+        current.runtime_account_id !== row.runtime_account_id ||
+        !sameChannelRuntimeOperation(current.metadata, runtimeOperation)
+      ) {
+        return [] as ChannelConnectionRow[];
+      }
+      const cleanMetadata = { ...metadataRecord(current.metadata) };
+      delete cleanMetadata._runtimeOperation;
+      return tx<ChannelConnectionRow[]>`
+        update channel_connections
+        set activated_at = now(), metadata = ${tx.json(JSON.stringify(cleanMetadata))},
+            updated_at = now()
+        where id = ${row.id} and desired_state = 'active'
+        returning ${CONNECTION_COLUMNS}
+      `;
+    });
+    if (!rows[0]) {
+      try {
+        await sync.removeHostedChannelAccount({
+          channel: row.channel,
+          runtimeAccountId: row.runtime_account_id,
+          deleteAccount: false,
+        });
+      } catch {
+        // The concurrent lifecycle mutation already revoked resolver access.
+      }
+      throw new ApiError(409, 'channel_connection_changed', 'Connection changed during activation');
+    }
     await audit({
       actorAccountId: account.accountId,
       ownerAccountId: row.account_id,
@@ -1640,21 +1782,34 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       connection: dto(rows[0]!),
       runtime: { boundAgent: agent.openclawId, runtimeAccountId: row.runtime_account_id },
     };
-  });
+  }));
 
-  app.post('/connections/:id/deactivate', { preHandler: app.requireAuth }, async (req, reply) => {
+  app.post('/connections/:id/deactivate', { preHandler: app.requireAuth }, lifecycleHandler(async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const row = await getOwnedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     // Revoke resolver eligibility first. Even if the config write fails, the
     // retained SecretRef can no longer retrieve plaintext for this account.
-    await pg`
-      update channel_connections
-      set desired_state = 'inactive', observed_state = 'stopping', status = 'paused',
-          last_error_code = null, last_error_message = null, updated_at = now()
-      where id = ${row.id}
-    `;
+    await pg.begin(async (tx) => {
+      const current = await tx<{ id: string }[]>`
+        select id from channel_connections
+        where id = ${row.id} and account_id = ${account.accountId}
+        for update
+      `;
+      if (!current[0]) throw new ApiError(404, 'channel_connection_not_found', 'Connection not found');
+      await tx`
+        update channel_connections
+        set desired_state = 'inactive', observed_state = 'stopping', status = 'paused',
+            last_error_code = null, last_error_message = null, updated_at = now()
+        where id = ${row.id}
+      `;
+      await tx`
+        update channel_pairing_requests
+        set status = 'expired', updated_at = now()
+        where connection_id = ${row.id} and status = 'pending'
+      `;
+    });
     if (row.runtime_account_id) {
       try {
         await sync.removeHostedChannelAccount({
@@ -1689,9 +1844,9 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       metadata: { channel: row.channel, runtimeAccountId: row.runtime_account_id },
     });
     return { ok: true, connection: dto(rows[0]!) };
-  });
+  }));
 
-  app.delete('/connections/:id', { preHandler: app.requireAuth }, async (req, reply) => {
+  app.delete('/connections/:id', { preHandler: app.requireAuth }, lifecycleHandler(async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const row = await getOwnedConnection(id, account.accountId, false);
@@ -1699,12 +1854,25 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     // Deletion is fail-closed from the first durable write: any retained
     // SecretRef becomes unresolvable while refunds and exact-account cleanup
     // complete.
-    await pg`
-      update channel_connections
-      set desired_state = 'inactive', observed_state = 'stopping', status = 'paused',
-          updated_at = now()
-      where id = ${row.id}
-    `;
+    await pg.begin(async (tx) => {
+      const current = await tx<{ id: string }[]>`
+        select id from channel_connections
+        where id = ${row.id} and account_id = ${account.accountId}
+        for update
+      `;
+      if (!current[0]) throw new ApiError(404, 'channel_connection_not_found', 'Connection not found');
+      await tx`
+        update channel_connections
+        set desired_state = 'inactive', observed_state = 'stopping', status = 'paused',
+            updated_at = now()
+        where id = ${row.id}
+      `;
+      await tx`
+        update channel_pairing_requests
+        set status = 'expired', updated_at = now()
+        where connection_id = ${row.id} and status = 'pending'
+      `;
+    });
     const openTurns = await pg<{ turn_id: string }[]>`
       select turn_id from channel_turns
       where connection_id = ${row.id}
@@ -1740,7 +1908,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     });
     await db.delete(channelConnections).where(eq(channelConnections.id, row.id));
     return { ok: true };
-  });
+  }));
 
   // Retained as a custody/safety smoke seam; no provider message is sent.
   app.post('/connections/:id/mock-message', { preHandler: app.requireAuth }, async (req, reply) => {
@@ -1794,7 +1962,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.post(
     '/connections/:id/pairing/:requestId/approve',
     { preHandler: app.requireAuth },
-    async (req, reply) => {
+    lifecycleHandler(async (req, reply) => {
       const account = req.account!;
       const { id, requestId } = pairingParamsSchema.parse(req.params);
       const body = approvePairingBodySchema.parse(req.body ?? {});
@@ -1847,13 +2015,29 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           throw new ApiError(502, 'configuration_error', SAFE_RUNTIME_ERRORS.configuration_error!);
         }
         const cleaned = await pg.begin(async (tx) => {
-          const currentConnections = await tx<{ metadata: unknown }[]>`
-            select metadata from channel_connections where id = ${connection.id} for update
+          const currentConnections = await tx<
+            Array<{
+              metadata: unknown;
+              desired_state: string;
+              account_id: string;
+              agent_id: string | null;
+              runtime_account_id: string | null;
+              channel: string;
+            }>
+          >`
+            select metadata, desired_state, account_id, agent_id, runtime_account_id, channel
+            from channel_connections where id = ${connection.id} for update
           `;
           const currentRequests = await tx<{ status: string; metadata: unknown }[]>`
             select status, metadata from channel_pairing_requests where id = ${requestId} for update
           `;
           if (
+            !currentConnections[0] ||
+            currentConnections[0].desired_state !== 'active' ||
+            currentConnections[0].account_id !== connection.account_id ||
+            currentConnections[0].agent_id !== connection.agent_id ||
+            currentConnections[0].runtime_account_id !== connection.runtime_account_id ||
+            currentConnections[0].channel !== connection.channel ||
             currentRequests[0]?.status !== 'approved' ||
             metadataRecord(currentRequests[0].metadata)._decisionNonce !== marker.nonce ||
             !samePairingDecisionMarker(currentConnections[0]?.metadata, marker)
@@ -1878,6 +2062,15 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           return true;
         });
         if (!cleaned) {
+          try {
+            await sync.removeHostedChannelAccount({
+              channel: connection.channel,
+              runtimeAccountId: connection.runtime_account_id,
+              deleteAccount: false,
+            });
+          } catch {
+            // The concurrent lifecycle mutation already revoked resolver access.
+          }
           throw new ApiError(409, 'pairing_request_changed', 'Pairing request changed; refresh and retry');
         }
         await audit({
@@ -2200,6 +2393,15 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           return true;
         });
         if (!runtimeRestored || !compensated) {
+          try {
+            await sync.removeHostedChannelAccount({
+              channel: prepared.connection.channel,
+              runtimeAccountId: prepared.connection.runtime_account_id!,
+              deleteAccount: false,
+            });
+          } catch {
+            // Desired-state revocation below remains the secret-use boundary.
+          }
           await pg`
             update channel_connections
             set desired_state = 'inactive', observed_state = 'error', status = 'error',
@@ -2218,12 +2420,16 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       let cleanupSucceeded = false;
       try {
         cleanupSucceeded = await pg.begin(async (tx) => {
-          const current = await tx<{ metadata: unknown }[]>`
-            select metadata from channel_connections
+          const current = await tx<{ metadata: unknown; desired_state: string }[]>`
+            select metadata, desired_state from channel_connections
             where id = ${prepared.connection.id}
             for update
           `;
-          if (!current[0] || !samePairingDecisionMarker(current[0].metadata, marker)) {
+          if (
+            !current[0] ||
+            current[0].desired_state !== 'active' ||
+            !samePairingDecisionMarker(current[0].metadata, marker)
+          ) {
             return false;
           }
           const request = await tx<{ status: string; metadata: unknown }[]>`
@@ -2280,7 +2486,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         throw new ApiError(502, 'configuration_error', SAFE_RUNTIME_ERRORS.configuration_error!);
       }
       return { ok: true, linkedToMyAccount: body.linkToMyAccount };
-    },
+    }),
   );
 
   app.post(
@@ -2346,6 +2552,24 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           hashtextextended(${'channel-pairing:' + connection.id}, 0)
         )
       `;
+      const currentConnections = await tx<
+        Array<{ id: string; account_id: string; channel: string; runtime_account_id: string }>
+      >`
+        select id, account_id, channel, runtime_account_id
+        from channel_connections
+        where id = ${connection.id} and desired_state = 'active'
+          and runtime_account_id = ${connection.runtime_account_id}
+          and channel in ('discord', 'telegram')
+        for update
+      `;
+      const currentConnection = currentConnections[0];
+      if (
+        !currentConnection ||
+        currentConnection.account_id !== connection.account_id ||
+        currentConnection.channel !== connection.channel
+      ) {
+        throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
+      }
       await tx`
         update channel_pairing_requests
         set status = 'expired', updated_at = now()

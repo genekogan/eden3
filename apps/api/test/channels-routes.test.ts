@@ -17,10 +17,17 @@ import {
 import type { ChannelProviderClientLike } from '../src/services/channel-provider';
 import {
   AesGcmSecretVault,
+  channelPeerSecretContext,
   channelTokenSecretContext,
 } from '../src/services/secret-vault';
 import { PostgresChannelCredentialCustody } from '../src/services/postgres-channel-connector-custody';
 import { PostgresTelegramManagedBotCustody } from '../src/services/postgres-telegram-managed-bot-custody';
+import {
+  ChannelSessionSync,
+  PostgresChannelSessionSyncStore,
+  channelConversationFingerprint,
+  channelPeerFingerprint,
+} from '../src/services/channel-session-sync';
 import { XByoConnectorService, type XUserClientLike } from '../src/services/x-byo-connector';
 import type { TelegramManagedBotApiClientLike } from '../src/services/telegram-managed-bots';
 import {
@@ -48,20 +55,29 @@ let app: FastifyInstance;
 
 const ensureCalls: Array<Record<string, unknown>> = [];
 const removeCalls: Array<Record<string, unknown>> = [];
+const activeRuntimeAccounts = new Set<string>();
 let ensureFailuresRemaining = 0;
+let ensurePause: Promise<void> | null = null;
+let ensureEntered: (() => void) | null = null;
 let providerValidationPause: Promise<void> | null = null;
 let providerValidationEntered: (() => void) | null = null;
 const fakeChannelSync = {
   async ensureHostedChannelAccount(opts: Record<string, unknown>) {
     ensureCalls.push(opts);
+    if (ensurePause) {
+      ensureEntered?.();
+      await ensurePause;
+    }
     if (ensureFailuresRemaining > 0) {
       ensureFailuresRemaining -= 1;
       throw new Error('fixture config write failed');
     }
+    activeRuntimeAccounts.add(String(opts.runtimeAccountId));
     return { changed: true };
   },
   async removeHostedChannelAccount(opts: Record<string, unknown>) {
     removeCalls.push(opts);
+    activeRuntimeAccounts.delete(String(opts.runtimeAccountId));
     return { changed: true };
   },
 };
@@ -705,7 +721,7 @@ describe('Telegram Managed Bots onboarding', () => {
       headers: { cookie: devCookie(adminId) },
       payload: { agentUsername: adminAgentUsername },
     });
-    expect(adminAttach.statusCode).toBe(403);
+    expect(adminAttach.statusCode).toBe(404);
     const unattached = await pg<{ agent_id: string | null }[]>`
       select agent_id from channel_connections where id = ${connectionId}
     `;
@@ -922,7 +938,7 @@ describe('named-account lifecycle', () => {
         },
       });
       expect(response.statusCode).toBe(400);
-      expect(response.body).toContain('guild/channel activation is disabled');
+      expect(response.body).toContain('group delivery requires at least one allowlisted sender id');
       expect(decryptSpy).not.toHaveBeenCalled();
       expect(validateSpy).not.toHaveBeenCalled();
       expect(ensureCalls).toHaveLength(ensureCallCount);
@@ -1256,6 +1272,94 @@ describe('pairing claim and verified identity linkage', () => {
     expect(JSON.stringify(rows[0]?.request_metadata)).not.toContain('pairingCode');
   });
 
+  it('serializes duplicate pairing resume so stale cleanup cannot remove the winner', async () => {
+    const connection = await activePairingConnection('pairing_resume_deactivate');
+    const peerId = '77449966';
+    const paired = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/pairing',
+      headers: { authorization: `Bearer ${runtimeToken}` },
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        peerId,
+        code: 'EDEN-5511',
+      },
+    });
+    const requestId = (paired.json() as { requestId: string }).requestId;
+    const marker = { requestId, nonce: randomUUID() };
+    await pg.begin(async (tx) => {
+      const connectionRows = await tx<{ metadata: unknown }[]>`
+        select metadata from channel_connections where id = ${connection.id} for update
+      `;
+      const requestRows = await tx<{ metadata: unknown }[]>`
+        select metadata from channel_pairing_requests where id = ${requestId} for update
+      `;
+      const connectionMetadata = connectionRows[0]?.metadata as Record<string, unknown>;
+      const config = connectionMetadata.config as Record<string, unknown>;
+      await tx`
+        update channel_connections
+        set metadata = ${tx.json(JSON.stringify({
+          ...connectionMetadata,
+          config: { ...config, allowFrom: [peerId] },
+          _pairingDecision: marker,
+        }))}
+        where id = ${connection.id}
+      `;
+      await tx`
+        update channel_pairing_requests
+        set status = 'approved', decided_at = now(), decided_by_account_id = ${ownerId},
+            metadata = ${tx.json(JSON.stringify({
+              ...(requestRows[0]?.metadata as Record<string, unknown>),
+              _decisionNonce: marker.nonce,
+            }))}
+        where id = ${requestId}
+      `;
+    });
+
+    let releaseEnsure!: () => void;
+    ensurePause = new Promise<void>((resolve) => {
+      releaseEnsure = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      ensureEntered = resolve;
+    });
+    const removesBefore = removeCalls.length;
+    try {
+      const firstResume = app.inject({
+        method: 'POST',
+        url: `/channels/connections/${connection.id}/pairing/${requestId}/approve`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: {},
+      });
+      await entered;
+      const duplicateResumes = Array.from({ length: 12 }, () =>
+        app.inject({
+          method: 'POST',
+          url: `/channels/connections/${connection.id}/pairing/${requestId}/approve`,
+          headers: { cookie: devCookie(ownerId) },
+          payload: {},
+        }),
+      );
+      releaseEnsure();
+      const [first, ...duplicates] = await Promise.all([firstResume, ...duplicateResumes]);
+      expect(first.statusCode).toBe(200);
+      expect(duplicates).toHaveLength(12);
+      for (const duplicate of duplicates) {
+        expect(duplicate.statusCode).toBe(409);
+        expect(duplicate.json()).toMatchObject({
+          error: { code: 'pairing_request_already_decided' },
+        });
+      }
+    } finally {
+      releaseEnsure();
+      ensurePause = null;
+      ensureEntered = null;
+    }
+    expect(activeRuntimeAccounts.has(connection.runtimeAccountId)).toBe(true);
+    expect(removeCalls).toHaveLength(removesBefore);
+  });
+
   it('serializes approvals behind an existing connection-scoped decision marker', async () => {
     const connection = await activePairingConnection('pairing_serialization');
     const peerId = '77448866';
@@ -1391,7 +1495,211 @@ describe('private runtime callbacks', () => {
   });
 });
 
+describe('Postgres channel group identity isolation', () => {
+  it('keeps a pre-linked group participant pseudonymous in membership and authorship', async () => {
+    const peerId = '77889911';
+    const guildId = '758719600895590441';
+    const conversationId = '758719600895590444';
+    const connection = await createConnection({
+      token: `valid_${marker}_group_identity`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: {
+        dmPolicy: 'allowlist',
+        allowFrom: [peerId],
+        discordGuilds: [{ guildId, channelIds: [conversationId] }],
+      },
+    });
+    expect(activated.statusCode).toBe(200);
+
+    const service = new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault);
+    await service.syncMessage({
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+      gatewaySessionKey: `agent:${marker}:discord:${connection.runtimeAccountId}:direct:${peerId}`,
+      conversationId: peerId,
+      conversationScope: 'direct',
+      peerId,
+      externalMessageId: `${marker}:direct-linked-peer`,
+      role: 'user',
+      content: 'direct identity seed',
+      createdAt: new Date(),
+    });
+    await pg`
+      update channel_external_identities
+      set linked_account_id = ${strangerId}, updated_at = now()
+      where connection_id = ${connection.id}
+        and peer_fingerprint = ${channelPeerFingerprint(connection.id, peerId)}
+    `;
+
+    const groupSessionKey =
+      `agent:${marker}:discord:${connection.runtimeAccountId}:group:${conversationId}`;
+    const result = await service.syncMessage({
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+      gatewaySessionKey: groupSessionKey,
+      conversationId,
+      conversationScope: 'group',
+      guildId,
+      peerId,
+      externalMessageId: `${marker}:group-linked-peer`,
+      role: 'user',
+      content: 'allowlisted group turn',
+      createdAt: new Date(),
+    });
+    expect(result.memoryContext.linkState).toBe('group');
+
+    const messages = await pg<Array<{ sender_id: string | null }>>`
+      select m.sender_id
+      from messages m
+      join sessions s on s.id = m.session_id
+      where s.gateway_session_key = ${groupSessionKey}
+        and m.external_id = ${marker + ':group-linked-peer'}
+    `;
+    expect(messages).toEqual([{ sender_id: null }]);
+    const members = await pg<{ user_account_id: string }[]>`
+      select su.user_account_id
+      from session_users su
+      join sessions s on s.id = su.session_id
+      where s.gateway_session_key = ${groupSessionKey}
+    `;
+    expect(members.map((member) => member.user_account_id)).toContain(ownerId);
+    expect(members.map((member) => member.user_account_id)).not.toContain(strangerId);
+  });
+
+  it('rejects a stale authorized snapshot after the connection is deactivated', async () => {
+    const peerId = '77889922';
+    const connection = await createConnection({
+      token: `valid_${marker}_stale_session`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'allowlist', allowFrom: [peerId], discordGuilds: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    const store = new PostgresChannelSessionSyncStore();
+    const snapshot = await store.getLiveConnection(connection.id);
+    expect(snapshot).not.toBeNull();
+    await pg`
+      update channel_connections set desired_state = 'inactive', updated_at = now()
+      where id = ${connection.id}
+    `;
+    const fingerprint = channelPeerFingerprint(connection.id, peerId);
+    const encrypted = vault.encrypt(peerId, channelPeerSecretContext(connection.id, fingerprint));
+    const gatewaySessionKey =
+      `agent:${marker}:discord:${connection.runtimeAccountId}:direct:stale-${peerId}`;
+    await expect(
+      store.persistMessage({
+        connection: snapshot!,
+        event: {
+          connectionId: connection.id,
+          runtimeAccountId: connection.runtimeAccountId,
+          gatewaySessionKey,
+          conversationScope: 'direct',
+          externalMessageId: `${marker}:stale-session-message`,
+          role: 'user',
+          content: 'must not persist',
+          createdAt: new Date(),
+        },
+        authorization: {
+          peerId,
+          conversationId: peerId,
+          conversationScope: 'direct',
+        },
+        identity: {
+          fingerprint,
+          ciphertext: encrypted.tokenCiphertext,
+          iv: encrypted.tokenIv,
+          authTag: encrypted.tokenAuthTag,
+          preview: null,
+          keyVersion: encrypted.keyVersion,
+        },
+        conversationFingerprint: channelConversationFingerprint(connection.id, peerId),
+        sessionExternalId: randomUUID(),
+        safeChannelMetadata: { type: 'discord', readOnly: true },
+      }),
+    ).rejects.toThrow('channel connection unavailable');
+    const sessions = await pg<{ id: string }[]>`
+      select id from sessions where gateway_session_key = ${gatewaySessionKey}
+    `;
+    expect(sessions).toEqual([]);
+  });
+});
+
 describe('channel money crash boundaries against Postgres', () => {
+  it('does not debit or return a provider ticket when deactivation wins after claim', async () => {
+    const connection = await createConnection({
+      token: `valid_${marker}_money_revoke_race`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    await credit({
+      accountId: ownerId,
+      amount: 1_000,
+      type: 'credit:test:channel-revoke-race',
+      idempotencyKey: `channel-revoke-race-credit:${marker}`,
+    });
+    let releaseAuthorize!: () => void;
+    const pauseAuthorize = new Promise<void>((resolve) => {
+      releaseAuthorize = resolve;
+    });
+    let authorizeEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      authorizeEntered = resolve;
+    });
+    class PausedAuthorizationStore extends PostgresChannelTurnStore {
+      override async authorize(turn: Parameters<PostgresChannelTurnStore['authorize']>[0]) {
+        authorizeEntered();
+        await pauseAuthorize;
+        return super.authorize(turn);
+      }
+    }
+    const service = new ChannelTurnMeteringService(
+      new PausedAuthorizationStore(async () => 'openclaw'),
+    );
+    const turnId = randomUUID();
+    const balanceBefore = (await getBalance(ownerId)).total;
+    const reservation = service.reserve({
+      turnId,
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+    });
+    await entered;
+    await pg`
+      update channel_connections set desired_state = 'inactive', updated_at = now()
+      where id = ${connection.id}
+    `;
+    releaseAuthorize();
+    await expect(reservation).rejects.toThrow('channel connection unavailable');
+    expect((await getBalance(ownerId)).total).toBe(balanceBefore);
+    const rows = await pg<
+      Array<{ status: string; authorization_count: number; debit_count: number }>
+    >`
+      select ct.status,
+             (select count(*)::int from turn_authorizations ta where ta.turn_id = ct.turn_id)
+               as authorization_count,
+             (
+               select count(*)::int from manna_transactions mt
+               where mt.idempotency_key = ${channelTurnLedgerKey(turnId)}
+             ) as debit_count
+      from channel_turns ct where ct.turn_id = ${turnId}
+    `;
+    expect(rows).toEqual([{ status: 'error', authorization_count: 0, debit_count: 0 }]);
+  });
+
   it('keeps settled authorization terminal while compensation and delivered rescue serialize exactly', async () => {
     const connection = await createConnection({
       token: `valid_${marker}_money_crash_boundary`,
@@ -1448,7 +1756,7 @@ describe('channel money crash boundaries against Postgres', () => {
     }>>`
       select ct.status as channel_status, ct.error_code,
              ta.state as authorization_state, ta.charged_manna,
-             ue.status as usage_status, ue.manna,
+             ue.status as usage_status, ue.manna as usage_manna,
              (
                select count(*)::int from manna_transactions mt
                where mt.idempotency_key = ${`refund:${channelTurnLedgerKey(compensatedTurn)}`}
