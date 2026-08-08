@@ -61,6 +61,14 @@ function serializeCredentials(credentials: XByoCredentials): string {
   return JSON.stringify(credentials);
 }
 
+function validIdentity(identity: XUserIdentity): boolean {
+  return (
+    /^\d{1,25}$/.test(identity.id) &&
+    /^[A-Za-z0-9_]{1,50}$/.test(identity.username) &&
+    (identity.name === null || (identity.name.length > 0 && identity.name.length <= 200))
+  );
+}
+
 function parseCredentials(plaintext: string): XByoCredentials {
   let parsed: unknown;
   try {
@@ -106,6 +114,14 @@ export class XByoConnectorService {
     }
     const validation = await this.client.validate(credentials);
     if (!validation.ok) return validation;
+    if (!validIdentity(validation.value)) {
+      return {
+        ok: false,
+        code: 'provider_unavailable',
+        message: 'X returned an invalid account identity.',
+        retryable: true,
+      };
+    }
     const handle = await this.custody.seal({
       accountId: input.accountId,
       agentId: input.agentId,
@@ -113,7 +129,12 @@ export class XByoConnectorService {
       label: input.label?.trim() || null,
       plaintext: serializeCredentials(credentials),
     });
-    assertRequestScopedSecretHandle(handle);
+    try {
+      assertRequestScopedSecretHandle(handle);
+    } catch (error) {
+      await Promise.resolve(this.custody.revoke(handle)).catch(() => undefined);
+      throw error;
+    }
     return { ok: true, value: { handle, user: validation.value } };
   }
 

@@ -116,4 +116,19 @@ describe('XByoConnectorService', () => {
     expect(custody.revoke).toHaveBeenCalledWith(HANDLE);
     expect(custody.withPlaintext).not.toHaveBeenCalled();
   });
+
+  it('rejects malformed provider identity before custody', async () => {
+    const { custody, client } = fixtures();
+    vi.mocked(client.validate).mockResolvedValue({
+      ok: true,
+      value: { id: 'not-an-id', username: 'bad username', name: null },
+    });
+    const result = await new XByoConnectorService(client, custody).connect({
+      accountId: 'account-1',
+      agentId: null,
+      credentials: CREDENTIALS,
+    });
+    expect(result).toMatchObject({ ok: false, code: 'provider_unavailable' });
+    expect(custody.seal).not.toHaveBeenCalled();
+  });
 });

@@ -142,6 +142,14 @@ export class DiscordByobService {
     }
     const validation = await this.client.getCurrentBot(token);
     if (!validation.ok) return validation;
+    if (!/^\d{3,25}$/.test(validation.bot.id)) {
+      return {
+        ok: false,
+        code: 'provider_unavailable',
+        message: 'Discord returned an invalid bot identity.',
+        retryable: true,
+      };
+    }
     const handle = await this.custody.seal({
       accountId: input.accountId,
       agentId: input.agentId,
@@ -149,7 +157,14 @@ export class DiscordByobService {
       label: input.label?.trim() || null,
       plaintext: token,
     });
-    assertRequestScopedSecretHandle(handle);
+    try {
+      assertRequestScopedSecretHandle(handle);
+    } catch (error) {
+      // Compensate a malformed custody response by revoking the row by its
+      // opaque handle. A valid SecretRef is never published to a caller.
+      await Promise.resolve(this.custody.revoke(handle)).catch(() => undefined);
+      throw error;
+    }
     return {
       ok: true,
       value: {
