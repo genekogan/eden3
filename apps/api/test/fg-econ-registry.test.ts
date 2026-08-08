@@ -32,31 +32,24 @@ function readTestFile(relFromApi: string): string {
   return readFileSync(abs, 'utf8');
 }
 
-/** Lines that open a test with a title (it(...) / it.each(...)(...)). */
-function activeTestTitleLines(src: string): string[] {
-  return src
-    .split('\n')
-    .filter((line) => /\bit\s*(\.each\s*\([^)]*\))?\s*\(/.test(line))
-    .filter((line) => !/\bit\s*\.(skip|todo|only)\b/.test(line))
-    .filter((line) => !/\.each\s*\([^)]*\)\s*\.(skip|todo|only)\b/.test(line));
+/**
+ * A test title containing `match` exists in `src`. The static scan is a coarse
+ * FORWARD guard (the id string appears in a quoted test title); the EXECUTION
+ * authority is scripts/fg-econ-registry-run.mjs, which confirms the id actually
+ * ran and PASSED in the right file on a fully-green, no-skip run. To keep the
+ * static side honest, `noSkipConstructs` separately forbids skip/only/todo in
+ * the battery files, so a title match can never sit under a disabled test.
+ */
+function hasTitleMatch(src: string, match: string): boolean {
+  // The match must appear inside a quoted string (a test title / describe),
+  // not only in a comment. Accept single, double, or backtick quotes.
+  const escaped = match.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`['"\`][^'"\`]*${escaped}`);
+  return re.test(src);
 }
 
-/** Does an ACTIVE test title in `src` contain `match`? */
-function hasActiveTitle(src: string, match: string): boolean {
-  // Fast path: the match sits on the same line as the it(...) opener.
-  const lines = src.split('\n');
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i]!;
-    const opensTest = /\bit\s*(\.each\s*\([^)]*\))?\s*\(/.test(line);
-    if (!opensTest) continue;
-    if (/\bit\s*\.(skip|todo|only)\b/.test(line) || /\.each\s*\([^)]*\)\s*\.(skip|todo|only)\b/.test(line)) {
-      continue;
-    }
-    // The title may continue onto the next couple of lines; join a small window.
-    const window = [line, lines[i + 1] ?? '', lines[i + 2] ?? ''].join('\n');
-    if (window.includes(match)) return true;
-  }
-  return false;
+function noSkipConstructs(src: string): boolean {
+  return !/(\bit|\bdescribe|\btest)\s*\.(skip|only|todo)\b/.test(src);
 }
 
 interface RegistryEntry {
@@ -87,35 +80,55 @@ describe('FG-ECON registry integrity (MVP-ACCEPTANCE §1.7)', () => {
     }
   });
 
-  it('every registered id resolves to an ACTIVE (non-skip/todo/only) test title', () => {
+  it('every registered id resolves to a test title in its file (forward guard)', () => {
     for (const e of entries) {
       const src = readTestFile(e.file);
-      expect(hasActiveTitle(src, e.match), `${e.id}: no active test titled with "${e.match}" in ${e.file}`).toBe(true);
+      expect(hasTitleMatch(src, e.match), `${e.id}: no test titled with "${e.match}" in ${e.file}`).toBe(true);
     }
   });
 
-  it('bidirectional: every FG-ECON-* id in the battery files is registered', () => {
+  it('battery files contain no skip/only/todo constructs (a match can never sit under a disabled test)', () => {
+    const batteryFiles = [
+      'test/fg-econ-battery.test.ts',
+      'test/fg-econ-studio.test.ts',
+      'test/fg-econ-crash-reaper.test.ts',
+      'test/econ-oracle.independence.test.ts',
+      'test/fg-econ-registry.test.ts',
+    ];
+    for (const file of batteryFiles) {
+      expect(noSkipConstructs(readTestFile(file)), `${file} has a skip/only/todo construct`).toBe(true);
+    }
+  });
+
+  it('bidirectional: every FG-ECON-* id used in a battery test title is registered', () => {
     const batteryFiles = [
       'test/fg-econ-battery.test.ts',
       'test/fg-econ-studio.test.ts',
       'test/fg-econ-crash-reaper.test.ts',
     ];
-    const registered = new Set(entries.map((e) => e.match));
+    // Registered id "cores" (a match may carry an it.each bracket suffix like
+    // `FG-ECON-STUDIO-01[`; the token regex is uppercase-only so `STUDIO-01b`
+    // reads as `STUDIO-01`). Overlap-tolerant membership handles both.
+    const registeredCores = entries.map((e) => e.match.replace(/\[.*$/, ''));
+    const covered = (token: string) =>
+      registeredCores.some((c) => c === token || c.startsWith(token) || token.startsWith(c));
     for (const file of batteryFiles) {
       const src = readTestFile(file);
-      // Collect ids used in this file's active titles.
       const ids = new Set<string>();
-      for (const m of src.matchAll(/FG-ECON-[A-Z0-9-]+/g)) {
-        // strip an it.each interpolation bracket suffix if present
-        ids.add(m[0]);
-      }
+      for (const m of src.matchAll(/FG-ECON-[A-Z0-9-]+/g)) ids.add(m[0]);
       for (const id of ids) {
-        // Every FG-ECON id string that appears in an ACTIVE title must be a
-        // registered `match` (base id) — orphan ids fail here.
-        if (!hasActiveTitle(src, id)) continue; // appears only in a comment/import
-        expect(registered.has(id), `${id} in ${file} is used in a test title but not registered`).toBe(true);
+        if (!hasTitleMatch(src, id)) continue; // appears only in a comment/import
+        expect(covered(id), `${id} in ${file} is used in a test title but not registered`).toBe(true);
       }
     }
+  });
+
+  it('defect-evidence entries are flagged so they are never counted as positive FG-ECON coverage', () => {
+    // Some registered ids document a KNOWN defect executably (e.g. the studio
+    // sub->durable laundering vector). They must carry `defect: true` so the
+    // generated evidence separates them from positive coverage.
+    const launder = entries.find((e) => e.id === 'FG-ECON-STUDIO-LAUNDER') as (RegistryEntry & { defect?: boolean }) | undefined;
+    expect(launder?.defect).toBe(true);
   });
 
   it('the execution-binding generator exists and targets the battery', () => {

@@ -7,9 +7,10 @@ import {
   getBalance,
   gatewaySessionKey,
   settleReservationIdempotencyKey,
+  turnAuthorizedMax,
 } from '@eden3/core';
 import { db, pg, sessions, type Session } from '@eden3/db';
-import type { AgentRuntime, SessionEvent } from '@eden3/shared';
+import { AGENT_MODEL_OPTIONS, type AgentRuntime, type SessionEvent } from '@eden3/shared';
 import type { GatewayTurnEvent } from '@eden3/gateway';
 import type { ClaudeTranscriptUsageCaptureLike } from '@eden3/gateway';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -226,12 +227,29 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
         },
       };
       const emitted: SessionEvent[] = [];
+      // Probe the committed reservation on an INDEPENDENT connection at the
+      // moment the first client-visible byte would be emitted — proving the
+      // reservation is durable BEFORE any emitted byte (not merely before the
+      // provider call). A pipeline that emitted turn.started then reserved
+      // would see an uncommitted reservation here and fail.
+      let reservationCommittedAtFirstEmit: number | null = null;
+      let firstEmitObserved = false;
+      const probeAtFirstEmit = async () => {
+        if (firstEmitObserved) return;
+        firstEmitObserved = true;
+        const [row] = await pg<{ amount: string }[]>`
+          select amount from manna_transactions
+          where manna_account_id in (select id from manna_accounts where account_id = ${fixture.user.accountId})
+            and type = 'spend:chat'`;
+        reservationCommittedAtFirstEmit = row ? Number(row.amount) : null;
+      };
       const beginStream: RunTurnParams['beginStream'] = () => {
         sinkOpened = true;
         // Provider must not have run before the sink even opens.
         sinkOpenedBeforeProvider = providerCalls === 0;
         return {
           emit(event) {
+            void probeAtFirstEmit();
             emitted.push(event);
           },
           end() {},
@@ -251,8 +269,11 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
       // The reservation committed BEFORE the provider call, at the oracle amount.
       expect(observed).toEqual({ amount: -expectedReservation, state: 'reserved', max: expectedReservation });
       // No client-visible byte preceded the reservation: the earliest emitted
-      // event is turn.started, published after the (already-committed) debit.
+      // event is turn.started, and the reservation was already committed and
+      // visible on an independent connection when that first byte fired.
       expect(emitted[0]?.type).toBe('turn.started');
+      expect(firstEmitObserved).toBe(true);
+      expect(reservationCommittedAtFirstEmit).toBe(-expectedReservation);
     },
   );
 
@@ -300,16 +321,22 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
   // FG-ECON-CHAT-04: settlement oracle matrix — several usage shapes on two
   // tiers; charged == oracle min(metered, reservation) exactly, overrun flagged
   // iff the oracle says so, settle ≤ authorized-max always.
+  // All four models × varied usage shapes (plain / cache-read / cache-write /
+  // overrun / zero-output), so model-specific mispricing cannot hide.
   const settlementCases: Array<{ name: string; model: string; usage: { promptTokens: number; completionTokens: number; cachedTokens?: number; cacheWriteTokens?: number } }> = [
     { name: 'haiku plain under-ceiling', model: 'anthropic/claude-haiku-4-5', usage: { promptTokens: 30_000, completionTokens: 2_000 } },
     { name: 'haiku cache-read heavy', model: 'anthropic/claude-haiku-4-5', usage: { promptTokens: 40_000, completionTokens: 500, cachedTokens: 38_000 } },
     { name: 'haiku overrun (>ceiling)', model: 'anthropic/claude-haiku-4-5', usage: { promptTokens: 1_000_000, completionTokens: 100_000 } },
-    { name: 'sonnet-4-6 mid', model: 'anthropic/claude-sonnet-4-6', usage: { promptTokens: 50_000, completionTokens: 4_000, cacheWriteTokens: 10_000 } },
+    { name: 'sonnet-4-5 plain', model: 'anthropic/claude-sonnet-4-5', usage: { promptTokens: 60_000, completionTokens: 3_000 } },
+    { name: 'sonnet-4-6 cache-write', model: 'anthropic/claude-sonnet-4-6', usage: { promptTokens: 50_000, completionTokens: 4_000, cacheWriteTokens: 10_000 } },
     { name: 'sonnet-4-6 zero-output', model: 'anthropic/claude-sonnet-4-6', usage: { promptTokens: 20_000, completionTokens: 0 } },
+    { name: 'opus plain', model: 'anthropic/claude-opus-4-6', usage: { promptTokens: 40_000, completionTokens: 5_000 } },
+    { name: 'opus overrun (>ceiling)', model: 'anthropic/claude-opus-4-6', usage: { promptTokens: 2_000_000, completionTokens: 200_000 } },
   ];
-  it.each(settlementCases)('FG-ECON-CHAT-04[$name]: settle == oracle charge, ≤ authorized-max', async ({ model, usage }) => {
+  it.each(settlementCases)('FG-ECON-CHAT-04[$name]: settle == oracle charge, ≤ authorized-max, exact ledger legs', async ({ model, usage }) => {
     const expected = oracleSettlement(usage, model);
-    const fixture = await makeFixture({ fundManna: expected.reservation + 200, model });
+    const startBalance = expected.reservation + 200;
+    const fixture = await makeFixture({ fundManna: startBalance, model });
     const outcome = await runTurn(makeDeps(completing(usage)), {
       session: fixture.session,
       agent: fixture.agent,
@@ -318,14 +345,33 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
       beginStream: sink,
     });
     expect(outcome.errorCode).toBeNull();
-    const startBalance = expected.reservation + 200;
+    // Exact final balance == start − oracle charge.
     expect((await getBalance(fixture.user.accountId)).total).toBe(startBalance - expected.charged);
     const authz = await authzRow(outcome.turnId);
     expect(authz).toMatchObject({ state: 'settled', overrun: expected.overrun });
     expect(Number(authz!.charged_manna)).toBe(expected.charged);
-    // The binding invariant: settle ≤ authorized-max, always.
-    expect(Number(authz!.charged_manna)).toBeLessThanOrEqual(Number(authz!.authorized_max_manna));
     expect(Number(authz!.authorized_max_manna)).toBe(expected.reservation);
+    // settle ≤ authorized-max, always.
+    expect(Number(authz!.charged_manna)).toBeLessThanOrEqual(Number(authz!.authorized_max_manna));
+    // Exact ledger legs: one reservation debit of the oracle reservation, and a
+    // linked settle refund of exactly (reservation − charge) on the authz-settle
+    // key — proving the unused reserve was returned, not just that the balance
+    // happened to land right.
+    const rows = await ledgerRows(fixture.user.accountId);
+    const reservation = rows.find((r) => r.idempotency_key === outcome.turnId && r.type === 'spend:chat');
+    expect(Number(reservation!.amount)).toBe(-expected.reservation);
+    const unused = expected.reservation - expected.charged;
+    const settleLeg = rows.find((r) => r.idempotency_key === settleReservationIdempotencyKey(outcome.turnId));
+    if (unused > 0) {
+      // Under the ceiling: the unused reserve is refunded on the settle leg.
+      expect(Number(settleLeg!.amount)).toBe(unused);
+    } else {
+      // Overrun: charged == reservation, nothing to refund — no settle leg.
+      expect(settleLeg).toBeUndefined();
+    }
+    // The usage row records the raw metered manna for reconciliation.
+    const [usageRow] = await pg<{ manna: number }[]>`select manna from usage_events where turn_id = ${outcome.turnId}`;
+    expect(usageRow!.manna).toBe(expected.charged);
   });
 
   // FG-ECON-CHAT-06: completeness — the oracle's INDEPENDENT model manifest is
@@ -369,7 +415,42 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
     ).rejects.toMatchObject({ code: 'model_not_authorizable' });
     expect(providerCalled).toBe(false);
     expect((await ledgerRows(fixture.user.accountId)).filter((r) => r.type.startsWith('spend'))).toHaveLength(0);
+
+    // BIDIRECTIONAL completeness (checkpoint-#2): the oracle's independent
+    // manifest must equal the production routable-model catalog EXACTLY — an
+    // added production model with no ceiling, or a manifest model dropped from
+    // production, both fail here. `AGENT_MODEL_OPTIONS` is the production
+    // catalog; the oracle enumerates the models it independently expects.
+    expect([...ORACLE_CHAT_MODEL_MANIFEST].sort()).toEqual([...AGENT_MODEL_OPTIONS].sort());
   });
+
+  // FG-ECON-CHAT-05: the per-call output-cap belt is wired to the gateway. The
+  // real turns.ts hands `maxOutputTokens` to the compat request; deleting that
+  // handoff (enlarging the D-004 exposure) must fail here. Value comes from the
+  // independent oracle ceiling table, per model.
+  it.each(ORACLE_CHAT_MODEL_MANIFEST)(
+    'FG-ECON-CHAT-05[%s]: the compat request carries the oracle maxOutputTokens (D-004 belt wired)',
+    async (model) => {
+      const fixture = await makeFixture({ fundManna: oracleReservation(model) + 100, model });
+      let seenMaxOutputTokens: number | undefined;
+      const compat: CompatClientLike = {
+        async *chatTurn(params): AsyncGenerator<GatewayTurnEvent, void, void> {
+          seenMaxOutputTokens = (params as { maxOutputTokens?: number }).maxOutputTokens;
+          yield { type: 'turn.started' };
+          yield { type: 'turn.completed', text: 'ok', emptyTurn: false, finishReason: 'stop', usage: { promptTokens: 500, completionTokens: 20, totalTokens: 520 } };
+        },
+      };
+      const outcome = await runTurn(makeDeps(compat), {
+        session: fixture.session,
+        agent: fixture.agent,
+        user: fixture.user,
+        content: 'belt',
+        beginStream: sink,
+      });
+      expect(outcome.errorCode).toBeNull();
+      expect(seenMaxOutputTokens).toBe(ORACLE_CEILINGS[model]!.maxOutputTokens);
+    },
+  );
 
   // FG-ECON-CHAT-10: same-turnId replay — the MONEY invariant survives (the
   // user is charged exactly once even under an abusive duplicated turnId), and
@@ -406,9 +487,10 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
     await Promise.allSettled([a, b]);
     release();
 
-    // MONEY INVARIANT (the binding FG-ECON property): exactly one reservation
-    // debit and at most one settle leg for this turn — the user is charged
-    // once, ≤ authorized-max, no matter how the reservation replays.
+    // MONEY INVARIANT (the binding FG-ECON property), asserted EXACTLY: one
+    // reservation debit, EXACTLY one settle leg of the exact unused-reserve
+    // amount, and a balance that dropped by exactly one charge — no matter how
+    // the reservation replays.
     const rows = await ledgerRows(fixture.user.accountId);
     const reservations = rows.filter((r) => r.idempotency_key === turnId && r.type === 'spend:chat');
     expect(reservations).toHaveLength(1);
@@ -416,7 +498,8 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
     const settleLegs = rows.filter(
       (r) => r.idempotency_key === settleReservationIdempotencyKey(turnId),
     );
-    expect(settleLegs.length).toBeLessThanOrEqual(1);
+    expect(settleLegs).toHaveLength(1);
+    expect(Number(settleLegs[0]!.amount)).toBe(expected.reservation - expected.charged);
     const authz = await authzRow(turnId);
     expect(authz!.state).toBe('settled');
     expect(Number(authz!.charged_manna)).toBe(expected.charged);
@@ -438,36 +521,58 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
 });
 
 describe('FG-ECON battery — subscription-runtime lane (claude-cli)', () => {
-  const captureFor = (usage: { promptTokens: number; completionTokens: number }): ClaudeTranscriptUsageCaptureLike => ({
+  const captureFor = (
+    usage: { promptTokens: number; completionTokens: number; cacheWriteTokens?: number },
+    modelId: string,
+  ): ClaudeTranscriptUsageCaptureLike => ({
     capture: async () => ({
       usage,
       claudeSessionId: `claude-${randomUUID().slice(0, 8)}`,
       providerMessageIds: [`msg_${randomUUID().slice(0, 8)}`],
-      models: ['claude-sonnet-4-6'],
+      models: [modelId],
     }),
   });
 
   // FG-ECON-SUB-01: a claude-cli turn reserves the ceiling pre-provider, records
-  // the notional-subscription basis, and settles from transcript usage ≤ max.
-  it('FG-ECON-SUB-01: subscription-lane turn reserves the ceiling, basis notional-subscription, settles ≤ max', async () => {
-    const model = 'anthropic/claude-sonnet-4-6';
-    const reservation = oracleReservation(model);
-    const usage = { promptTokens: 40_000, completionTokens: 3_000 };
-    const expected = oracleSettlement(usage, model);
-    const fixture = await makeFixture({ fundManna: reservation + 100, model, agentRuntime: 'claude-cli' });
-    const outcome = await runTurn(makeDeps(completing(usage), captureFor(usage)), {
-      session: fixture.session,
-      agent: fixture.agent,
-      user: fixture.user,
-      content: 'subscription turn',
-      beginStream: sink,
-    });
-    expect(outcome.errorCode).toBeNull();
-    const authz = await authzRow(outcome.turnId);
-    expect(authz).toMatchObject({ state: 'settled', pricing_basis: 'notional-subscription', model: 'claude-sonnet-4-6' });
-    expect(Number(authz!.charged_manna)).toBe(expected.charged);
-    expect(Number(authz!.charged_manna)).toBeLessThanOrEqual(reservation);
-  });
+  // the notional-subscription basis, and settles from the AUTHORITATIVE
+  // transcript usage (not the compat tail) ≤ max. Non-circular (checkpoint-#2):
+  // the compat tail carries a DECOY usage; the transcript carries the truth; the
+  // settlement must follow the transcript, proving capture is honored. Two
+  // models exercise the lane.
+  it.each([
+    { model: 'anthropic/claude-sonnet-4-6', modelShort: 'claude-sonnet-4-6', authoritative: { promptTokens: 40_000, completionTokens: 3_000 }, decoy: { promptTokens: 5, completionTokens: 5 } },
+    { model: 'anthropic/claude-haiku-4-5', modelShort: 'claude-haiku-4-5', authoritative: { promptTokens: 30_000, completionTokens: 2_000 }, decoy: { promptTokens: 1, completionTokens: 1 } },
+  ])(
+    'FG-ECON-SUB-01[$modelShort]: subscription lane reserves the ceiling, honors the transcript oracle, settles ≤ max',
+    async ({ model, modelShort, authoritative, decoy }) => {
+      const reservation = oracleReservation(model);
+      const expected = oracleSettlement(authoritative, model);
+      // The decoy would settle very differently — proving the transcript wins.
+      const decoyExpected = oracleSettlement(decoy, model);
+      expect(decoyExpected.charged).not.toBe(expected.charged);
+      const startBalance = reservation + 100;
+      const fixture = await makeFixture({ fundManna: startBalance, model, agentRuntime: 'claude-cli' });
+      const outcome = await runTurn(makeDeps(completing(decoy), captureFor(authoritative, modelShort)), {
+        session: fixture.session,
+        agent: fixture.agent,
+        user: fixture.user,
+        content: 'subscription turn',
+        beginStream: sink,
+      });
+      expect(outcome.errorCode).toBeNull();
+      const authz = await authzRow(outcome.turnId);
+      expect(authz).toMatchObject({ state: 'settled', pricing_basis: 'notional-subscription', model: modelShort });
+      expect(Number(authz!.authorized_max_manna)).toBe(reservation);
+      // Settled from the TRANSCRIPT usage, not the decoy compat tail.
+      expect(Number(authz!.charged_manna)).toBe(expected.charged);
+      expect(Number(authz!.charged_manna)).toBeLessThanOrEqual(reservation);
+      // Exact ledger: reservation debit + linked settle refund of the unused reserve.
+      const rows = await ledgerRows(fixture.user.accountId);
+      expect(Number(rows.find((r) => r.idempotency_key === outcome.turnId && r.type === 'spend:chat')!.amount)).toBe(-reservation);
+      expect(Number(rows.find((r) => r.idempotency_key === settleReservationIdempotencyKey(outcome.turnId))!.amount)).toBe(reservation - expected.charged);
+      expect((await getBalance(fixture.user.accountId)).total).toBe(startBalance - expected.charged);
+    },
+  );
 
   // FG-ECON-SUB-02: a near-zero-balance race on the subscription lane, using
   // DISTINCT sessions so the rejection is the ECONOMIC check — not the
@@ -493,7 +598,7 @@ describe('FG-ECON battery — subscription-runtime lane (claude-cli)', () => {
     const agent2 = { accountId: agentAccount!.id, username: agentAccount!.username, openclawId: `${marker}-bot2-${suffix}`, model, gatewayModelOverride: model, agentRuntime: 'claude-cli' as AgentRuntime };
 
     const { compat, calls, release } = gatedCompat(usage);
-    const capture = captureFor(usage);
+    const capture = captureFor(usage, 'claude-sonnet-4-6');
     const guard = (p: Promise<unknown>) =>
       p.catch((err) => {
         release();
@@ -508,6 +613,14 @@ describe('FG-ECON battery — subscription-runtime lane (claude-cli)', () => {
     expect(calls()).toBe(1);
     expect(rejected).toHaveLength(1);
     expect(rejected[0]!.reason).toBeInstanceOf(InsufficientMannaError);
+    // The one admitted turn reserved EXACTLY the oracle ceiling (a wrong,
+    // smaller reservation could also admit one — this pins the amount).
+    const spendRows = await pg<{ amount: string }[]>`
+      select amount from manna_transactions
+      where manna_account_id in (select id from manna_accounts where account_id = ${a.user.accountId})
+        and type = 'spend:chat'`;
+    expect(spendRows).toHaveLength(1);
+    expect(Number(spendRows[0]!.amount)).toBe(-reservation);
   });
 });
 
@@ -562,30 +675,41 @@ describe('FG-ECON battery — memory-dream lane', () => {
       beginStream: sink,
     });
     expect(outcome.errorCode).toBeNull();
+    const startBalance = reservation + 100;
     const authz = await authzRow(runId);
     expect(authz).toMatchObject({ state: 'settled' });
     expect(Number(authz!.authorized_max_manna)).toBe(reservation);
     expect(Number(authz!.charged_manna)).toBe(expected.charged);
     expect(Number(authz!.charged_manna)).toBeLessThanOrEqual(reservation);
-    const spend = (await ledgerRows(fixture.user.accountId)).filter((r) => r.idempotency_key === runId);
-    expect(spend.some((r) => r.type === 'spend:memory-dream')).toBe(true);
+    // Exact ledger + balance: dedicated dream spend label + linked settle refund.
+    const rows = await ledgerRows(fixture.user.accountId);
+    const spend = rows.filter((r) => r.idempotency_key === runId);
+    expect(spend.some((r) => r.type === 'spend:memory-dream' && Number(r.amount) === -reservation)).toBe(true);
+    expect(Number(rows.find((r) => r.idempotency_key === settleReservationIdempotencyKey(runId))!.amount)).toBe(reservation - expected.charged);
+    expect((await getBalance(fixture.user.accountId)).total).toBe(startBalance - expected.charged);
   });
 });
 
 describe('FG-ECON battery — markup-knob propagation (T-BILL, checkpoint-#1 finding 13)', () => {
-  // The oracle proves the knob MOVES both stages together at two markups; the
-  // kernel's turnAuthorizedMax is exercised at the default markup in every case
-  // above, so here we assert the oracle-level propagation invariant that the
-  // battery's expectations track the knob rather than a frozen constant.
-  it('FG-ECON-MARKUP-01: reservation + settlement both scale with the markup knob', () => {
+  // The REAL kernel function (turnAuthorizedMax) must propagate the markup knob,
+  // not a hardcoded 0.35 — so we exercise the code under test at two markups and
+  // assert EXACT oracle-agreed values (a kernel that ignored the option would
+  // return 61 at both and fail). Settlement-side propagation on a running stack
+  // (one env knob moving every stage) is the T-BILL tranche's scope; here we
+  // prove the authorization stage propagates in the landed code.
+  it('FG-ECON-MARKUP-01: the real turnAuthorizedMax propagates the markup knob (exact, both stages via oracle)', () => {
     const model = 'anthropic/claude-haiku-4-5';
+    // Real kernel at the default and a doubled markup.
+    const atDefault = turnAuthorizedMax({ provider: 'anthropic', model: 'claude-haiku-4-5' }, { markup: 0.35 });
+    const atDouble = turnAuthorizedMax({ provider: 'anthropic', model: 'claude-haiku-4-5' }, { markup: 1.0 });
+    // Exact independent-oracle expectations: 0.045×1.35×1000=61 ; 0.045×2.0×1000=90.
+    expect(atDefault.manna).toBe(oracleReservation(model, 0.35));
+    expect(atDefault.manna).toBe(61);
+    expect(atDouble.manna).toBe(oracleReservation(model, 1.0));
+    expect(atDouble.manna).toBe(90);
+    // The oracle's settlement stage also scales — the knob moves both stages.
     const usage = { promptTokens: 30_000, completionTokens: 2_000 };
-    const atDefault = oracleSettlement(usage, model, 0.35);
-    const atDouble = oracleSettlement(usage, model, 1.0);
-    // Both the ceiling reservation and the metered charge move up together.
-    expect(atDouble.reservation).toBeGreaterThan(atDefault.reservation);
-    expect(atDouble.metered).toBeGreaterThan(atDefault.metered);
-    // Default-markup reservation is the frozen anchor.
-    expect(atDefault.reservation).toBe(ORACLE_CEILINGS[model]!.expectedReservationManna);
+    expect(oracleSettlement(usage, model, 0.35).metered).toBe(54);
+    expect(oracleSettlement(usage, model, 1.0).metered).toBe(80);
   });
 });

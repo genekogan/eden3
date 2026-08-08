@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { credit, gatewaySessionKey, getBalance } from '@eden3/core';
+import { credit, debit, gatewaySessionKey, getBalance } from '@eden3/core';
 import { db, pg, sessions } from '@eden3/db';
 import { eq } from 'drizzle-orm';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -67,6 +67,30 @@ async function makeFixture(fundManna: number, subscriptionManna = 0): Promise<Fi
 async function authzState(turnId: string): Promise<string | null> {
   const [row] = await pg<{ state: string }[]>`select state from turn_authorizations where turn_id = ${turnId}`;
   return row?.state ?? null;
+}
+
+/** Debit a foreign account's reservation (for the isolation sentinel). */
+async function debitForeign(accountId: string, turnId: string, amount: number): Promise<string> {
+  const res = await debit({ accountId, amount, type: 'spend:chat', idempotencyKey: turnId });
+  return res.transaction.id;
+}
+
+/** Seed a foreign aged `reserved` authorization row bound to a real debit. */
+async function seedForeignReserved(
+  fixture: Fixture,
+  turnId: string,
+  reservationTxId: string,
+  amount: number,
+): Promise<void> {
+  await pg`
+    insert into turn_authorizations
+      (turn_id, account_id, provider, model, pricing_basis, ceiling_table_version,
+       authorized_max_manna, reserved_subscription_manna, reservation_tx_id, state,
+       created_at, updated_at)
+    values
+      (${turnId}, ${fixture.userId}, 'anthropic', 'claude-haiku-4-5', 'provider-api',
+       '2026-08-08.authz-v1', ${amount}, 0, ${reservationTxId}, 'reserved',
+       now() - interval '2 hours', now() - interval '2 hours')`;
 }
 
 afterAll(async () => {
@@ -138,10 +162,26 @@ describe('FG-ECON crash → reaper (T08-U03)', () => {
     child.kill('SIGKILL');
     await new Promise<void>((resolve) => child.on('exit', () => resolve()));
 
-    // The orphan is still 'reserved' (nothing reversed it in-process).
+    // The orphan is still 'reserved' (nothing reversed it in-process) — even
+    // though the client already saw a streamed token. The predeclared rule: an
+    // unpersisted turn is a failed turn and refunds in full (partial-output
+    // settlement is DEBT-004, undecided). No assistant message was persisted.
     expect(await authzState(turnId)).toBe('reserved');
+    const [assistantCount] = await pg<{ n: string }[]>`
+      select count(*)::text as n from messages where session_id = ${fixture.sessionId} and role = 'assistant'`;
+    expect(Number(assistantCount!.n)).toBe(0);
 
-    // Age the (marker-scoped) row past the reaper TTL and compensate it.
+    // ISOLATION SENTINEL (checkpoint-#2): a foreign aged `reserved` orphan on a
+    // DIFFERENT account, outside the reaper's accountScope, must survive the
+    // sweep untouched — proving accountScope really bounds the reap.
+    const foreign = await makeFixture(150);
+    const foreignTurn = randomUUID();
+    const foreignDebit = await debitForeign(foreign.userId, foreignTurn, oracleReservation(HAIKU));
+    await seedForeignReserved(foreign, foreignTurn, foreignDebit, oracleReservation(HAIKU));
+    expect(await authzState(foreignTurn)).toBe('reserved');
+
+    // Age the (marker-scoped) row past the reaper TTL and compensate it, scoped
+    // to ONLY our account.
     await pg`update turn_authorizations set created_at = now() - interval '2 hours' where turn_id = ${turnId}`;
     const reaper = new TurnReservationReaper({ accountScope: [fixture.userId] });
     const result = await reaper.runOnce();
@@ -154,10 +194,15 @@ describe('FG-ECON crash → reaper (T08-U03)', () => {
     expect(restored.balance).toBe(durableFund);
     expect(restored.total).toBe(durableFund + subShare);
 
+    // The foreign orphan is UNTOUCHED — the scope held.
+    expect(await authzState(foreignTurn)).toBe('reserved');
+    expect((await getBalance(foreign.userId)).total).toBe(150 - oracleReservation(HAIKU));
+
     // Idempotent: a second sweep neither double-credits nor re-touches it.
     await reaper.runOnce();
     expect((await getBalance(fixture.userId)).total).toBe(durableFund + subShare);
     expect(await authzState(turnId)).toBe('reaped');
+    expect(await authzState(foreignTurn)).toBe('reserved');
   }, 60_000);
 
   // FG-ECON-REAP-04: the reaper never touches a settled, delivered turn — even
