@@ -949,6 +949,7 @@ async function runClaimedTurn(
    */
   let usageEventRecorded = false;
   let usableOutputMarked = false;
+  let partialSettlementPending = false;
   const settleMarkedPartialOutput = async (): Promise<boolean> => {
     try {
       const partial = await settlePartialOutputAuthorization({
@@ -968,6 +969,7 @@ async function runClaimedTurn(
       }
       return true;
     } catch (err) {
+      partialSettlementPending = true;
       onError(err, 'partial-output full-reserve settlement');
       return false;
     }
@@ -1012,7 +1014,10 @@ async function runClaimedTurn(
     usageCapture?: ClaudeTranscriptUsageResult | null;
     usageSource?: 'compat-tail' | 'claude-transcript' | 'missing';
   }, options: { dbc?: DbHandle; strict?: boolean } = {}): Promise<void> => {
-    if (usageEventRecorded) return;
+    // A durably marked prefix whose atomic money+usage settlement failed is
+    // owned by the reaper. Do not preempt it with a generic usage row missing
+    // full-reserve-v1 provenance.
+    if (usageEventRecorded || partialSettlementPending) return;
     try {
       const metering = record.metering ?? meterChatUsage(record.usage, meteringModel);
       // Paired with the usage_events_turn_unique partial index: a retried or

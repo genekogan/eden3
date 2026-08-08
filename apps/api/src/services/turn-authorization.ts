@@ -51,14 +51,21 @@ export async function claimTurnProviderStart(
   turnId: string,
   dbc: DbHandle = db,
 ): Promise<boolean> {
-  const inserted = (await dbc.execute(sql`
-    insert into turn_provider_runs (turn_id)
-    select turn_id from turn_authorizations
-    where turn_id = ${turnId} and state = 'reserved'
-    on conflict (turn_id) do nothing
-    returning turn_id
-  `)) as unknown as { turn_id: string }[];
-  return inserted.length === 1;
+  return await dbc.transaction(async (tx) => {
+    // Lock the parent first so a terminal transition racing this claim yields
+    // a clean false, not a trigger error after a stale state read.
+    const parent = (await tx.execute(sql`
+      select state from turn_authorizations where turn_id = ${turnId} for update
+    `)) as unknown as { state: string }[];
+    if (parent[0]?.state !== 'reserved') return false;
+    const inserted = (await tx.execute(sql`
+      insert into turn_provider_runs (turn_id)
+      values (${turnId})
+      on conflict (turn_id) do nothing
+      returning turn_id
+    `)) as unknown as { turn_id: string }[];
+    return inserted.length === 1;
+  });
 }
 
 /**
@@ -162,6 +169,14 @@ export async function settlePartialOutputAuthorization(options: {
       throw new Error(`turn-authorization: turn ${options.turnId} reservation has no idempotency key`);
     }
     if (
+      row.reservation_type !== 'spend:chat' &&
+      row.reservation_type !== 'spend:memory-dream'
+    ) {
+      throw new Error(
+        `turn-authorization: turn ${options.turnId} has invalid reservation type ${String(row.reservation_type)}`,
+      );
+    }
+    if (
       row.pricing_basis !== 'provider-api' &&
       row.pricing_basis !== 'notional-subscription'
     ) {
@@ -171,6 +186,11 @@ export async function settlePartialOutputAuthorization(options: {
     }
 
     const chargedManna = numericToNumber(row.authorized_max_manna);
+    if (!Number.isSafeInteger(chargedManna) || chargedManna <= 0) {
+      throw new Error(
+        `turn-authorization: turn ${options.turnId} full-reserve charge is not a positive integer`,
+      );
+    }
     await markTurnSettled(tx, options.turnId, { chargedManna, overrun: false });
     const leg = await settleReservation({
       reservationKey: row.reservation_key,
