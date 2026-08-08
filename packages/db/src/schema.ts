@@ -1652,6 +1652,112 @@ export const storagePolicyEvents = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// app_notifications — tenant-owned, payload-free in-app notifications.
+// Build notifications identify only the agent account and a constrained
+// same-app path; user/provider content and secrets have no column to enter.
+// ---------------------------------------------------------------------------
+export const appNotifications = pgTable(
+  'app_notifications',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    kind: text('kind', { enum: ['agent_build_ready', 'agent_build_failed'] }).notNull(),
+    sourceAgentId: uuid('source_agent_id')
+      .notNull()
+      .references(() => agents.accountId, { onDelete: 'cascade' }),
+    targetPath: text('target_path'),
+    readAt: timestamptz('read_at'),
+    dismissedAt: timestamptz('dismissed_at'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('app_notifications_build_once_uq').on(t.accountId, t.kind, t.sourceAgentId),
+    index('app_notifications_account_created_idx')
+      .on(t.accountId, t.createdAt.desc())
+      .where(sql`${t.dismissedAt} is null`),
+    index('app_notifications_account_unread_idx')
+      .on(t.accountId, t.createdAt.desc())
+      .where(sql`${t.readAt} is null and ${t.dismissedAt} is null`),
+    check(
+      'app_notifications_kind_check',
+      sql`${t.kind} in ('agent_build_ready', 'agent_build_failed')`,
+    ),
+    check(
+      'app_notifications_build_source_check',
+      sql`${t.sourceAgentId} is not null`,
+    ),
+    check(
+      'app_notifications_target_path_check',
+      sql`${t.targetPath} is null or ${t.targetPath} ~ '^/agents/[a-z0-9][a-z0-9_-]{2,31}$'`,
+    ),
+    check(
+      'app_notifications_read_at_check',
+      sql`${t.readAt} is null or ${t.readAt} >= ${t.createdAt}`,
+    ),
+    check(
+      'app_notifications_dismissed_at_check',
+      sql`${t.dismissedAt} is null or (${t.readAt} is not null and ${t.dismissedAt} >= ${t.createdAt})`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// agent_provision_jobs — one durable, fenced provisioning claim per agent.
+// The existing agents row is the sole configuration source; this table holds
+// only recovery state and safe error codes, never copied persona or secrets.
+// ---------------------------------------------------------------------------
+export const agentProvisionJobs = pgTable(
+  'agent_provision_jobs',
+  {
+    agentAccountId: uuid('agent_account_id')
+      .primaryKey()
+      .references(() => agents.accountId, { onDelete: 'cascade' }),
+    state: text('state', { enum: ['pending', 'running', 'succeeded', 'failed'] })
+      .notNull()
+      .default('pending'),
+    attemptCount: integer('attempt_count').notNull().default(0),
+    nextAttemptAt: timestamptz('next_attempt_at').defaultNow(),
+    claimToken: uuid('claim_token'),
+    claimExpiresAt: timestamptz('claim_expires_at'),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+    completedAt: timestamptz('completed_at'),
+  },
+  (t) => [
+    index('agent_provision_jobs_due_idx')
+      .on(t.nextAttemptAt)
+      .where(sql`${t.state} = 'pending'`),
+    index('agent_provision_jobs_claim_expiry_idx')
+      .on(t.claimExpiresAt)
+      .where(sql`${t.state} = 'running'`),
+    check(
+      'agent_provision_jobs_state_check',
+      sql`${t.state} in ('pending', 'running', 'succeeded', 'failed')`,
+    ),
+    check('agent_provision_jobs_attempt_check', sql`${t.attemptCount} >= 0`),
+    check(
+      'agent_provision_jobs_claim_shape_check',
+      sql`(${t.state} = 'running' and ${t.claimToken} is not null and ${t.claimExpiresAt} is not null) or (${t.state} <> 'running' and ${t.claimToken} is null and ${t.claimExpiresAt} is null)`,
+    ),
+    check(
+      'agent_provision_jobs_schedule_shape_check',
+      sql`(${t.state} = 'pending' and ${t.nextAttemptAt} is not null) or (${t.state} <> 'pending' and ${t.nextAttemptAt} is null)`,
+    ),
+    check(
+      'agent_provision_jobs_completion_shape_check',
+      sql`(${t.state} in ('succeeded', 'failed') and ${t.completedAt} is not null) or (${t.state} not in ('succeeded', 'failed') and ${t.completedAt} is null)`,
+    ),
+    check(
+      'agent_provision_jobs_error_code_check',
+      sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z0-9_:-]{1,100}$'`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // etl_runs — immutable source boundaries for one bounded ETL attempt.
 //
 // Every canonical Mongo collection receives one identical prior-whole-second
@@ -1797,6 +1903,10 @@ export type StorageUploadPartAuthorization = typeof storageUploadPartAuthorizati
 export type NewStorageUploadPartAuthorization = typeof storageUploadPartAuthorizations.$inferInsert;
 export type StoragePolicyEvent = typeof storagePolicyEvents.$inferSelect;
 export type NewStoragePolicyEvent = typeof storagePolicyEvents.$inferInsert;
+export type AppNotification = typeof appNotifications.$inferSelect;
+export type NewAppNotification = typeof appNotifications.$inferInsert;
+export type AgentProvisionJob = typeof agentProvisionJobs.$inferSelect;
+export type NewAgentProvisionJob = typeof agentProvisionJobs.$inferInsert;
 export type EtlRun = typeof etlRuns.$inferSelect;
 export type NewEtlRun = typeof etlRuns.$inferInsert;
 export type EtlState = typeof etlState.$inferSelect;
