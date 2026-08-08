@@ -705,6 +705,7 @@ export class R2ObjectBackend implements ObjectBackend {
   private readonly secretAccessKey: string;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
+  private readonly completingKeys = new Set<string>();
 
   constructor(options: R2ObjectBackendOptions) {
     if (options.jurisdiction !== 'eu') throw new Error('R2 EU jurisdiction must be explicit');
@@ -980,28 +981,45 @@ export class R2ObjectBackend implements ObjectBackend {
 
   async completeMultipart(input: MultipartCompleteInput): Promise<ObjectHead> {
     if (input.parts.length === 0) throw new Error('Multipart completion requires parts');
-    const parts = [...input.parts].sort((a, b) => a.partNumber - b.partNumber);
-    if (new Set(parts.map((part) => part.partNumber)).size !== parts.length) throw new Error('Duplicate multipart parts');
-    const xml = `<CompleteMultipartUpload>${parts
-      .map((part) => {
-        assertPartNumber(part.partNumber);
-        const checksum = part.checksumSha256
-          ? `<ChecksumSHA256>${Buffer.from(part.checksumSha256, 'hex').toString('base64')}</ChecksumSHA256>`
-          : '';
-        return `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>\"${stripEtag(part.etag)}\"</ETag>${checksum}</Part>`;
-      })
-      .join('')}</CompleteMultipartUpload>`;
-    await this.request(
-      'POST',
-      input.key,
-      [['uploadId', input.uploadId]],
-      Buffer.from(xml),
-      { 'content-type': 'application/xml', 'if-none-match': '*' },
-      [200],
-    );
-    const head = await this.head(input.key);
-    if (!head) throw new Error('R2 completed multipart object is missing');
-    return head;
+    assertObjectKey(input.key);
+    if (this.completingKeys.has(input.key)) {
+      throw new Error('Multipart completion already in progress for immutable key');
+    }
+    this.completingKeys.add(input.key);
+    try {
+      if (await this.head(input.key)) throw new Error('Immutable object key already exists');
+      const parts = [...input.parts].sort((a, b) => a.partNumber - b.partNumber);
+      if (new Set(parts.map((part) => part.partNumber)).size !== parts.length) {
+        throw new Error('Duplicate multipart parts');
+      }
+      const xml = `<CompleteMultipartUpload>${parts
+        .map((part) => {
+          assertPartNumber(part.partNumber);
+          const etag = stripEtag(part.etag);
+          if (!/^[0-9a-f]{32}$/i.test(etag)) throw new Error('Invalid R2 multipart ETag');
+          if (part.checksumSha256 && !SHA256_PATTERN.test(part.checksumSha256)) {
+            throw new Error('Invalid R2 multipart checksum');
+          }
+          const checksum = part.checksumSha256
+            ? `<ChecksumSHA256>${Buffer.from(part.checksumSha256, 'hex').toString('base64')}</ChecksumSHA256>`
+            : '';
+          return `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>\"${etag}\"</ETag>${checksum}</Part>`;
+        })
+        .join('')}</CompleteMultipartUpload>`;
+      await this.request(
+        'POST',
+        input.key,
+        [['uploadId', input.uploadId]],
+        Buffer.from(xml),
+        { 'content-type': 'application/xml' },
+        [200],
+      );
+      const head = await this.head(input.key);
+      if (!head) throw new Error('R2 completed multipart object is missing');
+      return head;
+    } finally {
+      this.completingKeys.delete(input.key);
+    }
   }
 
   async abortMultipart(input: MultipartAbortInput): Promise<void> {
