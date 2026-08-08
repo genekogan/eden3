@@ -39,14 +39,20 @@ self.addEventListener("fetch", (event) => {
 
   if (request.mode === "navigate") {
     event.respondWith(
-      fetch(request).catch(() => caches.match(OFFLINE_URL)),
+      fetch(request).catch(() =>
+        caches.open(CACHE_NAME).then((cache) => cache.match(OFFLINE_URL)),
+      ),
     );
     return;
   }
 
   // Hashed Next.js assets are immutable. Cache them on first use without ever
   // caching authenticated HTML, API responses, media, or user-specific data.
-  if (url.pathname.startsWith("/_next/static/")) {
+  if (
+    url.pathname.startsWith("/_next/static/") &&
+    url.search === "" &&
+    !request.headers.has("authorization")
+  ) {
     event.respondWith(
       caches.open(CACHE_NAME).then(async (cache) => {
         const cached = await cache.match(request);

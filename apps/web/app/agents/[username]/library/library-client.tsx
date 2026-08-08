@@ -102,7 +102,7 @@ export function LibraryClient({ username }: { username: string }) {
             type="button"
             aria-pressed={scope === value}
             onClick={() => setScope(value)}
-            className={`px-3 py-2 text-sm transition-colors ${
+            className={`min-h-11 px-3 py-2 text-sm transition-colors ${
               scope === value
                 ? "bg-accent/15 text-accent-soft"
                 : "bg-raised text-muted hover:text-foreground"
@@ -124,7 +124,7 @@ export function LibraryClient({ username }: { username: string }) {
               <button
                 type="button"
                 onClick={() => setReloadKey((k) => k + 1)}
-                className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+                className="min-h-11 rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground"
               >
                 Try again
               </button>
@@ -158,7 +158,7 @@ export function LibraryClient({ username }: { username: string }) {
                   type="button"
                   onClick={() => void loadMore()}
                   disabled={loadingMore}
-                  className="rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:opacity-50"
+                  className="min-h-11 rounded-lg border border-edge px-3.5 py-2 text-sm text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:opacity-50"
                 >
                   {loadingMore ? "Loading…" : "Load more"}
                 </button>
