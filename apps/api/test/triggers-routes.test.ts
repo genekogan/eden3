@@ -1,4 +1,6 @@
-import { credit, debit, refund, refundIdempotencyKey, resetEnvCache, settleReservationIdempotencyKey } from '@eden3/core';
+import { randomUUID } from 'node:crypto';
+
+import { credit, debit, DevAuthProvider, getBalance, refund, refundIdempotencyKey, resetEnvCache, settleReservationIdempotencyKey } from '@eden3/core';
 import { db, loadRootEnv, pg, triggers } from '@eden3/db';
 import type { GatewayTurnEvent, GatewayUsage } from '@eden3/gateway';
 import type { TriggerDto } from '@eden3/shared';
@@ -24,10 +26,12 @@ import {
   SCHEDULED_TASK_REFUND_PENDING,
   SCHEDULED_TASK_REFUND_PENDING_PREFIX,
   SCHEDULED_TASK_STALE_RECOVERY_PREFIX,
+  manualTaskOccurrence,
   runScheduledTask,
   scheduledTaskOccurrence,
 } from '../src/services/scheduled-tasks';
 import type { CompatClientLike } from '../src/services/turns';
+import { TurnReservationReaper } from '../src/services/turn-reservation-reaper';
 import {
   deleteFixturesByMarker,
   devCookie,
@@ -76,6 +80,7 @@ const marker = makeMarker('taskapi');
 const agentUsername = `${marker}_bot`;
 let userId = '';
 let otherUserId = '';
+let adminId = '';
 let agentId = '';
 
 let app: FastifyInstance;
@@ -154,6 +159,19 @@ const fakeCompat: CompatClientLike = {
   },
 };
 
+it('scopes caller run-now idempotency keys to the exact task', () => {
+  const requestId = randomUUID();
+  const firstTask = randomUUID();
+  const secondTask = randomUUID();
+  expect(manualTaskOccurrence(firstTask, requestId)).toEqual(
+    manualTaskOccurrence(firstTask, requestId),
+  );
+  expect(manualTaskOccurrence(firstTask, requestId).id).not.toBe(
+    manualTaskOccurrence(secondTask, requestId).id,
+  );
+  expect(manualTaskOccurrence(firstTask, requestId).id).not.toBe(requestId);
+});
+
 async function spendCount(accountId: string): Promise<number> {
   const [row] = await pg<{ count: string }[]>`
     select count(*)::text as count
@@ -163,6 +181,88 @@ async function spendCount(accountId: string): Promise<number> {
       and mt.type like 'spend%'
   `;
   return Number(row?.count ?? 0);
+}
+
+async function seedCanonicalRecoveryOccurrence(options: {
+  taskId: string;
+  dueAt: Date;
+  usableOutput: boolean;
+}): Promise<{
+  occurrenceId: string;
+  reservationKey: string;
+  durableBefore: number;
+}> {
+  const occurrence = scheduledTaskOccurrence(options.taskId, options.dueAt);
+  const balanceBefore = await getBalance(userId);
+  await credit({
+    accountId: userId,
+    amount: 40,
+    type: 'credit:subscription',
+    toSubscriptionBalance: true,
+    idempotencyKey: `${marker}:subscription:${occurrence.id}`,
+  });
+  const reservationKey = automationLedgerKey(agentId, occurrence.id);
+  const debited = await debit({
+    accountId: userId,
+    amount: 61,
+    type: 'spend:chat',
+    idempotencyKey: reservationKey,
+  });
+  expect(debited.subscriptionDrawn).toBe(40);
+  const sessionId = randomUUID();
+  await pg`
+    insert into sessions (
+      id, owner_id, title, session_type, gateway_session_key
+    ) values (
+      ${sessionId}, ${userId}, ${`${marker} recovery ${occurrence.id}`},
+      'scheduled_task', ${`agent:main:eden3:session:${sessionId}`}
+    )
+  `;
+  await pg`
+    insert into session_agents (session_id, agent_account_id)
+    values (${sessionId}, ${agentId})
+  `;
+  await pg`
+    insert into session_users (session_id, user_account_id)
+    values (${sessionId}, ${userId})
+  `;
+  const old = new Date(Date.now() - 90 * 60_000);
+  await pg`
+    insert into turn_authorizations (
+      turn_id, account_id, agent_account_id, session_id,
+      provider, model, pricing_basis, ceiling_table_version,
+      authorized_max_manna, reserved_subscription_manna,
+      reservation_tx_id, state, created_at, updated_at
+    ) values (
+      ${occurrence.id}, ${userId}, ${agentId}, ${sessionId},
+      'anthropic', 'claude-haiku-4-5', 'provider-api', 'scheduler-test-v1',
+      61, ${debited.subscriptionDrawn ?? 0}, ${debited.transaction.id},
+      'reserved', ${old.toISOString()}, ${old.toISOString()}
+    )
+  `;
+  await pg`
+    insert into turn_provider_runs (turn_id, provider_started_at, usable_output_at)
+    values (
+      ${occurrence.id}, ${old.toISOString()},
+      ${options.usableOutput ? new Date(old.getTime() + 1000).toISOString() : null}
+    )
+  `;
+  await pg`
+    update triggers
+    set status = 'running',
+        next_scheduled_run = ${options.dueAt.toISOString()},
+        pending_occurrence_id = ${occurrence.id},
+        pending_occurrence_kind = 'scheduled',
+        pending_occurrence_at = ${options.dueAt.toISOString()},
+        pending_occurrence_claim_id = ${randomUUID()},
+        updated_at = ${old.toISOString()}
+    where id = ${options.taskId}
+  `;
+  return {
+    occurrenceId: occurrence.id,
+    reservationKey,
+    durableBefore: balanceBefore.balance,
+  };
 }
 
 function withEnv(name: string, value: string): () => void {
@@ -179,6 +279,7 @@ function withEnv(name: string, value: string): () => void {
 beforeAll(async () => {
   userId = await insertUserAccount(`${marker}_user`);
   otherUserId = await insertUserAccount(`${marker}_other`);
+  adminId = await insertUserAccount(`${marker}_admin`);
   agentId = await insertAgentAccount(agentUsername, {
     ownerId: userId,
     name: 'Task Bot',
@@ -198,6 +299,7 @@ beforeAll(async () => {
 
   fakeCron = makeFakeCronSync();
   app = await buildServer({
+    auth: { provider: new DevAuthProvider({ adminUsernames: [`${marker}_admin`] }) },
     gateway: { compat: fakeCompat, tools: emptyTools },
     provisioning: { provisioner: makeFakeProvisioner(), cronSync: fakeCron },
   });
@@ -458,6 +560,26 @@ describe('POST /tasks', () => {
     expect(res.statusCode).toBe(404);
   });
 
+  it('does not let a stranger or platform admin create a task for another owner\'s agent', async () => {
+    const before = await pg<{ count: number }[]>`
+      select count(*)::int as count from triggers where agent_id = ${agentId}
+    `;
+    for (const caller of [otherUserId, adminId]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/tasks',
+        headers: { cookie: devCookie(caller) },
+        payload: { agentUsername, name: 'foreign task', prompt: 'must not run', schedule },
+      });
+      expect(res.statusCode).toBe(404);
+      expect((res.json() as { error: { code: string } }).error.code).toBe('agent_not_found');
+    }
+    const after = await pg<{ count: number }[]>`
+      select count(*)::int as count from triggers where agent_id = ${agentId}
+    `;
+    expect(after[0]?.count).toBe(before[0]?.count);
+  });
+
   it('records the failure (201, last_error) when cron-sync throws', async () => {
     const failingCron = makeFakeCronSync({ fail: true });
     const app2 = await buildServer({
@@ -504,6 +626,7 @@ describe('POST /tasks', () => {
       method: 'POST',
       url: `/tasks/${task.id}/runs`,
       headers: { cookie: devCookie(userId) },
+      payload: { requestId: randomUUID() },
     });
     expect(fired.statusCode).toBe(201);
     const { run } = fired.json() as TaskRunBody;
@@ -564,6 +687,179 @@ describe('POST /tasks', () => {
     // The run's output session is linked on the task row (resolved from the
     // run's usage event).
     expect(listedTask?.lastRunSessionId).toBe(run.sessionId);
+  });
+
+  it('replays one task-scoped run-now request without another provider, charge, output, or notification', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Idempotent run now',
+        prompt: 'Run this exact request once.',
+        schedule,
+      },
+    });
+    const task = (created.json() as TaskBody).task;
+    const requestId = randomUUID();
+    const callsBefore = compatCalls.length;
+    const first = await app.inject({
+      method: 'POST',
+      url: `/tasks/${task.id}/runs`,
+      headers: { cookie: devCookie(userId) },
+      payload: { requestId },
+    });
+    expect(first.statusCode).toBe(201);
+    const firstRun = (first.json() as TaskRunBody).run;
+    const second = await app.inject({
+      method: 'POST',
+      url: `/tasks/${task.id}/runs`,
+      headers: { cookie: devCookie(userId) },
+      payload: { requestId },
+    });
+    expect(second.statusCode).toBe(201);
+    expect((second.json() as TaskRunBody).run).toEqual(firstRun);
+    expect(compatCalls).toHaveLength(callsBefore + 1);
+
+    const [counts] = await pg<{
+      usage: number;
+      assistant: number;
+      notification: number;
+      reservation: number;
+    }[]>`
+      select
+        (select count(*)::int from usage_events where turn_id = ${firstRun.outcome.turnId}) as usage,
+        (select count(*)::int from messages
+          where session_id = ${firstRun.sessionId} and role = 'assistant') as assistant,
+        (select count(*)::int from app_notifications where id = ${firstRun.outcome.turnId}) as notification,
+        (select count(*)::int from manna_transactions
+          where idempotency_key = ${automationLedgerKey(agentId, firstRun.outcome.turnId)}) as reservation
+    `;
+    expect(counts).toEqual({ usage: 1, assistant: 1, notification: 1, reservation: 1 });
+  });
+
+  it('uses an explicitly selected existing session and rejects a foreign tenant session', async () => {
+    const ownSessionId = randomUUID();
+    const foreignSessionId = randomUUID();
+    await pg`
+      insert into sessions (id, owner_id, title, session_type, gateway_session_key)
+      values
+        (${ownSessionId}, ${userId}, ${`${marker} own output`}, 'chat', ${`agent:test:eden3:session:${ownSessionId}`}),
+        (${foreignSessionId}, ${otherUserId}, ${`${marker} foreign output`}, 'chat', ${`agent:test:eden3:session:${foreignSessionId}`})
+    `;
+    await pg`
+      insert into session_agents (session_id, agent_account_id)
+      values (${ownSessionId}, ${agentId}), (${foreignSessionId}, ${agentId})
+    `;
+    await pg`
+      insert into session_users (session_id, user_account_id)
+      values (${ownSessionId}, ${userId}), (${foreignSessionId}, ${otherUserId})
+    `;
+
+    const foreign = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Foreign destination',
+        prompt: 'must not persist',
+        schedule,
+        sessionTarget: { kind: 'existing', sessionId: foreignSessionId },
+      },
+    });
+    expect(foreign.statusCode).toBe(409);
+    expect((foreign.json() as { error: { code: string } }).error.code).toBe(
+      'task_session_unavailable',
+    );
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Existing destination',
+        prompt: 'append here',
+        schedule,
+        sessionTarget: { kind: 'existing', sessionId: ownSessionId },
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const task = (created.json() as TaskBody).task;
+    expect(task).toMatchObject({ sessionTarget: 'existing', sessionExternalId: ownSessionId });
+    const beforeCalls = compatCalls.length;
+    const run = await app.inject({
+      method: 'POST',
+      url: `/tasks/${task.id}/runs`,
+      headers: { cookie: devCookie(userId) },
+      payload: { requestId: randomUUID() },
+    });
+    expect(run.statusCode).toBe(201);
+    expect((run.json() as TaskRunBody).run.sessionId).toBe(ownSessionId);
+    expect(compatCalls).toHaveLength(beforeCalls + 1);
+    expect(compatCalls.at(-1)?.sessionKey).toBe(`agent:test:eden3:session:${ownSessionId}`);
+  });
+
+  it('requires a valid run-now request id and never lets a stranger or admin execute it', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: { agentUsername, name: 'Owner only run', prompt: 'do not cross tenants', schedule },
+    });
+    const task = (created.json() as TaskBody).task;
+    const beforeCalls = compatCalls.length;
+    for (const caller of [otherUserId, adminId]) {
+      const denied = await app.inject({
+        method: 'POST',
+        url: `/tasks/${task.id}/runs`,
+        headers: { cookie: devCookie(caller) },
+        payload: { requestId: randomUUID() },
+      });
+      expect(denied.statusCode).toBe(403);
+    }
+    for (const payload of [undefined, {}, { requestId: 'not-a-uuid' }]) {
+      const invalid = await app.inject({
+        method: 'POST',
+        url: `/tasks/${task.id}/runs`,
+        headers: { cookie: devCookie(userId) },
+        ...(payload === undefined ? {} : { payload }),
+      });
+      expect(invalid.statusCode).toBe(400);
+    }
+    expect(compatCalls).toHaveLength(beforeCalls);
+  });
+
+  it('fails closed before provider execution when the task agent was deleted', async () => {
+    const deletedAgentId = await insertAgentAccount(`${marker}_deleted_agent`, {
+      ownerId: userId,
+      openclawId: `${marker}-deleted-agent`,
+      provisionStatus: 'ready',
+    });
+    const [task] = await pg<{ id: string }[]>`
+      insert into triggers (
+        user_id, agent_id, name, prompt, schedule, status,
+        session_target, next_scheduled_run
+      ) values (
+        ${userId}, ${deletedAgentId}, 'Deleted principal', 'must not run',
+        ${JSON.stringify(schedule)}::jsonb, 'active', 'new', now() + interval '1 day'
+      ) returning id
+    `;
+    await pg`update accounts set deleted = true where id = ${deletedAgentId}`;
+    const beforeCalls = compatCalls.length;
+    const denied = await app.inject({
+      method: 'POST',
+      url: `/tasks/${task!.id}/runs`,
+      headers: { cookie: devCookie(userId) },
+      payload: { requestId: randomUUID() },
+    });
+    expect(denied.statusCode).toBe(409);
+    expect((denied.json() as { error: { code: string } }).error.code).toBe(
+      'task_agent_unavailable',
+    );
+    expect(compatCalls).toHaveLength(beforeCalls);
   });
 
   it('auto-pauses when the worst-case reservation no longer fits the automation budget (rejected pre-provider)', async () => {
@@ -717,7 +1013,7 @@ describe('POST /tasks', () => {
     expect(row!.last_error).toContain('gateway responded 401 Unauthorized');
   });
 
-  it('does not advance a live or recovered provider failure until both refunds complete', async () => {
+  it('does not advance a live or recovered provider failure until canonical reversal completes', async () => {
     const created = await app.inject({
       method: 'POST',
       url: '/tasks',
@@ -733,9 +1029,7 @@ describe('POST /tasks', () => {
     const dueAt = new Date(Date.now() - 30_000);
     await pg`update triggers set next_scheduled_run = ${dueAt.toISOString()} where id = ${task.id}`;
     const occurrence = scheduledTaskOccurrence(task.id, dueAt);
-    const settlementKey = automationLedgerKey(agentId, occurrence.id, 'settle');
-    const reservationKey = automationLedgerKey(agentId, occurrence.id);
-    const attempts: string[] = [];
+    let reversalAttempts = 0;
     turnMode = 'provider_auth_error';
     const callsBefore = compatCalls.length;
     const pendingScheduler = new TaskScheduler({
@@ -745,12 +1039,9 @@ describe('POST /tasks', () => {
         registry: app.turnRegistry,
         historySync: app.historySync!,
         turnLimiter: app.turnLimiter,
-        refundLedger: async (params) => {
-          attempts.push(params.originalIdempotencyKey);
-          if (params.originalIdempotencyKey === settlementKey) {
-            throw new Error('simulated refund verification outage');
-          }
-          return await refund(params);
+        reverseAuthorization: async () => {
+          reversalAttempts += 1;
+          throw new Error('simulated authorization reversal outage');
         },
       }),
       intervalMs: 0,
@@ -761,7 +1052,7 @@ describe('POST /tasks', () => {
       triggerId: task.id,
       outcome: 'retry',
     });
-    expect(attempts).toEqual([settlementKey, reservationKey]);
+    expect(reversalAttempts).toBe(1);
     expect(compatCalls).toHaveLength(callsBefore + 1);
     const [pending] = await pg<{
       status: string;
@@ -780,8 +1071,8 @@ describe('POST /tasks', () => {
     expect(pending!.last_error).toContain('refund pending');
 
     // The error usage row is now the recovery checkpoint. A healthy retry
-    // refunds both keys idempotently and records the failure without replaying
-    // the provider.
+    // completes the exact authorization reversal and records the failure
+    // without replaying the provider.
     const healthyScheduler = new TaskScheduler({
       runTask: makeScheduledTaskRunner({
         compat: fakeCompat,
@@ -830,11 +1121,8 @@ describe('POST /tasks', () => {
           bus: app.eventsBus,
           registry: app.turnRegistry,
           historySync: app.historySync!,
-          refundLedger: async (params) => {
-            if (params.type === 'refund:chat:settle') {
-              throw new Error('manual refund path unavailable');
-            }
-            return await refund(params);
+          reverseAuthorization: async () => {
+            throw new Error('manual authorization reversal unavailable');
           },
         },
         initial!,
@@ -849,8 +1137,8 @@ describe('POST /tasks', () => {
     expect(pending!.pendingOccurrenceKind).toBe('manual');
     expect(pending!.pendingOccurrenceAt).toBeNull();
 
-    // A retry proposes a fresh random run-now UUID internally, but the atomic
-    // claim must recover the persisted UUID and never call the provider twice.
+    // A retry proposes a fresh task-scoped run-now UUID internally, but the
+    // atomic claim must recover the persisted UUID and never call the provider twice.
     await expect(
       runScheduledTask(
         {
@@ -1465,10 +1753,14 @@ describe('POST /tasks', () => {
       where idempotency_key = ${settlementKey}
     `;
     expect(settlement!.count).toBe(0);
-    const [usage] = await pg<{ count: number }[]>`
-      select count(*)::int as count from usage_events where turn_id = ${occurrence.id}
+    const [usage] = await pg<{ status: string; manna: number; error_code: string }[]>`
+      select status, manna, error_code from usage_events where turn_id = ${occurrence.id}
     `;
-    expect(usage!.count).toBe(0);
+    expect(usage).toMatchObject({
+      status: 'error',
+      manna: 61,
+      error_code: SCHEDULED_TASK_INDETERMINATE,
+    });
     const [assistant] = await pg<{ count: number }[]>`
       select count(*)::int as count from messages
       where session_id = ${occurrence.id} and role = 'assistant'
@@ -1478,7 +1770,11 @@ describe('POST /tasks', () => {
       select idempotency_key from manna_transactions
       where idempotency_key = ${refundIdempotencyKey(reservationKey)}
     `;
-    expect(refunds).toHaveLength(1);
+    expect(refunds).toHaveLength(0);
+    const [authorization] = await pg<{ state: string }[]>`
+      select state from turn_authorizations where turn_id = ${occurrence.id}
+    `;
+    expect(authorization?.state).toBe('settled');
   });
 
   it('atomically fences terminal settlement, assistant, and usage writes', async () => {
@@ -1573,10 +1869,10 @@ describe('POST /tasks', () => {
         (select count(*)::int from messages
           where session_id = ${occurrence.id} and role = 'assistant') as assistant
     `;
-    expect(terminal).toEqual({ usage: 0, assistant: 0 });
-    // Recovery reverses the reservation in full; there is no settlement debit
-    // to reverse in the authorization kernel (settlement is a refund leg that
-    // never landed — the zombie's terminal transaction rolled back whole).
+    expect(terminal).toEqual({ usage: 1, assistant: 0 });
+    // The nonblank token was durably checkpointed before the terminal write
+    // gate. Recovery therefore retains the full reserve and writes one loud
+    // error usage row under full-reserve-v1; it never fabricates an assistant.
     const refunds = await pg<{ idempotency_key: string; amount: string }[]>`
       select idempotency_key, amount from manna_transactions
       where idempotency_key in (
@@ -1585,9 +1881,11 @@ describe('POST /tasks', () => {
         ${settleReservationIdempotencyKey(reservationKey)}
       )
     `;
-    expect(refunds.map((row) => row.idempotency_key)).toEqual([
-      refundIdempotencyKey(reservationKey),
-    ]);
+    expect(refunds).toEqual([]);
+    const [authorization] = await pg<{ state: string }[]>`
+      select state from turn_authorizations where turn_id = ${occurrence.id}
+    `;
+    expect(authorization?.state).toBe('settled');
   });
 
   it('does not re-call the provider after a crash in the started-before-usage window', async () => {
@@ -1874,6 +2172,193 @@ describe('POST /tasks', () => {
     expect(usageCount!.count).toBe(1);
   });
 
+  it('loses the due-generation claim when an owner edit moves the selected occurrence', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Generation fenced edit',
+        prompt: 'old prompt must never execute',
+        schedule,
+      },
+    });
+    const { task } = created.json() as TaskBody;
+    const dueAt = new Date(Date.now() - 30_000);
+    await pg`update triggers set next_scheduled_run = ${dueAt.toISOString()} where id = ${task.id}`;
+    let releaseSelected!: () => void;
+    let markSelected!: () => void;
+    const selectedGate = new Promise<void>((resolve) => {
+      releaseSelected = resolve;
+    });
+    const selected = new Promise<void>((resolve) => {
+      markSelected = resolve;
+    });
+    const callsBefore = compatCalls.length;
+    const scheduler = new TaskScheduler({
+      runTask: makeScheduledTaskRunner({
+        compat: fakeCompat,
+        bus: app.eventsBus,
+        registry: app.turnRegistry,
+        historySync: app.historySync!,
+        turnLimiter: app.turnLimiter,
+      }),
+      intervalMs: 0,
+      restrictToTriggerIds: [task.id],
+      beforeProcessDue: async (selectedTrigger) => {
+        if (selectedTrigger.id !== task.id) return;
+        markSelected();
+        await selectedGate;
+      },
+    });
+
+    const ticking = scheduler.tick();
+    try {
+      await selected;
+      const edited = await app.inject({
+        method: 'PATCH',
+        url: `/tasks/${task.id}`,
+        headers: { cookie: devCookie(userId) },
+        payload: {
+          prompt: 'new owner prompt',
+          schedule: { hour: 17, minute: 5, timezone: 'UTC' },
+        },
+      });
+      expect(edited.statusCode).toBe(200);
+      releaseSelected();
+      expect((await ticking).outcomes).toContainEqual({
+        triggerId: task.id,
+        outcome: 'retry',
+      });
+    } finally {
+      releaseSelected();
+      await ticking.catch(() => {});
+    }
+
+    expect(compatCalls).toHaveLength(callsBefore);
+    const [final] = await pg<{
+      prompt: string;
+      schedule: unknown;
+      next_scheduled_run: string | Date;
+      pending_occurrence_id: string | null;
+    }[]>`
+      select prompt, schedule, next_scheduled_run, pending_occurrence_id
+      from triggers where id = ${task.id}
+    `;
+    expect(final!.prompt).toBe('new owner prompt');
+    expect(final!.schedule).toEqual({ hour: 17, minute: 5, timezone: 'UTC' });
+    expect(new Date(final!.next_scheduled_run).getTime()).toBeGreaterThan(Date.now());
+    expect(final!.pending_occurrence_id).toBeNull();
+  });
+
+  it('lets two independent workers produce exactly one provider execution and terminal result', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name: 'Two-worker occurrence',
+        prompt: 'Execute once across workers.',
+        schedule,
+      },
+    });
+    const { task } = created.json() as TaskBody;
+    const dueAt = new Date(Date.now() - 30_000);
+    const occurrence = scheduledTaskOccurrence(task.id, dueAt);
+    await pg`update triggers set next_scheduled_run = ${dueAt.toISOString()} where id = ${task.id}`;
+    let releaseProvider!: () => void;
+    turnGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    let releaseSelections!: () => void;
+    let markBothSelected!: () => void;
+    let selectedCount = 0;
+    const selectionGate = new Promise<void>((resolve) => {
+      releaseSelections = resolve;
+    });
+    const bothSelected = new Promise<void>((resolve) => {
+      markBothSelected = resolve;
+    });
+    const callsBefore = compatCalls.length;
+    const notificationFrames: string[] = [];
+    const unsubscribeNotifications = app.eventsBus.subscribe(`account:${userId}`, {
+      write: (frame: string) => notificationFrames.push(frame),
+    });
+    const makeWorker = () =>
+      new TaskScheduler({
+        runTask: makeScheduledTaskRunner({
+          compat: fakeCompat,
+          bus: app.eventsBus,
+          registry: app.turnRegistry,
+          historySync: app.historySync!,
+          turnLimiter: app.turnLimiter,
+        }),
+        intervalMs: 0,
+        restrictToTriggerIds: [task.id],
+        beforeProcessDue: async (selectedTrigger) => {
+          if (selectedTrigger.id !== task.id) return;
+          selectedCount += 1;
+          if (selectedCount === 2) markBothSelected();
+          await selectionGate;
+        },
+      });
+    const workerA = makeWorker();
+    const workerB = makeWorker();
+    const raced = Promise.all([workerA.tick(), workerB.tick()]);
+    try {
+      await bothSelected;
+      releaseSelections();
+      await expect.poll(() => compatCalls.length, { timeout: 5000 }).toBe(callsBefore + 1);
+      releaseProvider();
+      const results = await raced;
+      expect(results.flatMap((result) => result.outcomes)).toEqual(
+        expect.arrayContaining([
+          { triggerId: task.id, outcome: 'fired' },
+          { triggerId: task.id, outcome: 'retry' },
+        ]),
+      );
+    } finally {
+      releaseSelections();
+      releaseProvider();
+      turnGate = null;
+      unsubscribeNotifications();
+      await raced.catch(() => {});
+    }
+    expect(compatCalls).toHaveLength(callsBefore + 1);
+
+    const [terminal] = await pg<{
+      authorizations: number;
+      provider_starts: number;
+      usage: number;
+      user_messages: number;
+      assistant_messages: number;
+      notifications: number;
+    }[]>`
+      select
+        (select count(*)::int from turn_authorizations where turn_id = ${occurrence.id}) as authorizations,
+        (select count(*)::int from turn_provider_runs where turn_id = ${occurrence.id}) as provider_starts,
+        (select count(*)::int from usage_events where event_type = 'chat_turn' and turn_id = ${occurrence.id}) as usage,
+        (select count(*)::int from messages where session_id = ${occurrence.id} and role = 'user') as user_messages,
+        (select count(*)::int from messages where session_id = ${occurrence.id} and role = 'assistant') as assistant_messages,
+        (select count(*)::int from app_notifications where id = ${occurrence.id}) as notifications
+    `;
+    expect(terminal).toEqual({
+      authorizations: 1,
+      provider_starts: 1,
+      usage: 1,
+      user_messages: 1,
+      assistant_messages: 1,
+      notifications: 1,
+    });
+    const [authorization] = await pg<{ state: string }[]>`
+      select state from turn_authorizations where turn_id = ${occurrence.id}
+    `;
+    expect(authorization!.state).toBe('settled');
+    expect(notificationFrames.filter((frame) => frame.includes('notification.created'))).toHaveLength(1);
+  });
+
   it('rejects a concurrent second fire of the same task (atomic running claim)', async () => {
     const created = await app.inject({
       method: 'POST',
@@ -1905,6 +2390,7 @@ describe('POST /tasks', () => {
         method: 'POST',
         url: `/tasks/${task.id}/runs`,
         headers: { cookie: devCookie(userId) },
+        payload: { requestId: randomUUID() },
       });
       // Wait until the first run has both claimed the task and reached the
       // held provider turn. Observing only status='running' is too early: the
@@ -1928,6 +2414,7 @@ describe('POST /tasks', () => {
         method: 'POST',
         url: `/tasks/${task.id}/runs`,
         headers: { cookie: devCookie(userId) },
+        payload: { requestId: randomUUID() },
       });
       expect(second.statusCode).toBe(409);
       expect((second.json() as { error: { code: string } }).error.code).toBe('task_not_active');
@@ -1973,6 +2460,7 @@ describe('POST /tasks', () => {
         method: 'POST',
         url: `/tasks/${task.id}/runs`,
         headers: { cookie: devCookie(userId) },
+        payload: { requestId: randomUUID() },
       });
       await expect
         .poll(
@@ -2210,18 +2698,20 @@ describe('PATCH /tasks/:id', () => {
     expect(again.statusCode).toBe(404);
   });
 
-  it('403s non-owners and 404s unknown ids; 400s empty patches', async () => {
+  it('403s non-owners including admins and 404s unknown ids; 400s empty patches', async () => {
     const task = await createTask();
-    expect(
-      (
-        await app.inject({
-          method: 'PATCH',
-          url: `/tasks/${task.id}`,
-          headers: { cookie: devCookie(otherUserId) },
-          payload: { status: 'paused' },
-        })
-      ).statusCode,
-    ).toBe(403);
+    for (const caller of [otherUserId, adminId]) {
+      expect(
+        (
+          await app.inject({
+            method: 'PATCH',
+            url: `/tasks/${task.id}`,
+            headers: { cookie: devCookie(caller) },
+            payload: { status: 'paused' },
+          })
+        ).statusCode,
+      ).toBe(403);
+    }
     expect(
       (
         await app.inject({
@@ -2242,5 +2732,161 @@ describe('PATCH /tasks/:id', () => {
         })
       ).statusCode,
     ).toBe(400);
+  });
+});
+
+describe('scheduled occurrence canonical authorization recovery', () => {
+  async function createRecoveryTask(name: string): Promise<TriggerDto> {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/tasks',
+      headers: { cookie: devCookie(userId) },
+      payload: {
+        agentUsername,
+        name,
+        prompt: 'Recovery must never execute this prompt twice.',
+        schedule,
+      },
+    });
+    expect(response.statusCode).toBe(201);
+    return (response.json() as TaskBody).task;
+  }
+
+  it('reverses a no-output crash split-exactly under a three-way recovery race', async () => {
+    const task = await createRecoveryTask('Canonical split recovery race');
+    const dueAt = new Date(Date.now() - 90 * 60_000);
+    const seeded = await seedCanonicalRecoveryOccurrence({
+      taskId: task.id,
+      dueAt,
+      usableOutput: false,
+    });
+    const callsBefore = compatCalls.length;
+    const makeRecoveryWorker = () =>
+      new TaskScheduler({
+        runTask: async () => {
+          throw new Error('provider runner must not execute canonical recovery');
+        },
+        recoverTask: makeScheduledTaskRecoveryRunner(),
+        intervalMs: 0,
+        reapStaleRunningMs: 15 * 60_000,
+        restrictToTriggerIds: [task.id],
+      });
+    const reaper = new TurnReservationReaper({ accountScope: [userId] });
+
+    await Promise.all([
+      makeRecoveryWorker().recoveryTick(),
+      makeRecoveryWorker().recoveryTick(),
+      reaper.runOnce(),
+    ]);
+
+    expect(compatCalls).toHaveLength(callsBefore);
+    const balance = await getBalance(userId);
+    expect(balance.balance).toBe(seeded.durableBefore);
+    expect(balance.subscriptionBalance).toBe(40);
+    const [truth] = await pg<{
+      state: string;
+      refunds: number;
+      usage: number;
+      pending_occurrence_id: string | null;
+      pending_occurrence_claim_id: string | null;
+    }[]>`
+      select
+        a.state,
+        (select count(*)::int
+           from manna_transactions r
+          where r.refunds_transaction_id = a.reservation_tx_id
+            and r.amount > 0) as refunds,
+        (select count(*)::int from usage_events u
+          where u.event_type = 'chat_turn' and u.turn_id = a.turn_id) as usage,
+        t.pending_occurrence_id,
+        t.pending_occurrence_claim_id
+      from turn_authorizations a
+      join triggers t on t.id = ${task.id}
+      where a.turn_id = ${seeded.occurrenceId}
+    `;
+    expect(['reversed', 'reaped']).toContain(truth!.state);
+    expect(truth!.refunds).toBe(1);
+    expect(truth!.usage).toBe(0);
+    expect(truth!.pending_occurrence_id).toBeNull();
+    expect(truth!.pending_occurrence_claim_id).toBeNull();
+
+    // Leave the shared fixture account with an empty subscription pot so the
+    // following split-exact case independently proves a 40 subscription / 21
+    // durable reservation instead of inheriting this restored credit.
+    await debit({
+      accountId: userId,
+      amount: 40,
+      type: 'spend:test_cleanup',
+      idempotencyKey: `${marker}:consume-restored-subscription:${seeded.occurrenceId}`,
+    });
+  });
+
+  it('retains the full reserve after a durably checkpointed usable prefix', async () => {
+    const task = await createRecoveryTask('Canonical partial-output recovery');
+    const dueAt = new Date(Date.now() - 90 * 60_000);
+    const seeded = await seedCanonicalRecoveryOccurrence({
+      taskId: task.id,
+      dueAt,
+      usableOutput: true,
+    });
+    const callsBefore = compatCalls.length;
+    const scheduler = new TaskScheduler({
+      runTask: async () => {
+        throw new Error('provider runner must not replay usable output');
+      },
+      recoverTask: makeScheduledTaskRecoveryRunner(),
+      intervalMs: 0,
+      reapStaleRunningMs: 15 * 60_000,
+      restrictToTriggerIds: [task.id],
+    });
+
+    expect((await scheduler.recoveryTick()).outcomes).toContainEqual({
+      triggerId: task.id,
+      outcome: 'failed',
+    });
+    expect(compatCalls).toHaveLength(callsBefore);
+    const balance = await getBalance(userId);
+    expect(balance.balance).toBe(seeded.durableBefore - 21);
+    expect(balance.subscriptionBalance).toBe(0);
+    const [truth] = await pg<{
+      state: string;
+      charged_manna: string;
+      refunds: number;
+      usage: number;
+      usage_manna: string;
+      error_code: string;
+      assistants: number;
+      pending_occurrence_id: string | null;
+    }[]>`
+      select
+        a.state,
+        a.charged_manna,
+        (select count(*)::int
+           from manna_transactions r
+          where r.refunds_transaction_id = a.reservation_tx_id
+            and r.amount > 0) as refunds,
+        (select count(*)::int from usage_events u
+          where u.event_type = 'chat_turn' and u.turn_id = a.turn_id) as usage,
+        (select u.manna::text from usage_events u
+          where u.event_type = 'chat_turn' and u.turn_id = a.turn_id) as usage_manna,
+        (select u.error_code from usage_events u
+          where u.event_type = 'chat_turn' and u.turn_id = a.turn_id) as error_code,
+        (select count(*)::int from messages m
+          where m.session_id = a.session_id and m.role = 'assistant') as assistants,
+        t.pending_occurrence_id
+      from turn_authorizations a
+      join triggers t on t.id = ${task.id}
+      where a.turn_id = ${seeded.occurrenceId}
+    `;
+    expect(truth).toMatchObject({
+      state: 'settled',
+      charged_manna: '61.0000',
+      refunds: 0,
+      usage: 1,
+      usage_manna: '61',
+      error_code: SCHEDULED_TASK_INDETERMINATE,
+      assistants: 0,
+      pending_occurrence_id: null,
+    });
   });
 });

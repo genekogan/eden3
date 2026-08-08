@@ -1719,7 +1719,9 @@ export const appNotifications = pgTable(
     accountId: uuid('account_id')
       .notNull()
       .references(() => accounts.id, { onDelete: 'cascade' }),
-    kind: text('kind', { enum: ['agent_build_ready', 'agent_build_failed'] }).notNull(),
+    kind: text('kind', {
+      enum: ['agent_build_ready', 'agent_build_failed', 'scheduled_task_completed'],
+    }).notNull(),
     sourceAgentId: uuid('source_agent_id')
       .notNull()
       .references(() => agents.accountId, { onDelete: 'cascade' }),
@@ -1729,7 +1731,9 @@ export const appNotifications = pgTable(
     createdAt: timestamptz('created_at').notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex('app_notifications_build_once_uq').on(t.accountId, t.kind, t.sourceAgentId),
+    uniqueIndex('app_notifications_build_once_uq')
+      .on(t.accountId, t.kind, t.sourceAgentId)
+      .where(sql`${t.kind} in ('agent_build_ready', 'agent_build_failed')`),
     index('app_notifications_account_created_idx')
       .on(t.accountId, t.createdAt.desc())
       .where(sql`${t.dismissedAt} is null`),
@@ -1738,7 +1742,7 @@ export const appNotifications = pgTable(
       .where(sql`${t.readAt} is null and ${t.dismissedAt} is null`),
     check(
       'app_notifications_kind_check',
-      sql`${t.kind} in ('agent_build_ready', 'agent_build_failed')`,
+      sql`${t.kind} in ('agent_build_ready', 'agent_build_failed', 'scheduled_task_completed')`,
     ),
     check(
       'app_notifications_build_source_check',
@@ -1746,7 +1750,7 @@ export const appNotifications = pgTable(
     ),
     check(
       'app_notifications_target_path_check',
-      sql`${t.targetPath} is null or ${t.targetPath} ~ '^/agents/[a-z0-9][a-z0-9_-]{2,31}$'`,
+      sql`${t.targetPath} is null or ${t.targetPath} ~ '^/(agents/[a-z0-9][a-z0-9_-]{2,31}|sessions/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$'`,
     ),
     check(
       'app_notifications_read_at_check',

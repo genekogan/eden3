@@ -452,6 +452,9 @@ export function triggerDtoFromEntity(
     prompt: trigger.prompt,
     schedule: (trigger.schedule as CronSchedule | null) ?? null,
     status: trigger.status,
+    sessionTarget: trigger.sessionTarget === 'existing' ? 'existing' : 'new',
+    sessionExternalId:
+      trigger.sessionTarget === 'existing' ? trigger.sessionExternalId : null,
     lastRunTime: trigger.lastRunTime ? trigger.lastRunTime.toISOString() : null,
     nextScheduledRun: trigger.nextScheduledRun ? trigger.nextScheduledRun.toISOString() : null,
     // Not a column: resolved from the latest run's usage event (see

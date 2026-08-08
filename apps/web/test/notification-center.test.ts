@@ -32,6 +32,21 @@ describe("notification center model", () => {
     );
   });
 
+  it("derives scheduled-completion copy without exposing prompt or transcript content", () => {
+    const completed: AppNotificationDto = {
+      ...ready,
+      kind: "scheduled_task_completed",
+      targetPath: "/sessions/33333333-3333-4333-8333-333333333333",
+    };
+    expect(notificationCopy(completed)).toBe(
+      "@small-moon completed a scheduled task",
+    );
+    expect(notificationCopy(completed)).not.toContain("prompt");
+    expect(completed.targetPath).toBe(
+      "/sessions/33333333-3333-4333-8333-333333333333",
+    );
+  });
+
   it("marks a notification once without underflowing unread count", () => {
     const first = markNotificationRead(
       { items: [ready], unreadCount: 1 },

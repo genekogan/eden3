@@ -20,6 +20,7 @@ import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type {
   AccountSummary,
   AgentDto,
+  TaskSessionTargetInput,
   TriggerDto,
   TriggerStatus,
 } from "@/lib/types";
@@ -35,6 +36,7 @@ import {
   type ScheduleFormState,
 } from "./schedule-fields";
 import { NewTaskModal } from "./new-task-modal";
+import { TaskDestinationFields } from "./task-destination-fields";
 
 type AgentRef = Pick<AgentDto, "username" | "userImage"> & {
   name?: string | null;
@@ -121,10 +123,12 @@ function StatusChip({ status }: { status: string | null }) {
 
 function EditTaskModal({
   task,
+  agentUsername,
   onClose,
   onSaved,
 }: {
   task: TriggerDto;
+  agentUsername: string;
   onClose: () => void;
   onSaved: (task: TriggerDto) => void;
 }) {
@@ -133,10 +137,20 @@ function EditTaskModal({
   const [form, setForm] = useState<ScheduleFormState>(() =>
     formFromSchedule(task.schedule),
   );
+  const [sessionTarget, setSessionTarget] = useState<TaskSessionTargetInput>(() =>
+    task.sessionTarget === "existing"
+      ? { kind: "existing", sessionId: task.sessionExternalId ?? "" }
+      : { kind: "new" },
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const schedule = scheduleFromForm(form);
-  const canSave = !saving && name.trim() !== "" && prompt.trim() !== "" && schedule !== null;
+  const canSave =
+    !saving &&
+    name.trim() !== "" &&
+    prompt.trim() !== "" &&
+    schedule !== null &&
+    (sessionTarget.kind === "new" || sessionTarget.sessionId !== "");
 
   const save = async () => {
     if (!canSave || !schedule) return;
@@ -147,6 +161,7 @@ function EditTaskModal({
         name: name.trim(),
         prompt: prompt.trim(),
         schedule,
+        sessionTarget,
       });
       onSaved(updated);
       onClose();
@@ -236,6 +251,12 @@ function EditTaskModal({
             </div>
           </fieldset>
 
+          <TaskDestinationFields
+            agentUsername={agentUsername}
+            value={sessionTarget}
+            onChange={setSessionTarget}
+          />
+
           {error ? (
             <p className="rounded-lg border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger-soft">
               {error}
@@ -285,7 +306,10 @@ export function TasksClient({
   const [phase, setPhase] = useState<Phase>("loading");
   const [loadError, setLoadError] = useState<unknown>(null);
   const [modalOpen, setModalOpen] = useState(false);
-  const [editingTask, setEditingTask] = useState<TriggerDto | null>(null);
+  const [editingTask, setEditingTask] = useState<{
+    task: TriggerDto;
+    agentUsername: string;
+  } | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [note, setNote] = useState<{ kind: "error" | "success"; text: string } | null>(
@@ -293,6 +317,7 @@ export function TasksClient({
   );
   const alive = useRef(true);
   const confirmTimer = useRef<number | null>(null);
+  const runRequestIds = useRef(new Map<string, string>());
 
   const load = useCallback(async (soft = false) => {
     if (!soft) setPhase("loading");
@@ -385,8 +410,11 @@ export function TasksClient({
 
   const runNow = async (task: TriggerDto) => {
     setBusyId(task.id);
+    const requestId = runRequestIds.current.get(task.id) ?? crypto.randomUUID();
+    runRequestIds.current.set(task.id, requestId);
     try {
-      const run = await api.tasks.runNow(task.id);
+      const run = await api.tasks.runNow(task.id, { requestId });
+      runRequestIds.current.delete(task.id);
       if (!alive.current) return;
       setNote(
         run.outcome.errorCode
@@ -396,7 +424,11 @@ export function TasksClient({
       // Authoritative refresh: lastRunTime/lastRunSessionId/status changed.
       void load(true);
     } catch (error) {
+      // A server response is a definitive outcome. A network failure is
+      // ambiguous, so the next click reuses the same request id after restart.
+      if (error instanceof ApiError) runRequestIds.current.delete(task.id);
       if (alive.current) setNote({ kind: "error", text: errorCopy(error).hint });
+      if (alive.current) void load(true);
     } finally {
       if (alive.current) setBusyId(null);
     }
@@ -593,7 +625,10 @@ export function TasksClient({
                       <button
                         type="button"
                         disabled={busy}
-                        onClick={() => setEditingTask(task)}
+                        onClick={() => {
+                          const username = agent?.username ?? fixedAgent?.username;
+                          if (username) setEditingTask({ task, agentUsername: username });
+                        }}
                         className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         Edit
@@ -638,7 +673,8 @@ export function TasksClient({
       />
       {editingTask ? (
         <EditTaskModal
-          task={editingTask}
+          task={editingTask.task}
+          agentUsername={editingTask.agentUsername}
           onClose={() => setEditingTask(null)}
           onSaved={(updated) => {
             setTasks((prev) => prev.map((task) => (task.id === updated.id ? updated : task)));

@@ -4,6 +4,7 @@ import {
   FEED_DEFAULT_LIMIT,
   FEED_MAX_LIMIT,
   agentDto,
+  appNotificationDto,
   chatRequestDto,
   chatResponseDto,
   collectionDto,
@@ -176,6 +177,8 @@ describe('resource DTOs', () => {
       prompt: 'paint a rose',
       schedule,
       status: 'active',
+      sessionTarget: 'existing',
+      sessionExternalId: uuid('3'),
       lastRunTime: now,
       nextScheduledRun: null,
       lastRunSessionId: uuid('4'),
@@ -186,6 +189,30 @@ describe('resource DTOs', () => {
     expect(triggerDto.parse(trigger)).toEqual(trigger);
     expect(triggerDto.safeParse({ ...trigger, schedule: null }).success).toBe(true);
     expect(triggerDto.safeParse({ ...trigger, lastRunSessionId: null }).success).toBe(true);
+    expect(triggerDto.safeParse({ ...trigger, sessionTarget: 'channel' }).success).toBe(false);
+  });
+
+  it('accepts only typed same-app scheduled completion notifications', () => {
+    const notification = {
+      id: uuid('6'),
+      kind: 'scheduled_task_completed' as const,
+      sourceAgent: {
+        id: uuid('1'),
+        type: 'agent' as const,
+        username: 'abraham',
+        userImage: null,
+      },
+      targetPath: '/sessions/33333333-3333-4333-8333-333333333333',
+      readAt: null,
+      createdAt: now,
+    };
+    expect(appNotificationDto.parse(notification)).toEqual(notification);
+    expect(
+      appNotificationDto.safeParse({ ...notification, targetPath: 'https://evil.example' }).success,
+    ).toBe(false);
+    expect(
+      appNotificationDto.safeParse({ ...notification, targetPath: '/sessions/not-a-uuid' }).success,
+    ).toBe(false);
   });
 
   it('parses chat request/response', () => {

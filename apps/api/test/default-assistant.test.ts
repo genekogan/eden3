@@ -148,6 +148,9 @@ function protectedRouteRequest(
     case 'PATCH /tasks/:id':
       payload = { name: 'Must not change' };
       break;
+    case 'POST /tasks/:id/runs':
+      payload = { requestId: objectId };
+      break;
   }
   if (route.path.includes('/workspace/file')) {
     url += `${url.includes('?') ? '&' : '?'}path=memory/users/other.md`;

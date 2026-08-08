@@ -51,9 +51,14 @@ export async function applyLatestNotificationLoad(
 }
 
 export function notificationCopy(item: AppNotificationDto): string {
-  return item.kind === "agent_build_ready"
-    ? `@${item.sourceAgent.username} is ready`
-    : `@${item.sourceAgent.username} could not be built`;
+  switch (item.kind) {
+    case "agent_build_ready":
+      return `@${item.sourceAgent.username} is ready`;
+    case "agent_build_failed":
+      return `@${item.sourceAgent.username} could not be built`;
+    case "scheduled_task_completed":
+      return `@${item.sourceAgent.username} completed a scheduled task`;
+  }
 }
 
 export function markNotificationRead(

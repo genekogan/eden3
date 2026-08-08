@@ -16,6 +16,7 @@ import {
   runScheduledTask,
   scheduledTaskOccurrence,
   type ScheduledRefund,
+  type ScheduledRunDeps,
   type ScheduledRunResult,
   type ScheduledTaskOccurrence,
 } from './scheduled-tasks';
@@ -136,6 +137,10 @@ export interface TaskSchedulerOptions {
    * "run now" failures never auto-pause. <= 0 disables.
    */
   maxConsecutiveFailures?: number;
+  /** TEST SEAMS for deterministic schedule-generation races. */
+  beforeProcessDue?: (trigger: Trigger) => Promise<void>;
+  beforeNextRunPersistence?: (trigger: Trigger) => Promise<void>;
+  beforeMissedFirePersistence?: (trigger: Trigger) => Promise<void>;
   /**
    * TEST SEAM: when set, ticks only consider these trigger ids — suites run
    * full ticks against the shared dev database without touching real rows.
@@ -163,6 +168,9 @@ export class TaskScheduler {
   private readonly log: SchedulerLogger | null;
   private readonly batchLimit: number;
   private readonly maxConsecutiveFailures: number;
+  private readonly beforeProcessDue: ((trigger: Trigger) => Promise<void>) | null;
+  private readonly beforeNextRunPersistence: ((trigger: Trigger) => Promise<void>) | null;
+  private readonly beforeMissedFirePersistence: ((trigger: Trigger) => Promise<void>) | null;
   private readonly restrictToTriggerIds: string[] | null;
   private readonly inFlight = new Set<string>();
   private cleanupGatewayJobsDone = false;
@@ -188,6 +196,9 @@ export class TaskScheduler {
     this.log = options.logger ?? null;
     this.batchLimit = options.batchLimit ?? 50;
     this.maxConsecutiveFailures = options.maxConsecutiveFailures ?? 20;
+    this.beforeProcessDue = options.beforeProcessDue ?? null;
+    this.beforeNextRunPersistence = options.beforeNextRunPersistence ?? null;
+    this.beforeMissedFirePersistence = options.beforeMissedFirePersistence ?? null;
     this.restrictToTriggerIds = options.restrictToTriggerIds ?? null;
   }
 
@@ -424,6 +435,7 @@ export class TaskScheduler {
     if (this.inFlight.has(row.id)) return 'in_flight';
     this.inFlight.add(row.id);
     try {
+      await this.beforeProcessDue?.(row);
       const pendingKind = row.pendingOccurrenceKind;
       const pendingOccurrence = row.pendingOccurrenceId
         ? pendingKind === 'manual'
@@ -567,55 +579,51 @@ export class TaskScheduler {
 
   /** Compute the follow-up next_scheduled_run after a fire attempt. */
   private async stampNextRun(row: Trigger): Promise<void> {
-    // A running task may be edited through `/tasks` while its turn is in
-    // flight. Re-read the schedule after the turn so the old due-row snapshot
-    // cannot overwrite the owner's newly selected cadence.
-    const [fresh] = await db
-      .select()
-      .from(triggers)
-      .where(
-        and(
-          eq(triggers.id, row.id),
-          eq(triggers.status, 'active'),
-          eq(triggers.deleted, false),
-        ),
-      )
-      .limit(1);
-    if (!fresh) return;
-    if (isOneTimeSchedule(fresh.schedule)) {
-      // One shot spent (fired or failed): finish the task.
-      await db
-        .update(triggers)
-        .set({ status: 'finished', nextScheduledRun: null, updatedAt: new Date() })
+    await db.transaction(async (tx) => {
+      // Lock the current desired schedule through its next-run write. A PATCH
+      // either wins before this read (and is honored) or waits and wins after;
+      // an old scheduler snapshot can never overwrite the owner's edit.
+      const [fresh] = await tx
+        .select()
+        .from(triggers)
         .where(
           and(
             eq(triggers.id, row.id),
             eq(triggers.status, 'active'),
             eq(triggers.deleted, false),
           ),
-        );
-      return;
-    }
-    const next = this.safeNext(fresh);
-    await db
-      .update(triggers)
-      .set({
-        nextScheduledRun: next.value,
-        ...(next.error !== null
-          ? {
-              lastError: next.error.slice(0, 2000),
-              errorCount: sql`coalesce(${triggers.errorCount}, 0) + 1`,
-            }
-          : {}),
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(triggers.id, row.id),
-          eq(triggers.status, 'active'),
-          eq(triggers.deleted, false),
-        ),
-      );
+        )
+        .limit(1)
+        .for('update');
+      if (!fresh) return;
+      await this.beforeNextRunPersistence?.(fresh);
+      if (isOneTimeSchedule(fresh.schedule)) {
+        await tx
+          .update(triggers)
+          .set({ status: 'finished', nextScheduledRun: null, updatedAt: new Date() })
+          .where(eq(triggers.id, row.id));
+        return;
+      }
+      const next = this.safeNext(fresh);
+      const invalid = next.error !== null || next.value === null;
+      await tx
+        .update(triggers)
+        .set({
+          status: invalid ? 'paused' : 'active',
+          nextScheduledRun: invalid ? null : next.value,
+          ...(invalid
+            ? {
+                lastError: `auto-paused: ${next.error ?? 'schedule has no future occurrence'}`.slice(
+                  0,
+                  2000,
+                ),
+                errorCount: sql`coalesce(${triggers.errorCount}, 0) + 1`,
+              }
+            : {}),
+          updatedAt: new Date(),
+        })
+        .where(eq(triggers.id, row.id));
+    });
   }
 
   /**
@@ -626,16 +634,39 @@ export class TaskScheduler {
   private async skipMissedFire(row: Trigger, dueAt: Date): Promise<void> {
     const oneTime = isOneTimeSchedule(row.schedule);
     const next = oneTime ? { value: null, error: null } : this.safeNext(row);
-    await db
+    await this.beforeMissedFirePersistence?.(row);
+    const invalid = !oneTime && (next.error !== null || next.value === null);
+    const updated = await db
       .update(triggers)
       .set({
-        nextScheduledRun: next.value,
+        nextScheduledRun: invalid ? null : next.value,
         // A one-time task's single occurrence is gone — finish it.
-        ...(oneTime ? { status: 'finished' as const } : {}),
-        lastError: `missed fire at ${dueAt.toISOString()} (api was down)`,
+        ...(oneTime
+          ? { status: 'finished' as const }
+          : invalid
+            ? { status: 'paused' as const }
+            : {}),
+        lastError: invalid
+          ? `auto-paused after missed fire: ${next.error ?? 'schedule has no future occurrence'}`.slice(
+              0,
+              2000,
+            )
+          : `missed fire at ${dueAt.toISOString()} (api was down)`,
+        ...(invalid
+          ? { errorCount: sql`coalesce(${triggers.errorCount}, 0) + 1` }
+          : {}),
         updatedAt: new Date(),
       })
-      .where(and(eq(triggers.id, row.id), eq(triggers.status, 'active')));
+      .where(
+        and(
+          eq(triggers.id, row.id),
+          eq(triggers.status, 'active'),
+          eq(triggers.deleted, false),
+          eq(triggers.nextScheduledRun, dueAt),
+        ),
+      )
+      .returning({ id: triggers.id });
+    if (updated.length === 0) return;
     this.log?.warn(
       { triggerId: row.id, dueAt: dueAt.toISOString() },
       'task-scheduler: skipped missed fire',
@@ -644,7 +675,11 @@ export class TaskScheduler {
 
   private safeNext(row: Trigger): { value: Date | null; error: string | null } {
     try {
-      return { value: nextOccurrence(row.schedule, this.now()), error: null };
+      const value = nextOccurrence(row.schedule, this.now());
+      return {
+        value,
+        error: value === null ? 'schedule has no future occurrence' : null,
+      };
     } catch (err) {
       if (err instanceof TaskScheduleError) return { value: null, error: err.message };
       throw err;
@@ -682,6 +717,9 @@ export interface ScheduledTaskRunnerDeps {
   historySync: HistorySync;
   turnLimiter: TurnConcurrencyLimiter;
   refundLedger?: ScheduledRefund;
+  /** TEST SEAMS: production always uses the canonical authorization machine. */
+  reverseAuthorization?: ScheduledRunDeps['reverseAuthorization'];
+  settlePartialOutput?: ScheduledRunDeps['settlePartialOutput'];
   onError?: (err: unknown, context: string) => void;
   /** TEST SEAM: pause immediately before the durable debit-lease renewal. */
   beforeLeaseRenewal?: (claim: {
@@ -695,6 +733,9 @@ export interface ScheduledTaskRunnerDeps {
 
 export interface ScheduledTaskRecoveryRunnerDeps {
   refundLedger?: ScheduledRefund;
+  /** TEST SEAMS: production always uses the canonical authorization machine. */
+  reverseAuthorization?: ScheduledRunDeps['reverseAuthorization'];
+  settlePartialOutput?: ScheduledRunDeps['settlePartialOutput'];
   onError?: (err: unknown, context: string) => void;
 }
 
@@ -716,6 +757,8 @@ export function makeScheduledTaskRecoveryRunner(
     return await runScheduledTask(
       {
         ...(deps.refundLedger ? { refundLedger: deps.refundLedger } : {}),
+        ...(deps.reverseAuthorization ? { reverseAuthorization: deps.reverseAuthorization } : {}),
+        ...(deps.settlePartialOutput ? { settlePartialOutput: deps.settlePartialOutput } : {}),
         ...(deps.onError ? { onError: deps.onError } : {}),
       },
       trigger,
@@ -742,6 +785,8 @@ export function makeScheduledTaskRunner(
           registry: deps.registry,
           historySync: deps.historySync,
           ...(deps.refundLedger ? { refundLedger: deps.refundLedger } : {}),
+          ...(deps.reverseAuthorization ? { reverseAuthorization: deps.reverseAuthorization } : {}),
+          ...(deps.settlePartialOutput ? { settlePartialOutput: deps.settlePartialOutput } : {}),
           ...(deps.onError ? { onError: deps.onError } : {}),
           ...(deps.beforeLeaseRenewal
             ? { beforeLeaseRenewal: deps.beforeLeaseRenewal }

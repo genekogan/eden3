@@ -143,6 +143,7 @@ export type AgentDto = z.infer<typeof agentDto>;
 export const APP_NOTIFICATION_KINDS = [
   'agent_build_ready',
   'agent_build_failed',
+  'scheduled_task_completed',
 ] as const;
 export const appNotificationKindSchema = z.enum(APP_NOTIFICATION_KINDS);
 export type AppNotificationKind = z.infer<typeof appNotificationKindSchema>;
@@ -152,7 +153,12 @@ export const appNotificationDto = z.object({
   kind: appNotificationKindSchema,
   sourceAgent: accountSummaryDto,
   /** Constrained same-app destination; never an arbitrary/external URL. */
-  targetPath: z.string().regex(/^\/agents\/[a-z0-9][a-z0-9_-]{2,31}$/).nullable(),
+  targetPath: z
+    .string()
+    .regex(
+      /^\/(?:agents\/[a-z0-9][a-z0-9_-]{2,31}|sessions\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/,
+    )
+    .nullable(),
   readAt: isoDateTimeSchema.nullable(),
   createdAt: isoDateTimeSchema,
 });
@@ -341,6 +347,8 @@ export const triggerDto = z.object({
   prompt: z.string().nullable(),
   schedule: cronScheduleDto.nullable(),
   status: z.string().nullable(),
+  sessionTarget: z.enum(['new', 'existing']),
+  sessionExternalId: z.string().nullable(),
   lastRunTime: isoDateTimeSchema.nullable(),
   nextScheduledRun: isoDateTimeSchema.nullable(),
   /**

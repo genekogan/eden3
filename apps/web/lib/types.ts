@@ -681,12 +681,17 @@ export type TaskScheduleInput =
       timezone: string;
     };
 
+export type TaskSessionTargetInput =
+  | { kind: "new" }
+  | { kind: "existing"; sessionId: string };
+
 /** POST /api/tasks */
 export interface TaskCreateInput {
   agentUsername: string;
   name: string;
   prompt: string;
   schedule: TaskScheduleInput;
+  sessionTarget: TaskSessionTargetInput;
 }
 
 /** PATCH /api/tasks/:id */
@@ -695,6 +700,7 @@ export interface TaskUpdateInput {
   name?: string;
   prompt?: string;
   schedule?: TaskScheduleInput;
+  sessionTarget?: TaskSessionTargetInput;
   deleted?: true;
 }
 
@@ -709,6 +715,10 @@ export interface TaskRunResult {
     errorCode: string | null;
   };
   lastRunTime: string;
+}
+
+export interface TaskRunInput {
+  requestId: string;
 }
 
 // ---------------------------------------------------------------------------

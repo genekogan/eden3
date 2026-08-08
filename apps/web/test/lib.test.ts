@@ -279,6 +279,42 @@ describe("lib/api browser transport", () => {
     expect(init).toMatchObject({ method: "POST", credentials: "include" });
   });
 
+  it("sends the caller-owned idempotency key when running a task now", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({
+          run: {
+            triggerId: SESSION_ID,
+            sessionId: SESSION_ID,
+            outcome: {
+              turnId: TURN_ID,
+              userMessageId: SESSION_ID,
+              assistantMessageId: TURN_ID,
+              errorCode: null,
+            },
+            lastRunTime: "2026-08-08T12:00:00.000Z",
+          },
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      api.tasks.runNow("task/with slash", { requestId: TURN_ID }),
+    ).resolves.toMatchObject({
+      triggerId: SESSION_ID,
+      outcome: { turnId: TURN_ID, errorCode: null },
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("/api/tasks/task%2Fwith%20slash/runs");
+    expect(init).toMatchObject({ method: "POST", credentials: "include" });
+    expect(JSON.parse(String(init?.body))).toEqual({ requestId: TURN_ID });
+  });
+
   it("surfaces the canonical nested API error message", async () => {
     vi.stubGlobal("window", {});
     vi.stubGlobal(

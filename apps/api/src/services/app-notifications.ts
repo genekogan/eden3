@@ -109,7 +109,7 @@ export class PostgresAppNotificationStore implements AppNotificationStore {
 }
 
 /** Insert once and publish only after the transaction that created it commits. */
-export async function publishBuildNotification(
+export async function publishAppNotification(
   bus: EventsBus,
   accountId: string,
   kind: AppNotificationKind,
@@ -121,6 +121,9 @@ export async function publishBuildNotification(
     kind,
   });
 }
+
+/** Backward-compatible build-worker name. */
+export const publishBuildNotification = publishAppNotification;
 
 export function publishNotificationChanged(bus: EventsBus, accountId: string): void {
   bus.publish(notificationChannel(accountId), { type: 'notification.changed' });

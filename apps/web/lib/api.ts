@@ -89,6 +89,7 @@ import type {
   StudioGenerationQuote,
   StudioTool,
   TaskCreateInput,
+  TaskRunInput,
   TaskRunResult,
   TaskUpdateInput,
   TelegramManagedBotOnboardingStart,
@@ -1241,9 +1242,9 @@ export const api = {
     },
 
     /** POST /api/tasks/:id/runs — fire the task now (metered run). */
-    async runNow(id: string): Promise<TaskRunResult> {
+    async runNow(id: string, input: TaskRunInput): Promise<TaskRunResult> {
       return unwrap<TaskRunResult>(
-        await post<unknown>(`/tasks/${enc(id)}/runs`, {}),
+        await post<unknown>(`/tasks/${enc(id)}/runs`, input),
         "run",
       );
     },

@@ -71,6 +71,7 @@ describe('app notifications and async provisioning migration', () => {
     expect(config.columns.find((column) => column.name === 'kind')?.enumValues).toEqual([
       'agent_build_ready',
       'agent_build_failed',
+      'scheduled_task_completed',
     ]);
     const migration = await readFile(MIGRATION, 'utf8');
     const start = migration.indexOf('CREATE TABLE "app_notifications"');

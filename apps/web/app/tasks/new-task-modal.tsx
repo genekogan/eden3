@@ -15,7 +15,12 @@
 
 import { useEffect, useState } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
-import type { AgentDto, CronSchedule, TriggerDto } from "@/lib/types";
+import type {
+  AgentDto,
+  CronSchedule,
+  TaskSessionTargetInput,
+  TriggerDto,
+} from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { describeSchedule } from "./schedule";
 import {
@@ -24,6 +29,7 @@ import {
   scheduleFromForm,
   type ScheduleFormState,
 } from "./schedule-fields";
+import { TaskDestinationFields } from "./task-destination-fields";
 
 const FIELD_LABEL =
   "font-mono text-[10px] uppercase tracking-[0.2em] text-faint";
@@ -63,6 +69,7 @@ export function NewTaskModal({
   const [name, setName] = useState("");
   const [prompt, setPrompt] = useState("");
   const [form, setForm] = useState<ScheduleFormState>(defaultScheduleForm);
+  const [sessionTarget, setSessionTarget] = useState<TaskSessionTargetInput>({ kind: "new" });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -76,6 +83,7 @@ export function NewTaskModal({
     setName("");
     setPrompt("");
     setForm(defaultScheduleForm());
+    setSessionTarget({ kind: "new" });
     setSubmitting(false);
     setError(null);
   }, [open, initialAgent]);
@@ -127,7 +135,8 @@ export function NewTaskModal({
     agent !== null &&
     name.trim() !== "" &&
     prompt.trim() !== "" &&
-    schedule !== null;
+    schedule !== null &&
+    (sessionTarget.kind === "new" || sessionTarget.sessionId !== "");
 
   const submit = async () => {
     if (!canSubmit || !agent || !schedule) return;
@@ -139,6 +148,7 @@ export function NewTaskModal({
         name: name.trim(),
         prompt: prompt.trim(),
         schedule,
+        sessionTarget,
       });
       onCreated(
         created && typeof created === "object" && typeof created.id === "string"
@@ -214,6 +224,7 @@ export function NewTaskModal({
                   onClick={() => {
                     setAgent(null);
                     setAgentQuery("");
+                    setSessionTarget({ kind: "new" });
                   }}
                   className="shrink-0 text-xs text-muted transition-colors hover:text-foreground"
                 >
@@ -243,7 +254,10 @@ export function NewTaskModal({
                           type="button"
                           role="option"
                           aria-selected={false}
-                          onClick={() => setAgent(candidate)}
+                          onClick={() => {
+                            setAgent(candidate);
+                            setSessionTarget({ kind: "new" });
+                          }}
                           className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-sm text-muted transition-colors hover:bg-accent/10 hover:text-foreground"
                         >
                           <AgentAvatar account={candidate} size={22} />
@@ -310,6 +324,12 @@ export function NewTaskModal({
               </p>
             </div>
           </fieldset>
+
+          <TaskDestinationFields
+            agentUsername={agent?.username ?? null}
+            value={sessionTarget}
+            onChange={setSessionTarget}
+          />
 
           {error ? (
             <p className="rounded-lg border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger-soft">

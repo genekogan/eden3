@@ -17,6 +17,7 @@ import {
   sessionUsers,
   sessions,
   triggers,
+  turnAuthorizations,
   usageEvents,
   type Session,
   type Trigger,
@@ -28,6 +29,7 @@ import { and, eq, inArray, isNull, like, or, sql } from 'drizzle-orm';
 import { ApiError } from '../errors';
 import { defaultOpenclawDataDir } from '../gateway-glue';
 import type { EventsBus } from '../events-bus';
+import { publishAppNotification } from './app-notifications';
 import {
   AUTOMATION_BUDGET_SCOPE,
   AUTOMATION_HOURLY_BUDGET_ERROR,
@@ -36,6 +38,10 @@ import {
 } from './automation-budget';
 import type { HistorySync } from './history-sync';
 import type { TurnRegistry } from './turn-registry';
+import {
+  reverseTurnAuthorization,
+  settlePartialOutputAuthorization,
+} from './turn-authorization';
 import {
   runTurn,
   TurnClaimLostError,
@@ -47,7 +53,7 @@ import {
 
 export type ScheduledRefund = typeof refund;
 
-interface ScheduledRunDeps {
+export interface ScheduledRunDeps {
   /** Provider dependencies are absent for compensation-only recovery. */
   compat?: CompatClientLike;
   bus?: EventsBus;
@@ -63,6 +69,9 @@ interface ScheduledRunDeps {
   }) => Promise<void>;
   /** TEST SEAM: pause after terminal preflight but before atomic persistence. */
   beforeTerminalPersistence?: () => Promise<void>;
+  /** TEST SEAMS: production always uses the canonical authorization machine. */
+  reverseAuthorization?: typeof reverseTurnAuthorization;
+  settlePartialOutput?: typeof settlePartialOutputAuthorization;
 }
 
 export interface ScheduledRunResult {
@@ -73,7 +82,7 @@ export interface ScheduledRunResult {
 }
 
 export interface ScheduledTaskOccurrence {
-  /** Stable UUID derived from (trigger id, due instant), or random for run-now. */
+  /** Stable task-scoped UUID derived from its scheduled or caller-supplied request identity. */
   id: string;
   kind: 'manual' | 'scheduled';
   dueAt: Date | null;
@@ -100,8 +109,15 @@ export function scheduledTaskOccurrence(
   };
 }
 
-function manualTaskOccurrence(): ScheduledTaskOccurrence {
-  return { id: randomUUID(), kind: 'manual', dueAt: null };
+export function manualTaskOccurrence(
+  triggerId: string,
+  requestId: string = randomUUID(),
+): ScheduledTaskOccurrence {
+  return {
+    id: uuidFromDigest(`eden3:scheduled-task-manual:v1\0${triggerId}\0${requestId}`),
+    kind: 'manual',
+    dueAt: null,
+  };
 }
 
 /** Scheduler-visible error whose trigger streak was already stamped by the runner. */
@@ -123,11 +139,16 @@ async function loadTaskOwner(trigger: Trigger): Promise<AuthSession> {
     throw new ApiError(409, 'task_missing_owner', `Task ${trigger.id} has no owner`);
   }
   const [owner] = await db
-    .select({ id: accounts.id, username: accounts.username, deleted: accounts.deleted })
+    .select({
+      id: accounts.id,
+      username: accounts.username,
+      type: accounts.type,
+      deleted: accounts.deleted,
+    })
     .from(accounts)
     .where(eq(accounts.id, trigger.userId))
     .limit(1);
-  if (!owner || owner.deleted) {
+  if (!owner || owner.deleted || owner.type !== 'user') {
     throw new ApiError(409, 'task_owner_unavailable', `Task ${trigger.id} owner is unavailable`);
   }
   return { accountId: owner.id, username: owner.username, isAdmin: false };
@@ -141,6 +162,8 @@ async function loadTaskAgent(trigger: Trigger): Promise<TurnAgent> {
     .select({
       accountId: accounts.id,
       username: accounts.username,
+      deleted: accounts.deleted,
+      ownerId: agents.ownerId,
       openclawId: agents.openclawId,
       model: agents.model,
       thinkingLevel: agents.thinkingLevel,
@@ -153,6 +176,16 @@ async function loadTaskAgent(trigger: Trigger): Promise<TurnAgent> {
   if (!row) {
     throw new ApiError(409, 'task_agent_unavailable', `Task ${trigger.id} agent is unavailable`);
   }
+  if (row.deleted) {
+    throw new ApiError(409, 'task_agent_unavailable', `Task ${trigger.id} agent is unavailable`);
+  }
+  if (!trigger.userId || row.ownerId !== trigger.userId) {
+    throw new ApiError(
+      409,
+      'task_agent_owner_mismatch',
+      `Task ${trigger.id} agent is not owned by its task owner`,
+    );
+  }
   if (!row.openclawId || row.provisionStatus !== 'ready') {
     throw new ApiError(409, 'task_agent_not_ready', `Task ${trigger.id} agent is not ready`);
   }
@@ -160,6 +193,7 @@ async function loadTaskAgent(trigger: Trigger): Promise<TurnAgent> {
   return {
     accountId: row.accountId,
     username: row.username,
+    ownerId: row.ownerId,
     openclawId: row.openclawId,
     model,
     agentRuntime: await getModelAgentRuntime(model, { dataDir: defaultOpenclawDataDir() }),
@@ -214,17 +248,67 @@ async function resolveRunSession(
   agent: TurnAgent,
   occurrence: ScheduledTaskOccurrence,
 ): Promise<Session> {
-  if (trigger.sessionTarget === 'existing' && trigger.sessionExternalId) {
-    const existing = await resolveSession(trigger.sessionExternalId);
-    if (existing && existing.ownerId === owner.accountId) {
-      if (existing.gatewaySessionKey) return existing;
-      const [updated] = await db
-        .update(sessions)
-        .set({ gatewaySessionKey: gatewaySessionKey(existing.id), updatedAt: new Date() })
-        .where(eq(sessions.id, existing.id))
-        .returning();
-      if (updated) return updated;
+  if (trigger.sessionTarget === 'existing') {
+    if (!trigger.sessionExternalId) {
+      throw new ApiError(
+        409,
+        'task_session_unavailable',
+        `Task ${trigger.id} has no selected output session`,
+      );
     }
+    const existing = await resolveSession(trigger.sessionExternalId);
+    const [membership] = existing
+      ? await db
+          .select({ agentAccountId: sessionAgents.agentAccountId })
+          .from(sessionAgents)
+          .where(
+            and(
+              eq(sessionAgents.sessionId, existing.id),
+              eq(sessionAgents.agentAccountId, agent.accountId),
+            ),
+          )
+          .limit(1)
+      : [];
+    if (
+      !existing ||
+      existing.ownerId !== owner.accountId ||
+      existing.deleted ||
+      existing.visible === false ||
+      existing.channelConnectionId !== null ||
+      existing.sessionType === 'channel' ||
+      !membership
+    ) {
+      throw new ApiError(
+        409,
+        'task_session_unavailable',
+        'The selected output session is unavailable for this agent',
+      );
+    }
+    if (existing.gatewaySessionKey) return existing;
+    const [updated] = await db
+      .update(sessions)
+      .set({ gatewaySessionKey: gatewaySessionKey(existing.id), updatedAt: new Date() })
+      .where(
+        and(
+          eq(sessions.id, existing.id),
+          eq(sessions.ownerId, owner.accountId),
+          eq(sessions.deleted, false),
+        ),
+      )
+      .returning();
+    if (updated) return updated;
+    throw new ApiError(
+      409,
+      'task_session_unavailable',
+      'The selected output session changed before the run started',
+    );
+  }
+  if (trigger.sessionTarget !== 'new') {
+    throw new ApiError(
+      409,
+      'task_session_unavailable',
+      `Task ${trigger.id} has an invalid output-session policy`,
+    );
   }
   return await createRunSession(trigger, owner, agent, occurrence.id);
 }
@@ -286,6 +370,53 @@ export async function renewScheduledTaskOccurrenceLease(params: {
   if (renewed.length === 0) throw claimLost(params.triggerId);
 }
 
+/**
+ * Revalidate tenant, agent, and output-session authority inside every money
+ * transaction that can hand out or terminalize a provider ticket.
+ */
+async function fenceScheduledTaskExecution(
+  params: {
+    triggerId: string;
+    occurrenceId: string;
+    claimId: string;
+    sessionId: string;
+  },
+  dbc: DbHandle,
+): Promise<void> {
+  await renewScheduledTaskOccurrenceLease(params, dbc);
+  const rows = (await dbc.execute(sql`
+    select t.id
+    from triggers t
+    join accounts u on u.id = t.user_id
+    join agents g on g.account_id = t.agent_id
+    join accounts a on a.id = g.account_id
+    join sessions s on s.id = ${params.sessionId}::uuid
+    join session_agents sa
+      on sa.session_id = s.id and sa.agent_account_id = g.account_id
+    where t.id = ${params.triggerId}::uuid
+      and t.deleted = false
+      and t.status in ('running', 'paused')
+      and t.pending_occurrence_id = ${params.occurrenceId}::uuid
+      and t.pending_occurrence_claim_id = ${params.claimId}::uuid
+      and u.type = 'user' and u.deleted = false
+      and a.type = 'agent' and a.deleted = false
+      and g.owner_id = u.id
+      and g.openclaw_id is not null
+      and g.provision_status = 'ready'
+      and s.owner_id = u.id
+      and s.deleted = false
+      and s.visible is distinct from false
+      and s.channel_connection_id is null
+      and s.session_type is distinct from 'channel'
+    for key share of u, a, g, s, sa
+  `)) as unknown as { id: string }[];
+  if (rows.length !== 1) {
+    throw new TurnClaimLostError(
+      `Task ${params.triggerId} execution authority changed before provider work`,
+    );
+  }
+}
+
 function occurrenceCheckpoint(occurrence: ScheduledTaskOccurrence): Date {
   return occurrence.dueAt ?? new Date();
 }
@@ -295,71 +426,102 @@ function sameInstant(a: Date | null, b: Date | null): boolean {
 }
 
 async function markTaskOutcome(
+  deps: ScheduledRunDeps,
   trigger: Trigger,
   occurrence: ScheduledTaskOccurrence,
   claimId: string,
   outcome: TurnOutcome,
+  sessionId: string | null,
+  checkpointOverride?: Date,
 ): Promise<Date> {
-  const checkpoint = occurrenceCheckpoint(occurrence);
+  const checkpoint = checkpointOverride ?? occurrenceCheckpoint(occurrence);
   const failed = outcome.errorCode !== null;
-  const updated = await db
-    .update(triggers)
-    .set({
-      // Pausing is the one safe owner mutation while an occurrence is in
-      // flight. Preserve a pause observed after the original claim, and also
-      // restore it when the scheduler temporarily claims a paused recovery.
-      status: sql`case
-        when ${triggers.status} = 'paused' or ${trigger.status === 'paused'} then 'paused'
-        else 'active'
-      end`,
-      lastRunTime: checkpoint,
-      lastError: failed
-        ? (outcome.errorMessage ?? outcome.errorCode ?? 'scheduled task failed').slice(0, 2000)
-        : null,
-      // A restart can replay the trigger row before next_scheduled_run is
-      // stamped. The due instant is the occurrence checkpoint, so recovering
-      // the same failure never increments its streak twice.
-      errorCount: failed
-        ? sql`case when ${triggers.lastRunTime} is distinct from ${checkpoint.toISOString()}::timestamptz
-            then coalesce(${triggers.errorCount}, 0) + 1
-            else coalesce(${triggers.errorCount}, 0) end`
-        : 0,
-      updatedAt: new Date(),
-      pendingOccurrenceId: null,
-      pendingOccurrenceKind: null,
-      pendingOccurrenceAt: null,
-      pendingOccurrenceClaimId: null,
-    })
-    .where(
-      and(
-        eq(triggers.id, trigger.id),
-        inArray(triggers.status, ['running', 'paused']),
-        eq(triggers.deleted, false),
-        eq(triggers.pendingOccurrenceId, occurrence.id),
-        eq(triggers.pendingOccurrenceClaimId, claimId),
-      ),
-    )
-    .returning({ id: triggers.id });
-  if (updated.length === 0) {
-    throw claimLost(trigger.id);
+  const notificationId = await db.transaction(async (tx) => {
+    const updated = await tx
+      .update(triggers)
+      .set({
+        // Pausing is the one safe owner mutation while an occurrence is in
+        // flight. Preserve a pause observed after the original claim, and also
+        // restore it when the scheduler temporarily claims a paused recovery.
+        status: sql`case
+          when ${triggers.status} = 'paused' or ${trigger.status === 'paused'} then 'paused'
+          else 'active'
+        end`,
+        lastRunTime: checkpoint,
+        lastError: failed
+          ? (outcome.errorMessage ?? outcome.errorCode ?? 'scheduled task failed').slice(0, 2000)
+          : null,
+        // A restart can replay the trigger row before next_scheduled_run is
+        // stamped. The due instant is the occurrence checkpoint, so recovering
+        // the same failure never increments its streak twice.
+        errorCount: failed
+          ? sql`case when ${triggers.lastRunTime} is distinct from ${checkpoint.toISOString()}::timestamptz
+              then coalesce(${triggers.errorCount}, 0) + 1
+              else coalesce(${triggers.errorCount}, 0) end`
+          : 0,
+        updatedAt: new Date(),
+        pendingOccurrenceId: null,
+        pendingOccurrenceKind: null,
+        pendingOccurrenceAt: null,
+        pendingOccurrenceClaimId: null,
+      })
+      .where(
+        and(
+          eq(triggers.id, trigger.id),
+          inArray(triggers.status, ['running', 'paused']),
+          eq(triggers.deleted, false),
+          eq(triggers.pendingOccurrenceId, occurrence.id),
+          eq(triggers.pendingOccurrenceClaimId, claimId),
+        ),
+      )
+      .returning({ id: triggers.id });
+    if (updated.length === 0) throw claimLost(trigger.id);
+
+    if (failed || !sessionId || !trigger.userId || !trigger.agentId) return null;
+    const inserted = (await tx.execute(sql`
+      insert into app_notifications (
+        id, account_id, kind, source_agent_id, target_path
+      )
+      values (
+        ${occurrence.id}::uuid, ${trigger.userId}::uuid,
+        'scheduled_task_completed', ${trigger.agentId}::uuid,
+        ${`/sessions/${sessionId}`}
+      )
+      on conflict (id) do nothing
+      returning id
+    `)) as unknown as { id: string }[];
+    return inserted[0]?.id ?? null;
+  });
+  if (notificationId && deps.bus && trigger.userId) {
+    try {
+      await publishAppNotification(
+        deps.bus,
+        trigger.userId,
+        'scheduled_task_completed',
+        notificationId,
+      );
+    } catch (err) {
+      deps.onError?.(err, 'scheduled task completion notification publish');
+    }
   }
   return checkpoint;
 }
 
 async function markTaskError(
+  deps: ScheduledRunDeps,
   trigger: Trigger,
   occurrence: ScheduledTaskOccurrence,
   claimId: string,
   err: unknown,
 ): Promise<void> {
   const message = err instanceof Error ? err.message : String(err);
-  await markTaskOutcome(trigger, occurrence, claimId, {
+  await markTaskOutcome(deps, trigger, occurrence, claimId, {
     turnId: occurrence.id,
     userMessageId: occurrence.id,
     assistantMessageId: null,
     errorCode: err instanceof ApiError ? err.code : 'scheduled_task_error',
     errorMessage: message,
-  });
+  }, null);
 }
 
 async function releaseTaskForRefundRetry(
@@ -404,6 +566,72 @@ async function refundScheduledFailure(
   claimId: string,
 ): Promise<void> {
   if (!trigger.agentId) return;
+  const fence = (dbc: DbHandle) =>
+    renewScheduledTaskOccurrenceLease(
+      { triggerId: trigger.id, occurrenceId: occurrence.id, claimId },
+      dbc,
+    );
+  const settlePartial = deps.settlePartialOutput ?? settlePartialOutputAuthorization;
+  const reverseAuthorization = deps.reverseAuthorization ?? reverseTurnAuthorization;
+
+  try {
+    const partial = await settlePartial({
+      turnId: occurrence.id,
+      errorCode: SCHEDULED_TASK_INDETERMINATE,
+      errorMessage:
+        'Scheduled task process ended after emitting usable output; full authorized reserve retained',
+      fence,
+    });
+    if (partial.eligible) return;
+
+    const reversed = await reverseAuthorization({
+      turnId: occurrence.id,
+      refundType: 'refund:chat:scheduled-failure',
+      fence,
+    });
+    if (reversed.partialOutputRequired) {
+      const raced = await settlePartial({
+        turnId: occurrence.id,
+        errorCode: SCHEDULED_TASK_INDETERMINATE,
+        errorMessage:
+          'Scheduled task process ended after emitting usable output; full authorized reserve retained',
+        fence,
+      });
+      if (!raced.eligible) {
+        throw new Error('scheduled task usable-output authorization could not be terminalized');
+      }
+      return;
+    }
+
+    // A terminal v2 authorization owns the exact subscription/durable split.
+    // Never follow it with the legacy durable-only refund path.
+    const [authorization] = await db
+      .select({ state: turnAuthorizations.state })
+      .from(turnAuthorizations)
+      .where(eq(turnAuthorizations.turnId, occurrence.id))
+      .limit(1);
+    if (authorization) {
+      if (authorization.state === 'reserved') {
+        throw new Error('scheduled task authorization remained reserved after recovery');
+      }
+      return;
+    }
+  } catch (err) {
+    if (err instanceof TurnClaimLostError) throw err;
+    try {
+      deps.onError?.(err, 'scheduled occurrence authorization recovery');
+    } catch {
+      // Error reporting must not hide the durable refund-pending marker.
+    }
+    const message =
+      `${SCHEDULED_TASK_REFUND_PENDING_PREFIX} canonical authorization recovery failed; ` +
+      'the occurrence remains due and will retry without provider execution';
+    await releaseTaskForRefundRetry(trigger, occurrence, claimId, message);
+    throw new ApiError(503, SCHEDULED_TASK_REFUND_PENDING, message);
+  }
+
+  // Pre-authorization compatibility only. Absence of a turn_authorizations
+  // row is proven above before these legacy idempotent keys are considered.
   const refundLedger = deps.refundLedger ?? refund;
   const failedReversals: string[] = [];
   for (const reversal of [
@@ -502,7 +730,7 @@ async function recoveredUsageOutcome(occurrence: ScheduledTaskOccurrence): Promi
 export async function runScheduledTask(
   deps: ScheduledRunDeps,
   trigger: Trigger,
-  requestedOccurrence: ScheduledTaskOccurrence = manualTaskOccurrence(),
+  requestedOccurrence: ScheduledTaskOccurrence = manualTaskOccurrence(trigger.id),
 ): Promise<ScheduledRunResult> {
   if (trigger.deleted) throw new ApiError(404, 'task_not_found', `No task "${trigger.id}"`);
   const recoveryOnly = isScheduledTaskRecoveryPending(trigger);
@@ -538,11 +766,17 @@ export async function runScheduledTask(
     .where(
       and(
         eq(triggers.id, trigger.id),
+        eq(triggers.deleted, false),
         or(
           and(
             eq(triggers.status, 'active'),
             trigger.pendingOccurrenceId === null
-              ? isNull(triggers.pendingOccurrenceId)
+              ? and(
+                  isNull(triggers.pendingOccurrenceId),
+                  ...(requestedOccurrence.kind === 'scheduled' && requestedOccurrence.dueAt
+                    ? [eq(triggers.nextScheduledRun, requestedOccurrence.dueAt)]
+                    : []),
+                )
               : and(
                   eq(triggers.pendingOccurrenceId, expectedOccurrenceId),
                   recoveryMarker,
@@ -556,28 +790,26 @@ export async function runScheduledTask(
         ),
       ),
     )
-    .returning({
-      id: triggers.id,
-      occurrenceId: triggers.pendingOccurrenceId,
-      occurrenceKind: triggers.pendingOccurrenceKind,
-      occurrenceAt: triggers.pendingOccurrenceAt,
-    });
+    .returning();
   if (claimed.length === 0) {
     throw new ApiError(409, 'task_not_active', `Task ${trigger.id} is already running`);
   }
   const durable = claimed[0]!;
   if (
-    !durable.occurrenceId ||
-    (durable.occurrenceKind !== 'manual' && durable.occurrenceKind !== 'scheduled') ||
-    (durable.occurrenceKind === 'scheduled' && !durable.occurrenceAt)
+    !durable.pendingOccurrenceId ||
+    (durable.pendingOccurrenceKind !== 'manual' && durable.pendingOccurrenceKind !== 'scheduled') ||
+    (durable.pendingOccurrenceKind === 'scheduled' && !durable.pendingOccurrenceAt)
   ) {
     throw new Error('scheduled task durable occurrence identity unavailable');
   }
   const occurrence: ScheduledTaskOccurrence = {
-    id: durable.occurrenceId,
-    kind: durable.occurrenceKind,
-    dueAt: durable.occurrenceKind === 'scheduled' ? durable.occurrenceAt : null,
+    id: durable.pendingOccurrenceId,
+    kind: durable.pendingOccurrenceKind,
+    dueAt: durable.pendingOccurrenceKind === 'scheduled' ? durable.pendingOccurrenceAt : null,
   };
+  // Every downstream decision uses the row serialized by the claim, never
+  // the scheduler/route snapshot read before a concurrent edit.
+  trigger = pausedRecovery ? { ...durable, status: 'paused' } : durable;
 
   let outcome: TurnOutcome;
   let session: Session;
@@ -590,7 +822,15 @@ export async function runScheduledTask(
       if (outcome.errorCode !== null) {
         await refundScheduledFailure(deps, trigger, occurrence, claimId);
       }
-      const lastRunTime = await markTaskOutcome(trigger, occurrence, claimId, outcome);
+      const lastRunTime = await markTaskOutcome(
+        deps,
+        trigger,
+        occurrence,
+        claimId,
+        outcome,
+        recovered.sessionId,
+        trigger.lastRunTime ?? recovered.createdAt,
+      );
       const result = {
         triggerId: trigger.id,
         sessionId: recovered.sessionId,
@@ -624,13 +864,27 @@ export async function runScheduledTask(
       if (outcome.errorCode !== null) {
         await refundScheduledFailure(deps, trigger, occurrence, claimId);
       }
-      const lastRunTime = await markTaskOutcome(trigger, occurrence, claimId, outcome);
+      const checkpointSessionId =
+        trigger.sessionTarget === 'existing' && trigger.sessionExternalId
+          ? trigger.sessionExternalId
+          : occurrence.id;
+      const lastRunTime = await markTaskOutcome(
+        deps,
+        trigger,
+        occurrence,
+        claimId,
+        outcome,
+        // A legacy last-run checkpoint without terminal usage is sufficient
+        // to suppress provider replay, but it is not authoritative evidence
+        // for a new completion notification.
+        null,
+      );
       if (outcome.errorCode !== null) {
         throw new RecordedScheduledTaskError(502, outcome.errorCode, outcome.errorMessage!);
       }
       return {
         triggerId: trigger.id,
-        sessionId: occurrence.id,
+        sessionId: checkpointSessionId,
         outcome,
         lastRunTime: lastRunTime.toISOString(),
       };
@@ -659,7 +913,7 @@ export async function runScheduledTask(
           SCHEDULED_TASK_INDETERMINATE,
           'A prior scheduled occurrence reached funding but not a terminal record; it was not re-executed',
         );
-        await markTaskError(trigger, occurrence, claimId, recoveryError);
+        await markTaskError(deps, trigger, occurrence, claimId, recoveryError);
         throw recoveryError;
       }
     }
@@ -676,7 +930,7 @@ export async function runScheduledTask(
         SCHEDULED_TASK_INDETERMINATE,
         'A stale scheduled occurrence had no terminal record and was closed without provider replay',
       );
-      await markTaskError(trigger, occurrence, claimId, recoveryError);
+      await markTaskError(deps, trigger, occurrence, claimId, recoveryError);
       throw recoveryError;
     }
 
@@ -696,7 +950,12 @@ export async function runScheduledTask(
     // are checkpointed like every other real scheduled attempt.
     await assertAutomationBudget(agent.accountId);
     session = await resolveRunSession(trigger, owner, agent, occurrence);
-    const claim = { triggerId: trigger.id, occurrenceId: occurrence.id, claimId };
+    const claim = {
+      triggerId: trigger.id,
+      occurrenceId: occurrence.id,
+      claimId,
+      sessionId: session.id,
+    };
     outcome = await runTurn(
       {
         compat: deps.compat,
@@ -722,9 +981,9 @@ export async function runScheduledTask(
         beforeDebit: async () => {
           await deps.beforeLeaseRenewal?.(claim);
         },
-        fundingFence: (dbc) => renewScheduledTaskOccurrenceLease(claim, dbc),
-        beforeProvider: () => renewScheduledTaskOccurrenceLease(claim),
-        beforeTerminal: () => renewScheduledTaskOccurrenceLease(claim),
+        fundingFence: (dbc) => fenceScheduledTaskExecution(claim, dbc),
+        beforeProvider: () => fenceScheduledTaskExecution(claim, db),
+        beforeTerminal: () => fenceScheduledTaskExecution(claim, db),
         ...(deps.beforeTerminalPersistence
           ? { beforeTerminalPersistence: deps.beforeTerminalPersistence }
           : {}),
@@ -739,7 +998,7 @@ export async function runScheduledTask(
     if (err instanceof RecordedScheduledTaskError) throw err;
     if (err instanceof ApiError && err.code === SCHEDULED_TASK_REFUND_PENDING) throw err;
     await refundScheduledFailure(deps, trigger, occurrence, claimId);
-    await markTaskError(trigger, occurrence, claimId, err);
+    await markTaskError(deps, trigger, occurrence, claimId, err);
     if (
       err instanceof RollingSpendCapExceededError &&
       err.scope === AUTOMATION_BUDGET_SCOPE
@@ -759,7 +1018,14 @@ export async function runScheduledTask(
   if (outcome.errorCode !== null) {
     await refundScheduledFailure(deps, trigger, occurrence, claimId);
   }
-  const lastRunTime = await markTaskOutcome(trigger, occurrence, claimId, outcome);
+  const lastRunTime = await markTaskOutcome(
+    deps,
+    trigger,
+    occurrence,
+    claimId,
+    outcome,
+    session.id,
+  );
 
   const result = {
     triggerId: trigger.id,

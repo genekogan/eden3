@@ -16,7 +16,7 @@ import type { GatewayGlue } from '../gateway-glue';
 import { triggerDtoFromEntity } from '../route-helpers';
 import { concurrentTurnLimit } from '../services/chat-limits';
 import { isPlatformEve, isPlatformEveAccountId } from '../services/default-assistant';
-import { runScheduledTask } from '../services/scheduled-tasks';
+import { manualTaskOccurrence, runScheduledTask } from '../services/scheduled-tasks';
 import { assertTurnAdmissible } from '../services/turns';
 import { nextOccurrence, TaskScheduleError } from '../services/task-schedule';
 import { agentTaskLimitError, MAX_ENABLED_TASKS_PER_AGENT } from '../services/task-limits';
@@ -68,11 +68,17 @@ const oneTimeScheduleSchema = z
 
 const scheduleSchema = z.union([oneTimeScheduleSchema, recurringScheduleSchema]);
 
+const sessionTargetSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('new') }).strict(),
+  z.object({ kind: z.literal('existing'), sessionId: z.string().uuid() }).strict(),
+]);
+
 const createBodySchema = z.object({
   agentUsername: z.string().trim().min(1).max(200),
   name: z.string().trim().min(1).max(200),
   prompt: z.string().trim().min(1).max(10_000),
   schedule: scheduleSchema,
+  sessionTarget: sessionTargetSchema.default({ kind: 'new' }),
 });
 
 const patchBodySchema = z
@@ -81,6 +87,7 @@ const patchBodySchema = z
     name: z.string().trim().min(1).max(200).optional(),
     prompt: z.string().trim().min(1).max(10_000).optional(),
     schedule: scheduleSchema.optional(),
+    sessionTarget: sessionTargetSchema.optional(),
     deleted: z.literal(true).optional(),
   })
   .strict()
@@ -90,6 +97,7 @@ const patchBodySchema = z
       body.name !== undefined ||
       body.prompt !== undefined ||
       body.schedule !== undefined ||
+      body.sessionTarget !== undefined ||
       body.deleted !== undefined,
     {
     message: 'provide status and/or deleted',
@@ -97,6 +105,7 @@ const patchBodySchema = z
   );
 
 const idParamsSchema = z.object({ id: z.string().trim().min(1).max(200) });
+const runBodySchema = z.object({ requestId: z.string().uuid() }).strict();
 
 /**
  * Next fire instant for a schedule, with TaskScheduleError mapped onto the
@@ -200,12 +209,11 @@ async function lastRunSessionIds(
   return new Map(rows.map((row) => [row.trigger_id, row.session_id]));
 }
 
-async function scheduledTaskQuotaError(account: { accountId: string; isAdmin: boolean }): Promise<{
+async function scheduledTaskQuotaError(account: { accountId: string }): Promise<{
   statusCode: 429;
   code: 'task_quota_exceeded';
   message: string;
 } | null> {
-  if (account.isAdmin) return null;
   const limit = getEnv().MAX_SCHEDULED_TASKS_PER_USER;
   const [quota] = await pg<{ count: number }[]>`
     select count(*)::int as count
@@ -278,8 +286,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         'Eve is platform-owned and cannot be configured with scheduled tasks',
       );
     }
-    const isOwner = viewer.isAdmin || viewer.accountId === agent.ownerId;
-    if (!agent.public && !isOwner) {
+    if (viewer.accountId !== agent.ownerId) {
       return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
     }
 
@@ -303,13 +310,40 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       if ((enabled?.count ?? 0) >= MAX_ENABLED_TASKS_PER_AGENT) {
         throw agentTaskLimitError(agentAccount.id);
       }
+      if (body.sessionTarget.kind === 'existing') {
+        const [target] = await tx<{ id: string }[]>`
+          select s.id
+          from sessions s
+          where s.id = ${body.sessionTarget.sessionId}::uuid
+            and s.owner_id = ${viewer.accountId}
+            and s.deleted = false
+            and s.visible is distinct from false
+            and s.channel_connection_id is null
+            and s.session_type is distinct from 'channel'
+            and exists (
+              select 1 from session_agents sa
+              where sa.session_id = s.id
+                and sa.agent_account_id = ${agentAccount.id}
+            )
+          for key share of s
+        `;
+        if (!target) {
+          throw new ApiError(
+            409,
+            'task_session_unavailable',
+            'The selected output session is unavailable for this agent',
+          );
+        }
+      }
       const [inserted] = await tx<{ id: string }[]>`
         insert into triggers (
           user_id, agent_id, name, prompt, schedule, status,
-          session_target, next_scheduled_run
+          session_target, session_external_id, next_scheduled_run
         ) values (
           ${viewer.accountId}, ${agentAccount.id}, ${body.name}, ${body.prompt},
-          ${JSON.stringify(body.schedule)}::jsonb, 'active', 'new', ${nextScheduledRun.toISOString()}
+          ${JSON.stringify(body.schedule)}::jsonb, 'active', ${body.sessionTarget.kind},
+          ${body.sessionTarget.kind === 'existing' ? body.sessionTarget.sessionId : null},
+          ${nextScheduledRun.toISOString()}
         )
         returning id
       `;
@@ -328,12 +362,13 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     const viewer = req.account;
     if (!viewer) return null; // unreachable — requireAuth replied 401
     const { id } = idParamsSchema.parse(req.params);
+    const { requestId } = runBodySchema.parse(req.body);
 
     const existing = await findTrigger(id);
     if (!existing || existing.deleted) {
       return sendError(reply, 404, 'task_not_found', `No task "${id}"`);
     }
-    if (!viewer.isAdmin && existing.userId !== viewer.accountId) {
+    if (existing.userId !== viewer.accountId) {
       return sendError(reply, 403, 'forbidden', 'Only the task owner can run it');
     }
     if (await isPlatformEveAccountId(existing.agentId)) {
@@ -388,6 +423,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
           onError: (err, context) => req.log.error({ err, context }, 'scheduled task side-error'),
         },
         existing,
+        manualTaskOccurrence(existing.id, requestId),
       );
       return reply.code(201).send({ run });
     } catch (err) {
@@ -422,7 +458,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     if (!existing || existing.deleted) {
       return sendError(reply, 404, 'task_not_found', `No task "${id}"`);
     }
-    if (!viewer.isAdmin && existing.userId !== viewer.accountId) {
+    if (existing.userId !== viewer.accountId) {
       return sendError(reply, 403, 'forbidden', 'Only the task owner can modify it');
     }
     if (await isPlatformEveAccountId(existing.agentId)) {
@@ -449,9 +485,12 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         name: string | null;
         prompt: string | null;
         schedule: unknown;
+        session_target: string | null;
+        session_external_id: string | null;
         pending_occurrence_id: string | null;
       }[]>`
         select id, agent_id, deleted, status, name, prompt, schedule,
+               session_target, session_external_id,
                pending_occurrence_id
         from triggers
         where id = ${existing.id}
@@ -463,6 +502,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         body.name === undefined &&
         body.prompt === undefined &&
         body.schedule === undefined &&
+        body.sessionTarget === undefined &&
         body.deleted === undefined;
       if (current.pending_occurrence_id && !pauseOnly) {
         throw new ApiError(
@@ -477,6 +517,12 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         ? (current.status ?? 'paused')
         : (body.status ?? current.status);
       const nextSchedule = body.schedule ?? current.schedule ?? {};
+      const nextSessionTarget = body.sessionTarget?.kind ?? current.session_target ?? 'new';
+      const nextSessionExternalId = body.sessionTarget
+        ? body.sessionTarget.kind === 'existing'
+          ? body.sessionTarget.sessionId
+          : null
+        : current.session_external_id;
       // 'running' = active with a run in flight — schedule edits keep it live.
       const enabled = !nextDeleted && (nextStatus === 'active' || nextStatus === 'running');
       const wasEnabled = current.status === 'active' || current.status === 'running';
@@ -497,6 +543,31 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
           throw agentTaskLimitError(current.agent_id);
         }
       }
+      if (body.sessionTarget?.kind === 'existing' && current.agent_id) {
+        const [target] = await tx<{ id: string }[]>`
+          select s.id
+          from sessions s
+          where s.id = ${body.sessionTarget.sessionId}::uuid
+            and s.owner_id = ${viewer.accountId}
+            and s.deleted = false
+            and s.visible is distinct from false
+            and s.channel_connection_id is null
+            and s.session_type is distinct from 'channel'
+            and exists (
+              select 1 from session_agents sa
+              where sa.session_id = s.id
+                and sa.agent_account_id = ${current.agent_id}
+            )
+          for key share of s
+        `;
+        if (!target) {
+          throw new ApiError(
+            409,
+            'task_session_unavailable',
+            'The selected output session is unavailable for this agent',
+          );
+        }
+      }
       const [changed] = await tx<{ id: string }[]>`
         update triggers
         set deleted = ${nextDeleted},
@@ -504,6 +575,8 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
             name = ${body.name ?? current.name},
             prompt = ${body.prompt ?? current.prompt},
             schedule = ${JSON.stringify(nextSchedule)}::jsonb,
+            session_target = ${nextSessionTarget},
+            session_external_id = ${nextSessionExternalId},
             next_scheduled_run = ${nextScheduledRun?.toISOString() ?? null},
             updated_at = now()
         where id = ${existing.id}

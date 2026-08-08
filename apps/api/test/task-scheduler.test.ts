@@ -92,6 +92,9 @@ function makeScheduler(opts: {
   intervalMs?: number;
   reapStaleRunningMs?: number;
   maxConsecutiveFailures?: number;
+  beforeProcessDue?: (trigger: Trigger) => Promise<void>;
+  beforeNextRunPersistence?: (trigger: Trigger) => Promise<void>;
+  beforeMissedFirePersistence?: (trigger: Trigger) => Promise<void>;
 }): TaskScheduler {
   return new TaskScheduler({
     runTask: opts.runTask ?? (async () => {}),
@@ -110,6 +113,13 @@ function makeScheduler(opts: {
       : {}),
     ...(opts.maxConsecutiveFailures !== undefined
       ? { maxConsecutiveFailures: opts.maxConsecutiveFailures }
+      : {}),
+    ...(opts.beforeProcessDue ? { beforeProcessDue: opts.beforeProcessDue } : {}),
+    ...(opts.beforeNextRunPersistence
+      ? { beforeNextRunPersistence: opts.beforeNextRunPersistence }
+      : {}),
+    ...(opts.beforeMissedFirePersistence
+      ? { beforeMissedFirePersistence: opts.beforeMissedFirePersistence }
       : {}),
     restrictToTriggerIds: fixtureTriggerIds,
   });
@@ -256,6 +266,89 @@ describe('TaskScheduler.tick', () => {
     expect(row.error_count).toBe(0);
   });
 
+  it('serializes next-run persistence against a concurrent owner schedule edit', async () => {
+    const dueAt = new Date('2026-08-08T08:59:00.000Z');
+    const ownerNext = new Date('2026-08-10T16:45:00.000Z');
+    const ownerSchedule = { hour: 16, minute: 45, timezone: 'UTC' };
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: dueAt,
+    });
+    let releasePersistence!: () => void;
+    let markPersistenceEntered!: () => void;
+    const persistenceGate = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    const persistenceEntered = new Promise<void>((resolve) => {
+      markPersistenceEntered = resolve;
+    });
+    const scheduler = makeScheduler({
+      now: () => new Date('2026-08-08T09:00:00.000Z'),
+      beforeNextRunPersistence: async (fresh) => {
+        if (fresh.id !== id) return;
+        markPersistenceEntered();
+        await persistenceGate;
+      },
+    });
+
+    const ticking = scheduler.tick();
+    await persistenceEntered;
+    let ownerEditCommitted = false;
+    const ownerEdit = pg`
+      update triggers
+      set schedule = ${JSON.stringify(ownerSchedule)}::jsonb,
+          next_scheduled_run = ${ownerNext.toISOString()},
+          updated_at = now()
+      where id = ${id}
+    `.then(() => {
+      ownerEditCommitted = true;
+    });
+    // The scheduler holds the row lock from its authoritative schedule read
+    // through its write, so the owner edit must serialize after that write.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(ownerEditCommitted).toBe(false);
+
+    releasePersistence();
+    await ticking;
+    await ownerEdit;
+    const [final] = await pg<{
+      schedule: unknown;
+      next_scheduled_run: string | Date;
+      status: string;
+    }[]>`
+      select schedule, next_scheduled_run, status from triggers where id = ${id}
+    `;
+    expect(final).toMatchObject({ schedule: ownerSchedule, status: 'active' });
+    expect(new Date(final!.next_scheduled_run).toISOString()).toBe(ownerNext.toISOString());
+  });
+
+  it('auto-pauses a recurring schedule that has no future occurrence', async () => {
+    const now = new Date('2025-03-01T12:00:00.000Z');
+    const id = await insertTrigger({
+      // The next leap day is beyond the scheduler's 400-day scan cap.
+      schedule: { month: 2, day: 29, hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: new Date(now.getTime() - 60_000),
+    });
+    let calls = 0;
+    const scheduler = makeScheduler({
+      now: () => now,
+      runTask: async () => {
+        calls += 1;
+      },
+    });
+
+    expect((await scheduler.tick()).outcomes).toContainEqual({
+      triggerId: id,
+      outcome: 'fired',
+    });
+    expect(calls).toBe(1);
+    const row = await readTrigger(id);
+    expect(row.status).toBe('paused');
+    expect(row.next_scheduled_run).toBeNull();
+    expect(row.last_error).toContain('auto-paused: schedule has no future occurrence');
+    expect(row.error_count).toBe(1);
+  });
+
   it('finishes one-time tasks after firing (status finished, next null)', async () => {
     const at = new Date(Date.now() - 30_000).toISOString();
     const id = await insertTrigger({
@@ -300,6 +393,56 @@ describe('TaskScheduler.tick', () => {
     expect(new Date(row.next_scheduled_run!).getTime()).toBeGreaterThan(Date.now());
     expect(row.last_error).toMatch(/^missed fire at .* \(api was down\)$/);
     expect(row.error_count).toBe(3); // advisory only — NOT incremented
+  });
+
+  it('does not let a stale missed-fire worker overwrite an owner reschedule', async () => {
+    const dueAt = new Date('2026-08-08T01:00:00.000Z');
+    const ownerNext = new Date('2026-08-10T18:15:00.000Z');
+    const ownerSchedule = { hour: 18, minute: 15, timezone: 'UTC' };
+    const id = await insertTrigger({
+      schedule: { hour: 9, minute: 30, timezone: 'UTC' },
+      nextScheduledRun: dueAt,
+    });
+    let releaseMissed!: () => void;
+    let markMissedEntered!: () => void;
+    const missedGate = new Promise<void>((resolve) => {
+      releaseMissed = resolve;
+    });
+    const missedEntered = new Promise<void>((resolve) => {
+      markMissedEntered = resolve;
+    });
+    const scheduler = makeScheduler({
+      now: () => new Date('2026-08-08T09:00:00.000Z'),
+      beforeMissedFirePersistence: async (selected) => {
+        if (selected.id !== id) return;
+        markMissedEntered();
+        await missedGate;
+      },
+    });
+
+    const ticking = scheduler.tick();
+    await missedEntered;
+    await pg`
+      update triggers
+      set schedule = ${JSON.stringify(ownerSchedule)}::jsonb,
+          next_scheduled_run = ${ownerNext.toISOString()},
+          last_error = null,
+          updated_at = now()
+      where id = ${id}
+    `;
+    releaseMissed();
+    await ticking;
+
+    const [final] = await pg<{
+      schedule: unknown;
+      next_scheduled_run: string | Date;
+      last_error: string | null;
+    }[]>`
+      select schedule, next_scheduled_run, last_error from triggers where id = ${id}
+    `;
+    expect(final!.schedule).toEqual(ownerSchedule);
+    expect(new Date(final!.next_scheduled_run).toISOString()).toBe(ownerNext.toISOString());
+    expect(final!.last_error).toBeNull();
   });
 
   it('fires late when the miss is within the grace window', async () => {
