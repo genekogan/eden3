@@ -307,6 +307,7 @@ describe("lib/api browser transport", () => {
         isAdmin: true,
       },
       manna: { balance: 12, subscriptionBalance: 3 },
+      accessGated: false,
     });
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe("/api/auth/me");

@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
+import { AccessGate } from "@/components/AccessGate";
 import { AppShell } from "@/components/shell/app-shell";
 import { DevUserGate } from "@/components/DevUserGate";
 import { ErrorBoundary } from "@/components/error-boundary";
@@ -36,7 +37,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <ThemeProvider>
           <AppShell>
             <ErrorBoundary>
-              <DevUserGate>{children}</DevUserGate>
+              <DevUserGate>
+                <AccessGate>{children}</AccessGate>
+              </DevUserGate>
             </ErrorBoundary>
           </AppShell>
         </ThemeProvider>
