@@ -17,6 +17,8 @@
  */
 import { z } from 'zod';
 
+import { appNotificationKindSchema } from './dto';
+
 const uuid = z.string().uuid();
 
 // ---------------------------------------------------------------------------
@@ -96,6 +98,14 @@ export const errorEventSchema = z.object({
 });
 export type ErrorEvent = z.infer<typeof errorEventSchema>;
 
+/** A durable notification was committed for the authenticated account. */
+export const notificationCreatedEventSchema = z.object({
+  type: z.literal('notification.created'),
+  notificationId: uuid,
+  kind: appNotificationKindSchema,
+});
+export type NotificationCreatedEvent = z.infer<typeof notificationCreatedEventSchema>;
+
 // ---------------------------------------------------------------------------
 // Discriminated union
 // ---------------------------------------------------------------------------
@@ -107,6 +117,7 @@ export const sessionEventSchema = z.discriminatedUnion('type', [
   mediaPendingEventSchema,
   mediaAttachedEventSchema,
   mannaUpdatedEventSchema,
+  notificationCreatedEventSchema,
   errorEventSchema,
 ]);
 export type SessionEvent = z.infer<typeof sessionEventSchema>;
@@ -119,6 +130,7 @@ export const SESSION_EVENT_TYPES = [
   'media.pending',
   'media.attached',
   'manna.updated',
+  'notification.created',
   'error',
 ] as const satisfies readonly SessionEventType[];
 

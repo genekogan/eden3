@@ -42,6 +42,11 @@ const fixtures: SessionEvent[] = [
     creationId: ids.creation,
   },
   { type: 'manna.updated', accountId: ids.account, balance: 42.5 },
+  {
+    type: 'notification.created',
+    notificationId: ids.message,
+    kind: 'agent_build_ready',
+  },
   { type: 'error', turnId: ids.turn, code: 'gateway_error', message: 'upstream 502' },
   { type: 'error', code: 'insufficient_manna', message: 'balance is 0' },
 ];

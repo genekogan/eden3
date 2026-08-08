@@ -137,6 +137,34 @@ export const agentDto = z.object({
 export type AgentDto = z.infer<typeof agentDto>;
 
 // ---------------------------------------------------------------------------
+// In-app notifications
+// ---------------------------------------------------------------------------
+
+export const APP_NOTIFICATION_KINDS = [
+  'agent_build_ready',
+  'agent_build_failed',
+] as const;
+export const appNotificationKindSchema = z.enum(APP_NOTIFICATION_KINDS);
+export type AppNotificationKind = z.infer<typeof appNotificationKindSchema>;
+
+export const appNotificationDto = z.object({
+  id: uuidSchema,
+  kind: appNotificationKindSchema,
+  sourceAgent: accountSummaryDto,
+  /** Constrained same-app destination; never an arbitrary/external URL. */
+  targetPath: z.string().regex(/^\/agents\/[a-z0-9][a-z0-9_-]{2,31}$/).nullable(),
+  readAt: isoDateTimeSchema.nullable(),
+  createdAt: isoDateTimeSchema,
+});
+export type AppNotificationDto = z.infer<typeof appNotificationDto>;
+
+export const appNotificationsResponseDto = z.object({
+  items: z.array(appNotificationDto),
+  unreadCount: z.number().int().nonnegative(),
+});
+export type AppNotificationsResponseDto = z.infer<typeof appNotificationsResponseDto>;
+
+// ---------------------------------------------------------------------------
 // Session
 // ---------------------------------------------------------------------------
 

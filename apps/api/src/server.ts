@@ -22,6 +22,7 @@ import { ensureBuiltinSkills } from './services/agent-skills';
 import { ensureEveAssistant } from './services/default-assistant';
 import { registerHttpHardening } from './services/http-hardening';
 import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './services/history-sync';
+import { AgentProvisioningWorker } from './services/agent-provisioning';
 import { AgentRuntimeSyncScheduler } from './services/agent-runtime-sync';
 import { MediaPipeline } from './services/media-pipeline';
 import {
@@ -54,6 +55,7 @@ import { devRoutes } from './routes/dev';
 import { feedRoutes } from './routes/feed';
 import { mannaRoutes } from './routes/manna';
 import { mediaObjectRoutes } from './routes/media-objects';
+import { notificationsRoutes, type NotificationsRoutesOptions } from './routes/notifications';
 import { operatorRoutes } from './routes/operator';
 import { searchRoutes } from './routes/search';
 import { sessionShareRoutes } from './routes/session-shares';
@@ -88,6 +90,14 @@ export interface BuildServerOptions {
    * (see gateway-glue.ts).
    */
   provisioning?: GatewayGlueOptions;
+  /** Async agent-build worker timing overrides for deterministic tests. */
+  agentProvisioning?: {
+    intervalMs?: number;
+    leaseMs?: number;
+    retryMs?: number;
+    maxAttempts?: number;
+    batchSize?: number;
+  };
   /**
    * Media-pipeline hook: called for every `MEDIA:`/`Attachment:` line
    * history-sync finds in a gateway transcript (see services/history-sync).
@@ -126,6 +136,7 @@ export interface BuildServerOptions {
     autoStart?: boolean;
   };
   shares?: { repository: SessionShareRepository };
+  notifications?: NotificationsRoutesOptions;
 }
 
 declare module 'fastify' {
@@ -144,6 +155,8 @@ declare module 'fastify' {
     turnReservationReaper: TurnReservationReaper;
     /** Eden-managed, activity-gated native deep + metered REM loop. */
     memoryDreamScheduler: MemoryDreamScheduler | null;
+    /** Durable, fenced async agent-build worker (tests may drive tick()). */
+    agentProvisioningWorker: AgentProvisioningWorker;
   }
 }
 
@@ -383,6 +396,25 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // real clients by default, fakes injectable via opts.provisioning.
   app.decorate('gatewayGlue', new GatewayGlue(opts.provisioning));
 
+  const agentProvisioningWorker = new AgentProvisioningWorker({
+    provisioner: {
+      provisionAgent: (params, options) =>
+        app.gatewayGlue.provisioner.provisionAgent(params, options),
+      updateAgentPersona: (params) => app.gatewayGlue.provisioner.updateAgentPersona(params),
+    },
+    skillSync: {
+      syncAgentSkills: (params) => app.gatewayGlue.skillSync.syncAgentSkills(params),
+    },
+    toolSync: {
+      syncAgentToolGroups: (params) => app.gatewayGlue.toolSync.syncAgentToolGroups(params),
+    },
+    bus: app.eventsBus,
+    logger: app.log,
+    ...(opts.agentProvisioning ?? {}),
+  });
+  app.decorate('agentProvisioningWorker', agentProvisioningWorker);
+  app.addHook('onClose', async () => agentProvisioningWorker.stop());
+
   // DB-authoritative runtime/persona convergence. Route edits attempt an
   // immediate fenced sync; this independent loop closes every process-death,
   // gateway-outage, and partial-filesystem-restore window from the durable
@@ -487,6 +519,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   });
   if (opts.scheduler?.autoStart === true) memoryDreamScheduler?.start();
   await ensureBuiltinSkills();
+  if (opts.scheduler?.autoStart === true) agentProvisioningWorker.start();
   await ensureEveAssistant({
     // The real API entrypoint starts the media watcher and talks to the live
     // gateway. In that mode @eve must also sync OpenClaw's default workspace;
@@ -499,6 +532,10 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
   await app.register(chatRoutes, { prefix: '/sessions' }); // POST /sessions/:idOrNew/messages
   await app.register(authRoutes, { prefix: '/auth' });
+  await app.register(notificationsRoutes, {
+    prefix: '/notifications',
+    ...(opts.notifications ?? {}),
+  });
   await app.register(accountRoutes, { prefix: '/account' });
   await app.register(sessionsRoutes, { prefix: '/sessions' });
   await app.register(agentsRoutes, { prefix: '/agents' });

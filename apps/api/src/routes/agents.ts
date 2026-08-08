@@ -10,7 +10,7 @@ import {
   type AuthSession,
   type MediaStore,
 } from '@eden3/core';
-import { accounts, agents, db, pg, type Account, type Agent } from '@eden3/db';
+import { agentProvisionJobs, accounts, agents, db, pg, type Account, type Agent } from '@eden3/db';
 import {
   DEFAULT_AGENT_MODEL,
   DEFAULT_AGENT_THINKING_LEVEL,
@@ -828,7 +828,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     const body = createBodySchema.parse(req.body);
 
     // Fail fast (503) when the gateway is unconfigured — before any rows land.
-    const provisioner = app.gatewayGlue.provisioner;
+    void app.gatewayGlue.provisioner;
     const quotaError = await nativeAgentQuotaError(viewer);
     if (quotaError) {
       return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
@@ -867,6 +867,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
           })
           .returning();
         if (!agent) throw new Error('agents insert returned no row');
+        await tx.insert(agentProvisionJobs).values({ agentAccountId: account.id });
         return { account, agent };
       });
     } catch (err) {
@@ -876,51 +877,11 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       throw err;
     }
 
-    let provisionStatus: 'ready' | 'failed' = 'ready';
-    let workspacePath: string | null = null;
-    try {
-      const result = await provisioner.provisionAgent({
-        openclawId: body.username,
-        name: body.name,
-        username: body.username,
-        description: body.description,
-        persona: body.persona,
-        greeting: body.greeting,
-        voice: body.voice,
-        thinkingLevel: body.thinkingLevel,
-        model: body.model,
-      });
-      workspacePath = result.hostWorkspaceDir;
-      await installDefaultAgentSkills({
-        agentId: created.account.id,
-        openclawId: body.username,
-        workspacePath,
-        skillSync: app.gatewayGlue.skillSync,
-      });
-      await app.gatewayGlue.toolSync.syncAgentToolGroups({
-        openclawId: body.username,
-        toolGroups: body.toolGroups,
-      });
-    } catch (err) {
-      provisionStatus = 'failed';
-      req.log.error({ err }, `provisioning failed for agent "${body.username}"`);
-    }
-
-    const [updatedAgent] = await db
-      .update(agents)
-      .set({
-        provisionStatus,
-        ...(provisionStatus === 'ready'
-          ? { provisionedAt: new Date(), workspacePath }
-          : {}),
-      })
-      .where(eq(agents.accountId, created.account.id))
-      .returning();
-
+    app.agentProvisioningWorker.wake();
     return reply.code(201).send({
-      agent: agentDtoFromEntities(created.account, updatedAgent ?? created.agent, {
+      agent: agentDtoFromEntities(created.account, created.agent, {
         includePersona: true,
-        agentRuntime: await runtimeForModel((updatedAgent ?? created.agent).model),
+        agentRuntime: await runtimeForModel(created.agent.model),
       }),
     });
   });
