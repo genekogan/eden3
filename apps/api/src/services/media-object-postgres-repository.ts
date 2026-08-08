@@ -14,6 +14,7 @@ interface Row {
   verified_size_bytes: string | number | null;
   verified_sha256: string | null;
   public_reference_owner_account_id: string | null;
+  share_reference_active: boolean;
 }
 
 function nullableSize(raw: string | number | null): number | null {
@@ -25,7 +26,10 @@ function nullableSize(raw: string | number | null): number | null {
 
 /** Safe projection only; backing locators never leave the resolver layer. */
 export class PostgresMediaObjectRepository implements MediaObjectRepository {
-  async findById(objectId: string): Promise<MediaObjectRecord | null> {
+  async findById(
+    objectId: string,
+    shareTokenHash: string | null = null,
+  ): Promise<MediaObjectRecord | null> {
     const durableUrl = `/media/${objectId}`;
     const rows = await pg<Row[]>`
       select o.id, o.owner_account_id, o.display_name, o.state, o.backing_store,
@@ -47,7 +51,47 @@ export class PostgresMediaObjectRepository implements MediaObjectRepository {
                    or (o.legacy_source_url is not null and c.thumbnail_url = o.legacy_source_url)
                  )
                limit 1
-             ) as public_reference_owner_account_id
+             ) as public_reference_owner_account_id,
+             case when ${shareTokenHash}::text is null then false else exists (
+               select 1
+               from session_share_links sl
+               where sl.token_hash = ${shareTokenHash}
+                 and sl.revoked_at is null
+                 and (
+                   (
+                     sl.mode = 'snapshot'
+                     and jsonb_path_exists(
+                       sl.snapshot_payload,
+                       '$.messages[*].attachments[*] ? (@.url == $url)',
+                       jsonb_build_object('url', ${durableUrl})
+                     )
+                   )
+                   or (
+                     sl.mode = 'live'
+                     and exists (
+                       select 1
+                       from messages m
+                       cross join lateral jsonb_array_elements(
+                         case
+                           when jsonb_typeof(m.attachments) = 'array' then m.attachments
+                           else '[]'::jsonb
+                         end
+                       ) attachment(value)
+                       where m.session_id = sl.session_id
+                         and (
+                           (
+                             jsonb_typeof(attachment.value) = 'string'
+                             and attachment.value #>> '{}' = ${durableUrl}
+                           )
+                           or (
+                             jsonb_typeof(attachment.value) = 'object'
+                             and attachment.value->>'url' = ${durableUrl}
+                           )
+                         )
+                     )
+                   )
+                 )
+             end as share_reference_active
       from storage_objects o
       where o.id = ${objectId}
       limit 1
@@ -65,6 +109,7 @@ export class PostgresMediaObjectRepository implements MediaObjectRepository {
       verifiedSizeBytes: nullableSize(row.verified_size_bytes),
       verifiedSha256: row.verified_sha256,
       publicReferenceOwnerAccountId: row.public_reference_owner_account_id,
+      shareReferenceActive: row.share_reference_active,
     } : null;
   }
 }

@@ -178,7 +178,11 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         {
           requestId: req.id,
           method: req.method,
-          url: req.url.startsWith('/shares/') ? '/shares/[redacted]' : req.url,
+          url: req.url.startsWith('/shares/')
+            ? '/shares/[redacted]'
+            : req.url.startsWith('/media/share/')
+              ? '/media/share/[redacted]'
+              : req.url,
           statusCode: reply.statusCode,
           elapsedMs: Number(reply.elapsedTime.toFixed(1)),
           ...(sessionId ? { sessionId } : {}),

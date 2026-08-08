@@ -47,12 +47,15 @@ export interface AuthPluginOptions {
 const GATE_EXEMPT_EXACT = new Set(['/health', '/billing/webhook']);
 const GATE_EXEMPT_PREFIXES = ['/auth/', '/dev/'] as const;
 const PUBLIC_SHARE_PATH = /^\/shares\/[^/]+$/;
+const PUBLIC_SHARE_MEDIA_PATH =
+  /^\/media\/share\/[^/]+\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 
 function isGateExempt(method: string, url: string): boolean {
   const path = url.split('?', 1)[0]!;
   return (
     GATE_EXEMPT_EXACT.has(path) ||
-    ((method === 'GET' || method === 'HEAD') && PUBLIC_SHARE_PATH.test(path)) ||
+    ((method === 'GET' || method === 'HEAD') &&
+      (PUBLIC_SHARE_PATH.test(path) || PUBLIC_SHARE_MEDIA_PATH.test(path))) ||
     GATE_EXEMPT_PREFIXES.some((prefix) =>
       path === prefix.slice(0, -1) || path.startsWith(prefix),
     )

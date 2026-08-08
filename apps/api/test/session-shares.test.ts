@@ -22,6 +22,7 @@ const STRANGER_ID = '00000000-0000-4000-8000-000000000004';
 const MESSAGE_ONE = '00000000-0000-4000-8000-000000000011';
 const MESSAGE_TWO = '00000000-0000-4000-8000-000000000012';
 const MESSAGE_THREE = '00000000-0000-4000-8000-000000000013';
+const PRIVATE_OBJECT_ID = '00000000-0000-4000-8000-000000000021';
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -45,6 +46,12 @@ class MemoryShareRepository implements SessionShareRepository {
             mime: 'image/png',
             width: 640,
             height: 480,
+          },
+          {
+            url: `/media/${PRIVATE_OBJECT_ID}`,
+            mime: 'image/png',
+            width: null,
+            height: null,
           },
         ],
         createdAt: '2026-08-08T10:00:00.000Z',
@@ -173,7 +180,10 @@ describe('session share service', () => {
     expect(fixedPublic?.snapshot.messages[0]).toMatchObject({
       id: MESSAGE_ONE,
       content: 'Original question',
-      attachments: [{ url: 'https://cdn.example.test/reference.png' }],
+      attachments: [
+        { url: 'https://cdn.example.test/reference.png' },
+        { url: `/media/share/${snapshot.token}/${PRIVATE_OBJECT_ID}` },
+      ],
     });
     expect((await service.resolvePublic(live.token))?.snapshot.messages.at(-1)?.content).toBe(
       'Live append',

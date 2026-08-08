@@ -5,14 +5,20 @@ import { z } from 'zod';
 
 import { ApiError } from '../errors';
 import type { MediaObjectResolver } from '../services/media-object-repository';
+import { hashSessionShareToken } from '../services/session-shares';
 
 export interface MediaObjectRoutesOptions {
   resolver: MediaObjectResolver;
 }
 
 const paramsSchema = z.object({ objectId: z.string().uuid() });
+const shareParamsSchema = paramsSchema.extend({
+  token: z.string().regex(/^[A-Za-z0-9_-]{32,200}$/),
+});
 const objectRoute =
   '/media/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
+const sharedObjectRoute =
+  '/media/share/:token(^[A-Za-z0-9_-]{32,200}$)/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
 
 interface ByteRange {
   start: number;
@@ -44,7 +50,16 @@ function parseRange(value: string | undefined, size: number): ByteRange | null {
 export const mediaObjectRoutes: FastifyPluginAsync<MediaObjectRoutesOptions> = async (app, options) => {
   const handle = async (request: FastifyRequest, reply: FastifyReply) => {
     const { objectId } = paramsSchema.parse(request.params);
-    const resolved = await options.resolver.resolve(objectId, request.account?.accountId ?? null);
+    const rawParams = request.params as Record<string, unknown>;
+    const shareTokenHash =
+      typeof rawParams.token === 'string'
+        ? hashSessionShareToken(shareParamsSchema.parse(rawParams).token)
+        : null;
+    const resolved = await options.resolver.resolve(
+      objectId,
+      request.account?.accountId ?? null,
+      shareTokenHash,
+    );
     reply.header('accept-ranges', 'bytes');
     reply.header('content-type', resolved.mime);
     reply.header('etag', `"${resolved.sha256}"`);
@@ -81,6 +96,8 @@ export const mediaObjectRoutes: FastifyPluginAsync<MediaObjectRoutesOptions> = a
     return reply.send(stream);
   };
 
+  app.get(sharedObjectRoute, { exposeHeadRoute: false }, handle);
+  app.head(sharedObjectRoute, handle);
   app.get(objectRoute, { exposeHeadRoute: false }, handle);
   app.head(objectRoute, handle);
 };

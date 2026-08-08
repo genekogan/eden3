@@ -25,6 +25,8 @@ describe('closed-alpha public share gate seam', () => {
     app.post('/sessions/:sessionId/shares', async () => ({ managed: true }));
     app.delete('/sessions/:sessionId/shares/:shareId', async () => ({ managed: true }));
     app.post('/shares/:token', async () => ({ mutated: true }));
+    app.get('/media/share/:token/:objectId', { exposeHeadRoute: false }, async () => ({ media: true }));
+    app.head('/media/share/:token/:objectId', async (_request, reply) => reply.send());
     return app;
   }
 
@@ -41,12 +43,27 @@ describe('closed-alpha public share gate seam', () => {
     },
   );
 
+  it.each(['GET', 'HEAD'] as const)(
+    'allows anonymous %s of an exact share-scoped media capability',
+    async (method) => {
+      const app = await setup();
+      const response = await app.inject({
+        method,
+        url: `/media/share/${'x'.repeat(32)}/00000000-0000-4000-8000-000000000001`,
+      });
+      expect(response.statusCode).toBe(200);
+      if (method === 'GET') expect(response.json()).toEqual({ media: true });
+    },
+  );
+
   it.each([
     ['GET', '/sessions/session-1/shares'],
     ['POST', '/sessions/session-1/shares'],
     ['DELETE', '/sessions/session-1/shares/00000000-0000-4000-8000-000000000001'],
     ['POST', `/shares/${'x'.repeat(32)}`],
     ['GET', `/shares/${'x'.repeat(32)}/extra`],
+    ['POST', `/media/share/${'x'.repeat(32)}/00000000-0000-4000-8000-000000000001`],
+    ['GET', `/media/share/${'x'.repeat(32)}/not-a-uuid`],
   ] as const)('keeps %s %s behind the gate', async (method, url) => {
     const app = await setup();
     const response = await app.inject({ method, url });

@@ -69,6 +69,34 @@ export function hashSessionShareToken(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex');
 }
 
+const PRIVATE_OBJECT_PATH = /^\/media\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+
+/**
+ * Turn private lifecycle-object references into revocable, share-scoped media
+ * capabilities. External and legacy media URLs remain byte-for-byte intact.
+ */
+function scopePrivateMediaUrls(
+  share: PublicSessionShareDto,
+  token: string,
+): PublicSessionShareDto {
+  const scopedToken = encodeURIComponent(token);
+  return {
+    ...share,
+    snapshot: {
+      ...share.snapshot,
+      messages: share.snapshot.messages.map((message) => ({
+        ...message,
+        attachments: message.attachments.map((attachment) => {
+          const match = PRIVATE_OBJECT_PATH.exec(attachment.url);
+          return match
+            ? { ...attachment, url: `/media/share/${scopedToken}/${match[1]}` }
+            : attachment;
+        }),
+      })),
+    },
+  };
+}
+
 function serviceError(status: CreateSessionShareResult['status']): SessionShareServiceError {
   if (status === 'forbidden') return new SessionShareServiceError('share_forbidden');
   if (status === 'invalid_boundary') return new SessionShareServiceError('invalid_boundary');
@@ -141,9 +169,9 @@ export class SessionShareService {
     if (!/^[A-Za-z0-9_-]{32,}$/.test(token)) return null;
     const result = await this.repository.resolvePublic(hashSessionShareToken(token));
     if (!result) return null;
-    return publicSessionShareDto.parse({
+    return scopePrivateMediaUrls(publicSessionShareDto.parse({
       ...result,
       snapshot: publicSessionSnapshotDto.parse(result.snapshot),
-    });
+    }), token);
   }
 }

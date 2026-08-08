@@ -15,10 +15,12 @@ export interface MediaObjectRecord {
   verifiedSha256: string | null;
   /** Owner id of an eligible public creation reference, otherwise null. */
   publicReferenceOwnerAccountId: string | null;
+  /** True only when the supplied active share token references this object. */
+  shareReferenceActive: boolean;
 }
 
 export interface MediaObjectRepository {
-  findById(objectId: string): Promise<MediaObjectRecord | null>;
+  findById(objectId: string, shareTokenHash?: string | null): Promise<MediaObjectRecord | null>;
 }
 
 export interface MediaObjectHydrator {
@@ -55,8 +57,12 @@ export class MediaObjectResolver {
     readonly hydrator: MediaObjectHydrator,
   ) {}
 
-  async resolve(objectId: string, viewerAccountId: string | null): Promise<ResolvedMediaObject> {
-    const row = await this.repository.findById(objectId);
+  async resolve(
+    objectId: string,
+    viewerAccountId: string | null,
+    shareTokenHash: string | null = null,
+  ): Promise<ResolvedMediaObject> {
+    const row = await this.repository.findById(objectId, shareTokenHash);
     if (
       !row ||
       row.state !== 'available' ||
@@ -71,7 +77,11 @@ export class MediaObjectResolver {
       throw notFound();
     }
     const publiclyReferenced = row.publicReferenceOwnerAccountId === row.ownerAccountId;
-    if (viewerAccountId !== row.ownerAccountId && !publiclyReferenced) throw notFound();
+    if (
+      viewerAccountId !== row.ownerAccountId &&
+      !publiclyReferenced &&
+      !row.shareReferenceActive
+    ) throw notFound();
     return {
       objectId: row.id,
       displayName: row.displayName,

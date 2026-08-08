@@ -12,10 +12,12 @@ import {
   type MediaObjectRecord,
   type MediaObjectRepository,
 } from '../src/services/media-object-repository';
+import { hashSessionShareToken } from '../src/services/session-shares';
 
 const OBJECT_ID = '00000000-0000-4000-8000-000000000001';
 const OWNER = '00000000-0000-4000-8000-00000000000a';
 const OTHER = '00000000-0000-4000-8000-00000000000b';
+const SHARE_TOKEN = 's'.repeat(43);
 
 function record(overrides: Partial<MediaObjectRecord> = {}): MediaObjectRecord {
   return {
@@ -30,13 +32,18 @@ function record(overrides: Partial<MediaObjectRecord> = {}): MediaObjectRecord {
     verifiedSizeBytes: 10,
     verifiedSha256: 'a'.repeat(64),
     publicReferenceOwnerAccountId: null,
+    shareReferenceActive: false,
     ...overrides,
   };
 }
 
 class FakeRepository implements MediaObjectRepository {
   row: MediaObjectRecord | null = record();
-  async findById() { return this.row; }
+  lastShareTokenHash: string | null = null;
+  async findById(_objectId: string, shareTokenHash: string | null = null) {
+    this.lastShareTokenHash = shareTokenHash;
+    return this.row;
+  }
 }
 
 describe('GET /media/:objectId lifecycle boundary', () => {
@@ -167,6 +174,27 @@ describe('GET /media/:objectId lifecycle boundary', () => {
     const response = await app.inject({ method: 'GET', url: `/media/${OBJECT_ID}` });
     expect(response.statusCode).toBe(404);
     expect(counts().hydrations).toBe(0);
+  });
+
+  it('serves an exact active share reference and fails closed after revocation', async () => {
+    const { app, repository, counts } = await setup();
+    repository.row = record({ shareReferenceActive: true });
+    const shared = await app.inject({
+      method: 'GET',
+      url: `/media/share/${SHARE_TOKEN}/${OBJECT_ID}`,
+    });
+    expect(shared.statusCode).toBe(200);
+    expect(shared.body).toBe('0123456789');
+    expect(repository.lastShareTokenHash).toBe(hashSessionShareToken(SHARE_TOKEN));
+    expect(shared.headers['cache-control']).toBe('private, no-store');
+
+    repository.row = record({ shareReferenceActive: false });
+    const revoked = await app.inject({
+      method: 'GET',
+      url: `/media/share/${SHARE_TOKEN}/${OBJECT_ID}`,
+    });
+    expect(revoked.statusCode).toBe(404);
+    expect(counts().hydrations).toBe(1);
   });
 
   it('keeps the Postgres public-reference query owner-bound and moderation-bound', async () => {
