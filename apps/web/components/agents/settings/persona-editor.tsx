@@ -110,12 +110,18 @@ export function PersonaEditor({ username }: { username: string }) {
       setToast("Saved — the soul shapes the very next message.");
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
-        const body = (error.body ?? {}) as Partial<WorkspaceWriteConflict>;
-        setConflict({
-          currentSha256: body.currentSha256 ?? null,
-          currentMtime: body.currentMtime ?? null,
-          currentRevision: body.currentRevision,
-        });
+        const body = (error.body ?? {}) as Partial<WorkspaceWriteConflict> & {
+          error?: { code?: string };
+        };
+        if (body.error?.code === "workspace_sync_busy") {
+          setActionError("The agent is finishing a Workspace sync. Retry Save in a moment.");
+        } else {
+          setConflict({
+            currentSha256: body.currentSha256 ?? null,
+            currentMtime: body.currentMtime ?? null,
+            currentRevision: body.currentRevision,
+          });
+        }
       } else if (error instanceof ApiError && error.status === 422) {
         setDoctrineError(error.message);
       } else {

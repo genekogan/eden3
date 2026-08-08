@@ -289,12 +289,18 @@ export function AgentWorkspacePanel({
       void loadTree();
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
-        const body = (error.body ?? {}) as Partial<WorkspaceWriteConflict>;
-        setConflict({
-          currentSha256: body.currentSha256 ?? null,
-          currentMtime: body.currentMtime ?? null,
-          currentRevision: body.currentRevision,
-        });
+        const body = (error.body ?? {}) as Partial<WorkspaceWriteConflict> & {
+          error?: { code?: string };
+        };
+        if (body.error?.code === "workspace_sync_busy") {
+          setActionError("The agent is finishing a Settings sync. Retry Save in a moment.");
+        } else {
+          setConflict({
+            currentSha256: body.currentSha256 ?? null,
+            currentMtime: body.currentMtime ?? null,
+            currentRevision: body.currentRevision,
+          });
+        }
       } else {
         setActionError(describeApiFailure(error));
       }

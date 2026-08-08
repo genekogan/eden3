@@ -237,7 +237,17 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
         // The runtime projector owns this exact cross-process session-lock
         // identity. Taking its transaction-scoped form first ensures no stale
         // renderer can resume after this filesystem write and clobber it.
-        await tx`select pg_advisory_xact_lock(hashtextextended(${agentRuntimeSyncLockKey(account.id)}::text, ${AGENT_RUNTIME_SYNC_LOCK_SEED}))`;
+        const runtimeLock = await tx<{ locked: boolean }[]>`
+          select pg_try_advisory_xact_lock(
+            hashtextextended(
+              ${agentRuntimeSyncLockKey(account.id)}::text,
+              ${AGENT_RUNTIME_SYNC_LOCK_SEED}
+            )
+          ) as locked
+        `;
+        if (runtimeLock[0]?.locked !== true) {
+          return { ok: false as const, busy: true as const };
+        }
         // Match PATCH /agents/:username's desired-row lock namespace after the
         // external-mutation fence. Settings releases seed 91 before it enters
         // runtime synchronization, so this order cannot cycle with PATCH.
@@ -298,6 +308,19 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
       });
 
       if (!outcome.ok) {
+        if ('busy' in outcome) {
+          return reply
+            .header('retry-after', '1')
+            .code(409)
+            .send({
+              ...errorEnvelope(
+                409,
+                'workspace_sync_busy',
+                'The agent is finishing a Settings sync — retry this save in a moment',
+              ),
+              retryable: true,
+            });
+        }
         return reply.code(409).send({
           ...errorEnvelope(
             409,

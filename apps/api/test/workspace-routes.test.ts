@@ -970,7 +970,7 @@ describe('PUT /agents/:username/workspace/file', () => {
     expect(afterRow).toEqual(beforeRow);
   });
 
-  it('waits for an active runtime projector before committing a newer SOUL revision', async () => {
+  it('fails busy without pool starvation, then saves after the active projector releases', async () => {
     const oldPersona = 'You are the Files Agent. Projector revision.';
     await writeFile(path.join(wsRace, 'SOUL.md'), oldPersona);
     const [pending] = await pg<{ runtime_sync_version: number }[]>`
@@ -1018,22 +1018,52 @@ describe('PUT /agents/:username/workspace/file', () => {
     ).file;
     expect(loaded.doctrineRevision).toBe(pending!.runtime_sync_version);
     const winnerPersona = 'You are the Files Agent. Workspace winner.';
-    let saveSettled = false;
-    const savePromise = app.inject({
-      method: 'PUT',
-      url: `${treeUrl(agentRace)}/file`,
-      headers: asOwner,
-      payload: {
-        path: 'SOUL.md',
-        content: winnerPersona,
-        baseSha256: loaded.sha256,
-        baseRevision: loaded.doctrineRevision,
-      },
-    }).finally(() => {
-      saveSettled = true;
-    });
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    expect(saveSettled).toBe(false);
+    const save = (content: string) =>
+      app.inject({
+        method: 'PUT',
+        url: `${treeUrl(agentRace)}/file`,
+        headers: asOwner,
+        payload: {
+          path: 'SOUL.md',
+          content,
+          baseSha256: loaded.sha256,
+          baseRevision: loaded.doctrineRevision,
+        },
+      });
+    let saturationTimeout: NodeJS.Timeout | undefined;
+    const busyResponses = await Promise.race([
+      Promise.all(
+        Array.from({ length: 12 }, (_, index) => save(`${winnerPersona} contender ${index}`)),
+      ),
+      new Promise<never>((_, reject) => {
+        saturationTimeout = setTimeout(
+          () => reject(new Error('seed-92 busy responses exhausted the database pool')),
+          2_000,
+        );
+      }),
+    ]);
+    if (saturationTimeout) clearTimeout(saturationTimeout);
+    expect(busyResponses).toHaveLength(12);
+    for (const response of busyResponses) {
+      expect(response.statusCode).toBe(409);
+      expect(response.headers['retry-after']).toBe('1');
+      expect(response.json()).toMatchObject({
+        error: { code: 'workspace_sync_busy' },
+        retryable: true,
+      });
+    }
+    expect(await readFile(path.join(wsRace, 'SOUL.md'), 'utf8')).toBe(oldPersona);
+    const [whileBusy] = await pg<{
+      persona: string | null;
+      runtime_sync_version: number;
+      runtime_sync_claim_token: string | null;
+    }[]>`
+      select persona, runtime_sync_version, runtime_sync_claim_token
+      from agents where account_id = ${agentRaceId}
+    `;
+    expect(whileBusy!.persona).toBe(oldPersona);
+    expect(whileBusy!.runtime_sync_version).toBe(pending!.runtime_sync_version);
+    expect(whileBusy!.runtime_sync_claim_token).toEqual(expect.any(String));
 
     pause = false;
     releaseProjector();
@@ -1041,9 +1071,9 @@ describe('PUT /agents/:username/workspace/file', () => {
       status: 'synced',
       version: pending!.runtime_sync_version,
     });
-    const save = await savePromise;
-    expect(save.statusCode).toBe(200);
-    const saved = (save.json() as TextFileBody).file;
+    const retry = await save(winnerPersona);
+    expect(retry.statusCode).toBe(200);
+    const saved = (retry.json() as TextFileBody).file;
     expect(saved.doctrineRevision).toBe(pending!.runtime_sync_version + 1);
     expect(await readFile(path.join(wsRace, 'SOUL.md'), 'utf8')).toBe(winnerPersona);
 
