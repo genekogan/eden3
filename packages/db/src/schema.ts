@@ -1818,6 +1818,141 @@ export const agentProvisionJobs = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// account_erasure_* — payload-free, restore-replayable deletion identifiers.
+// account_id intentionally has no FK: a WORM erasure ledger can be replayed
+// before the corresponding account row is restored. Migration 0040 owns the
+// lifecycle, ownership, write-fence, and cleanup-claim triggers.
+// ---------------------------------------------------------------------------
+export const accountErasureJobs = pgTable(
+  'account_erasure_jobs',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id').notNull(),
+    state: text('state', {
+      enum: ['intent_pending', 'claimed', 'manifest_pending', 'pending', 'attention', 'succeeded'],
+    }).notNull().default('intent_pending'),
+    acceptedAt: timestamptz('accepted_at').notNull().defaultNow(),
+    ledgerConfirmedAt: timestamptz('ledger_confirmed_at'),
+    ledgerSha256: text('ledger_sha256'),
+    ledgerMacSha256: text('ledger_mac_sha256'),
+    inventoriedAt: timestamptz('inventoried_at'),
+    inventorySha256: text('inventory_sha256'),
+    recoveryManifestConfirmedAt: timestamptz('recovery_manifest_confirmed_at'),
+    recoveryCiphertextSha256: text('recovery_ciphertext_sha256'),
+    recoveryMacSha256: text('recovery_mac_sha256'),
+    recoveryKeyVersion: integer('recovery_key_version'),
+    attemptCount: bigint('attempt_count', { mode: 'number' }).notNull().default(0),
+    nextAttemptAt: timestamptz('next_attempt_at').defaultNow(),
+    claimToken: uuid('claim_token'),
+    claimExpiresAt: timestamptz('claim_expires_at'),
+    completedAt: timestamptz('completed_at'),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('account_erasure_jobs_account_active_uq')
+      .on(t.accountId)
+      .where(sql`${t.state} <> 'succeeded'`),
+    index('account_erasure_jobs_due_idx')
+      .on(t.nextAttemptAt, t.id)
+      .where(sql`${t.state} in ('intent_pending', 'manifest_pending')`),
+    index('account_erasure_jobs_claim_expiry_idx')
+      .on(t.claimExpiresAt, t.id)
+      .where(sql`${t.state} = 'claimed'`),
+    check(
+      'account_erasure_jobs_state_check',
+      sql`${t.state} in ('intent_pending', 'claimed', 'manifest_pending', 'pending', 'attention', 'succeeded')`,
+    ),
+    check('account_erasure_jobs_attempt_check', sql`${t.attemptCount} >= 0`),
+    check(
+      'account_erasure_jobs_hash_check',
+      sql`(${t.ledgerSha256} is null or ${t.ledgerSha256} ~ '^[0-9a-f]{64}$') and (${t.ledgerMacSha256} is null or ${t.ledgerMacSha256} ~ '^[0-9a-f]{64}$') and (${t.inventorySha256} is null or ${t.inventorySha256} ~ '^[0-9a-f]{64}$') and (${t.recoveryCiphertextSha256} is null or ${t.recoveryCiphertextSha256} ~ '^[0-9a-f]{64}$') and (${t.recoveryMacSha256} is null or ${t.recoveryMacSha256} ~ '^[0-9a-f]{64}$')`,
+    ),
+    check(
+      'account_erasure_jobs_error_check',
+      sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z][a-z0-9_]{0,99}$'`,
+    ),
+    check(
+      'account_erasure_jobs_evidence_group_check',
+      sql`((${t.ledgerConfirmedAt} is null and ${t.ledgerSha256} is null and ${t.ledgerMacSha256} is null) or (${t.ledgerConfirmedAt} is not null and ${t.ledgerSha256} is not null and ${t.ledgerMacSha256} is not null)) and ((${t.inventoriedAt} is null and ${t.inventorySha256} is null) or (${t.inventoriedAt} is not null and ${t.inventorySha256} is not null)) and ((${t.recoveryManifestConfirmedAt} is null and ${t.recoveryCiphertextSha256} is null and ${t.recoveryMacSha256} is null and ${t.recoveryKeyVersion} is null) or (${t.recoveryManifestConfirmedAt} is not null and ${t.recoveryCiphertextSha256} is not null and ${t.recoveryMacSha256} is not null and ${t.recoveryKeyVersion} >= 1))`,
+    ),
+    check(
+      'account_erasure_jobs_shape_check',
+      sql`(${t.state} = 'intent_pending' and ${t.ledgerConfirmedAt} is null and ${t.inventoriedAt} is null and ${t.recoveryManifestConfirmedAt} is null and ${t.nextAttemptAt} is not null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is null) or (${t.state} = 'claimed' and ${t.claimToken} is not null and ${t.claimExpiresAt} is not null and ${t.nextAttemptAt} is null and ${t.completedAt} is null and ${t.lastErrorCode} is null and ((${t.ledgerConfirmedAt} is null and ${t.inventoriedAt} is null and ${t.recoveryManifestConfirmedAt} is null) or (${t.ledgerConfirmedAt} is not null and ${t.inventoriedAt} is not null and ${t.recoveryManifestConfirmedAt} is null))) or (${t.state} = 'manifest_pending' and ${t.ledgerConfirmedAt} is not null and ${t.inventoriedAt} is not null and ${t.recoveryManifestConfirmedAt} is null and ${t.nextAttemptAt} is not null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is null) or (${t.state} = 'pending' and ${t.ledgerConfirmedAt} is not null and ${t.inventoriedAt} is not null and ${t.recoveryManifestConfirmedAt} is not null and ${t.nextAttemptAt} is null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is null and ${t.lastErrorCode} is null) or (${t.state} = 'attention' and ${t.nextAttemptAt} is null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is null and ${t.lastErrorCode} is not null) or (${t.state} = 'succeeded' and ${t.ledgerConfirmedAt} is not null and ${t.inventoriedAt} is not null and ${t.recoveryManifestConfirmedAt} is not null and ${t.nextAttemptAt} is null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is not null and ${t.lastErrorCode} is null)`,
+    ),
+  ],
+);
+
+export const accountErasureTargets = pgTable(
+  'account_erasure_targets',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    jobId: uuid('job_id').notNull().references(() => accountErasureJobs.id, { onDelete: 'restrict' }),
+    kind: text('kind', {
+      enum: ['storage_object', 'legacy_media_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone'],
+    }).notNull(),
+    resourceId: uuid('resource_id').notNull(),
+    state: text('state', { enum: ['pending', 'claimed', 'attention', 'succeeded'] })
+      .notNull().default('pending'),
+    attemptCount: bigint('attempt_count', { mode: 'number' }).notNull().default(0),
+    nextAttemptAt: timestamptz('next_attempt_at').defaultNow(),
+    claimToken: uuid('claim_token'),
+    claimExpiresAt: timestamptz('claim_expires_at'),
+    completedAt: timestamptz('completed_at'),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('account_erasure_targets_job_kind_resource_uq').on(t.jobId, t.kind, t.resourceId),
+    index('account_erasure_targets_due_idx').on(t.nextAttemptAt, t.id).where(sql`${t.state} = 'pending'`),
+    index('account_erasure_targets_claim_expiry_idx').on(t.claimExpiresAt, t.id).where(sql`${t.state} = 'claimed'`),
+    check('account_erasure_targets_kind_check', sql`${t.kind} in ('storage_object', 'legacy_media_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone')`),
+    check('account_erasure_targets_state_check', sql`${t.state} in ('pending', 'claimed', 'attention', 'succeeded')`),
+    check('account_erasure_targets_attempt_check', sql`${t.attemptCount} >= 0`),
+    check('account_erasure_targets_error_check', sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z][a-z0-9_]{0,99}$'`),
+    check('account_erasure_targets_shape_check', sql`(${t.state} = 'pending' and ${t.nextAttemptAt} is not null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is null) or (${t.state} = 'claimed' and ${t.nextAttemptAt} is null and ${t.claimToken} is not null and ${t.claimExpiresAt} is not null and ${t.completedAt} is null and ${t.lastErrorCode} is null) or (${t.state} = 'attention' and ${t.nextAttemptAt} is null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is null and ${t.lastErrorCode} is not null) or (${t.state} = 'succeeded' and ${t.nextAttemptAt} is null and ${t.claimToken} is null and ${t.claimExpiresAt} is null and ${t.completedAt} is not null and ${t.lastErrorCode} is null)`),
+  ],
+);
+
+export const accountErasureTargetRequeues = pgTable(
+  'account_erasure_target_requeues',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    jobId: uuid('job_id').notNull().references(() => accountErasureJobs.id, { onDelete: 'restrict' }),
+    targetId: uuid('target_id').notNull().references(() => accountErasureTargets.id, { onDelete: 'restrict' }),
+    priorAttemptCount: bigint('prior_attempt_count', { mode: 'number' }).notNull(),
+    operatorId: text('operator_id').notNull(),
+    reasonCode: text('reason_code').notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('account_erasure_target_requeues_attempt_uq').on(t.targetId, t.priorAttemptCount),
+    index('account_erasure_target_requeues_job_idx').on(t.jobId, t.createdAt),
+    check('account_erasure_target_requeues_attempt_check', sql`${t.priorAttemptCount} >= 0`),
+    check('account_erasure_target_requeues_operator_check', sql`${t.operatorId} ~ '^[a-z][a-z0-9_.:-]{0,99}$'`),
+    check('account_erasure_target_requeues_reason_check', sql`${t.reasonCode} ~ '^[a-z][a-z0-9_]{0,99}$'`),
+  ],
+);
+
+export const accountErasureMessageTombstones = pgTable(
+  'account_erasure_message_tombstones',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    jobId: uuid('job_id').notNull().references(() => accountErasureJobs.id, { onDelete: 'restrict' }),
+    sessionId: uuid('session_id').notNull(),
+    messageId: uuid('message_id').notNull(),
+    authorPrincipalId: uuid('author_principal_id').notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('account_erasure_message_tombstones_job_message_uq').on(t.jobId, t.messageId),
+    index('account_erasure_message_tombstones_session_idx').on(t.sessionId, t.createdAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // etl_runs — immutable source boundaries for one bounded ETL attempt.
 //
 // Every canonical Mongo collection receives one identical prior-whole-second
@@ -1909,6 +2044,12 @@ export type Concept = typeof concepts.$inferSelect;
 export type NewConcept = typeof concepts.$inferInsert;
 export type ConceptImage = typeof conceptImages.$inferSelect;
 export type NewConceptImage = typeof conceptImages.$inferInsert;
+export type AccountErasureJob = typeof accountErasureJobs.$inferSelect;
+export type NewAccountErasureJob = typeof accountErasureJobs.$inferInsert;
+export type AccountErasureTarget = typeof accountErasureTargets.$inferSelect;
+export type NewAccountErasureTarget = typeof accountErasureTargets.$inferInsert;
+export type AccountErasureTargetRequeue = typeof accountErasureTargetRequeues.$inferSelect;
+export type AccountErasureMessageTombstone = typeof accountErasureMessageTombstones.$inferSelect;
 export type MannaAccount = typeof mannaAccounts.$inferSelect;
 export type NewMannaAccount = typeof mannaAccounts.$inferInsert;
 export type MannaTransaction = typeof mannaTransactions.$inferSelect;
