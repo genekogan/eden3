@@ -245,6 +245,20 @@ async function createConnection(params: {
   return (response.json() as { connection: ConnectionDto }).connection;
 }
 
+async function runtimeCoordinates(connectionId: string): Promise<{
+  agentId: string;
+  bindingId: string;
+}> {
+  const rows = await pg<Array<{ agent_id: string; binding_id: string | null }>>`
+    select a.openclaw_id as agent_id, c.metadata ->> '_runtimeBindingId' as binding_id
+    from channel_connections c
+    join agents a on a.account_id = c.agent_id
+    where c.id = ${connectionId} and c.desired_state = 'active'
+  `;
+  expect(rows[0]?.binding_id).toMatch(/^[0-9a-f-]{36}$/);
+  return { agentId: rows[0]!.agent_id, bindingId: rows[0]!.binding_id! };
+}
+
 beforeAll(async () => {
   ownerId = await insertUserAccount(`${marker}_owner`);
   strangerId = await insertUserAccount(`${marker}_stranger`);
@@ -498,6 +512,38 @@ describe('X BYO-app custody and posting', () => {
     for (const secret of Object.values(credentials)) {
       expect(JSON.stringify(xAudits)).not.toContain(secret);
       expect(JSON.stringify(xAudits)).not.toContain(secret.slice(-4));
+    }
+
+    const decryptSpy = vi.spyOn(vault, 'decrypt');
+    const validateSpy = vi.spyOn(providerClient, 'validate');
+    const discoverSpy = vi.spyOn(providerClient, 'discoverDestinations');
+    const ensureBeforeGeneric = ensureCalls.length;
+    const removeBeforeGeneric = removeCalls.length;
+    try {
+      const genericAttempts = await Promise.all([
+        app.inject({ method: 'POST', url: `/channels/connections/${connectionId}/retry`, headers: { cookie: devCookie(ownerId) }, payload: {} }),
+        app.inject({ method: 'GET', url: `/channels/connections/${connectionId}/destinations`, headers: { cookie: devCookie(ownerId) } }),
+        app.inject({ method: 'POST', url: `/channels/connections/${connectionId}/activate`, headers: { cookie: devCookie(ownerId) }, payload: {} }),
+        app.inject({ method: 'POST', url: `/channels/connections/${connectionId}/deactivate`, headers: { cookie: devCookie(ownerId) }, payload: {} }),
+        app.inject({ method: 'DELETE', url: `/channels/connections/${connectionId}`, headers: { cookie: devCookie(ownerId) } }),
+        app.inject({ method: 'GET', url: `/channels/connections/${connectionId}/pairing`, headers: { cookie: devCookie(ownerId) } }),
+      ]);
+      expect(genericAttempts.map((response) => response.statusCode)).toEqual(
+        Array(genericAttempts.length).fill(404),
+      );
+      expect(decryptSpy).not.toHaveBeenCalled();
+      expect(validateSpy).not.toHaveBeenCalled();
+      expect(discoverSpy).not.toHaveBeenCalled();
+      expect(ensureCalls).toHaveLength(ensureBeforeGeneric);
+      expect(removeCalls).toHaveLength(removeBeforeGeneric);
+      const untouched = await pg<{ desired_state: string; channel: string }[]>`
+        select desired_state, channel from channel_connections where id = ${connectionId}
+      `;
+      expect(untouched).toEqual([{ desired_state: 'active', channel: 'x' }]);
+    } finally {
+      decryptSpy.mockRestore();
+      validateSpy.mockRestore();
+      discoverSpy.mockRestore();
     }
 
     const auditsBeforeAdmin = await pg<{ count: number }[]>`
@@ -863,6 +909,116 @@ describe('Telegram Managed Bots onboarding', () => {
 });
 
 describe('named-account lifecycle', () => {
+  it('fences stale runtime callbacks across activation and token rotation', async () => {
+    const connection = await createConnection({
+      token: `valid_${marker}_binding_generation_a`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    const readBinding = async () => {
+      const rows = await pg<Array<{ binding_id: string | null }>>`
+        select metadata ->> '_runtimeBindingId' as binding_id
+        from channel_connections where id = ${connection.id}
+      `;
+      return rows[0]!.binding_id!;
+    };
+    const firstBinding = await readBinding();
+    expect(firstBinding).toMatch(/^[0-9a-f-]{36}$/);
+    const runtimeHeaders = { authorization: `Bearer ${runtimeToken}` };
+    const messagePayload = {
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+      agentId: firstAgentUsername,
+      bindingId: firstBinding,
+      gatewaySessionKey: `agent:${firstAgentUsername}:discord:${connection.runtimeAccountId}:direct:44556677`,
+      conversationId: '44556677',
+      conversationScope: 'direct',
+      peerId: '44556677',
+      externalMessageId: `${marker}:binding-message`,
+      role: 'user',
+      content: 'binding proof',
+      createdAt: new Date().toISOString(),
+    };
+    const sessionCalls = sessionSync.syncMessage.mock.calls.length;
+    const reserveCalls = turnMetering.reserve.mock.calls.length;
+    for (const payload of [
+      { ...messagePayload, agentId: undefined, bindingId: undefined },
+      { ...messagePayload, agentId: secondAgentUsername },
+      { ...messagePayload, bindingId: randomUUID() },
+    ]) {
+      const denied = await app.inject({
+        method: 'POST',
+        url: '/channels/runtime/messages',
+        headers: runtimeHeaders,
+        payload,
+      });
+      expect(denied.statusCode).toBe(404);
+    }
+    expect(sessionSync.syncMessage).toHaveBeenCalledTimes(sessionCalls);
+    const staleReserve = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/turns/reserve',
+      headers: runtimeHeaders,
+      payload: {
+        turnId: randomUUID(),
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        agentId: firstAgentUsername,
+        bindingId: randomUUID(),
+      },
+    });
+    expect(staleReserve.statusCode).toBe(404);
+    expect(turnMetering.reserve).toHaveBeenCalledTimes(reserveCalls);
+
+    const rotated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/retry`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { token: `valid_${marker}_binding_generation_b` },
+    });
+    expect(rotated.statusCode).toBe(200);
+    const secondBinding = await readBinding();
+    expect(secondBinding).not.toBe(firstBinding);
+    const staleStatus = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/status',
+      headers: runtimeHeaders,
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        agentId: firstAgentUsername,
+        bindingId: firstBinding,
+        state: 'live',
+      },
+    });
+    const stalePairing = await app.inject({
+      method: 'POST',
+      url: '/channels/runtime/pairing',
+      headers: runtimeHeaders,
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        agentId: firstAgentUsername,
+        bindingId: firstBinding,
+        peerId: '44556677',
+        code: 'stale-code',
+      },
+    });
+    expect(staleStatus.statusCode).toBe(404);
+    expect(stalePairing.statusCode).toBe(404);
+    const pairingRows = await pg<{ count: number }[]>`
+      select count(*)::int as count from channel_pairing_requests
+      where connection_id = ${connection.id}
+    `;
+    expect(pairingRows[0]?.count).toBe(0);
+  });
+
   it('rejects activation when the attached agent changes during provider validation', async () => {
     const connection = await createConnection({
       token: `valid_${marker}_activation_agent_race`,
@@ -1035,6 +1191,7 @@ describe('named-account lifecycle', () => {
       payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
     });
     expect(activated.statusCode).toBe(200);
+    const runtime = await runtimeCoordinates(connection.id);
     const stopped = await app.inject({
       method: 'POST',
       url: '/channels/runtime/status',
@@ -1042,6 +1199,7 @@ describe('named-account lifecycle', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...runtime,
         state: 'stopped',
       },
     });
@@ -1066,6 +1224,7 @@ describe('named-account lifecycle', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...runtime,
         state: 'error',
         errorCode: 'delivery_ack_lost',
       },
@@ -1097,6 +1256,7 @@ describe('named-account lifecycle', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...runtime,
         state: 'live',
       },
     });
@@ -1149,6 +1309,7 @@ describe('pairing claim and verified identity linkage', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...(await runtimeCoordinates(connection.id)),
         peerId,
         code,
       },
@@ -1206,6 +1367,7 @@ describe('pairing claim and verified identity linkage', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...(await runtimeCoordinates(connection.id)),
         peerId,
         code: 'EDEN-2211',
       },
@@ -1245,6 +1407,7 @@ describe('pairing claim and verified identity linkage', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...(await runtimeCoordinates(connection.id)),
         peerId,
         code: 'EDEN-3311',
       },
@@ -1313,6 +1476,7 @@ describe('pairing claim and verified identity linkage', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...(await runtimeCoordinates(connection.id)),
         peerId,
         code: 'EDEN-5511',
       },
@@ -1401,6 +1565,7 @@ describe('pairing claim and verified identity linkage', () => {
       payload: {
         connectionId: connection.id,
         runtimeAccountId: connection.runtimeAccountId,
+        ...(await runtimeCoordinates(connection.id)),
         peerId,
         code: 'EDEN-4422',
       },
@@ -1446,12 +1611,29 @@ describe('pairing claim and verified identity linkage', () => {
 });
 
 describe('private runtime callbacks', () => {
+  async function activeRuntimeFixture(suffix: string) {
+    const connection = await createConnection({
+      token: `valid_${marker}_runtime_${suffix}`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    return { connection, runtime: await runtimeCoordinates(connection.id) };
+  }
+
   it('rejects unauthenticated sync and accepts an exact bearer credential', async () => {
     sessionSync.syncMessage.mockClear();
+    const { connection, runtime } = await activeRuntimeFixture('messages');
     const body = {
-      connectionId: randomUUID(),
-      runtimeAccountId: 'eden-runtime',
-      gatewaySessionKey: 'agent:fixture:discord:eden-runtime:direct:123456',
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+      ...runtime,
+      gatewaySessionKey: `agent:fixture:discord:${connection.runtimeAccountId}:direct:123456`,
       peerId: '123456',
       externalMessageId: 'discord:message:1',
       role: 'user',
@@ -1478,6 +1660,7 @@ describe('private runtime callbacks', () => {
   });
 
   it('exposes authenticated reserve, settle, and refund transitions', async () => {
+    const { connection, runtime } = await activeRuntimeFixture('metering');
     const turnId = randomUUID();
     const headers = { authorization: `Bearer ${runtimeToken}` };
     const reserve = await app.inject({
@@ -1486,8 +1669,9 @@ describe('private runtime callbacks', () => {
       headers,
       payload: {
         turnId,
-        connectionId: randomUUID(),
-        runtimeAccountId: 'eden-runtime',
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        ...runtime,
       },
     });
     expect(reserve.statusCode).toBe(200);
@@ -1546,11 +1730,13 @@ describe('Postgres channel group identity isolation', () => {
       },
     });
     expect(activated.statusCode).toBe(200);
+    const runtime = await runtimeCoordinates(connection.id);
 
     const service = new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault);
     await service.syncMessage({
       connectionId: connection.id,
       runtimeAccountId: connection.runtimeAccountId,
+      ...runtime,
       gatewaySessionKey: `agent:${marker}:discord:${connection.runtimeAccountId}:direct:${peerId}`,
       conversationId: peerId,
       conversationScope: 'direct',
@@ -1572,6 +1758,7 @@ describe('Postgres channel group identity isolation', () => {
     const result = await service.syncMessage({
       connectionId: connection.id,
       runtimeAccountId: connection.runtimeAccountId,
+      ...runtime,
       gatewaySessionKey: groupSessionKey,
       conversationId,
       conversationScope: 'group',
@@ -1661,6 +1848,123 @@ describe('Postgres channel group identity isolation', () => {
       select id from sessions where gateway_session_key = ${gatewaySessionKey}
     `;
     expect(sessions).toEqual([]);
+  });
+
+  it('fails closed for deleted owners, agents, and channel sessions', async () => {
+    const peerId = '77889933';
+    const connection = await createConnection({
+      token: `valid_${marker}_deleted_principal`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'allowlist', allowFrom: [peerId], discordGuilds: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    const runtime = await runtimeCoordinates(connection.id);
+    const gatewaySessionKey =
+      `agent:${marker}:discord:${connection.runtimeAccountId}:direct:deleted-${peerId}`;
+    const service = new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault);
+    const first = await service.syncMessage({
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+      ...runtime,
+      gatewaySessionKey,
+      conversationId: peerId,
+      conversationScope: 'direct',
+      peerId,
+      externalMessageId: `${marker}:before-session-delete`,
+      role: 'user',
+      content: 'session lifecycle seed',
+      createdAt: new Date(),
+    });
+    const meteringStore = new PostgresChannelTurnStore(async () => 'openclaw');
+    await pg`
+      insert into session_agents (session_id, agent_account_id)
+      values (${first.sessionId}, ${secondAgentId})
+    `;
+    await expect(
+      meteringStore.getBillableConnection(connection.id, first.sessionId, runtime),
+    ).resolves.toBeNull();
+    await expect(
+      service.syncMessage({
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        ...runtime,
+        gatewaySessionKey,
+        conversationId: peerId,
+        conversationScope: 'direct',
+        peerId,
+        externalMessageId: `${marker}:cross-agent-session`,
+        role: 'user',
+        content: 'must not cross-bind',
+        createdAt: new Date(),
+      }),
+    ).rejects.toThrow('channel session isolation violation');
+    await pg`
+      delete from session_agents
+      where session_id = ${first.sessionId} and agent_account_id = ${secondAgentId}
+    `;
+    await pg`update sessions set deleted = true, updated_at = now() where id = ${first.sessionId}`;
+
+    await expect(
+      service.syncMessage({
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        ...runtime,
+        gatewaySessionKey,
+        conversationId: peerId,
+        conversationScope: 'direct',
+        peerId,
+        externalMessageId: `${marker}:after-session-delete`,
+        role: 'user',
+        content: 'must not persist',
+        createdAt: new Date(),
+      }),
+    ).rejects.toThrow('channel session isolation violation');
+    await expect(
+      meteringStore.getBillableConnection(connection.id, first.sessionId, runtime),
+    ).resolves.toBeNull();
+
+    const runtimeBody = {
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+      ...runtime,
+      gatewaySessionKey,
+      peerId,
+      externalMessageId: `${marker}:deleted-principal`,
+      role: 'user',
+      content: 'must not reach session sync',
+      createdAt: new Date().toISOString(),
+    };
+    const callsBefore = sessionSync.syncMessage.mock.calls.length;
+    try {
+      await pg`update accounts set deleted = true, updated_at = now() where id = ${ownerId}`;
+      const deletedOwner = await app.inject({
+        method: 'POST',
+        url: '/channels/runtime/messages',
+        headers: { authorization: `Bearer ${runtimeToken}` },
+        payload: runtimeBody,
+      });
+      expect(deletedOwner.statusCode).toBe(404);
+    } finally {
+      await pg`update accounts set deleted = false, updated_at = now() where id = ${ownerId}`;
+    }
+    try {
+      await pg`update accounts set deleted = true, updated_at = now() where id = ${firstAgentId}`;
+      const deletedAgent = await app.inject({
+        method: 'POST',
+        url: '/channels/runtime/messages',
+        headers: { authorization: `Bearer ${runtimeToken}` },
+        payload: runtimeBody,
+      });
+      expect(deletedAgent.statusCode).toBe(404);
+    } finally {
+      await pg`update accounts set deleted = false, updated_at = now() where id = ${firstAgentId}`;
+    }
+    expect(sessionSync.syncMessage).toHaveBeenCalledTimes(callsBefore);
   });
 });
 

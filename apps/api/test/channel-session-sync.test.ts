@@ -18,6 +18,7 @@ const connection: ChannelSyncConnection = {
   id: randomUUID(),
   accountId: randomUUID(),
   agentId: randomUUID(),
+  runtimeAgentId: 'agent-runtime-fixture',
   channel: 'discord',
   runtimeAccountId: 'eden-connection-one',
   allowedGroups: [],
@@ -133,6 +134,39 @@ describe('ChannelSessionSync', () => {
     expect(JSON.stringify({ event: input.event, metadata: input.safeChannelMetadata })).not.toContain(
       '1234567890',
     );
+  });
+
+  it('rejects stale or cross-agent callbacks after a runtime binding is published', async () => {
+    const bound: ChannelSyncConnection = {
+      ...connection,
+      bindingId: '33333333-3333-4333-8333-333333333333',
+    };
+    const persistMessage = vi.fn();
+    const service = new ChannelSessionSync(
+      { getLiveConnection: vi.fn(async () => bound), persistMessage },
+      vault(),
+    );
+    const event = {
+      connectionId: bound.id,
+      runtimeAccountId: bound.runtimeAccountId,
+      agentId: bound.runtimeAgentId,
+      bindingId: bound.bindingId,
+      gatewaySessionKey: 'bound-session',
+      peerId: '1234567890',
+      externalMessageId: 'bound-message',
+      role: 'user' as const,
+      content: 'must remain isolated',
+      createdAt: new Date(),
+    };
+    for (const mutation of [
+      { agentId: undefined, bindingId: undefined },
+      { agentId: 'agent-runtime-other' },
+      { bindingId: '44444444-4444-4444-8444-444444444444' },
+    ]) {
+      await expect(service.syncMessage({ ...event, ...mutation }))
+        .rejects.toThrow('channel connection unavailable');
+    }
+    expect(persistMessage).not.toHaveBeenCalled();
   });
 
   it('isolates the same peer between bot connections', () => {

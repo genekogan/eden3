@@ -482,6 +482,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       turnId: RUN_A,
       connectionId: CONNECTION_A,
       runtimeAccountId: 'account-a',
+      agentId: 'agent-a',
       sessionId: EDEN_SESSION_A,
       externalMessageId: '1532630091471786166',
     });
@@ -2221,6 +2222,33 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     }
   });
 
+  it('blocks a queued turn when the published agent binding generation changes', async () => {
+    const config = hostedConfig();
+    const oldBinding = '33333333-3333-4333-8333-333333333333';
+    const newBinding = '44444444-4444-4444-8444-444444444444';
+    config.plugins.entries['eden3-channel-runtime'].config.accounts[0].bindingId = oldBinding;
+    const { bridge, calls } = mockBridge(config);
+    receiveA(bridge);
+    config.plugins.entries['eden3-channel-runtime'].config.accounts[0].bindingId = newBinding;
+
+    await expect(
+      bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'stale queued turn', messages: [] },
+        {
+          runId: RUN_A,
+          sessionKey: SESSION_A,
+          messageProvider: 'discord',
+          agentId: 'agent-a',
+        },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block' });
+    expect(calls.some((call) => call.path === '/channels/runtime/turns/reserve')).toBe(false);
+    expect(calls.find((call) => call.path === '/channels/runtime/messages').body).toMatchObject({
+      agentId: 'agent-a',
+      bindingId: oldBinding,
+    });
+  });
+
   it('forwards native pairing code privately and reports reconnect/error lifecycle', async () => {
     const { bridge, calls } = mockBridge();
     await bridge.onPairingRequested(
@@ -2236,6 +2264,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(calls.find((call) => call.path.endsWith('/pairing')).body).toEqual({
       connectionId: CONNECTION_A,
       runtimeAccountId: 'account-a',
+      agentId: 'agent-a',
       peerId: PEER_A,
       code: 'one-time-code',
     });
