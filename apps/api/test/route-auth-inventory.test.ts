@@ -1,5 +1,4 @@
 import { mkdtempSync, rmSync } from 'node:fs';
-import { readFileSync } from 'node:fs';
 import { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,17 +8,24 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   ROUTE_AUTH_INVENTORY,
   verifyRouteAuthInventory,
+  type RouteAuthGuardIdentity,
   type RouteAuthManifestEntry,
 } from '../scripts/route-auth-inventory';
 
 type CapturedRoute = {
   method: string;
   path: string;
-  preHandlers: string[];
-  serviceGuard: string | null;
+  preHandlers: unknown[];
+  serviceGuard: unknown | null;
+  hasExactServiceMarker: boolean;
+  hasLookalikeServiceMarker: boolean;
 };
 
-const capture = vi.hoisted(() => ({ routes: [] as CapturedRoute[] }));
+const capture = vi.hoisted(() => ({
+  routes: { dev: [] as CapturedRoute[], production: [] as CapturedRoute[] },
+  profile: 'dev' as 'dev' | 'production',
+  serviceMarker: null as symbol | null,
+}));
 
 vi.mock('fastify', async () => {
   const actual = await vi.importActual<typeof import('fastify')>('fastify');
@@ -29,22 +35,28 @@ vi.mock('fastify', async () => {
       const app = actual.default(options);
       app.addHook('onRoute', (route) => {
         const methods = Array.isArray(route.method) ? route.method : [route.method];
-        const preHandlers = (
+        const preHandlers: unknown[] = (
           Array.isArray(route.preHandler) ? route.preHandler : route.preHandler ? [route.preHandler] : []
-        ).map((handler) => handler.name || 'anonymous');
-        const serviceGuardKey = Reflect.ownKeys(route.config ?? {}).find(
-          (key) => typeof key === 'symbol' && key.description === 'eden.service-callback-guard',
         );
-        const serviceGuard = serviceGuardKey
-          ? (route.config as Record<PropertyKey, unknown>)[serviceGuardKey]
+        const config = route.config ?? {};
+        const functionSymbolKeys = Reflect.ownKeys(config).filter(
+          (key) => typeof key === 'symbol' && typeof (config as Record<PropertyKey, unknown>)[key] === 'function',
+        );
+        const serviceGuard = capture.serviceMarker
+          ? (config as Record<PropertyKey, unknown>)[capture.serviceMarker]
           : null;
         for (const method of methods) {
-          capture.routes.push({
+          capture.routes[capture.profile].push({
             method,
             path: route.url,
             preHandlers,
-            serviceGuard:
-              typeof serviceGuard === 'function' ? serviceGuard.name || 'anonymous' : null,
+            serviceGuard: serviceGuard ?? null,
+            hasExactServiceMarker:
+              capture.serviceMarker !== null &&
+              Reflect.ownKeys(config).includes(capture.serviceMarker),
+            hasLookalikeServiceMarker: functionSymbolKeys.some(
+              (key) => key !== capture.serviceMarker,
+            ),
           });
         }
       });
@@ -70,54 +82,105 @@ process.env.CHANNEL_TOKEN_ENCRYPTION_KEY = '11'.repeat(32);
 const connectSpy = vi.spyOn(Socket.prototype, 'connect');
 
 describe('effective route auth inventory capture', () => {
-  let app: Awaited<ReturnType<typeof import('../src/server').buildServer>>;
+  const apps: Array<Awaited<ReturnType<typeof import('../src/server').buildServer>>> = [];
+  let guardIdentity: RouteAuthGuardIdentity;
 
   beforeAll(async () => {
+    const auth = await import('../src/auth-plugin');
+    const probeGuard = () => undefined;
+    const probeConfig = auth.serviceAuthenticatedCallback(probeGuard).config;
+    const exactMarkers = Reflect.ownKeys(probeConfig).filter(
+      (key): key is symbol =>
+        typeof key === 'symbol' &&
+        (probeConfig as Record<PropertyKey, unknown>)[key] === probeGuard,
+    );
+    expect(exactMarkers).toHaveLength(1);
+    capture.serviceMarker = exactMarkers[0]!;
+    guardIdentity = { requireAuth: auth.requireAuth };
+
+    const { resetEnvCache } = await import('@eden3/core');
     const { buildServer } = await import('../src/server');
-    const storageRuntime = {
-      mediaResolver: {},
-      uploadService: { localPartUploadsEnabled: true },
-      policyEventWorker: { tick: async () => ({}) },
-      multipartCleanupWorker: { tick: async () => ({}) },
+    const buildProfile = async (profile: 'dev' | 'production') => {
+      capture.profile = profile;
+      process.env.AUTH_PROVIDER = profile === 'dev' ? 'dev' : 'clerk';
+      process.env.EDEN3_DEV_ROUTES = profile === 'dev' ? '1' : '0';
+      resetEnvCache();
+      const storageRuntime = {
+        mediaResolver: {},
+        uploadService: { localPartUploadsEnabled: true },
+        policyEventWorker: { tick: async () => ({}) },
+        multipartCleanupWorker: { tick: async () => ({}) },
+      };
+      const app = await buildServer({
+        gateway: null,
+        auth: { provider: { getSession: async () => null } },
+        media: { autoStartWatcher: false },
+        scheduler: { autoStart: false },
+        storage: { runtime: storageRuntime as never, autoStartPolicyWorker: false },
+      });
+      await app.ready();
+      apps.push(app);
     };
-    app = await buildServer({
-      gateway: null,
-      auth: { provider: { getSession: async () => null } },
-      media: { autoStartWatcher: false },
-      scheduler: { autoStart: false },
-      storage: { runtime: storageRuntime as never, autoStartPolicyWorker: false },
-    });
-    await app.ready();
+    await buildProfile('dev');
+    await buildProfile('production');
   });
 
   afterAll(async () => {
-    await app.close();
+    await Promise.all(apps.map((app) => app.close()));
     connectSpy.mockRestore();
     rmSync(mediaDir, { recursive: true, force: true });
   });
 
   it('classifies the effective prefixed route surface without a DB connection', () => {
     expect(connectSpy).not.toHaveBeenCalled();
-    expect(capture.routes.length).toBe(ROUTE_AUTH_INVENTORY.length);
-    expect(() => verifyRouteAuthInventory(capture.routes)).not.toThrow();
-    expect(capture.routes.some((route) => route.path === '/404')).toBe(false);
+    expect(capture.routes.dev.length).toBe(ROUTE_AUTH_INVENTORY.length);
+    expect(() => verifyRouteAuthInventory(capture.routes.dev, guardIdentity)).not.toThrow();
+    expect(capture.routes.dev.some((route) => route.path === '/404')).toBe(false);
+  });
+
+  it('captures production mode with no dev routes and the same non-dev graph', () => {
+    const productionManifest = ROUTE_AUTH_INVENTORY.filter(
+      (route) => route.classification !== 'dev-only',
+    );
+    expect(capture.routes.production.some((route) => route.path.startsWith('/dev/'))).toBe(false);
+    expect(() =>
+      verifyRouteAuthInventory(capture.routes.production, guardIdentity, productionManifest),
+    ).not.toThrow();
+    const keys = (routes: CapturedRoute[]) =>
+      routes
+        .filter((route) => !route.path.startsWith('/dev/'))
+        .map((route) => `${route.method} ${route.path}`)
+        .sort();
+    expect(keys(capture.routes.production)).toEqual(keys(capture.routes.dev));
   });
 
   it('fails when a route guard is removed', () => {
-    const mutated = capture.routes.map((route) =>
+    const mutated = capture.routes.dev.map((route) =>
       route.method === 'POST' && route.path === '/uploads'
         ? { ...route, preHandlers: [] }
         : route,
     );
-    expect(() => verifyRouteAuthInventory(mutated)).toThrow(/guard drift: POST \/uploads/);
+    expect(() => verifyRouteAuthInventory(mutated, guardIdentity)).toThrow(
+      /guard drift: POST \/uploads/,
+    );
   });
 
   it('fails on an unclassified route or exact public lookalike', () => {
     expect(() =>
-      verifyRouteAuthInventory([
-        ...capture.routes,
-        { method: 'GET', path: '/shares/:token/extra', preHandlers: [], serviceGuard: null },
-      ]),
+      verifyRouteAuthInventory(
+        [
+          ...capture.routes.dev,
+          {
+            method: 'GET',
+            path: '/shares/:token/extra',
+            preHandlers: [],
+            serviceGuard: null,
+            hasExactServiceMarker: false,
+            hasLookalikeServiceMarker: false,
+          },
+        ],
+        guardIdentity,
+      ),
     ).toThrow(/unclassified effective route: GET \/shares\/:token\/extra/);
   });
 
@@ -127,19 +190,31 @@ describe('effective route auth inventory capture', () => {
         ? { ...route, path: '/shares/*' }
         : { ...route },
     );
-    expect(() => verifyRouteAuthInventory(capture.routes, broadened)).toThrow(
+    expect(() => verifyRouteAuthInventory(capture.routes.dev, guardIdentity, broadened)).toThrow(
       /unapproved wildcard\/lookalike route: GET \/shares\/\*/,
     );
   });
 
   it('fails when a service guard is swapped', () => {
-    const mutated = capture.routes.map((route) =>
+    const telegramGuard = capture.routes.dev.find(
+      (route) => route.path === '/channels/telegram/managed-bots/webhook',
+    )!.serviceGuard;
+    const mutated = capture.routes.dev.map((route) =>
       route.path === '/channels/runtime/messages'
-        ? { ...route, serviceGuard: 'requireTelegramManager' }
+        ? { ...route, serviceGuard: telegramGuard }
         : route,
     );
-    expect(() => verifyRouteAuthInventory(mutated)).toThrow(
-      /guard drift: POST \/channels\/runtime\/messages/,
+    expect(() => verifyRouteAuthInventory(mutated, guardIdentity)).toThrow(
+      /service guard (?:equivalence drift|identity reused across classes)/,
+    );
+
+    const lookalike = capture.routes.dev.map((route) =>
+      route.path === '/media/runtime/authorizations'
+        ? { ...route, hasExactServiceMarker: false, hasLookalikeServiceMarker: true }
+        : route,
+    );
+    expect(() => verifyRouteAuthInventory(lookalike, guardIdentity)).toThrow(
+      /lookalike opaque service marker: POST \/media\/runtime\/authorizations/,
     );
   });
 
@@ -153,19 +228,33 @@ describe('effective route auth inventory capture', () => {
         guardIdentifiers: ['root:cohort-exact-policy'],
       },
     ];
-    expect(() => verifyRouteAuthInventory(capture.routes, unsupported)).toThrow(
+    expect(() => verifyRouteAuthInventory(capture.routes.dev, guardIdentity, unsupported)).toThrow(
       /unsupported method: CONNECT \/health/,
     );
 
-    const duplicate = capture.routes.find(
+    const duplicate = capture.routes.dev.find(
       (route) => route.method === 'POST' && route.path === '/uploads',
     )!;
     expect(() =>
-      verifyRouteAuthInventory([
-        ...capture.routes,
-        { ...duplicate, preHandlers: [], serviceGuard: 'otherGuard' },
-      ]),
+      verifyRouteAuthInventory(
+        [
+          ...capture.routes.dev,
+          { ...duplicate, preHandlers: [], serviceGuard: () => undefined },
+        ],
+        guardIdentity,
+      ),
     ).toThrow(/duplicate effective route: POST \/uploads/);
+  });
+
+  it('fails class-label mutations that retain the old route guard', () => {
+    const mislabeled = ROUTE_AUTH_INVENTORY.map((route) =>
+      route.method === 'POST' && route.path === '/uploads'
+        ? { ...route, classification: 'public-exact' as const }
+        : route,
+    );
+    expect(() => verifyRouteAuthInventory(capture.routes.dev, guardIdentity, mislabeled)).toThrow(
+      /invalid public guard contract: POST \/uploads/,
+    );
   });
 
   it('pins exact service POSTs, capability methods, and production-off dev mounting', () => {
@@ -195,8 +284,5 @@ describe('effective route auth inventory capture', () => {
       ),
     ).toBe(true);
 
-    const serverSource = readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8');
-    expect(serverSource).toContain("if (env.AUTH_PROVIDER === 'dev' || env.EDEN3_DEV_ROUTES)");
-    expect(serverSource).toContain("app.register(devRoutes, { prefix: '/dev' })");
   });
 });

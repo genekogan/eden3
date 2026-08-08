@@ -19,8 +19,14 @@ export type RouteAuthManifestEntry = {
 export type CapturedRouteAuth = {
   method: string;
   path: string;
-  preHandlers: readonly string[];
-  serviceGuard: string | null;
+  preHandlers: readonly unknown[];
+  serviceGuard: unknown | null;
+  hasExactServiceMarker: boolean;
+  hasLookalikeServiceMarker: boolean;
+};
+
+export type RouteAuthGuardIdentity = {
+  requireAuth: unknown;
 };
 
 type PathMethods = readonly [path: string, methods: readonly string[]];
@@ -161,7 +167,7 @@ const DEV_ROUTES: readonly PathMethods[] = [
   ['/dev/users', ['GET', 'HEAD']],
 ];
 
-const RUNTIME_SERVICE_ROUTES: readonly PathMethods[] = [
+const CHANNEL_RUNTIME_SERVICE_ROUTES: readonly PathMethods[] = [
   ['/channels/runtime/messages', ['POST']],
   ['/channels/runtime/pairing', ['POST']],
   ['/channels/runtime/status', ['POST']],
@@ -170,6 +176,9 @@ const RUNTIME_SERVICE_ROUTES: readonly PathMethods[] = [
   ['/channels/runtime/turns/:turnId/refund', ['POST']],
   ['/channels/runtime/turns/:turnId/settle', ['POST']],
   ['/channels/runtime/turns/reserve', ['POST']],
+];
+
+const MEDIA_RUNTIME_SERVICE_ROUTES: readonly PathMethods[] = [
   ['/media/runtime/authorizations', ['POST']],
   ['/media/runtime/authorizations/:authorizationId/fail', ['POST']],
 ];
@@ -224,8 +233,13 @@ export const ROUTE_AUTH_INVENTORY: readonly RouteAuthManifestEntry[] = [
   ...entries('dev-only', ['server:dev-mount-condition'], DEV_ROUTES),
   ...entries(
     'service-authenticated',
-    ['root-service:requireRuntime'],
-    RUNTIME_SERVICE_ROUTES,
+    ['root-service:channels-runtime'],
+    CHANNEL_RUNTIME_SERVICE_ROUTES,
+  ),
+  ...entries(
+    'service-authenticated',
+    ['root-service:media-runtime'],
+    MEDIA_RUNTIME_SERVICE_ROUTES,
   ),
   ...entries(
     'service-authenticated',
@@ -249,14 +263,9 @@ const SUPPORTED_METHODS = new Set([
 ]);
 const APPROVED_WILDCARD_KEYS = new Set(['OPTIONS *', 'GET /media/*', 'HEAD /media/*']);
 
-function observableGuards(route: CapturedRouteAuth): string[] {
-  const guards = route.preHandlers.map((name) => `route:${name}`);
-  if (route.serviceGuard) guards.push(`root-service:${route.serviceGuard}`);
-  return guards.sort();
-}
-
 export function verifyRouteAuthInventory(
   captured: readonly CapturedRouteAuth[],
+  guardIdentity: RouteAuthGuardIdentity,
   manifest: readonly RouteAuthManifestEntry[] = ROUTE_AUTH_INVENTORY,
 ): void {
   const failures: string[] = [];
@@ -280,24 +289,49 @@ export function verifyRouteAuthInventory(
         failures.push(`invalid service callback contract: ${routeKey}`);
       }
     }
+    const guards = [...entry.guardIdentifiers].sort().join('|');
     if (
-      ['authenticated-user-agent', 'owner-member', 'admin-operator'].includes(
-        entry.classification,
-      ) &&
-      !entry.guardIdentifiers.includes('route:requireAuth')
+      entry.classification === 'authenticated-user-agent' &&
+      guards !== 'route:requireAuth'
     ) {
-      failures.push(`authenticated classification lacks requireAuth: ${routeKey}`);
+      failures.push(`invalid authenticated guard contract: ${routeKey}`);
+    }
+    if (
+      entry.classification === 'owner-member' &&
+      guards !== 'handler:resource-authority|route:requireAuth'
+    ) {
+      failures.push(`invalid owner/member guard contract: ${routeKey}`);
+    }
+    if (
+      entry.classification === 'admin-operator' &&
+      guards !== 'handler:admin|route:requireAuth'
+    ) {
+      failures.push(`invalid admin guard contract: ${routeKey}`);
+    }
+    if (
+      entry.classification === 'dev-only' &&
+      (guards !== 'server:dev-mount-condition' || !entry.path.startsWith('/dev/'))
+    ) {
+      failures.push(`invalid dev-only guard contract: ${routeKey}`);
+    }
+    if (
+      entry.classification === 'public-exact' &&
+      entry.guardIdentifiers.some(
+        (guard) => guard.startsWith('route:') || guard.startsWith('root-service:'),
+      )
+    ) {
+      failures.push(`invalid public guard contract: ${routeKey}`);
     }
   }
 
   const capturedByKey = new Map<string, CapturedRouteAuth>();
+  const serviceGuardByIdentifier = new Map<string, unknown>();
+  const identifierByServiceGuard = new Map<unknown, string>();
   for (const route of captured) {
     const routeKey = key(route);
     const prior = capturedByKey.get(routeKey);
     if (prior) {
-      failures.push(
-        `duplicate effective route: ${routeKey} (${observableGuards(prior).join(',')} vs ${observableGuards(route).join(',')})`,
-      );
+      failures.push(`duplicate effective route: ${routeKey}`);
       continue;
     }
     capturedByKey.set(routeKey, route);
@@ -306,14 +340,51 @@ export function verifyRouteAuthInventory(
       failures.push(`unclassified effective route: ${routeKey}`);
       continue;
     }
-    const observed = observableGuards(route);
-    const expectedObservable = expected.guardIdentifiers
-      .filter((guard) => guard.startsWith('route:') || guard.startsWith('root-service:'))
-      .sort();
-    if (observed.join('|') !== expectedObservable.join('|')) {
-      failures.push(
-        `guard drift: ${routeKey} expected [${expectedObservable.join(', ')}] got [${observed.join(', ')}]`,
-      );
+    if (route.hasLookalikeServiceMarker) {
+      failures.push(`lookalike opaque service marker: ${routeKey}`);
+    }
+
+    const requiresRouteAuth = [
+      'authenticated-user-agent',
+      'owner-member',
+      'admin-operator',
+    ].includes(expected.classification);
+    const hasExactRouteAuth =
+      route.preHandlers.length === 1 && route.preHandlers[0] === guardIdentity.requireAuth;
+    if (requiresRouteAuth !== hasExactRouteAuth) {
+      failures.push(`guard drift: ${routeKey} exact requireAuth mismatch`);
+    }
+
+    if (expected.classification === 'service-authenticated') {
+      const identifier = expected.guardIdentifiers.find((guard) =>
+        guard.startsWith('root-service:'),
+      )!;
+      if (
+        route.preHandlers.length !== 0 ||
+        !route.hasExactServiceMarker ||
+        typeof route.serviceGuard !== 'function'
+      ) {
+        failures.push(`guard drift: ${routeKey} exact opaque service marker mismatch`);
+      } else {
+        const boundGuard = serviceGuardByIdentifier.get(identifier);
+        if (boundGuard !== undefined && boundGuard !== route.serviceGuard) {
+          failures.push(`service guard equivalence drift: ${routeKey}`);
+        } else {
+          serviceGuardByIdentifier.set(identifier, route.serviceGuard);
+        }
+        const boundIdentifier = identifierByServiceGuard.get(route.serviceGuard);
+        if (boundIdentifier !== undefined && boundIdentifier !== identifier) {
+          failures.push(`service guard identity reused across classes: ${routeKey}`);
+        } else {
+          identifierByServiceGuard.set(route.serviceGuard, identifier);
+        }
+      }
+    } else if (
+      route.hasExactServiceMarker ||
+      route.serviceGuard !== null ||
+      (!requiresRouteAuth && route.preHandlers.length !== 0)
+    ) {
+      failures.push(`guard drift: ${routeKey} unexpected route/service guard`);
     }
   }
   for (const routeKey of manifestByKey.keys()) {
