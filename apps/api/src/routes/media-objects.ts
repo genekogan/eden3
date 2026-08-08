@@ -11,6 +11,8 @@ export interface MediaObjectRoutesOptions {
 }
 
 const paramsSchema = z.object({ objectId: z.string().uuid() });
+const objectRoute =
+  '/media/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
 
 interface ByteRange {
   start: number;
@@ -79,6 +81,6 @@ export const mediaObjectRoutes: FastifyPluginAsync<MediaObjectRoutesOptions> = a
     return reply.send(stream);
   };
 
-  app.get('/media/:objectId', { exposeHeadRoute: false }, handle);
-  app.head('/media/:objectId', handle);
+  app.get(objectRoute, { exposeHeadRoute: false }, handle);
+  app.head(objectRoute, handle);
 };

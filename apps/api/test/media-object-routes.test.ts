@@ -123,6 +123,29 @@ describe('GET /media/:objectId lifecycle boundary', () => {
     expect(owner.body).toBe('0123456789');
   });
 
+  it('routes legacy filenames to static media without weakening guessed-object denial', async () => {
+    const { app, counts } = await setup();
+    const publicDir = await mkdtemp(path.join(os.tmpdir(), 'eden3-public-media-'));
+    dirs.push(publicDir);
+    await writeFile(path.join(publicDir, 'legacy-render.png'), 'legacy-public-media');
+    await app.register(fastifyStatic, {
+      root: publicDir,
+      prefix: '/media/',
+      index: false,
+      list: false,
+    });
+
+    const legacy = await app.inject({ method: 'GET', url: '/media/legacy-render.png' });
+    expect(legacy.statusCode).toBe(200);
+    expect(legacy.body).toBe('legacy-public-media');
+    expect(counts().hydrations).toBe(0);
+
+    const guessedObject = await app.inject({ method: 'GET', url: `/media/${OBJECT_ID}` });
+    expect(guessedObject.statusCode).toBe(404);
+    expect(guessedObject.body).not.toContain('legacy-public-media');
+    expect(counts().hydrations).toBe(0);
+  });
+
   it('allows anonymous public references and supports HEAD and a single byte range', async () => {
     const { app, repository, counts } = await setup();
     repository.row = record({ publicReferenceOwnerAccountId: OWNER });
