@@ -297,6 +297,33 @@ export class MediaPipeline {
       .where(eq(mediaAssets.sha256, put.sha256))
       .limit(1);
 
+    const settleIdenticalAuthorizedOutput = async (
+      messageId: string | null,
+      creationId: string | null,
+    ) => {
+      if (!hasChatAuthorization || !sessionId || !action) return null;
+      const settled = await this.db.transaction((tx) =>
+        completePendingChatMedia(tx, {
+          sessionId: sessionId as string,
+          action,
+          messageId,
+          creationId,
+          observedTool: opts.tool ?? null,
+        }),
+      );
+      if (!settled) {
+        throw new Error('media-pipeline: identical output lost its pending authorization');
+      }
+      if (this.bus) {
+        this.bus.publish(sessionId, {
+          type: 'manna.updated',
+          accountId: settled.accountId,
+          balance: settled.balance,
+        });
+      }
+      return settled;
+    };
+
     if (existing) {
       const sameSession = (existing.sessionId ?? null) === sessionId;
       const alreadyComplete = sameSession && (existing.creationId !== null || !correlated);
@@ -315,6 +342,10 @@ export class MediaPipeline {
             completion: attachTo,
             kind,
           });
+          const mediaAuthorization = await settleIdenticalAuthorizedOutput(
+            attachTo.id,
+            rehomed.creation?.id ?? existing.creationId,
+          );
           if (this.bus && rehomed.creation) {
             try {
               this.bus.publish(sessionId as string, {
@@ -339,8 +370,8 @@ export class MediaPipeline {
             mime: put.mime,
             kind,
             sha256: put.sha256,
-            billedAccountId: null,
-            mediaAuthorizationId: null,
+            billedAccountId: mediaAuthorization?.accountId ?? null,
+            mediaAuthorizationId: mediaAuthorization?.authorizationId ?? null,
             debit: null,
             debitError: null,
             deduped: true,
@@ -357,6 +388,10 @@ export class MediaPipeline {
             .limit(1);
           creation = row ?? null;
         }
+        const mediaAuthorization = await settleIdenticalAuthorizedOutput(
+          existing.messageId,
+          existing.creationId,
+        );
         const result = {
           asset: existing,
           creation,
@@ -365,8 +400,8 @@ export class MediaPipeline {
           mime: put.mime,
           kind,
           sha256: put.sha256,
-          billedAccountId: null,
-          mediaAuthorizationId: null,
+          billedAccountId: mediaAuthorization?.accountId ?? null,
+          mediaAuthorizationId: mediaAuthorization?.authorizationId ?? null,
           debit: null,
           debitError: null,
           deduped: true,

@@ -6,16 +6,18 @@ import { serviceAuthenticatedCallback } from '../auth-plugin';
 import { ApiError } from '../errors';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
 import {
+  canonicalChatMediaProviderArgs,
   compensateChatMedia,
   isChatMediaTool,
   reserveChatMedia,
+  verifyPendingStudioMedia,
 } from '../services/chat-media-authorization';
 
 const hostId = z.string().trim().min(1).max(200);
 const authorizeSchema = z
   .object({
-    runId: hostId,
-    toolCallId: hostId,
+    runId: hostId.optional(),
+    toolCallId: hostId.optional(),
     sessionKey: z.string().trim().min(1).max(1_000),
     agentId: z.string().trim().min(1).max(200),
     tool: z.string().trim().min(1).max(100),
@@ -48,12 +50,30 @@ export const mediaRuntimeRoutes: FastifyPluginAsync = async (app) => {
         throw new ApiError(400, 'unsupported_media_tool', 'Media tool is not authorized');
       }
       try {
+        const request = { ...body, tool: body.tool };
+        const providerArgs = canonicalChatMediaProviderArgs(body.tool, body.args);
+        const studio = await verifyPendingStudioMedia({ request });
+        if (studio) {
+          return {
+            ok: true,
+            authorizationOwner: 'studio' as const,
+            authorizationId: studio.authorizationId,
+            authorizedMaxManna: studio.quote.manna,
+            tool: studio.tool,
+            action: studio.action,
+            provider: studio.quote.provider,
+            model: studio.quote.model,
+            tableVersion: studio.quote.tableVersion,
+            providerArgs,
+          };
+        }
         const authorization = await reserveChatMedia({
-          request: { ...body, tool: body.tool },
+          request,
           dailyCap: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER,
         });
         return {
           ok: true,
+          authorizationOwner: 'chat' as const,
           authorizationId: authorization.authorizationId,
           authorizedMaxManna: authorization.quote.manna,
           tool: authorization.tool,
@@ -61,6 +81,7 @@ export const mediaRuntimeRoutes: FastifyPluginAsync = async (app) => {
           provider: authorization.quote.provider,
           model: authorization.quote.model,
           tableVersion: authorization.quote.tableVersion,
+          providerArgs,
         };
       } catch (err) {
         req.log.warn({ err }, 'chat media authorization denied');

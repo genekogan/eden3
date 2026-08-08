@@ -10,11 +10,14 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   CHAT_MEDIA_EVENT_TYPE,
   ChatMediaReservationReaper,
+  canonicalChatMediaProviderArgs,
   compensateChatMedia,
   quoteChatMediaTool,
   reserveChatMedia,
+  verifyPendingStudioMedia,
 } from '../src/services/chat-media-authorization';
 import { MediaPipeline } from '../src/services/media-pipeline';
+import { reserveStudioGeneration } from '../src/services/studio-reservations';
 
 loadRootEnv();
 
@@ -83,6 +86,37 @@ afterAll(async () => {
 }, 30_000);
 
 describe('FG-ECON in-chat media authorization', () => {
+  it('strictly binds quoted media args to one canonical provider route', () => {
+    expect(
+      canonicalChatMediaProviderArgs('image_generate', { prompt: 'x' }),
+    ).toEqual({ prompt: 'x', model: 'fal/fal-ai/flux/dev' });
+    expect(
+      canonicalChatMediaProviderArgs('video_generate', {
+        prompt: 'x',
+        durationSeconds: 10,
+      }),
+    ).toEqual({
+      prompt: 'x',
+      durationSeconds: 10,
+      model: 'fal/fal-ai/kling-video/v3/pro/text-to-video',
+    });
+    expect(
+      canonicalChatMediaProviderArgs('music_generate', { prompt: 'x', duration: 30 }),
+    ).toEqual({
+      prompt: 'x',
+      durationSeconds: 30,
+      model: 'google/lyria-3-clip-preview',
+    });
+    for (const args of [
+      { prompt: 'x', duration: '10' },
+      { prompt: 'x', durationSeconds: 11 },
+      { prompt: 'x', duration: 5, durationSeconds: 5 },
+      { prompt: 'x', durationSeconds: 5, model: 'premium/fallback' },
+    ]) {
+      expect(() => quoteChatMediaTool('video_generate', args)).toThrow();
+    }
+  });
+
   it('FG-ECON-MEDIA-01: near-zero video is denied before provider admission/debit', async () => {
     const quote = quoteChatMediaTool('video_generate', { prompt: 'expensive', duration: 5 });
     const f = await fixture(quote.manna - 1);
@@ -123,7 +157,7 @@ describe('FG-ECON in-chat media authorization', () => {
     });
     const [pending] = await pg<{ status: string; manna: number }[]>`
       select status, manna from usage_events where turn_id = ${auth.authorizationId}`;
-    providerObservedPending = pending?.status === 'pending';
+    providerObservedPending = pending?.status === 'provider_admitted';
     expect(providerObservedPending).toBe(true);
     expect((await getBalance(f.userId)).total).toBe(before.total - quote.manna);
 
@@ -159,23 +193,74 @@ describe('FG-ECON in-chat media authorization', () => {
   });
 
   it('FG-ECON-MEDIA-03: concurrent different-cost same-action calls admit one provider/debit', async () => {
-    const expensive = quoteChatMediaTool('tts', { text: 'x'.repeat(1_000) });
+    const expensive = quoteChatMediaTool('video_generate', { prompt: 'x', durationSeconds: 10 });
     const f = await fixture(expensive.manna * 3);
     let providerCalls = 0;
-    const gate = async (text: string) => {
+    const gate = async (durationSeconds: number) => {
       const result = await reserveChatMedia({
-        request: request(f, 'tts', { text }),
+        request: request(f, 'video_generate', { prompt: 'x', durationSeconds }),
         dailyCap: 100_000,
       });
       providerCalls += 1;
       return result;
     };
-    const outcomes = await Promise.allSettled([gate('short'), gate('x'.repeat(1_000))]);
+    const outcomes = await Promise.allSettled([gate(2), gate(10)]);
     expect(outcomes.filter((outcome) => outcome.status === 'fulfilled')).toHaveLength(1);
     expect(outcomes.filter((outcome) => outcome.status === 'rejected')).toHaveLength(1);
     expect(providerCalls).toBe(1);
     const rows = await pg`select 1 from usage_events where user_id = ${f.userId} and event_type = ${CHAT_MEDIA_EVENT_TYPE}`;
     expect(rows).toHaveLength(1);
+  });
+
+  it('durably consumes one provider-admission ticket and rejects exact replay', async () => {
+    const quote = quoteChatMediaTool('image_generate', { prompt: 'once' });
+    const f = await fixture(quote.manna * 2);
+    const exactRequest = request(f, 'image_generate', { prompt: 'once' });
+    const first = await reserveChatMedia({ request: exactRequest, dailyCap: 100_000 });
+    await expect(
+      reserveChatMedia({ request: exactRequest, dailyCap: 100_000 }),
+    ).rejects.toThrow('provider admission ticket already consumed');
+    const rows = await pg<{ status: string }[]>`
+      select status from usage_events where turn_id = ${first.authorizationId}`;
+    expect(rows).toEqual([{ status: 'provider_admitted' }]);
+    const spends = await pg`
+      select 1 from manna_transactions
+      where idempotency_key = ${first.metadata.reservation.idempotencyKey}`;
+    expect(spends).toHaveLength(1);
+  });
+
+  it('revokes media authorization for deleted sessions, payers, and agents', async () => {
+    for (const revoked of ['session', 'payer', 'agent'] as const) {
+      const quote = quoteChatMediaTool('image_generate', { prompt: revoked });
+      const f = await fixture(quote.manna + 1);
+      if (revoked === 'session') await pg`update sessions set deleted = true where id = ${f.sessionId}`;
+      if (revoked === 'payer') await pg`update accounts set deleted = true where id = ${f.userId}`;
+      if (revoked === 'agent') await pg`update accounts set deleted = true where id = ${f.agentId}`;
+      await expect(
+        reserveChatMedia({
+          request: request(f, 'image_generate', { prompt: revoked }),
+          dailyCap: 100_000,
+        }),
+      ).rejects.toThrow('session/agent binding unavailable');
+      const rows = await pg`
+        select 1 from usage_events
+        where user_id = ${f.userId} and event_type = ${CHAT_MEDIA_EVENT_TYPE}`;
+      expect(rows).toHaveLength(0);
+    }
+  });
+
+  it('fails closed for deferred in-chat TTS before debit', async () => {
+    const f = await fixture(100);
+    await expect(
+      reserveChatMedia({
+        request: request(f, 'tts', { text: 'hello' }),
+        dailyCap: 100_000,
+      }),
+    ).rejects.toThrow('in-chat tts is deferred');
+    const rows = await pg`
+      select 1 from usage_events
+      where user_id = ${f.userId} and event_type = ${CHAT_MEDIA_EVENT_TYPE}`;
+    expect(rows).toHaveLength(0);
   });
 
   it('FG-ECON-MEDIA-04: provider/tool failure restores the exact reservation and terminalizes usage', async () => {
@@ -230,5 +315,48 @@ describe('FG-ECON in-chat media authorization', () => {
       manna: 0,
       error_code: 'media_generation_timeout',
     });
+  });
+
+  it('admits direct Studio tools only through their exact committed reservation', async () => {
+    const quote = quoteChatMediaTool('video_generate', { prompt: 'studio clip', duration: 5 });
+    const f = await fixture(quote.manna + 10);
+    const turnId = randomUUID();
+    await reserveStudioGeneration({
+      turnId,
+      accountId: f.userId,
+      tool: 'video_generate',
+      quote,
+      reservationKey: `studio:${turnId}:reserve`,
+      dailyCap: 100_000,
+    });
+    const exact = await verifyPendingStudioMedia({
+      request: {
+        sessionKey: `agent:main:eden3:studio:${turnId}`,
+        agentId: 'main',
+        tool: 'video_generate',
+        args: { prompt: 'studio clip', duration: 5 },
+      },
+    });
+    expect(exact).toMatchObject({ authorizationId: turnId, tool: 'video_generate' });
+    await expect(
+      verifyPendingStudioMedia({
+        request: {
+          sessionKey: `agent:main:eden3:studio:${turnId}`,
+          agentId: 'main',
+          tool: 'video_generate',
+          args: { prompt: 'studio clip', duration: 10 },
+        },
+      }),
+    ).rejects.toThrow('Studio reservation identity mismatch');
+    await expect(
+      verifyPendingStudioMedia({
+        request: {
+          sessionKey: `agent:main:eden3:studio:${randomUUID()}`,
+          agentId: 'main',
+          tool: 'video_generate',
+          args: { prompt: 'studio clip', duration: 5 },
+        },
+      }),
+    ).rejects.toThrow('pending Studio authorization unavailable');
   });
 });

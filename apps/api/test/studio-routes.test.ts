@@ -476,12 +476,6 @@ describe('POST /studio/generate', () => {
       file: () => fakeMediaFile('studio-music.mp3', 'audio/mpeg', 'audio'),
       expectedMime: 'audio/mpeg',
     },
-    {
-      tool: 'tts' as const,
-      args: { text: 'Welcome to Eden.' },
-      file: () => fakeMediaFile('studio-voice.mp3', 'audio/mpeg', 'audio'),
-      expectedMime: 'audio/mpeg',
-    },
   ] satisfies Array<{
     tool: StudioToolName;
     args: Record<string, unknown>;
@@ -534,7 +528,7 @@ describe('POST /studio/generate', () => {
     expect((await getBalance(richUserId)).total).toBe(before.total - quote.manna);
   });
 
-  it('falls back to direct ElevenLabs TTS when OpenClaw lacks a direct tts invoke tool', async () => {
+  it('routes Studio TTS directly to its quoted ElevenLabs adapter', async () => {
     invokeCalls = [];
     invokeError = new GatewayHttpError(404, 'gateway responded 404 to /tools/invoke (tts)');
     nextClaim = claimUnused;
@@ -560,8 +554,7 @@ describe('POST /studio/generate', () => {
     };
     expect(body.mime).toBe('audio/mpeg');
     expect(body.metering).toMatchObject({ provider: 'elevenlabs', model: 'tts', manna: quote.manna });
-    expect(invokeCalls).toHaveLength(1);
-    expect(invokeCalls[0]).toMatchObject({ tool: 'tts', agentId: 'main' });
+    expect(invokeCalls).toHaveLength(0);
 
     const [creation] = await pg<
       { userId: string; tool: string; url: string; args: unknown; public: boolean }[]

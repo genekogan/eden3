@@ -349,6 +349,33 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
     expect(Number(countRow!.count)).toBe(1);
   });
 
+  it('settles a new authorization when the provider produces identical bytes', async () => {
+    const file = fakePngFile('authorized-identical.png');
+    await authorize(sessionId, 'image_generate');
+    const first = await pipeline.ingestFile(file, {
+      sessionId,
+      agentAccountId: agentId,
+      tool: 'image_generate',
+    });
+    const beforeSecond = await getBalance(userId);
+    const secondAuthorization = await authorize(sessionId, 'image_generate');
+    const second = await pipeline.ingestFile(file, {
+      sessionId,
+      agentAccountId: agentId,
+      tool: 'image_generate',
+    });
+    expect(second.deduped).toBe(true);
+    expect(second.creation?.id).toBe(first.creation?.id);
+    expect(second.mediaAuthorizationId).toBe(secondAuthorization.authorizationId);
+    expect((await getBalance(userId)).total).toBe(
+      beforeSecond.total - secondAuthorization.quote.manna,
+    );
+    const [usage] = await pg<{ status: string; creation_id: string }[]>`
+      select status, metadata->>'creationId' as creation_id
+      from usage_events where turn_id = ${secondAuthorization.authorizationId}`;
+    expect(usage).toMatchObject({ status: 'completed', creation_id: first.creation!.id });
+  });
+
   it('concurrent double-ingest of the same NEW file creates exactly one creation (W2 #7)', async () => {
     const file = fakePngFile('concurrent.png');
     const before = await getBalance(userId);

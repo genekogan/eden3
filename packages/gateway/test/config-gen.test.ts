@@ -400,8 +400,17 @@ describe('ensureBaseline', () => {
           },
           imageGenerationModel: {
             primary: 'fal/fal-ai/flux/dev',
-            fallbacks: ['google/gemini-3-pro-image-preview'],
+            fallbacks: [],
           },
+          videoGenerationModel: {
+            primary: 'fal/fal-ai/kling-video/v3/pro/text-to-video',
+            fallbacks: [],
+          },
+          musicGenerationModel: {
+            primary: 'google/lyria-3-clip-preview',
+            fallbacks: [],
+          },
+          mediaGenerationAutoProviderFallback: false,
           memorySearch: {
             enabled: true,
             provider: 'openai',

@@ -771,13 +771,22 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       timeout.unref();
     });
     try {
-      const invoke = getToolsClient().invokeTool({
-        tool: body.tool,
-        args: studioProviderArgs(body),
-        agentId,
-        sessionKey: gatewaySessionKey,
-        signal: controller.signal,
-      });
+      // The built-in TTS tool has no per-call provider parameter and may obey
+      // mutable host preferences. Studio's quote is specifically ElevenLabs,
+      // so execute its already-reviewed direct ElevenLabs adapter instead of
+      // allowing an unbound OpenClaw provider route.
+      const invoke =
+        body.tool === 'tts' && ttsFallback !== null
+          ? Promise.reject(
+              new GatewayHttpError(404, 'POST /tools/invoke intentionally bypassed for exact tts'),
+            )
+          : getToolsClient().invokeTool({
+              tool: body.tool,
+              args: studioProviderArgs(body),
+              agentId,
+              sessionKey: gatewaySessionKey,
+              signal: controller.signal,
+            });
       const [, claimedFile] = await Promise.race([
         Promise.all([invoke, claim.promise]),
         timeoutPromise,

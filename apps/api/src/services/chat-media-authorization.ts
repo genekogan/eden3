@@ -18,6 +18,7 @@ import {
   type StudioToolName,
 } from '../routes/studio';
 import { plainSessionKey } from './turn-registry';
+import { STUDIO_RESERVATION_EVENT_TYPE } from './studio-reservations';
 
 export const CHAT_MEDIA_EVENT_TYPE = 'chat_media';
 export const CHAT_MEDIA_RESERVATION_TTL_MS = 60 * 60 * 1_000;
@@ -29,14 +30,23 @@ const MEDIA_TOOLS = new Set<StudioToolName>([
   'music_generate',
   'tts',
 ]);
+const CHAT_VIDEO_MODEL = 'fal/fal-ai/kling-video/v3/pro/text-to-video';
+const CHAT_MUSIC_MODEL = 'google/lyria-3-clip-preview';
 
 export interface ChatMediaAuthorizationRequest {
-  runId: string;
-  toolCallId: string;
+  runId?: string;
+  toolCallId?: string;
   sessionKey: string;
   agentId: string;
   tool: StudioToolName;
   args: Record<string, unknown>;
+}
+
+export interface StudioMediaAuthorization {
+  authorizationId: string;
+  tool: StudioToolName;
+  action: string;
+  quote: StudioGenerationQuote;
 }
 
 export interface ChatMediaAuthorizationMetadata {
@@ -63,6 +73,7 @@ export interface ChatMediaAuthorizationMetadata {
   requestedAt: string;
   failureCode?: string;
   failureLatencyMs?: number;
+  providerAdmittedAt?: string;
 }
 
 export interface ChatMediaAuthorization {
@@ -117,6 +128,87 @@ export function isChatMediaTool(value: string): value is StudioToolName {
   return MEDIA_TOOLS.has(value as StudioToolName);
 }
 
+function imageModelKey(raw: unknown): keyof typeof IMAGE_MODEL_OPTIONS | null {
+  if (raw === undefined) return DEFAULT_IMAGE_MODEL;
+  for (const [key, option] of Object.entries(IMAGE_MODEL_OPTIONS) as Array<
+    [keyof typeof IMAGE_MODEL_OPTIONS, (typeof IMAGE_MODEL_OPTIONS)[keyof typeof IMAGE_MODEL_OPTIONS]]
+  >) {
+    if (raw === key || raw === option.openclawModel || raw === option.model) return key;
+  }
+  return null;
+}
+
+/**
+ * Verify the separate Studio reservation for a direct OpenClaw tool invoke.
+ * The `eden3:studio:<uuid>` context is only an index, never authority: the
+ * callback admits provider work only after independently observing the exact
+ * committed pending usage row and its linked debit.
+ */
+export async function verifyPendingStudioMedia(options: {
+  request: ChatMediaAuthorizationRequest;
+  db?: DbHandle;
+}): Promise<StudioMediaAuthorization | null> {
+  const sessionKey = plainSessionKey(safeHostIdentity(options.request.sessionKey, 'sessionKey'));
+  const match = /^eden3:studio:([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(
+    sessionKey,
+  );
+  if (!match) return null;
+  if (!isChatMediaTool(options.request.tool)) {
+    throw new Error('chat-media-authorization: unsupported Studio tool');
+  }
+  const authorizationId = match[1]!.toLowerCase();
+  const quote = quoteChatMediaTool(options.request.tool, options.request.args);
+  const rows = (await (options.db ?? db).execute(sql`
+    select ue.user_id, ue.metadata, mt.id as transaction_id, mt.amount, mt.type,
+           mt.idempotency_key
+    from usage_events ue
+    join manna_accounts ma on ma.account_id = ue.user_id
+    join manna_transactions mt
+      on mt.manna_account_id = ma.id
+     and mt.id = nullif(ue.metadata->'reservation'->>'transactionId', '')::uuid
+    where ue.event_type = ${STUDIO_RESERVATION_EVENT_TYPE}
+      and ue.turn_id = ${authorizationId}
+      and ue.status = 'pending'
+    limit 2
+  `)) as unknown as Array<{
+    user_id: string;
+    metadata: unknown;
+    transaction_id: string;
+    amount: string | number;
+    type: string;
+    idempotency_key: string | null;
+  }>;
+  if (rows.length !== 1) {
+    throw new Error('chat-media-authorization: pending Studio authorization unavailable');
+  }
+  const row = rows[0]!;
+  const metadata = isRecord(row.metadata) ? row.metadata : null;
+  const studioQuote = metadata && isRecord(metadata.quote) ? metadata.quote : null;
+  const reservation = metadata && isRecord(metadata.reservation) ? metadata.reservation : null;
+  const reservationKey = `studio:${authorizationId}:reserve`;
+  if (
+    !metadata ||
+    !studioQuote ||
+    !reservation ||
+    metadata.tool !== options.request.tool ||
+    studioQuote.action !== quote.action ||
+    studioQuote.provider !== quote.provider ||
+    studioQuote.model !== quote.model ||
+    studioQuote.tableVersion !== quote.tableVersion ||
+    studioQuote.manna !== quote.manna ||
+    studioQuote.costUsd !== quote.costUsd ||
+    reservation.idempotencyKey !== reservationKey ||
+    reservation.transactionId !== row.transaction_id ||
+    reservation.reservedManna !== quote.manna ||
+    row.idempotency_key !== reservationKey ||
+    numericToNumber(String(row.amount)) !== -quote.manna ||
+    row.type !== `spend:${quote.action}`
+  ) {
+    throw new Error('chat-media-authorization: Studio reservation identity mismatch');
+  }
+  return { authorizationId, tool: options.request.tool, action: quote.action, quote };
+}
+
 /**
  * The M3 chat surface intentionally supports only the cost-bounded default
  * media routes. OpenClaw exposes many provider-specific knobs (count, quality,
@@ -131,7 +223,7 @@ export function quoteChatMediaTool(
     tool === 'image_generate'
       ? new Set(['action', 'prompt', 'model'])
       : tool === 'video_generate' || tool === 'music_generate'
-        ? new Set(['action', 'prompt', 'duration'])
+        ? new Set(['action', 'prompt', 'duration', 'durationSeconds', 'model'])
         : new Set(['action', 'text']);
   for (const key of Object.keys(rawArgs)) {
     if (!allowed.has(key)) {
@@ -151,19 +243,57 @@ export function quoteChatMediaTool(
     throw new Error(`chat-media-authorization: invalid ${tool} prompt`);
   }
   if (tool === 'image_generate') {
-    const rawModel = rawArgs.model;
-    const aliases = new Map<string, keyof typeof IMAGE_MODEL_OPTIONS>([
-      [DEFAULT_IMAGE_MODEL, DEFAULT_IMAGE_MODEL],
-      [IMAGE_MODEL_OPTIONS[DEFAULT_IMAGE_MODEL].openclawModel, DEFAULT_IMAGE_MODEL],
-      [IMAGE_MODEL_OPTIONS[DEFAULT_IMAGE_MODEL].model, DEFAULT_IMAGE_MODEL],
-    ]);
-    const model = rawModel === undefined ? DEFAULT_IMAGE_MODEL : aliases.get(String(rawModel));
-    if (!model) throw new Error('chat-media-authorization: only the default image route is enabled');
+    const model = imageModelKey(rawArgs.model);
+    if (!model) throw new Error('chat-media-authorization: unsupported image route');
     return quoteStudioGeneration(tool, { prompt, model });
   }
-  const args: Record<string, unknown> = { prompt };
-  if (rawArgs.duration !== undefined) args.duration = rawArgs.duration;
+  if (rawArgs.duration !== undefined && rawArgs.durationSeconds !== undefined) {
+    throw new Error(`chat-media-authorization: ambiguous ${tool} duration`);
+  }
+  const suppliedDuration = rawArgs.durationSeconds ?? rawArgs.duration;
+  const duration = suppliedDuration ?? (tool === 'video_generate' ? 5 : 30);
+  const bounds = tool === 'video_generate' ? { min: 2, max: 10 } : { min: 5, max: 120 };
+  if (
+    typeof duration !== 'number' ||
+    !Number.isFinite(duration) ||
+    !Number.isInteger(duration) ||
+    duration < bounds.min ||
+    duration > bounds.max
+  ) {
+    throw new Error(`chat-media-authorization: invalid ${tool} duration`);
+  }
+  const expectedModel = tool === 'video_generate' ? CHAT_VIDEO_MODEL : CHAT_MUSIC_MODEL;
+  if (rawArgs.model !== undefined && rawArgs.model !== expectedModel) {
+    throw new Error(`chat-media-authorization: unsupported ${tool} model`);
+  }
+  const args: Record<string, unknown> = { prompt, duration };
   return quoteStudioGeneration(tool, args);
+}
+
+/** Exact args executed after the provider route has been authorized. */
+export function canonicalChatMediaProviderArgs(
+  tool: StudioToolName,
+  rawArgs: Record<string, unknown>,
+): Record<string, unknown> {
+  // Validation and duration canonicalization are intentionally shared with
+  // the quote path so the hook can never execute a different cost shape.
+  quoteChatMediaTool(tool, rawArgs);
+  if (tool === 'tts') {
+    const text = String(rawArgs.text).trim();
+    return { text };
+  }
+  const prompt = String(rawArgs.prompt).trim();
+  if (tool === 'image_generate') {
+    const model = imageModelKey(rawArgs.model);
+    if (!model) throw new Error('chat-media-authorization: unsupported image model');
+    return { prompt, model: IMAGE_MODEL_OPTIONS[model].openclawModel };
+  }
+  const durationSeconds = rawArgs.durationSeconds ?? rawArgs.duration ?? (tool === 'video_generate' ? 5 : 30);
+  return {
+    prompt,
+    durationSeconds,
+    model: tool === 'video_generate' ? CHAT_VIDEO_MODEL : CHAT_MUSIC_MODEL,
+  };
 }
 
 function readMetadata(value: unknown): ChatMediaAuthorizationMetadata {
@@ -236,12 +366,15 @@ export async function reserveChatMedia(options: {
 }): Promise<ChatMediaAuthorization> {
   const dbc = options.db ?? db;
   const request = options.request;
-  const runId = safeHostIdentity(request.runId, 'runId');
-  const toolCallId = safeHostIdentity(request.toolCallId, 'toolCallId');
+  const runId = safeHostIdentity(request.runId ?? '', 'runId');
+  const toolCallId = safeHostIdentity(request.toolCallId ?? '', 'toolCallId');
   const sessionKey = plainSessionKey(safeHostIdentity(request.sessionKey, 'sessionKey'));
   const agentId = safeHostIdentity(request.agentId, 'agentId');
   if (!isChatMediaTool(request.tool)) throw new Error('chat-media-authorization: unsupported tool');
   const quote = quoteChatMediaTool(request.tool, request.args);
+  if (request.tool === 'tts') {
+    throw new Error('chat-media-authorization: in-chat tts is deferred');
+  }
   const action = String(quote.action);
   const outputKind = outputKindForTool(request.tool);
 
@@ -249,9 +382,14 @@ export async function reserveChatMedia(options: {
     const targets = (await tx.execute(sql`
       select s.id as session_id, s.owner_id as account_id, a.account_id as agent_account_id
       from sessions s
+      join accounts owner_account on owner_account.id = s.owner_id
       join session_agents sa on sa.session_id = s.id
       join agents a on a.account_id = sa.agent_account_id
+      join accounts agent_account on agent_account.id = a.account_id
       where s.gateway_session_key = ${sessionKey}
+        and s.deleted = false
+        and owner_account.deleted = false and owner_account.type = 'user'
+        and agent_account.deleted = false and agent_account.type = 'agent'
         and s.session_type is distinct from 'channel' and s.channel_connection_id is null
         and a.openclaw_id = ${agentId}
       order by a.account_id
@@ -277,7 +415,7 @@ export async function reserveChatMedia(options: {
       select turn_id from usage_events
       where event_type = ${CHAT_MEDIA_EVENT_TYPE}
         and session_id = ${target.session_id}
-        and status in ('pending', 'refund_pending')
+        and status in ('pending', 'provider_admitted', 'refund_pending')
         and metadata->>'outputKind' = ${outputKind}
       limit 1
     `)) as unknown as Array<{ turn_id: string }>;
@@ -295,46 +433,7 @@ export async function reserveChatMedia(options: {
     });
     const now = options.now ?? new Date();
     if (debited.alreadyApplied) {
-      const rows = (await tx.execute(sql`
-        select user_id, agent_id, session_id, status, metadata
-        from usage_events
-        where event_type = ${CHAT_MEDIA_EVENT_TYPE} and turn_id = ${authorizationId}
-        for update
-      `)) as unknown as Array<{
-        user_id: string | null;
-        agent_id: string | null;
-        session_id: string | null;
-        status: string;
-        metadata: unknown;
-      }>;
-      const row = rows[0];
-      const metadata = row ? readMetadata(row.metadata) : null;
-      if (
-        !row ||
-        row.status !== 'pending' ||
-        row.user_id !== target.account_id ||
-        row.agent_id !== target.agent_account_id ||
-        row.session_id !== target.session_id ||
-        metadata?.runIdHash !== digestIdentity(runId) ||
-        metadata.toolCallIdHash !== digestIdentity(toolCallId) ||
-        metadata.tool !== request.tool ||
-        metadata.quote.manna !== quote.manna ||
-        metadata.quote.provider !== quote.provider ||
-        metadata.quote.model !== quote.model
-      ) {
-        throw new Error('chat-media-authorization: replay identity mismatch');
-      }
-      await assertReservationProvenance(tx, target.account_id, metadata);
-      return {
-        authorizationId,
-        accountId: target.account_id,
-        agentAccountId: target.agent_account_id,
-        sessionId: target.session_id,
-        tool: request.tool,
-        action,
-        quote,
-        metadata,
-      };
+      throw new Error('chat-media-authorization: provider admission ticket already consumed');
     }
 
     const subscriptionManna = debited.subscriptionDrawn ?? 0;
@@ -360,12 +459,13 @@ export async function reserveChatMedia(options: {
         durableManna: Number((quote.manna - subscriptionManna).toFixed(4)),
       },
       requestedAt: now.toISOString(),
+      providerAdmittedAt: now.toISOString(),
     };
     const [inserted] = await tx
       .insert(usageEvents)
       .values({
         eventType: CHAT_MEDIA_EVENT_TYPE,
-        status: 'pending',
+        status: 'provider_admitted',
         userId: target.account_id,
         agentId: target.agent_account_id,
         sessionId: target.session_id,
@@ -413,7 +513,7 @@ export async function completePendingChatMedia(
     from usage_events
     where event_type = ${CHAT_MEDIA_EVENT_TYPE}
       and session_id = ${options.sessionId}
-      and status = 'pending'
+      and status in ('pending', 'provider_admitted')
       and metadata->>'action' = ${options.action}
     limit 2
     for update
@@ -460,7 +560,7 @@ export async function completePendingChatMedia(
       and(
         eq(usageEvents.eventType, CHAT_MEDIA_EVENT_TYPE),
         eq(usageEvents.turnId, row.turn_id),
-        eq(usageEvents.status, 'pending'),
+        inArray(usageEvents.status, ['pending', 'provider_admitted']),
       ),
     )
     .returning({ id: usageEvents.id });
@@ -477,7 +577,7 @@ export async function hasPendingChatMediaAuthorization(options: {
     select 1 from usage_events
     where event_type = ${CHAT_MEDIA_EVENT_TYPE}
       and session_id = ${options.sessionId}
-      and status = 'pending'
+      and status in ('pending', 'provider_admitted')
       and metadata->>'action' = ${options.action}
     limit 1
   `)) as unknown as unknown[];
@@ -500,7 +600,11 @@ export async function compensateChatMedia(options: {
     `)) as unknown as Array<{ status: string; metadata: unknown }>;
     const row = rows[0];
     if (!row || row.status === 'completed' || row.status === 'error') return null;
-    if (row.status !== 'pending' && row.status !== 'refund_pending') {
+    if (
+      row.status !== 'pending' &&
+      row.status !== 'provider_admitted' &&
+      row.status !== 'refund_pending'
+    ) {
       throw new Error(`chat-media-authorization: unexpected compensation state ${row.status}`);
     }
     const metadata = readMetadata(row.metadata);
@@ -614,7 +718,7 @@ export class ChatMediaReservationReaper {
         .where(
           and(
             eq(usageEvents.eventType, CHAT_MEDIA_EVENT_TYPE),
-            inArray(usageEvents.status, ['pending', 'refund_pending']),
+            inArray(usageEvents.status, ['pending', 'provider_admitted', 'refund_pending']),
             lt(usageEvents.createdAt, cutoff),
           ),
         )
