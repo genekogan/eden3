@@ -15,7 +15,6 @@ import { api, ApiError, isApiUnavailable } from "@/lib/api";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import type { AccountSummary, CreationDto } from "@/lib/types";
 import { studioRemixHref } from "@/components/studio/prefill";
-import { CreationLikeButton } from "./creation-like-button";
 
 /**
  * /creations/:id — the permalink. Server-rendered (share links get real
@@ -143,10 +142,10 @@ export default async function CreationPage({ params }: Props) {
   return (
     <div className="mx-auto w-full max-w-6xl px-4 py-8 md:px-8 md:py-10">
       <Link
-        href="/explore"
+        href={agent ? `/agents/${encodeURIComponent(agent.username)}/library` : "/"}
         className="text-xs text-muted transition-colors hover:text-foreground"
       >
-        ← Explore
+        ← Library
       </Link>
 
       <div className="mt-5 grid items-start gap-6 lg:grid-cols-[minmax(0,1fr)_300px] lg:gap-10">
@@ -183,16 +182,10 @@ export default async function CreationPage({ params }: Props) {
                 />
               ) : null}
               {creator ? (
-                <PersonRow
-                  label="Creator"
-                  href={`/explore?user=${encodeURIComponent(creator.username)}`}
-                  account={creator}
-                />
+                <PersonRow label="Creator" href="/" account={creator} />
               ) : null}
             </dl>
           ) : null}
-
-          <CreationLikeButton creation={creation} />
 
           {args ? (
             <details className="group rounded-lg border border-edge">

@@ -79,13 +79,13 @@ function ActivityRow({ event }: { event: UsageActivityEvent }) {
       <span
         aria-hidden
         className={`size-1.5 shrink-0 rounded-full ${
-          errored ? "bg-rose-400" : "bg-emerald-400"
+          errored ? "bg-danger" : "bg-success"
         }`}
       />
       <div className="min-w-0 flex-1">
         <p className="truncate text-sm text-foreground">{friendlyAction(event)}</p>
         {errored ? (
-          <p className="mt-0.5 text-xs text-rose-300/90">
+          <p className="mt-0.5 text-xs text-danger-soft/90">
             {manna > 0 ? "failed" : "failed — refunded"}
           </p>
         ) : event.model ? (
@@ -138,26 +138,43 @@ function SpendCard({
   );
 }
 
-export function UsageClient() {
+export function UsageClient({
+  fixedAgent,
+}: {
+  /**
+   * Agent-scoped "Log" mode (username): hides the account header + balance,
+   * scopes spend/activity to the agent, and adds a This-agent/All toggle.
+   */
+  fixedAgent?: string;
+} = {}) {
   const [summary, setSummary] = useState<UserUsageSummary | null>(null);
   const [phase, setPhase] = useState<Phase>("loading");
   const [error, setError] = useState<unknown>(null);
+  const [scope, setScope] = useState<"agent" | "all">(fixedAgent ? "agent" : "all");
   const alive = useRef(true);
 
-  const load = useCallback(async (soft = false) => {
-    if (!soft) setPhase("loading");
-    try {
-      const data = await api.usage.summary({ limit: 25 });
-      if (!alive.current) return;
-      setSummary(data);
-      setPhase("ready");
-      setError(null);
-    } catch (err) {
-      if (!alive.current) return;
-      setError(err);
-      setPhase("error");
-    }
-  }, []);
+  const agentParam = fixedAgent && scope === "agent" ? fixedAgent : undefined;
+
+  const load = useCallback(
+    async (soft = false) => {
+      if (!soft) setPhase("loading");
+      try {
+        const data = await api.usage.summary({
+          limit: 25,
+          ...(agentParam ? { agent: agentParam } : {}),
+        });
+        if (!alive.current) return;
+        setSummary(data);
+        setPhase("ready");
+        setError(null);
+      } catch (err) {
+        if (!alive.current) return;
+        setError(err);
+        setPhase("error");
+      }
+    },
+    [agentParam],
+  );
 
   useEffect(() => {
     alive.current = true;
@@ -173,26 +190,66 @@ export function UsageClient() {
   const total = summary?.balance.total ?? null;
 
   return (
-    <div className="mx-auto w-full max-w-3xl px-6 py-14 md:px-10">
-      <header className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
-            Account
-          </p>
-          <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
-            Usage &amp; billing
-          </h1>
-        </div>
-        {phase === "ready" ? (
-          <button
-            type="button"
-            onClick={() => void load(true)}
-            className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/40 hover:text-foreground"
+    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-3xl px-6 py-14 md:px-10"}>
+      {fixedAgent ? (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div
+            role="group"
+            aria-label="Log scope"
+            className="flex w-fit overflow-hidden rounded-lg border border-edge"
           >
-            Refresh
-          </button>
-        ) : null}
-      </header>
+            {(
+              [
+                ["agent", "This agent"],
+                ["all", "All agents"],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                aria-pressed={scope === value}
+                onClick={() => setScope(value)}
+                className={`px-3 py-2 text-sm transition-colors ${
+                  scope === value
+                    ? "bg-accent/15 text-accent-soft"
+                    : "bg-raised text-muted hover:text-foreground"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {phase === "ready" ? (
+            <button
+              type="button"
+              onClick={() => void load(true)}
+              className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/40 hover:text-foreground"
+            >
+              Refresh
+            </button>
+          ) : null}
+        </div>
+      ) : (
+        <header className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
+              Account
+            </p>
+            <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
+              Usage &amp; billing
+            </h1>
+          </div>
+          {phase === "ready" ? (
+            <button
+              type="button"
+              onClick={() => void load(true)}
+              className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/40 hover:text-foreground"
+            >
+              Refresh
+            </button>
+          ) : null}
+        </header>
+      )}
 
       {phase === "loading" ? (
         <div className="mt-10 space-y-6">
@@ -219,9 +276,12 @@ export function UsageClient() {
           />
         </div>
       ) : summary ? (
-        <main className="mt-10 space-y-10">
-          {/* Balance */}
-          <section aria-label="Balance" className="rounded-xl border border-edge bg-surface p-6 md:p-8">
+        <main className={`space-y-10 ${fixedAgent ? "mt-6" : "mt-10"}`}>
+          {/* Balance — user-level, hidden in agent-scoped Log mode. */}
+          <section
+            aria-label="Balance"
+            className={`rounded-xl border border-edge bg-surface p-6 md:p-8 ${fixedAgent ? "hidden" : ""}`}
+          >
             <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-faint">
               Manna balance
             </p>
@@ -238,7 +298,7 @@ export function UsageClient() {
             <p className="mt-4 border-t border-edge pt-4 text-xs text-faint">
               Manna is Eden&apos;s usage credit — 1,000 manna ≈ $1. Every chat
               turn and generation spends a little.{" "}
-              <a href="/manna" className="text-accent-soft hover:underline">
+              <a href="/account/manna" className="text-accent-soft hover:underline">
                 Top up or manage billing
               </a>
               .

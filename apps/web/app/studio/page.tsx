@@ -1,25 +1,13 @@
-import type { Metadata } from "next";
-import { StudioView } from "@/components/studio/studio-view";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
 
-export const metadata: Metadata = {
-  title: "Studio",
-  description:
-    "Generate images, video, music, and speech directly with Eden's tools.",
-};
+const LAST_TOOL_COOKIE = "eden3_last_tool";
+const DEFAULT_TOOL = "image_generate";
 
-export default function StudioPage() {
-  return (
-    <div className="mx-auto w-full max-w-4xl px-6 py-14 md:px-10">
-      <header>
-        <h1 className="text-3xl font-light tracking-tight md:text-4xl">
-          Studio
-        </h1>
-        <p className="mt-2 text-sm text-muted">
-          Generate images, video, music, and speech — straight to your
-          creations.
-        </p>
-      </header>
-      <StudioView />
-    </div>
-  );
+/** /studio → the last-used tool, else the default (image). */
+export default async function StudioIndexPage() {
+  const store = await cookies();
+  const last = store.get(LAST_TOOL_COOKIE)?.value;
+  const tool = last && /^[a-zA-Z0-9_-]{1,80}$/.test(last) ? last : DEFAULT_TOOL;
+  redirect(`/studio/${encodeURIComponent(tool)}`);
 }

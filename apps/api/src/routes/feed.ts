@@ -26,7 +26,9 @@ import {
  *
  *   GET /feed/creations — public+not-deleted creations, keyset (created_at,id)
  *                         desc; optional agent/user filter (username, uuid, or
- *                         legacy 24-hex id). Stored URLs are served verbatim —
+ *                         legacy 24-hex id). `user=me` = the signed-in viewer's
+ *                         own creations, INCLUDING non-public rows (401 when
+ *                         anonymous). Stored URLs are served verbatim —
  *                         legacy CloudFront links pass straight through.
  *   GET /feed/agents    — recently-active public agents (activity = latest
  *                         public creation inside the newest slice of the feed).
@@ -88,10 +90,20 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
       if (agentId === null) return { items: [], nextCursor: null };
     }
     let userId: string | null = null;
-    if (user !== undefined) {
+    if (user === 'me') {
+      // Viewer's own creations — resolved BEFORE resolveAccountRef so a real
+      // account named "me" can never shadow the special case.
+      if (viewerId === null) throw new ApiError(401, 'unauthorized', 'Authentication required');
+      userId = viewerId;
+    } else if (user !== undefined) {
       userId = await resolveAccountRef(user);
       if (userId === null) return { items: [], nextCursor: null };
     }
+
+    // When the viewer asks for their own creations, show everything they own
+    // (legacy-private and nsfw-flagged included) — only the public feed keeps
+    // the public+nsfw gates. Strictly gated on userId === viewerId.
+    const ownScope = userId !== null && userId === viewerId;
 
     const rows = await pg<CreationRow[]>`
       select c.id, c.external_id, c.user_id, c.agent_id, c.tool, c.filename,
@@ -112,8 +124,9 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
       from creations c
       left join accounts cu on cu.id = c.user_id
       left join accounts ag on ag.id = c.agent_id
-      where c.public = true and c.deleted = false
-        ${safePublicCreationFilter()}
+      where c.deleted = false
+        ${ownScope ? pg`` : pg`and c.public = true`}
+        ${ownScope ? pg`` : safePublicCreationFilter()}
         ${agentId !== null ? pg`and c.agent_id = ${agentId}` : pg``}
         ${userId !== null ? pg`and c.user_id = ${userId}` : pg``}
         ${

@@ -45,15 +45,15 @@ function tokenPreview(connection: ChannelConnectionDto): string {
 
 function statusTone(connection: ChannelConnectionDto): string {
   if (connection.observedState === "live") {
-    return "border-emerald-400/25 bg-emerald-400/10 text-emerald-300";
+    return "border-success/25 bg-success/10 text-success-soft";
   }
   if (connection.observedState === "error") {
-    return "border-rose-400/25 bg-rose-400/10 text-rose-300";
+    return "border-danger/25 bg-danger/10 text-danger-soft";
   }
   if (connection.observedState === "starting") {
-    return "border-amber-400/25 bg-amber-400/10 text-amber-200";
+    return "border-warning/25 bg-warning/10 text-warning-soft";
   }
-  return "border-edge bg-white/[0.04] text-muted";
+  return "border-edge bg-foreground/[0.04] text-muted";
 }
 
 function initialDraft(connection: ChannelConnectionDto): ConnectionDraft {
@@ -83,7 +83,15 @@ function FormField({ label, children }: { label: string; children: React.ReactNo
   );
 }
 
-export function ChannelsClient() {
+export function ChannelsClient({
+  fixedAgent,
+}: {
+  /**
+   * Pin the view to one agent (username) — used by the agent-scoped Gateway
+   * page. Hides the agent picker and the standalone-page header.
+   */
+  fixedAgent?: string;
+} = {}) {
   const [agents, setAgents] = useState<AgentDto[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [connections, setConnections] = useState<ChannelConnectionDto[]>([]);
@@ -135,6 +143,12 @@ export function ChannelsClient() {
       setConnections(channelList.items);
       setDrafts(Object.fromEntries(channelList.items.map((item) => [item.id, initialDraft(item)])));
       setSelectedAgentId((current) => {
+        if (fixedAgent) {
+          const pinned = mine.find(
+            (agent) => agent.username.toLowerCase() === fixedAgent.toLowerCase(),
+          );
+          return pinned?.id ?? null;
+        }
         if (current && mine.some((agent) => agent.id === current)) return current;
         const requested = new URLSearchParams(window.location.search)
           .get("agent")
@@ -154,7 +168,7 @@ export function ChannelsClient() {
       setNote(errorCopy(error));
       setPhase("error");
     }
-  }, []);
+  }, [fixedAgent]);
 
   useEffect(() => {
     alive.current = true;
@@ -389,17 +403,17 @@ export function ChannelsClient() {
             </p>
             <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-faint">Updated {formatRelativeTime(connection.updatedAt)}</p>
           </div>
-          <button type="button" disabled={busy === `delete:${connection.id}`} onClick={() => void remove(connection)} className={`rounded-lg border px-3 py-1.5 text-xs ${confirmingId === connection.id ? "border-rose-400/50 bg-rose-400/10 text-rose-300" : "border-edge text-muted hover:text-rose-300"}`}>
+          <button type="button" disabled={busy === `delete:${connection.id}`} onClick={() => void remove(connection)} className={`rounded-lg border px-3 py-1.5 text-xs ${confirmingId === connection.id ? "border-danger/50 bg-danger/10 text-danger-soft" : "border-edge text-muted hover:text-danger-soft"}`}>
             {confirmingId === connection.id ? "Confirm delete" : "Delete"}
           </button>
         </div>
 
         {connection.lastError ? (
-          <div className="mt-4 rounded-lg border border-rose-400/25 bg-rose-400/10 p-3">
-            <p className="text-xs text-rose-200">{connection.lastError.message}</p>
+          <div className="mt-4 rounded-lg border border-danger/25 bg-danger/10 p-3">
+            <p className="text-xs text-danger-soft">{connection.lastError.message}</p>
             <div className="mt-2 flex gap-2">
               <input value={rotateTokens[connection.id] ?? ""} onChange={(event) => setRotateTokens((current) => ({ ...current, [connection.id]: event.target.value }))} type="password" autoComplete="off" placeholder="New token (or retry stored)" className={inputClass} />
-              <button type="button" onClick={() => void retry(connection)} disabled={busy === `retry:${connection.id}`} className="rounded-lg border border-rose-300/30 px-3 text-xs text-rose-200 disabled:opacity-50">Retry</button>
+              <button type="button" onClick={() => void retry(connection)} disabled={busy === `retry:${connection.id}`} className="rounded-lg border border-danger-soft/30 px-3 text-xs text-danger-soft disabled:opacity-50">Retry</button>
             </div>
           </div>
         ) : null}
@@ -448,8 +462,8 @@ export function ChannelsClient() {
                       <div className="flex items-start justify-between gap-3">
                         <div><p className="text-xs text-muted">Sender ••••{request.peerPreview ?? "unknown"}</p><p className="text-[10px] text-faint">Requested {formatRelativeTime(request.requestedAt)}</p></div>
                         <div className="flex gap-2">
-                          <button type="button" disabled={busy === `pairing:${request.id}`} onClick={() => void decidePairing(connection, request, "deny")} className="text-xs text-rose-300 disabled:opacity-40">Deny</button>
-                          <button type="button" disabled={busy === `pairing:${request.id}` || (linkToMyAccount && !code.trim())} onClick={() => void decidePairing(connection, request, "approve")} className="text-xs text-emerald-300 disabled:opacity-40">Approve</button>
+                          <button type="button" disabled={busy === `pairing:${request.id}`} onClick={() => void decidePairing(connection, request, "deny")} className="text-xs text-danger-soft disabled:opacity-40">Deny</button>
+                          <button type="button" disabled={busy === `pairing:${request.id}` || (linkToMyAccount && !code.trim())} onClick={() => void decidePairing(connection, request, "approve")} className="text-xs text-success-soft disabled:opacity-40">Approve</button>
                         </div>
                       </div>
                       <label className="mt-2 flex items-start gap-2 text-xs text-muted">
@@ -483,17 +497,19 @@ export function ChannelsClient() {
   };
 
   return (
-    <div className="mx-auto w-full max-w-6xl px-6 py-14 md:px-10">
-      <header>
-        <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">Autonomy</p>
-        <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">Connections</h1>
-        <p className="mt-2 max-w-2xl text-sm text-muted">
-          Give an agent its own Discord or Telegram bot. Tokens stay encrypted; only the last
-          four characters are ever shown here.
-        </p>
-      </header>
+    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-6xl px-6 py-14 md:px-10"}>
+      {fixedAgent ? null : (
+        <header>
+          <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">Autonomy</p>
+          <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">Connections</h1>
+          <p className="mt-2 max-w-2xl text-sm text-muted">
+            Give an agent its own Discord or Telegram bot. Tokens stay encrypted; only the last
+            four characters are ever shown here.
+          </p>
+        </header>
+      )}
 
-      {phase === "ready" && agents.length > 0 ? (
+      {phase === "ready" && agents.length > 0 && !fixedAgent ? (
         <div className="mt-8 max-w-sm">
           <FormField label="Agent">
             <select
@@ -568,7 +584,7 @@ export function ChannelsClient() {
               <ul className="space-y-4">{agentConnections.map(renderConnection)}</ul>
             )}
 
-            {unassignedConnections.length > 0 ? (
+            {unassignedConnections.length > 0 && !fixedAgent ? (
               <div className="mt-8">
                 <p className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">
                   Not linked to any of your agents

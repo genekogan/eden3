@@ -89,19 +89,19 @@ function errorCopy(error: unknown): { title: string; hint: string } {
 
 const STATUS_TONES: Record<string, { chip: string; dot: string }> = {
   active: {
-    chip: "border-emerald-400/25 bg-emerald-400/10 text-emerald-300",
-    dot: "bg-emerald-400",
+    chip: "border-success/25 bg-success/10 text-success-soft",
+    dot: "bg-success",
   },
   running: {
     chip: "border-accent/40 bg-accent/10 text-accent-soft",
     dot: "animate-pulse bg-accent",
   },
   paused: {
-    chip: "border-edge bg-white/[0.04] text-muted",
+    chip: "border-edge bg-foreground/[0.04] text-muted",
     dot: "bg-faint",
   },
   finished: {
-    chip: "border-edge bg-white/[0.03] text-faint",
+    chip: "border-edge bg-foreground/[0.03] text-faint",
     dot: "bg-faint/60",
   },
 };
@@ -182,7 +182,7 @@ function EditTaskModal({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="rounded-md p-1 text-faint transition-colors hover:bg-white/[0.05] hover:text-foreground"
+            className="rounded-md p-1 text-faint transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
           >
             <svg
               viewBox="0 0 24 24"
@@ -237,7 +237,7 @@ function EditTaskModal({
           </fieldset>
 
           {error ? (
-            <p className="rounded-lg border border-rose-400/25 bg-rose-400/10 px-3 py-2 text-xs text-rose-300">
+            <p className="rounded-lg border border-danger/25 bg-danger/10 px-3 py-2 text-xs text-danger-soft">
               {error}
             </p>
           ) : null}
@@ -270,7 +270,16 @@ function EditTaskModal({
 
 type Phase = "loading" | "ready" | "error";
 
-export function TasksClient() {
+export function TasksClient({
+  fixedAgent,
+}: {
+  /**
+   * Pin to one agent (the agent-scoped Schedule page): server-filters the
+   * list, preselects the agent in the New-task modal, and drops the
+   * standalone-page header.
+   */
+  fixedAgent?: AgentDto | null;
+} = {}) {
   const [tasks, setTasks] = useState<TriggerDto[]>([]);
   const [agents, setAgents] = useState<Map<string, AgentRef>>(new Map());
   const [phase, setPhase] = useState<Phase>("loading");
@@ -288,11 +297,19 @@ export function TasksClient() {
   const load = useCallback(async (soft = false) => {
     if (!soft) setPhase("loading");
     try {
-      const { items } = await api.tasks.list();
+      const { items } = await api.tasks.list(
+        fixedAgent ? { agent: fixedAgent.username } : {},
+      );
       if (!alive.current) return;
       setTasks(items);
       setPhase("ready");
       setLoadError(null);
+
+      if (fixedAgent) {
+        // Single known agent — no identity resolution needed.
+        setAgents(new Map(items.map((task) => [task.agentId ?? "", fixedAgent])));
+        return;
+      }
 
       // Resolve agent identities: embedded summaries first, then pages of
       // GET /api/agents until every referenced agentId is covered (capped).
@@ -328,7 +345,7 @@ export function TasksClient() {
         setPhase("error");
       }
     }
-  }, []);
+  }, [fixedAgent]);
 
   useEffect(() => {
     alive.current = true;
@@ -419,29 +436,33 @@ export function TasksClient() {
   );
 
   return (
-    <div className="mx-auto w-full max-w-4xl px-6 py-14 md:px-10">
-      <header className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
-            Automation
-          </p>
-          <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
-            Tasks
-          </h1>
-          <p className="mt-2 text-sm text-muted">
-            Prompts your agents run on a schedule.
-          </p>
-        </div>
-        {newTaskButton}
-      </header>
+    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-4xl px-6 py-14 md:px-10"}>
+      {fixedAgent ? (
+        <div className="flex justify-end">{newTaskButton}</div>
+      ) : (
+        <header className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
+              Automation
+            </p>
+            <h1 className="mt-2 text-3xl font-light tracking-tight md:text-4xl">
+              Tasks
+            </h1>
+            <p className="mt-2 text-sm text-muted">
+              Prompts your agents run on a schedule.
+            </p>
+          </div>
+          {newTaskButton}
+        </header>
+      )}
 
       {note ? (
         <p
           role="status"
           className={`mt-6 rounded-lg border px-3 py-2 text-xs ${
             note.kind === "success"
-              ? "border-emerald-400/25 bg-emerald-400/10 text-emerald-300"
-              : "border-rose-400/25 bg-rose-400/10 text-rose-300"
+              ? "border-success/25 bg-success/10 text-success-soft"
+              : "border-danger/25 bg-danger/10 text-danger-soft"
           }`}
         >
           {note.text}
@@ -539,7 +560,7 @@ export function TasksClient() {
                       ) : null}
                       {task.lastError ? (
                         <p
-                          className="mt-1.5 line-clamp-2 text-xs text-rose-300"
+                          className="mt-1.5 line-clamp-2 text-xs text-danger-soft"
                           title={task.lastError}
                         >
                           {task.lastError}
@@ -583,8 +604,8 @@ export function TasksClient() {
                         onClick={() => void remove(task)}
                         className={`rounded-lg border px-3 py-1.5 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                           confirmingId === task.id
-                            ? "border-rose-400/50 bg-rose-400/10 text-rose-300"
-                            : "border-edge text-muted hover:border-rose-400/50 hover:text-rose-300"
+                            ? "border-danger/50 bg-danger/10 text-danger-soft"
+                            : "border-edge text-muted hover:border-danger/50 hover:text-danger-soft"
                         }`}
                       >
                         {confirmingId === task.id ? "Confirm" : "Delete"}
@@ -600,6 +621,7 @@ export function TasksClient() {
 
       <NewTaskModal
         open={modalOpen}
+        initialAgent={fixedAgent ?? null}
         onClose={() => setModalOpen(false)}
         onCreated={(created, agent) => {
           if (created) {
