@@ -18,6 +18,7 @@ const DEFAULT_INTERVAL_MS = 2_000;
 const DEFAULT_LEASE_MS = 35 * 60_000;
 const DEFAULT_RETRY_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
+const PROVISION_LOCK_SEED = 117;
 
 interface ProvisioningLogger {
   info(obj: unknown, message?: string): void;
@@ -73,6 +74,47 @@ function safeToolGroups(value: unknown): string[] {
     : [...DEFAULT_AGENT_TOOL_GROUPS];
 }
 
+/**
+ * Serialize filesystem/OpenClaw mutations per agent across API processes.
+ * A lease fences database completion; this session advisory lock additionally
+ * prevents an expired-but-resumed claimant from mutating alongside its
+ * replacement. PostgreSQL releases it automatically on process/connection
+ * loss. The claim is revalidated after a potentially blocking lock wait.
+ */
+async function withAgentProvisionLock(
+  claim: ClaimedProvisionJob,
+  run: () => Promise<void>,
+): Promise<void> {
+  const connection = await pg.reserve();
+  const lockKey = `eden3:agent-provision:${claim.agentAccountId}`;
+  let locked = false;
+  try {
+    await connection.unsafe(
+      `select pg_advisory_lock(hashtextextended($1::text, ${PROVISION_LOCK_SEED}))`,
+      [lockKey],
+    );
+    locked = true;
+    const current = await connection.unsafe(
+      `select 1 from agent_provision_jobs
+       where agent_account_id = $1::uuid and state = 'running' and claim_token = $2::uuid`,
+      [claim.agentAccountId, claim.claimToken],
+    );
+    if (current.length === 0) return;
+    await run();
+  } finally {
+    try {
+      if (locked) {
+        await connection.unsafe(
+          `select pg_advisory_unlock(hashtextextended($1::text, ${PROVISION_LOCK_SEED}))`,
+          [lockKey],
+        );
+      }
+    } finally {
+      connection.release();
+    }
+  }
+}
+
 export class AgentProvisioningWorker {
   private readonly intervalMs: number;
   private readonly leaseMs: number;
@@ -93,7 +135,7 @@ export class AgentProvisioningWorker {
 
   start(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => void this.tick(), this.intervalMs);
+    this.timer = setInterval(() => this.kick(), this.intervalMs);
     this.timer.unref();
     this.wake();
   }
@@ -109,7 +151,13 @@ export class AgentProvisioningWorker {
     this.wakeQueued = true;
     setImmediate(() => {
       this.wakeQueued = false;
-      void this.tick();
+      this.kick();
+    });
+  }
+
+  private kick(): void {
+    void this.tick().catch((error) => {
+      this.options.logger?.error({ err: error }, 'agent provisioning tick failed');
     });
   }
 
@@ -235,38 +283,42 @@ export class AgentProvisioningWorker {
     heartbeat.unref();
 
     try {
-      const result = await this.options.provisioner.provisionAgent({
-        openclawId: claim.username,
-        name: claim.name,
-        username: claim.username,
-        description: claim.description,
-        persona: claim.persona,
-        greeting: claim.greeting,
-        voice: claim.voice,
-        thinkingLevel: claim.thinkingLevel,
-        model: claim.model,
-      });
-      await (this.options.installSkills ?? installDefaultAgentSkills)({
-        agentId: claim.agentAccountId,
-        openclawId: claim.username,
-        workspacePath: result.hostWorkspaceDir,
-        skillSync: this.options.skillSync,
-      });
-      await this.options.toolSync.syncAgentToolGroups({
-        openclawId: claim.username,
-        toolGroups: claim.toolGroups,
-      });
-      const notificationId = this.options.store
-        ? await this.options.store.finishReady(claim, result.hostWorkspaceDir)
-        : await this.finishReady(claim, result.hostWorkspaceDir);
-      if (notificationId) {
-        await publishBuildNotification(
-          this.options.bus,
-          claim.ownerAccountId,
-          'agent_build_ready',
-          notificationId,
-        );
-      }
+      const build = async () => {
+        const result = await this.options.provisioner.provisionAgent({
+          openclawId: claim.username,
+          name: claim.name,
+          username: claim.username,
+          description: claim.description,
+          persona: claim.persona,
+          greeting: claim.greeting,
+          voice: claim.voice,
+          thinkingLevel: claim.thinkingLevel,
+          model: claim.model,
+        });
+        await (this.options.installSkills ?? installDefaultAgentSkills)({
+          agentId: claim.agentAccountId,
+          openclawId: claim.username,
+          workspacePath: result.hostWorkspaceDir,
+          skillSync: this.options.skillSync,
+        });
+        await this.options.toolSync.syncAgentToolGroups({
+          openclawId: claim.username,
+          toolGroups: claim.toolGroups,
+        });
+        const notificationId = this.options.store
+          ? await this.options.store.finishReady(claim, result.hostWorkspaceDir)
+          : await this.finishReady(claim, result.hostWorkspaceDir);
+        if (notificationId) {
+          await publishBuildNotification(
+            this.options.bus,
+            claim.ownerAccountId,
+            'agent_build_ready',
+            notificationId,
+          );
+        }
+      };
+      if (this.options.store) await build();
+      else await withAgentProvisionLock(claim, build);
     } catch (error) {
       this.options.logger?.error(
         { err: error, agentAccountId: claim.agentAccountId },
@@ -305,13 +357,15 @@ export class AgentProvisioningWorker {
         returning agent_account_id
       `;
       if (!fenced[0]) return null;
-      await tx`
+      const updated = await tx<{ account_id: string }[]>`
         update agents
         set provision_status = 'ready', provisioned_at = now(),
             workspace_path = ${workspacePath}
         where account_id = ${claim.agentAccountId}
           and provision_status = 'provisioning'
+        returning account_id
       `;
+      if (!updated[0]) throw new Error('agent provisioning state changed before completion');
       const inserted = await tx<{ id: string }[]>`
         insert into app_notifications (account_id, kind, source_agent_id, target_path)
         values (
@@ -350,12 +404,14 @@ export class AgentProvisioningWorker {
         returning agent_account_id
       `;
       if (!fenced[0]) return null;
-      await tx`
+      const updated = await tx<{ account_id: string }[]>`
         update agents
         set provision_status = 'failed'
         where account_id = ${claim.agentAccountId}
           and provision_status = 'provisioning'
+        returning account_id
       `;
+      if (!updated[0]) throw new Error('agent provisioning state changed before failure');
       const inserted = await tx<{ id: string }[]>`
         insert into app_notifications (account_id, kind, source_agent_id, target_path)
         values (
