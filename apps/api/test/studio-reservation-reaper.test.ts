@@ -220,10 +220,10 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
       select status from usage_events
       where event_type = 'studio_generation' and turn_id = ${turnId}`;
     expect(usageBefore?.status).toBe('pending');
+    await pg`update usage_events set created_at = now() - interval '2 hours'
+             where event_type = 'studio_generation' and turn_id = ${turnId}`;
 
     const reaper = new StudioReservationReaper({
-      ttlMs: 0,
-      now: () => new Date(Date.now() + 1),
       accountScope: [accountId],
     });
     expect((await reaper.runOnce()).reaped).toBe(1);

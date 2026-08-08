@@ -105,6 +105,10 @@ describe('GET /health', () => {
       await expect.poll(() => cleanupSweeps).toBe(1);
       expect(probe.taskScheduler).not.toBeNull();
       expect(probe.taskScheduler?.running).toBe(false);
+      expect(probe.studioReservationReaper).toBeDefined();
+      expect(
+        (probe.studioReservationReaper as unknown as { timer: NodeJS.Timeout | null }).timer,
+      ).not.toBeNull();
     } finally {
       await probe.close();
       restoreToken();
