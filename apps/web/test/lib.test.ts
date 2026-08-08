@@ -354,6 +354,7 @@ describe("lib/api browser transport", () => {
     expect(JSON.parse(String(fetchMock.mock.calls[2]![1]?.body))).toEqual({
       agentUsername: "eden",
     });
+    expect(fetchMock.mock.calls[3]![1]?.body).toBeUndefined();
   });
 
   it("normalizes the auth settings payload", async () => {
