@@ -358,6 +358,10 @@ function ensureHostedSecretProvider(config: OpenClawConfig): boolean {
     source: 'exec',
     command: EDEN_CHANNEL_SECRET_RESOLVER_COMMAND,
     args: ['--socket', EDEN_CHANNEL_SECRET_RESOLVER_SOCKET],
+    passEnv: [
+      'EDEN_CHANNEL_REQUESTER_KEY',
+      'EDEN_CHANNEL_REQUESTER_INSTANCE_ID',
+    ],
     jsonOnly: true,
     timeoutMs: 5_000,
     noOutputTimeoutMs: 5_000,

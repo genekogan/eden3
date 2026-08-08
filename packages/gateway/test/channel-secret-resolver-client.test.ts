@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -11,6 +12,19 @@ const CLIENT = fileURLToPath(
   new URL('../../../infra/openclaw/eden-channel-secret-resolver.mjs', import.meta.url),
 );
 const tempDirs: string[] = [];
+const REQUESTER_KEY = randomBytes(32);
+const PROCESS_INSTANCE_ID = randomUUID();
+const CONNECTION_ID = randomUUID();
+const SECRET_ID = `channel/${CONNECTION_ID}.c1.AAAAAAAAAAAAAAAAAAAAAA`;
+const REQUESTER = {
+  id: SECRET_ID,
+  configPath: 'channels.discord.accounts.eden-agent.token',
+  connectionId: CONNECTION_ID,
+  channel: 'discord',
+  runtimeAccountId: 'eden-agent',
+  agentId: 'eden-agent',
+  credentialField: 'token',
+};
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -23,6 +37,11 @@ function runClient(socketPath: string, input: string): Promise<{
 }> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [CLIENT, '--socket', socketPath], {
+      env: {
+        ...process.env,
+        EDEN_CHANNEL_REQUESTER_KEY: REQUESTER_KEY.toString('base64'),
+        EDEN_CHANNEL_REQUESTER_INSTANCE_ID: PROCESS_INSTANCE_ID,
+      },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -44,6 +63,9 @@ async function socketFixture(
   let receive!: (value: string) => void;
   const received = new Promise<string>((resolve) => (receive = resolve));
   const server = net.createServer((socket) => {
+    socket.write(
+      `${JSON.stringify({ protocolVersion: 2, challenge: randomBytes(32).toString('base64url') })}\n`,
+    );
     let input = '';
     socket.setEncoding('utf8');
     socket.on('data', (chunk) => {
@@ -65,26 +87,35 @@ describe('eden-channel-secret-resolver exec client', () => {
     const token = 'runtime-only-secret';
     const fixture = await socketFixture(
       JSON.stringify({
-        protocolVersion: 1,
-        values: { 'channel/connection-id': token },
+        protocolVersion: 2,
+        values: { [SECRET_ID]: token },
         ignoredDiagnostic: 'must-not-pass',
       }),
     );
     const request = JSON.stringify({
       protocolVersion: 1,
       provider: 'eden-channel-vault',
-      ids: ['channel/connection-id'],
+      ids: [SECRET_ID],
+      requesters: [REQUESTER],
     });
     try {
       const result = await runClient(fixture.socketPath, request);
       expect(result.code).toBe(0);
       expect(JSON.parse(result.stdout)).toEqual({
         protocolVersion: 1,
-        values: { 'channel/connection-id': token },
+        values: { [SECRET_ID]: token },
       });
       expect(result.stdout).not.toContain('ignoredDiagnostic');
       expect(result.stderr).toBe('');
-      await expect(fixture.received).resolves.toBe(request);
+      const received = JSON.parse(await fixture.received);
+      expect(received).toMatchObject({
+        protocolVersion: 2,
+        provider: 'eden-channel-vault',
+        ids: [SECRET_ID],
+        requesters: [REQUESTER],
+        processInstanceId: PROCESS_INSTANCE_ID,
+      });
+      expect(received.proof).toMatch(/^[A-Za-z0-9_-]{43}$/);
     } finally {
       await new Promise<void>((resolve) => fixture.server.close(() => resolve()));
     }

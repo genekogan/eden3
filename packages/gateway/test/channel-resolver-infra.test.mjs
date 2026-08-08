@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import { assertMatchingDatabaseSelection } from '../../../infra/channel-secret-resolver/server.mjs';
+import { deriveRequesterKey } from '../../../infra/channel-secret-resolver/server.mjs';
+import { deriveComposeChannelRequesterKey } from '../../../scripts/compose.mjs';
 
 const INFRA = fileURLToPath(new URL('../../../infra/', import.meta.url));
 
@@ -39,7 +41,25 @@ describe('channel resolver infrastructure contract', () => {
     expect(openclaw).not.toContain('- channel_secret_db');
     expect(openclaw).not.toContain('DATABASE_URL:');
     expect(openclaw).not.toContain('CHANNEL_TOKEN_ENCRYPTION_KEY:');
+    expect(openclaw).toContain('EDEN_CHANNEL_REQUESTER_KEY:');
     expect(compose).toMatch(/channel_secret_db:\n\s+internal: true/);
+  });
+
+  it('derives the same requester key at compose and resolver boundaries', () => {
+    const vaultKey = Buffer.alloc(32, 0x5a);
+    expect(Buffer.from(deriveComposeChannelRequesterKey(vaultKey.toString('base64')), 'base64')).toEqual(
+      deriveRequesterKey(vaultKey),
+    );
+  });
+
+  it('linearizes grants with lifecycle writes and excludes API-only X credentials', async () => {
+    const server = await readFile(`${INFRA}channel-secret-resolver/server.mjs`, 'utf8');
+    expect(server).toContain('sql.begin((tx) =>');
+    expect(server).toContain("join agents a on a.account_id = c.agent_id");
+    expect(server).toContain("and c.channel in ('discord', 'telegram')");
+    expect(server).toContain('for share of c, a, agent_account, owner');
+    expect(server).toContain('processInstanceId: event.processInstanceId');
+    expect(server).not.toContain("and c.channel in ('discord', 'telegram', 'x')");
   });
 
   it('fails closed if its logical database differs from the API selection', () => {

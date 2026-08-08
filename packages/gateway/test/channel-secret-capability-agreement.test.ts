@@ -7,15 +7,19 @@ import { describe, expect, it } from 'vitest';
 // against the typed gateway module — the anti-drift contract.
 import {
   deriveCapabilityKey as mjsDeriveKey,
+  deriveRequesterKey as mjsDeriveRequesterKey,
   parseSecretId as mjsParse,
+  requesterProof as mjsRequesterProof,
   verifySecretId as mjsVerify,
   CAPABILITY_EPOCH_DEFAULT as MJS_EPOCH,
 } from '../../../infra/channel-secret-resolver/server.mjs';
 import {
   CAPABILITY_EPOCH_DEFAULT,
   deriveCapabilityKey,
+  deriveRequesterKey,
   mintCapabilityId,
   parseSecretId,
+  requesterProof,
   verifySecretId,
 } from '../src/channel-secret-capability';
 
@@ -33,6 +37,29 @@ describe('capability implementations agree (gateway TS ↔ deployed server.mjs)'
     expect((mjsDeriveKey(vaultKey) as Buffer).equals(deriveCapabilityKey(vaultKey))).toBe(true);
     expect((mjsDeriveKey(vaultKey.toString('hex')) as Buffer).equals(capKey)).toBe(true);
     expect(MJS_EPOCH).toBe(CAPABILITY_EPOCH_DEFAULT);
+  });
+
+  it('derives and signs requester challenges identically', () => {
+    const requesterKey = deriveRequesterKey(vaultKey);
+    const scope = base();
+    const id = mintCapabilityId(capKey, scope);
+    const params = {
+      challenge: randomBytes(32).toString('base64url'),
+      processInstanceId: randomUUID(),
+      requesters: [
+        {
+          id,
+          configPath: 'channels.discord.accounts.eden-test.token',
+          connectionId: scope.connectionId,
+          channel: 'discord' as const,
+          runtimeAccountId: 'eden-test',
+          agentId: 'test-agent',
+          credentialField: 'token' as const,
+        },
+      ],
+    };
+    expect(mjsDeriveRequesterKey(vaultKey)).toEqual(requesterKey);
+    expect(mjsRequesterProof(requesterKey, params)).toBe(requesterProof(requesterKey, params));
   });
 
   it('parse capability, legacy, and malformed ids identically', () => {

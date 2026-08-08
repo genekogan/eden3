@@ -29,25 +29,28 @@ import { createHmac, hkdfSync, timingSafeEqual } from 'node:crypto';
 /** Domain-separated HKDF derivation from the shared vault key. */
 const HKDF_SALT = 'eden3-channel-secret-capability';
 const HKDF_INFO = 'v1';
+const REQUESTER_HKDF_SALT = 'eden3-channel-secret-requester';
+const REQUESTER_HKDF_INFO = 'v2';
+const REQUESTER_DOMAIN = 'eden3-channel-request-v2';
 /** Domain tag inside the MAC input, distinct from the AES-GCM AAD tag. */
 const SCOPE_DOMAIN = 'eden3-channel-cap-v1';
 /** 128-bit truncated MAC → 22 base64url chars (no padding). */
 export const CAPABILITY_MAC_BYTES = 16;
 export const CAPABILITY_EPOCH_DEFAULT = 'c1';
+export const CHANNEL_SECRET_REQUEST_PROTOCOL_VERSION = 2;
 
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const EPOCH = 'c[0-9]{1,6}';
 const MAC_B64URL = '[A-Za-z0-9_-]{22}';
 
 /** Legacy, unscoped id: `channel/<uuid>` (pre-capability custody). */
-export const LEGACY_SECRET_ID = new RegExp(`^channel/(${UUID})$`, 'i');
+export const LEGACY_SECRET_ID = new RegExp(`^channel/(${UUID})$`);
 /** Capability-bound id: `channel/<uuid>.<epoch>.<mac>`. */
 export const CAPABILITY_SECRET_ID = new RegExp(
   `^channel/(${UUID})\\.(${EPOCH})\\.(${MAC_B64URL})$`,
-  'i',
 );
-const EPOCH_RE = new RegExp(`^${EPOCH}$`, 'i');
-const UUID_RE = new RegExp(`^${UUID}$`, 'i');
+const EPOCH_RE = new RegExp(`^${EPOCH}$`);
+const UUID_RE = new RegExp(`^${UUID}$`);
 
 export interface CapabilityScope {
   /** channel_connections.id (PK). */
@@ -60,6 +63,16 @@ export interface CapabilityScope {
   runtimeAccountId: string;
   /** Capability epoch; bumped by T12-U02 rotation to revoke prior capabilities. */
   epoch: string;
+}
+
+export interface ChannelSecretRequesterContext {
+  id: string;
+  configPath: string;
+  connectionId: string;
+  channel: 'discord' | 'telegram';
+  runtimeAccountId: string;
+  agentId: string;
+  credentialField: 'token' | 'botToken';
 }
 
 export type SecretIdDecision =
@@ -98,6 +111,89 @@ export function deriveCapabilityKey(vaultKey: Buffer | string): Buffer {
   if (ikm.length !== 32) throw new Error('vault key must be exactly 32 bytes');
   return Buffer.from(
     hkdfSync('sha256', ikm, Buffer.from(HKDF_SALT, 'utf8'), Buffer.from(HKDF_INFO, 'utf8'), 32),
+  );
+}
+
+/** Domain-separated authentication key for the trusted gateway exec bridge. */
+export function deriveRequesterKey(vaultKey: Buffer | string): Buffer {
+  const ikm = typeof vaultKey === 'string' ? parseVaultKey(vaultKey) : vaultKey;
+  if (ikm.length !== 32) throw new Error('vault key must be exactly 32 bytes');
+  return Buffer.from(
+    hkdfSync(
+      'sha256',
+      ikm,
+      Buffer.from(REQUESTER_HKDF_SALT, 'utf8'),
+      Buffer.from(REQUESTER_HKDF_INFO, 'utf8'),
+      32,
+    ),
+  );
+}
+
+function canonicalRequesterContext(context: ChannelSecretRequesterContext): string[] {
+  const expectedPath =
+    `channels.${context.channel}.accounts.${context.runtimeAccountId}.${context.credentialField}`;
+  const expectedField = context.channel === 'discord' ? 'token' : 'botToken';
+  const parts = [
+    context.id,
+    context.configPath,
+    context.connectionId,
+    context.channel,
+    context.runtimeAccountId,
+    context.agentId,
+    context.credentialField,
+  ];
+  if (
+    parts.some((part) => typeof part !== 'string' || part.length === 0 || part.includes('\0')) ||
+    context.configPath !== expectedPath ||
+    context.credentialField !== expectedField ||
+    !UUID_RE.test(context.connectionId) ||
+    !RUNTIME_ACCOUNT_ID_RE.test(context.runtimeAccountId) ||
+    !RUNTIME_ACCOUNT_ID_RE.test(context.agentId)
+  ) {
+    throw new Error('invalid channel secret requester context');
+  }
+  return parts;
+}
+
+const RUNTIME_ACCOUNT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/** Canonical HMAC input for one socket challenge and one exact requester batch. */
+export function canonicalRequesterProofInput(params: {
+  challenge: string;
+  processInstanceId: string;
+  requesters: ChannelSecretRequesterContext[];
+}): string {
+  if (
+    !/^[A-Za-z0-9_-]{43}$/.test(params.challenge) ||
+    !UUID_RE.test(params.processInstanceId) ||
+    params.requesters.length < 1 ||
+    params.requesters.length > 128
+  ) {
+    throw new Error('invalid channel secret requester proof input');
+  }
+  const parts = [REQUESTER_DOMAIN, params.challenge, params.processInstanceId];
+  const ids = new Set<string>();
+  for (const requester of params.requesters) {
+    if (ids.has(requester.id)) throw new Error('duplicate channel secret requester id');
+    ids.add(requester.id);
+    parts.push(...canonicalRequesterContext(requester));
+  }
+  return parts.join('\0');
+}
+
+export function requesterProof(
+  requesterKey: Buffer,
+  params: {
+    challenge: string;
+    processInstanceId: string;
+    requesters: ChannelSecretRequesterContext[];
+  },
+): string {
+  if (requesterKey.length !== 32) throw new Error('requester key must be exactly 32 bytes');
+  return b64url(
+    createHmac('sha256', requesterKey)
+      .update(canonicalRequesterProofInput(params), 'utf8')
+      .digest(),
   );
 }
 
@@ -197,6 +293,7 @@ export function verifySecretId(params: {
   if (
     !presented ||
     presented.length !== CAPABILITY_MAC_BYTES ||
+    b64url(presented) !== parsed.mac ||
     runtimeAccountId === null ||
     accountId === null
   ) {

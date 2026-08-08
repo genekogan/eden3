@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { loadRootEnv, pg } from '@eden3/db';
-import { deriveCapabilityKey, mintCapabilityId } from '@eden3/gateway';
+import { deriveCapabilityKey, deriveRequesterKey, mintCapabilityId } from '@eden3/gateway';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 // Real-path (§1.13) proof for T12-U01. The deployed resolver's production
@@ -37,6 +37,8 @@ let server: Server | undefined;
 let socketDir: string;
 let socketPath: string;
 let ownerAccountId: string;
+let agentAccountId = '';
+let agentOpenclawId = '';
 let connectionId = '';
 let runtimeAccountId = '';
 let token: string;
@@ -55,8 +57,24 @@ function encryptToken(id: string, accountId: string, channel: string, plaintext:
 function callBridge(
   ids: string[],
 ): Promise<{ values: Record<string, string>; errors?: Record<string, string>; _stderr: string }> {
+  const requesters = ids.map((id) => ({
+    id,
+    configPath: ['channels', 'discord', 'accounts', runtimeAccountId, 'token'],
+    channel: 'discord',
+    runtimeAccountId,
+    agentId: agentOpenclawId,
+    connectionId,
+    credentialField: 'token',
+  }));
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [BRIDGE, '--socket', socketPath], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [BRIDGE, '--socket', socketPath], {
+      env: {
+        ...process.env,
+        EDEN_CHANNEL_REQUESTER_KEY: deriveRequesterKey(TEST_KEY).toString('base64'),
+        EDEN_CHANNEL_REQUESTER_INSTANCE_ID: randomUUID(),
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     let out = '';
     let err = '';
     child.stdout.on('data', (d) => (out += d));
@@ -71,7 +89,9 @@ function callBridge(
           reject(e as Error);
         }
     });
-    child.stdin.write(JSON.stringify({ protocolVersion: 1, provider: 'eden-channel-vault', ids }));
+    child.stdin.write(
+      JSON.stringify({ protocolVersion: 1, provider: 'eden-channel-vault', ids, requesters }),
+    );
     child.stdin.end();
   });
 }
@@ -88,9 +108,22 @@ beforeAll(async () => {
     return;
   }
 
-  const acct = await pg<{ id: string }[]>`select id from accounts limit 1`;
-  if (acct.length === 0) throw new Error('itest requires at least one account row in the target DB');
-  ownerAccountId = acct[0]!.id;
+  const suffix = randomUUID().slice(0, 8);
+  const [owner] = await pg<{ id: string }[]>`
+    insert into accounts (type, username, external_id)
+    values ('user', ${`${MARKER}-owner-${suffix}`}, ${`${MARKER}-owner`})
+    returning id`;
+  const [agentAccount] = await pg<{ id: string }[]>`
+    insert into accounts (type, username, external_id)
+    values ('agent', ${`${MARKER}-agent-${suffix}`}, ${`${MARKER}-agent`})
+    returning id`;
+  if (!owner || !agentAccount) throw new Error('itest account fixture insert failed');
+  ownerAccountId = owner.id;
+  agentAccountId = agentAccount.id;
+  agentOpenclawId = `t12u01-${suffix}`;
+  await pg`
+    insert into agents (account_id, owner_id, openclaw_id, provision_status)
+    values (${agentAccountId}, ${ownerAccountId}, ${agentOpenclawId}, 'ready')`;
 
   connectionId = randomUUID();
   runtimeAccountId = `eden-${connectionId}`;
@@ -99,10 +132,10 @@ beforeAll(async () => {
   seededCiphertext = enc.ciphertext;
   await pg`
     insert into channel_connections (
-      id, account_id, channel, label, runtime_account_id, desired_state, status,
+      id, account_id, agent_id, channel, label, runtime_account_id, desired_state, status,
       token_ciphertext, token_iv, token_auth_tag, token_sha256, key_version
     ) values (
-      ${connectionId}, ${ownerAccountId}, 'discord', ${MARKER}, ${runtimeAccountId}, 'active', 'connected',
+      ${connectionId}, ${ownerAccountId}, ${agentAccountId}, 'discord', ${MARKER}, ${runtimeAccountId}, 'active', 'connected',
       ${enc.ciphertext}, ${enc.iv}, ${enc.tag}, ${'itest-no-real-hash'}, 'v2'
     )
   `;
@@ -118,7 +151,12 @@ beforeAll(async () => {
   socketPath = path.join(socketDir, 'channel-secrets.sock');
   // The EXACT production wiring (buildResolveRequest) against the real DB.
   server = createResolverServer(
-    buildResolveRequest(pg, { encryptionKey: TEST_KEY, capKey: CAP_KEY, allowLegacyUnscoped: false }),
+    buildResolveRequest(pg, {
+      encryptionKey: TEST_KEY,
+      capKey: CAP_KEY,
+      requesterKey: deriveRequesterKey(TEST_KEY),
+      allowLegacyUnscoped: false,
+    }),
   ) as Server;
   await new Promise<void>((resolve, reject) => {
     server!.once('error', reject);
@@ -137,6 +175,11 @@ afterAll(async () => {
     await pg`delete from secret_access_audit_events where secret_id = ${connectionId} and metadata->>'actor' = 'openclaw_secret_resolver'`;
     await pg`delete from channel_connections where id = ${connectionId}`;
   }
+  if (agentAccountId) {
+    await pg`delete from agents where account_id = ${agentAccountId}`;
+    await pg`delete from accounts where id = ${agentAccountId}`;
+  }
+  if (ownerAccountId) await pg`delete from accounts where id = ${ownerAccountId}`;
 });
 
 describe('channel-secret resolver — deployed wiring (buildResolveRequest) + real Postgres', () => {

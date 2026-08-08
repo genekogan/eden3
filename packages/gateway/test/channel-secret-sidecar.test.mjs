@@ -12,7 +12,9 @@ import {
   channelTokenSecretContext,
   decryptStoredSecret,
   deriveCapabilityKey,
+  deriveRequesterKey,
   parseEncryptionKey,
+  requesterProof,
   resolveSecretRequest,
 } from '../../../infra/channel-secret-resolver/server.mjs';
 import { mintCapabilityId } from '../src/channel-secret-capability';
@@ -20,6 +22,52 @@ import { mintCapabilityId } from '../src/channel-secret-capability';
 const execFileAsync = promisify(execFile);
 const AGREEMENT_KEY = randomBytes(32);
 const AGREEMENT_CAP_KEY = deriveCapabilityKey(AGREEMENT_KEY);
+const AGREEMENT_REQUESTER_KEY = deriveRequesterKey(AGREEMENT_KEY);
+
+function activeRow(row) {
+  return {
+    ...row,
+    agent_openclaw_id: row.runtime_account_id,
+    agent_owner_id: row.account_id,
+    agent_deleted: false,
+    owner_deleted: false,
+  };
+}
+
+function request(ids, rows, challenge = randomBytes(32).toString('base64url')) {
+  const processInstanceId = randomUUID();
+  const requesters = ids.map((id) => {
+    const connectionId = id.split('/')[1].split('.')[0];
+    const row = rows.find((candidate) => candidate.id === connectionId);
+    const channel = row?.channel ?? 'discord';
+    const runtimeAccountId = row?.runtime_account_id ?? 'missing-account';
+    return {
+      id,
+      configPath: `channels.${channel}.accounts.${runtimeAccountId}.${channel === 'discord' ? 'token' : 'botToken'}`,
+      connectionId,
+      channel,
+      runtimeAccountId,
+      agentId: row?.agent_openclaw_id ?? runtimeAccountId,
+      credentialField: channel === 'discord' ? 'token' : 'botToken',
+    };
+  });
+  return {
+    input: {
+      protocolVersion: 2,
+      provider: 'eden-channel-vault',
+      ids,
+      requesters,
+      challenge,
+      processInstanceId,
+      proof: requesterProof(AGREEMENT_REQUESTER_KEY, {
+        challenge,
+        processInstanceId,
+        requesters,
+      }),
+    },
+    challenge,
+  };
+}
 
 /** Mint a capability id for a synthetic row (matches loadActive output shape). */
 function capId(row, epoch = 'c1') {
@@ -80,15 +128,18 @@ describe('channel secret resolver sidecar', () => {
   });
 
   it('returns only active records and audits (GRANT) before releasing plaintext', async () => {
-    const active = { id: randomUUID(), account_id: randomUUID(), channel: 'discord', runtime_account_id: 'eden-one' };
+    const active = activeRow({ id: randomUUID(), account_id: randomUUID(), channel: 'discord', runtime_account_id: 'eden-one' });
     const missingId = randomUUID();
     const events = [];
     const activeCap = capId(active);
     const missingCap = capId({ id: missingId, account_id: randomUUID(), channel: 'discord', runtime_account_id: 'eden-x' });
+    const signed = request([activeCap, missingCap], [active]);
     const result = await resolveSecretRequest(
-      { protocolVersion: 1, provider: 'eden-channel-vault', ids: [activeCap, missingCap] },
+      signed.input,
       {
         capKey: AGREEMENT_CAP_KEY,
+        requesterKey: AGREEMENT_REQUESTER_KEY,
+        challenge: signed.challenge,
         loadActive: vi.fn(async () => [active]),
         decrypt: vi.fn(() => {
           events.push('decrypt');
@@ -99,19 +150,22 @@ describe('channel secret resolver sidecar', () => {
     );
     expect(events).toEqual(['decrypt', 'granted', 'denied']); // grant decrypts+audits; missing → deny audit
     expect(result).toEqual({
-      protocolVersion: 1,
+      protocolVersion: 2,
       values: { [activeCap]: 'runtime-token' },
       errors: { [missingCap]: 'secret unavailable' },
     });
   });
 
   it('withholds plaintext when its audit cannot be written', async () => {
-    const row = { id: randomUUID(), account_id: randomUUID(), channel: 'discord', runtime_account_id: 'eden-one' };
+    const row = activeRow({ id: randomUUID(), account_id: randomUUID(), channel: 'discord', runtime_account_id: 'eden-one' });
     const id = capId(row);
+    const signed = request([id], [row]);
     const result = await resolveSecretRequest(
-      { protocolVersion: 1, provider: 'eden-channel-vault', ids: [id] },
+      signed.input,
       {
         capKey: AGREEMENT_CAP_KEY,
+        requesterKey: AGREEMENT_REQUESTER_KEY,
+        challenge: signed.challenge,
         loadActive: async () => [row],
         decrypt: () => 'must-not-return',
         audit: async (r) => {
@@ -120,15 +174,46 @@ describe('channel secret resolver sidecar', () => {
       },
     );
     expect(result).toEqual({
-      protocolVersion: 1,
+      protocolVersion: 2,
       values: {},
       errors: { [id]: 'secret unavailable' },
     });
     expect(JSON.stringify(result)).not.toContain('must-not-return');
   });
 
+  it('rejects a captured authenticated request against a fresh socket challenge before DB work', async () => {
+    const row = activeRow({
+      id: randomUUID(),
+      account_id: randomUUID(),
+      channel: 'discord',
+      runtime_account_id: 'eden-one',
+    });
+    const id = capId(row);
+    const oldChallenge = randomBytes(32).toString('base64url');
+    const signed = request([id], [row], oldChallenge);
+    const loadActive = vi.fn();
+    await expect(
+      resolveSecretRequest(signed.input, {
+        capKey: AGREEMENT_CAP_KEY,
+        requesterKey: AGREEMENT_REQUESTER_KEY,
+        challenge: randomBytes(32).toString('base64url'),
+        loadActive,
+        decrypt: vi.fn(),
+        audit: vi.fn(),
+      }),
+    ).rejects.toThrow('invalid resolver request');
+    expect(loadActive).not.toHaveBeenCalled();
+  });
+
   it('rejects wrong providers and path-like secret ids', async () => {
-    const deps = { capKey: AGREEMENT_CAP_KEY, loadActive: vi.fn(), decrypt: vi.fn(), audit: vi.fn() };
+    const deps = {
+      capKey: AGREEMENT_CAP_KEY,
+      requesterKey: AGREEMENT_REQUESTER_KEY,
+      challenge: randomBytes(32).toString('base64url'),
+      loadActive: vi.fn(),
+      decrypt: vi.fn(),
+      audit: vi.fn(),
+    };
     await expect(
       resolveSecretRequest({ protocolVersion: 1, provider: 'other', ids: ['channel/nope'] }, deps),
     ).rejects.toThrow('invalid resolver request');

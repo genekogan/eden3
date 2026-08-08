@@ -135,6 +135,27 @@ describe('mintCapabilityId / parseSecretId', () => {
     expect(parseSecretId(42 as unknown).kind).toBe('malformed');
     expect(LEGACY_SECRET_ID.test(`channel/${randomUUID()}`)).toBe(true);
   });
+
+  it('accepts only the canonical base64url and lowercase UUID spelling', () => {
+    const capKey = deriveCapabilityKey(VAULT_KEY);
+    const s = scope();
+    const id = mintCapabilityId(capKey, s);
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+    const granted = [...alphabet]
+      .map((tail) => `${id.slice(0, -1)}${tail}`)
+      .filter((candidate) =>
+        verifySecretId({
+          id: candidate,
+          capKey,
+          row: rowOf(s),
+          allowLegacyUnscoped: false,
+        }).ok,
+      );
+    expect(granted).toEqual([id]);
+    expect(parseSecretId(id.replace(s.connectionId, s.connectionId.toUpperCase()))).toEqual({
+      kind: 'malformed',
+    });
+  });
 });
 
 describe('capabilityMac binds every scope field', () => {

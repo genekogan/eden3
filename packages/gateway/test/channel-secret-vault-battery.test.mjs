@@ -12,6 +12,7 @@ import {
   createResolverServer,
   decryptStoredSecret,
   deriveCapabilityKey,
+  deriveRequesterKey,
   resolveSecretRequest,
 } from '../../../infra/channel-secret-resolver/server.mjs';
 import { mintCapabilityId } from '../src/channel-secret-capability';
@@ -22,6 +23,8 @@ const PROVIDER = 'eden-channel-vault';
 
 const VAULT_KEY = randomBytes(32);
 const CAP_KEY = deriveCapabilityKey(VAULT_KEY);
+const REQUESTER_KEY = deriveRequesterKey(VAULT_KEY);
+const PROCESS_INSTANCE_ID = randomUUID();
 
 /**
  * FG-VAULT (gap 45) — the channel-token custody attack battery, through the
@@ -53,6 +56,10 @@ function connectionRow(overrides = {}) {
     account_id,
     channel,
     runtime_account_id,
+    agent_openclaw_id: runtime_account_id,
+    agent_owner_id: account_id,
+    agent_deleted: false,
+    owner_deleted: false,
     token_ciphertext: ciphertext.toString('base64'),
     token_iv: iv.toString('base64'),
     token_auth_tag: cipher.getAuthTag().toString('base64'),
@@ -86,9 +93,11 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     const byId = new Map(rows.map((r) => [r.id, r]));
     const resolveRequest =
       resolveOverride ??
-      ((request) =>
+      ((request, socketContext) =>
         resolveSecretRequest(request, {
           capKey: CAP_KEY,
+          requesterKey: REQUESTER_KEY,
+          challenge: socketContext.challenge,
           allowLegacyUnscoped,
           loadActive: async (ids) => {
             loadActiveCalls += 1;
@@ -126,9 +135,31 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
   }
 
   /** Drive a request through the real OpenClaw bridge; capture stdout AND stderr. */
-  function callBridge(ids) {
+  function requesterFor(id) {
+    const connectionId = id.split('/')[1]?.split('.')[0];
+    const row = rows.find((candidate) => candidate.id === connectionId);
+    const channel = row?.channel ?? 'discord';
+    const runtimeAccountId = row?.runtime_account_id ?? 'missing-account';
+    return {
+      id,
+      configPath: `channels.${channel}.accounts.${runtimeAccountId}.${channel === 'discord' ? 'token' : 'botToken'}`,
+      connectionId: connectionId ?? randomUUID(),
+      channel,
+      runtimeAccountId,
+      agentId: row?.agent_openclaw_id ?? runtimeAccountId,
+      credentialField: channel === 'discord' ? 'token' : 'botToken',
+    };
+  }
+
+  function callBridge(ids, requesters = ids.map(requesterFor), envOverrides = {}) {
     return new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [BRIDGE, '--socket', socketPath], {
+        env: {
+          ...process.env,
+          EDEN_CHANNEL_REQUESTER_KEY: REQUESTER_KEY.toString('base64'),
+          EDEN_CHANNEL_REQUESTER_INSTANCE_ID: PROCESS_INSTANCE_ID,
+          ...envOverrides,
+        },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let out = '';
@@ -147,7 +178,9 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
           reject(e);
         }
       });
-      child.stdin.write(JSON.stringify({ protocolVersion: 1, provider: PROVIDER, ids }));
+      child.stdin.write(
+        JSON.stringify({ protocolVersion: 1, provider: PROVIDER, ids, requesters }),
+      );
       child.stdin.end();
     });
   }
@@ -179,6 +212,59 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     expect(auditLog).toEqual([
       expect.objectContaining({ decision: 'granted', reason: 'granted', connectionId: row.id }),
     ]);
+  });
+
+  it('REQUESTER BINDING: an intact capability transplanted to another agent path is denied before decrypt', async () => {
+    const row = connectionRow({ runtime_account_id: 'runtime-one' });
+    rows = [row];
+    await start();
+    const id = capIdFor(row);
+    const wrong = { ...requesterFor(id), agentId: 'attacker-agent' };
+    const res = await callBridge([id], [wrong]);
+    expect(res.values[id]).toBeUndefined();
+    expect(res.errors[id]).toBe('secret unavailable');
+    expect(decryptCount).toBe(0);
+    expect(aggregateDenied()).toEqual([
+      expect.objectContaining({ deniedReasons: { requester_scope_mismatch: 1 } }),
+    ]);
+  });
+
+  it('REQUESTER BINDING: wrong config path/runtime account is denied before decrypt', async () => {
+    const row = connectionRow({ runtime_account_id: 'runtime-one' });
+    rows = [row];
+    await start();
+    const id = capIdFor(row);
+    const wrong = {
+      ...requesterFor(id),
+      configPath: 'channels.discord.accounts.runtime-two.token',
+      runtimeAccountId: 'runtime-two',
+    };
+    const res = await callBridge([id], [wrong]);
+    expect(res.values[id]).toBeUndefined();
+    expect(decryptCount).toBe(0);
+  });
+
+  it('PROCESS AUTH: a process without the gateway requester key fails before DB/decrypt', async () => {
+    const row = connectionRow();
+    rows = [row];
+    await start();
+    const id = capIdFor(row);
+    await expect(
+      callBridge([id], [requesterFor(id)], {
+        EDEN_CHANNEL_REQUESTER_KEY: randomBytes(32).toString('base64'),
+      }),
+    ).rejects.toMatchObject({ code: 1 });
+    expect(loadActiveCalls).toBe(0);
+    expect(decryptCount).toBe(0);
+  });
+
+  it('LEAST PRIVILEGE: X credentials are not redeemable through the OpenClaw socket', async () => {
+    const row = connectionRow({ channel: 'x', runtime_account_id: 'x-runtime' });
+    rows = [row];
+    await start();
+    await expect(callBridge([capIdFor(row)])).rejects.toMatchObject({ code: 1 });
+    expect(decryptCount).toBe(0);
+    expect(loadActiveCalls).toBe(0);
   });
 
   it('CROSS-AGENT: a capability minted for active A cannot release active B (connectionId swap) — zero decrypts', async () => {
@@ -374,7 +460,7 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
         const row = byId.get(connectionId);
         if (row) values[id] = decryptStoredSecret(row, VAULT_KEY); // NO verify
       }
-      return { protocolVersion: 1, values };
+      return { protocolVersion: 2, values };
     };
     await start({ resolveOverride: brokenResolve });
     const forged = capIdFor(victim, 'c1', deriveCapabilityKey(randomBytes(32)));
@@ -382,10 +468,11 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     expect(res.values[forged]).toBe(tokensById.get(victim.id)); // leaks → real check is load-bearing
   });
 
-  it('KNOWN RESIDUAL (documented, DEBT-012): an intact capability is a bearer token — the resolver has no requester identity', async () => {
-    // Blind forgery/enumeration/cross-scope are closed; full requester-binding
-    // needs a broker-with-requester-context or gateway sharding (D-005). This
-    // pins the boundary honestly — NOT a green FG-VAULT closure.
+  it('KNOWN RESIDUAL (DEBT-012): the correct shared key-holder can freshly redeem an intact capability', async () => {
+    // Config-origin transplants and captured frames are closed. The correct
+    // shared gateway holds both this proof key and every exact config tuple,
+    // so it can originate a fresh challenged request. Per-connection process
+    // and socket isolation is required to flip this residual to denial.
     const row = connectionRow();
     rows = [row];
     await start();

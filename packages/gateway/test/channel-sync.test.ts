@@ -324,6 +324,7 @@ describe('hosted named channel accounts', () => {
       source: 'exec',
       command: '/usr/local/bin/eden-channel-secret-resolver',
       args: ['--socket', '/run/eden3/channel-secrets.sock'],
+      passEnv: ['EDEN_CHANNEL_REQUESTER_KEY', 'EDEN_CHANNEL_REQUESTER_INSTANCE_ID'],
       jsonOnly: true,
       timeoutMs: 5000,
       noOutputTimeoutMs: 5000,
