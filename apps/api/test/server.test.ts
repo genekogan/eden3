@@ -57,6 +57,7 @@ describe('GET /health', () => {
           expectedCount: 34,
           appliedCount: 33,
           missingCount: 1,
+          unexpectedCount: 0,
         }),
       },
     });

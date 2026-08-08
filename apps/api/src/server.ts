@@ -277,6 +277,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       expectedCount: null;
       appliedCount: null;
       missingCount: null;
+      unexpectedCount: null;
     };
     if (opts.health?.schemaReadiness) {
       try {
@@ -288,6 +289,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
           expectedCount: 0,
           appliedCount: null,
           missingCount: null,
+          unexpectedCount: null,
         };
       }
     } else {
@@ -297,6 +299,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         expectedCount: null,
         appliedCount: null,
         missingCount: null,
+        unexpectedCount: null,
       };
     }
     const ok = schema.status === 'ready' || (schema.status === 'unchecked' && !requireSchema);

@@ -23,11 +23,12 @@ if (
 const expectedMigration: string = expectedTag;
 
 export interface SchemaReadiness {
-  status: 'ready' | 'missing_migrations' | 'database_unavailable';
+  status: 'ready' | 'missing_migrations' | 'unexpected_migrations' | 'database_unavailable';
   expectedMigration: string;
   expectedCount: number;
   appliedCount: number | null;
   missingCount: number | null;
+  unexpectedCount: number | null;
 }
 
 export type AppliedMigrationReader = () => Promise<readonly string[]>;
@@ -45,16 +46,27 @@ export async function checkSchemaReadiness(
 ): Promise<SchemaReadiness> {
   try {
     const applied = new Set(await readApplied());
+    const expected = new Set(expectedHashes);
     const missingCount = expectedHashes.reduce(
       (count, hash) => count + (applied.has(hash) ? 0 : 1),
       0,
     );
+    const unexpectedCount = [...applied].reduce(
+      (count, hash) => count + (expected.has(hash) ? 0 : 1),
+      0,
+    );
     return {
-      status: missingCount === 0 ? 'ready' : 'missing_migrations',
+      status:
+        missingCount > 0
+          ? 'missing_migrations'
+          : unexpectedCount > 0
+            ? 'unexpected_migrations'
+            : 'ready',
       expectedMigration,
       expectedCount: expectedHashes.length,
       appliedCount: applied.size,
       missingCount,
+      unexpectedCount,
     };
   } catch {
     return {
@@ -63,6 +75,7 @@ export async function checkSchemaReadiness(
       expectedCount: expectedHashes.length,
       appliedCount: null,
       missingCount: null,
+      unexpectedCount: null,
     };
   }
 }

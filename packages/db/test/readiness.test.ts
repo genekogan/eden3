@@ -16,6 +16,7 @@ describe('schema readiness', () => {
       expectedCount: hashes.length,
       appliedCount: hashes.length - 1,
       missingCount: 1,
+      unexpectedCount: 0,
     });
 
     const ready = await checkSchemaReadiness(async () => hashes);
@@ -25,6 +26,16 @@ describe('schema readiness', () => {
       expectedCount: hashes.length,
       appliedCount: hashes.length,
       missingCount: 0,
+      unexpectedCount: 0,
+    });
+
+    const ahead = await checkSchemaReadiness(async () => [...hashes, 'unexpected-hash']);
+    expect(ahead).toMatchObject({
+      status: 'unexpected_migrations',
+      expectedCount: hashes.length,
+      appliedCount: hashes.length + 1,
+      missingCount: 0,
+      unexpectedCount: 1,
     });
   });
 
@@ -36,6 +47,7 @@ describe('schema readiness', () => {
       status: 'database_unavailable',
       appliedCount: null,
       missingCount: null,
+      unexpectedCount: null,
     });
     expect(JSON.stringify(result)).not.toContain('password');
   });
