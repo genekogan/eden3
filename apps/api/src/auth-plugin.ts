@@ -145,14 +145,15 @@ export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {})
     const guard = route.config?.[SERVICE_CALLBACK_GUARD];
     if (!guard) return;
     const methods = Array.isArray(route.method) ? route.method : [route.method];
-    const handlers = Array.isArray(route.preHandler)
-      ? route.preHandler
-      : route.preHandler
-        ? [route.preHandler]
-        : [];
-    if (methods.length !== 1 || methods[0] !== 'POST' || !handlers.includes(guard)) {
+    if (
+      methods.length !== 1 ||
+      methods[0] !== 'POST' ||
+      route.preHandler !== guard ||
+      route.url.includes('*') ||
+      route.url.includes('?')
+    ) {
       throw new Error(
-        'serviceAuthenticatedCallback requires one exact POST route with its bound pre-handler',
+        'serviceAuthenticatedCallback requires one exact POST route with its sole bound pre-handler',
       );
     }
   });
