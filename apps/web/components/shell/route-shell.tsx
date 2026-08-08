@@ -5,13 +5,13 @@ import type { ReactNode } from "react";
 
 import { AccessGate } from "@/components/AccessGate";
 import { DevUserGate } from "@/components/DevUserGate";
-import { isPublicSharePath } from "@/lib/public-routes";
+import { isPublicRoutePath } from "@/lib/public-routes";
 import { AppShell } from "./app-shell";
 
-/** Public shares bypass account gates and cockpit chrome; everything else does not. */
+/** Reviewed public documents bypass account gates and cockpit chrome; everything else does not. */
 export function RouteShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  if (isPublicSharePath(pathname)) return <>{children}</>;
+  if (isPublicRoutePath(pathname)) return <>{children}</>;
   return (
     <AppShell>
       <DevUserGate>
