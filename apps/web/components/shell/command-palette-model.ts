@@ -1,4 +1,5 @@
 import { fuzzyFilter, type FuzzyResult } from "../../lib/fuzzy";
+import { agentSectionHref } from "../../lib/eve";
 import type {
   ResolvedOntologyEntry,
   ResolvedOntologyTarget,
@@ -84,7 +85,7 @@ export function buildPaletteCommands({
       hint: `@${agent.username}`,
       target: {
         type: "navigate",
-        href: `/agents/${encodeURIComponent(agent.username)}/${subPath}`,
+        href: agentSectionHref(agent.username, subPath) as `/${string}`,
       },
       avatar: agent,
     });

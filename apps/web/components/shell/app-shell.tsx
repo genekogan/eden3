@@ -13,7 +13,7 @@ import { Sidebar } from "./sidebar";
 export function AppShell({ children }: { children: ReactNode }) {
   return (
     <SelectedAgentProvider>
-      <div className="flex min-h-dvh">
+      <div className="pwa-safe-area-shell flex min-h-dvh">
         <Sidebar />
         <main className="relative min-w-0 flex-1 pt-14 sm:pt-0">{children}</main>
       </div>

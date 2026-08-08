@@ -69,6 +69,19 @@ describe("command palette model", () => {
     });
   });
 
+  it("never switches Eve into a concealed configuration route", () => {
+    const [command] = buildPaletteCommands({
+      ontology: [],
+      agents: [{ username: "eve", name: "Eve" }],
+      selectedUsername: "ada",
+      selectedSubPath: "settings/persona",
+    });
+    expect(command?.target).toEqual({
+      type: "navigate",
+      href: "/agents/eve/chats",
+    });
+  });
+
   it("filters labels, descriptions, and ontology aliases deterministically", () => {
     const commands = buildPaletteCommands({
       ontology: ownerOntology(),
