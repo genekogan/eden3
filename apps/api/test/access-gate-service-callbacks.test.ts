@@ -154,7 +154,29 @@ describe('closed-cohort admission for channel service callbacks', () => {
     }
   });
 
-  it('refuses registration when a service callback replaces its bound auth guard', async () => {
+  it.each(['before', 'after'] as const)(
+    'refuses a %s-guard side-effect handler on a service callback',
+    async (position) => {
+      const app = Fastify();
+      registerAuth(app, {
+        accessAllowlist: ['gene'],
+        provider: { async getSession() { return null; } },
+      });
+      const guard = async (_request: FastifyRequest, _reply: FastifyReply) => undefined;
+      const sideEffect = async () => undefined;
+      const preHandler = position === 'before' ? [sideEffect, guard] : [guard, sideEffect];
+      expect(() => {
+        app.post(
+          '/unsafe',
+          { ...serviceAuthenticatedCallback(guard), preHandler },
+          async () => ({ mutated: true }),
+        );
+      }).toThrow('serviceAuthenticatedCallback requires one exact POST route');
+      await app.close();
+    },
+  );
+
+  it('refuses a wildcard service callback declaration', async () => {
     const app = Fastify();
     registerAuth(app, {
       accessAllowlist: ['gene'],
@@ -163,8 +185,8 @@ describe('closed-cohort admission for channel service callbacks', () => {
     const guard = async (_request: FastifyRequest, _reply: FastifyReply) => undefined;
     expect(() => {
       app.post(
-        '/unsafe',
-        { ...serviceAuthenticatedCallback(guard), preHandler: async () => undefined },
+        '/unsafe/*',
+        serviceAuthenticatedCallback(guard),
         async () => ({ mutated: true }),
       );
     }).toThrow('serviceAuthenticatedCallback requires one exact POST route');
