@@ -154,25 +154,37 @@ describe('closed-cohort admission for channel service callbacks', () => {
     }
   });
 
-  it.each(['before', 'after'] as const)(
-    'refuses a %s-guard side-effect handler on a service callback',
+  it.each(['onRequest', 'preHandler'] as const)(
+    'authenticates before a marked route can run its %s side effect',
     async (position) => {
       const app = Fastify();
       registerAuth(app, {
         accessAllowlist: ['gene'],
         provider: { async getSession() { return null; } },
       });
-      const guard = async (_request: FastifyRequest, _reply: FastifyReply) => undefined;
-      const sideEffect = async () => undefined;
-      const preHandler = position === 'before' ? [sideEffect, guard] : [guard, sideEffect];
-      expect(() => {
-        app.post(
-          '/unsafe',
-          { ...serviceAuthenticatedCallback(guard), preHandler },
-          async () => ({ mutated: true }),
-        );
-      }).toThrow('serviceAuthenticatedCallback requires one exact POST route');
-      await app.close();
+      let sideEffects = 0;
+      const guard = async (_request: FastifyRequest, reply: FastifyReply) =>
+        unauthorized(reply, 'runtime_unauthorized');
+      const sideEffect = async () => { sideEffects += 1; };
+      app.post(
+        '/unsafe',
+        {
+          ...serviceAuthenticatedCallback(guard),
+          ...(position === 'onRequest'
+            ? { onRequest: sideEffect }
+            : { preHandler: sideEffect }),
+        },
+        async () => ({ mutated: true }),
+      );
+      await app.ready();
+      try {
+        const response = await app.inject({ method: 'POST', url: '/unsafe', payload: {} });
+        expect(response.statusCode).toBe(401);
+        expect(response.json().error.code).toBe('runtime_unauthorized');
+        expect(sideEffects).toBe(0);
+      } finally {
+        await app.close();
+      }
     },
   );
 
@@ -189,7 +201,7 @@ describe('closed-cohort admission for channel service callbacks', () => {
         serviceAuthenticatedCallback(guard),
         async () => ({ mutated: true }),
       );
-    }).toThrow('serviceAuthenticatedCallback requires one exact POST route');
+    }).toThrow('serviceAuthenticatedCallback requires one exact non-wildcard POST route');
     await app.close();
   });
 
