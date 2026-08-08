@@ -147,7 +147,8 @@ async function toApiError(res: Response, path: string): Promise<ApiError> {
     body && typeof body === "object" && "message" in body
       ? String((body as { message: unknown }).message)
       : res.statusText;
-  return new ApiError(res.status, `${res.status} ${path}: ${detail}`, body);
+  const safePath = path.replace(/^\/shares\/[^/?#]+/, "/shares/[redacted]");
+  return new ApiError(res.status, `${res.status} ${safePath}: ${detail}`, body);
 }
 
 async function apiFetch<T>(

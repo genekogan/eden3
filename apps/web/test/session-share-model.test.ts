@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   absoluteShareUrl,
@@ -6,6 +6,7 @@ import {
   sessionShareDialogReducer,
 } from "../components/chat/session-share-model";
 import { isPublicSharePath } from "../lib/public-routes";
+import { api, ApiError } from "../lib/api";
 
 const SHARE = {
   id: "00000000-0000-4000-8000-000000000101",
@@ -17,6 +18,8 @@ const SHARE = {
 };
 
 describe("session share journey model", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it("moves create → copyable public route → terminal revoke without exposing cockpit chrome", () => {
     let state = sessionShareDialogReducer(initialSessionShareDialogState, { type: "open" });
     state = sessionShareDialogReducer(state, { type: "title", title: "Launch excerpt" });
@@ -43,5 +46,23 @@ describe("session share journey model", () => {
     });
     expect(state.publicUrl).toBeNull();
     expect(state.items[0]?.revokedAt).toBe("2026-08-08T10:01:00.000Z");
+  });
+
+  it("never includes the raw share token in an API error message", async () => {
+    const token = "s".repeat(43);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ message: "synthetic failure" }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const error = await api.shares.public(token).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as Error).message).not.toContain(token);
+    expect((error as Error).message).toContain("[redacted]");
   });
 });

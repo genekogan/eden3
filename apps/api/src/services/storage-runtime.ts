@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, open, readFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, open, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 
 import {
@@ -71,6 +71,35 @@ function assertPrivateRoots(mediaDir: string, objectRoot: string, cacheRoot: str
   }
 }
 
+async function materializePrivateRoots(
+  mediaDir: string,
+  objectRoot: string,
+  cacheRoot: string,
+  secretFile: string,
+): Promise<{ mediaDir: string; objectRoot: string; cacheRoot: string; secretFile: string }> {
+  await Promise.all([
+    mkdir(mediaDir, { recursive: true }),
+    mkdir(objectRoot, { recursive: true }),
+    mkdir(cacheRoot, { recursive: true }),
+    mkdir(path.dirname(secretFile), { recursive: true, mode: 0o700 }),
+  ]);
+  const [physicalMediaDir, physicalObjectRoot, physicalCacheRoot, physicalSecretParent] =
+    await Promise.all([
+      realpath(mediaDir),
+      realpath(objectRoot),
+      realpath(cacheRoot),
+      realpath(path.dirname(secretFile)),
+    ]);
+  const physicalSecretFile = path.join(physicalSecretParent, path.basename(secretFile));
+  assertPrivateRoots(physicalMediaDir, physicalObjectRoot, physicalCacheRoot, physicalSecretFile);
+  return {
+    mediaDir: physicalMediaDir,
+    objectRoot: physicalObjectRoot,
+    cacheRoot: physicalCacheRoot,
+    secretFile: physicalSecretFile,
+  };
+}
+
 function decodeCapabilityKey(raw: string): Buffer {
   const trimmed = raw.trim();
   const decoded = /^[a-f0-9]{64}$/i.test(trimmed)
@@ -95,6 +124,10 @@ async function persistentCapabilityKey(filePath: string, configured: string | un
     }
   } catch (error) {
     if (!(error instanceof Error && 'code' in error && error.code === 'EEXIST')) throw error;
+  }
+  const file = await lstat(filePath);
+  if (!file.isFile() || file.isSymbolicLink()) {
+    throw new Error('UPLOAD_CAPABILITY_KEY_FILE must be a regular file');
   }
   await chmod(filePath, 0o600);
   return decodeCapabilityKey(await readFile(filePath, 'utf8'));
@@ -140,10 +173,13 @@ function r2Backend(env: NodeJS.ProcessEnv): R2ObjectBackend | null {
 /** Build the one process-wide object/upload runtime without exposing private roots. */
 export async function createStorageRuntime(options: CreateStorageRuntimeOptions): Promise<StorageRuntime> {
   const env = options.env ?? process.env;
-  const objectRoot = resolved(env.OBJECT_LOCAL_DIR, 'var/object-store');
-  const cacheRoot = resolved(env.OBJECT_CACHE_DIR, 'var/object-cache');
-  const secretFile = resolved(env.UPLOAD_CAPABILITY_KEY_FILE, 'var/secrets/upload-capability.key');
-  assertPrivateRoots(options.mediaDir, objectRoot, cacheRoot, secretFile);
+  const roots = await materializePrivateRoots(
+    path.resolve(options.mediaDir),
+    resolved(env.OBJECT_LOCAL_DIR, 'var/object-store'),
+    resolved(env.OBJECT_CACHE_DIR, 'var/object-cache'),
+    resolved(env.UPLOAD_CAPABILITY_KEY_FILE, 'var/secrets/upload-capability.key'),
+  );
+  const { objectRoot, cacheRoot, secretFile } = roots;
 
   const backend = r2Backend(env) ?? new LocalObjectBackend({ root: objectRoot });
   const capabilityKey = await persistentCapabilityKey(secretFile, env.UPLOAD_CAPABILITY_KEY);
@@ -198,5 +234,7 @@ export async function createStorageRuntime(options: CreateStorageRuntimeOptions)
 }
 
 export function storagePolicyIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
-  return integer(env.UPLOAD_POLICY_INTERVAL_MS, 30_000, 'UPLOAD_POLICY_INTERVAL_MS');
+  const interval = integer(env.UPLOAD_POLICY_INTERVAL_MS, 30_000, 'UPLOAD_POLICY_INTERVAL_MS');
+  if (interval === 0) throw new Error('UPLOAD_POLICY_INTERVAL_MS must be a positive integer');
+  return interval;
 }
