@@ -421,6 +421,10 @@ export function subscribeNotifications(
 ): () => void {
   if (typeof EventSource === "undefined") return () => {};
   const source = new EventSource(options.url ?? "/api/notifications/events");
+  // Re-read durable authority after every initial connect/reconnect. This
+  // closes the process-death window between DB commit and best-effort publish
+  // without introducing polling.
+  source.onopen = () => onCreated();
   source.onmessage = (message: MessageEvent<string>) => {
     const event = decodeSessionEventData(message.data);
     if (event?.type === "notification.created") onCreated();

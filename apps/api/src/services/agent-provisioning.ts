@@ -15,7 +15,7 @@ import { installDefaultAgentSkills } from './agent-skills';
 import { publishBuildNotification } from './app-notifications';
 
 const DEFAULT_INTERVAL_MS = 2_000;
-const DEFAULT_LEASE_MS = 35 * 60_000;
+const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_RETRY_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 3;
 const PROVISION_LOCK_SEED = 117;

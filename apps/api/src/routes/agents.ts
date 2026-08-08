@@ -829,6 +829,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
 
     // Fail fast (503) when the gateway is unconfigured — before any rows land.
     void app.gatewayGlue.provisioner;
+    const agentRuntime = await runtimeForModel(body.model);
     const quotaError = await nativeAgentQuotaError(viewer);
     if (quotaError) {
       return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
@@ -881,7 +882,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     return reply.code(201).send({
       agent: agentDtoFromEntities(created.account, created.agent, {
         includePersona: true,
-        agentRuntime: await runtimeForModel(created.agent.model),
+        agentRuntime,
       }),
     });
   });
