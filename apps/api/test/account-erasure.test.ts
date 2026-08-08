@@ -137,6 +137,44 @@ describe('account erasure admission and ledger ordering', () => {
     expect(repository.sealAfterLedgerConfirmation).not.toHaveBeenCalled();
   });
 
+  it('converges after a crash between confirmed ledger and transaction 2', async () => {
+    const repository = store();
+    const ledger = sink();
+    vi.mocked(repository.sealAfterLedgerConfirmation)
+      .mockRejectedValueOnce(new Error('process died before tx2'))
+      .mockResolvedValueOnce({ jobId: JOB_ID, status: 'pending' });
+
+    await expect(requestAccountErasure(request(), repository, ledger)).rejects.toThrow(
+      'process died before tx2',
+    );
+    await expect(requestAccountErasure(request(), repository, ledger)).resolves.toEqual({
+      jobId: JOB_ID,
+      status: 'pending',
+    });
+    expect(repository.acceptIntent).toHaveBeenCalledTimes(2);
+    expect(ledger.writeAndConfirm).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(ledger.writeAndConfirm).mock.calls[0]?.[0]).toEqual(
+      vi.mocked(ledger.writeAndConfirm).mock.calls[1]?.[0],
+    );
+    expect(repository.sealAfterLedgerConfirmation).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects malformed integrity evidence before transaction 2', async () => {
+    const repository = store();
+    const ledger = sink();
+    vi.mocked(ledger.writeAndConfirm).mockImplementation(async (record) => ({
+      record,
+      confirmedAt: CONFIRMED_AT,
+      sha256: 'not-a-sha256',
+      macSha256: MAC,
+    }));
+    await expect(requestAccountErasure(request(), repository, ledger)).rejects.toMatchObject({
+      statusCode: 503,
+      code: 'erasure_ledger_mismatch',
+    } satisfies Partial<ApiError>);
+    expect(repository.sealAfterLedgerConfirmation).not.toHaveBeenCalled();
+  });
+
   it('refuses admin self-erasure before intent or sink mutation', async () => {
     const repository = store();
     const ledger = sink();
