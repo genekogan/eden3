@@ -75,19 +75,19 @@ async function buildAdmissionHarness(): Promise<FastifyInstance> {
   };
 
   for (const url of RUNTIME_ROUTE_PATTERNS) {
-    app.post(url, { preHandler: requireRuntime }, async () => ({ ok: true }));
+    app.post(url, serviceAuthenticatedCallback(requireRuntime), async () => ({ ok: true }));
   }
 
   app.post(
     '/channels/telegram/managed-bots/webhook',
-    {
-      preHandler: async (request, reply) => {
+    serviceAuthenticatedCallback(
+      async (request, reply) => {
         const presented = request.headers['x-telegram-bot-api-secret-token'];
         if (presented !== TELEGRAM_WEBHOOK_SECRET) {
           return unauthorized(reply, 'telegram_webhook_unauthorized');
         }
       },
-    },
+    ),
     async () => ({ ok: true, accepted: false }),
   );
 
@@ -187,6 +187,36 @@ describe('closed-cohort admission for channel service callbacks', () => {
       }
     },
   );
+
+  it('rejects a bad bearer in the root hook before request-body parsing', async () => {
+    const app = Fastify();
+    registerAuth(app, {
+      accessAllowlist: ['gene'],
+      provider: { async getSession() { return null; } },
+    });
+    let parsed = 0;
+    app.addContentTypeParser('application/x-eden-test', (_request, payload, done) => {
+      parsed += 1;
+      payload.resume();
+      done(null, {});
+    });
+    const guard = async (_request: FastifyRequest, reply: FastifyReply) =>
+      unauthorized(reply, 'runtime_unauthorized');
+    app.post('/runtime-before-parse', serviceAuthenticatedCallback(guard), async () => ({ ok: true }));
+    await app.ready();
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/runtime-before-parse',
+        headers: { 'content-type': 'application/x-eden-test' },
+        payload: 'must-not-parse',
+      });
+      expect(response.statusCode).toBe(401);
+      expect(parsed).toBe(0);
+    } finally {
+      await app.close();
+    }
+  });
 
   it('refuses a wildcard service callback declaration', async () => {
     const app = Fastify();

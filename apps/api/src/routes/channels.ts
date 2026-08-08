@@ -19,6 +19,7 @@ import { eq } from 'drizzle-orm';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
+import { serviceAuthenticatedCallback } from '../auth-plugin';
 import { ApiError, sendError } from '../errors';
 import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
@@ -795,6 +796,27 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       return sendError(reply, 401, 'runtime_unauthorized', 'Runtime authorization required');
     }
   };
+  const requireTelegramManager = async (req: FastifyRequest, reply: FastifyReply) => {
+    if (!telegramManager) {
+      return sendError(
+        reply,
+        503,
+        'telegram_manager_not_configured',
+        'Telegram manager is not configured',
+      );
+    }
+    const presented = Array.isArray(req.headers['x-telegram-bot-api-secret-token'])
+      ? req.headers['x-telegram-bot-api-secret-token'][0]
+      : req.headers['x-telegram-bot-api-secret-token'];
+    if (!secretsEqual(telegramManager.webhookSecret, presented)) {
+      return sendError(
+        reply,
+        401,
+        'telegram_webhook_unauthorized',
+        'Webhook authorization required',
+      );
+    }
+  };
 
   app.get('/connections', { preHandler: app.requireAuth }, async (req) => {
     const account = req.account!;
@@ -1101,93 +1123,90 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     return { connection: dto(connection) };
   });
 
-  app.post('/telegram/managed-bots/webhook', async (req, reply) => {
-    if (!telegramManager) {
-      return sendError(reply, 503, 'telegram_manager_not_configured', 'Telegram manager is not configured');
-    }
-    const presented = Array.isArray(req.headers['x-telegram-bot-api-secret-token'])
-      ? req.headers['x-telegram-bot-api-secret-token'][0]
-      : req.headers['x-telegram-bot-api-secret-token'];
-    if (!secretsEqual(telegramManager.webhookSecret, presented)) {
-      return sendError(reply, 401, 'telegram_webhook_unauthorized', 'Webhook authorization required');
-    }
+  app.post(
+    '/telegram/managed-bots/webhook',
+    serviceAuthenticatedCallback(requireTelegramManager),
+    async (req, reply) => {
+      const start = telegramStartBinding(req.body);
+      if (start) {
+        const rows = await pg<{ id: string }[]>`
+          update channel_onboarding_intents
+          set provider_owner_id_hash = ${telegramOwnerHash(start.ownerId)},
+              state = 'awaiting_bot', last_error_code = null, updated_at = now()
+          where channel = 'telegram' and intent_secret_hash = ${intentSecretHash(start.nonce)}
+            and state = 'pending_owner' and expires_at > now()
+          returning id
+        `;
+        return { ok: true, accepted: Boolean(rows[0]) };
+      }
 
-    const start = telegramStartBinding(req.body);
-    if (start) {
-      const rows = await pg<{ id: string }[]>`
-        update channel_onboarding_intents
-        set provider_owner_id_hash = ${telegramOwnerHash(start.ownerId)},
-            state = 'awaiting_bot', last_error_code = null, updated_at = now()
-        where channel = 'telegram' and intent_secret_hash = ${intentSecretHash(start.nonce)}
-          and state = 'pending_owner' and expires_at > now()
-        returning id
-      `;
-      return { ok: true, accepted: Boolean(rows[0]) };
-    }
-
-    const raw = metadataRecord(req.body).managed_bot;
-    if (!raw) return { ok: true, accepted: false };
-    let managed;
-    try {
-      managed = normalizeTelegramManagedBotUpdate(raw);
-    } catch {
-      return { ok: true, accepted: false };
-    }
-    const ownerHash = telegramOwnerHash(managed.owner.id);
-    const intent = await pg.begin(async (tx) => {
-      const rows = await tx<TelegramOnboardingIntentRow[]>`
-        select id, account_id, provider_owner_id_hash, suggested_bot_username, state,
-               expires_at, connection_id, last_error_code, created_at, updated_at
-        from channel_onboarding_intents
-        where channel = 'telegram' and provider_owner_id_hash = ${ownerHash}
-          and state = 'awaiting_bot' and expires_at > now()
-        for update
-      `;
-      const row = rows[0];
-      if (!row) return null;
-      await tx`
-        update channel_onboarding_intents
-        set state = 'exchanging', updated_at = now()
-        where id = ${row.id} and state = 'awaiting_bot'
-      `;
-      return { ...row, state: 'exchanging' as const };
-    });
-    if (!intent) return { ok: true, accepted: false };
-    if (await quotaExceeded(intent.account_id, false)) {
-      await pg`
-        update channel_onboarding_intents
-        set state = 'failed', last_error_code = 'channel_quota_exceeded', updated_at = now()
-        where id = ${intent.id} and state = 'exchanging'
-      `;
-      return { ok: true, accepted: false };
-    }
-
-    try {
-      const service = new TelegramManagedBotsService(
-        telegramManager.botApiClient,
-        new PostgresTelegramManagedBotCustody(
-          { id: intent.id, accountId: intent.account_id },
-          vault,
-        ),
-      );
-      await service.exchangeAndStore({
-        ownerAccountId: intent.account_id,
-        expectedTelegramOwnerId: managed.owner.id,
-        update: raw,
+      const raw = metadataRecord(req.body).managed_bot;
+      if (!raw) return { ok: true, accepted: false };
+      let managed;
+      try {
+        managed = normalizeTelegramManagedBotUpdate(raw);
+      } catch {
+        return { ok: true, accepted: false };
+      }
+      const ownerHash = telegramOwnerHash(managed.owner.id);
+      const intent = await pg.begin(async (tx) => {
+        const rows = await tx<TelegramOnboardingIntentRow[]>`
+          select id, account_id, provider_owner_id_hash, suggested_bot_username, state,
+                 expires_at, connection_id, last_error_code, created_at, updated_at
+          from channel_onboarding_intents
+          where channel = 'telegram' and provider_owner_id_hash = ${ownerHash}
+            and state = 'awaiting_bot' and expires_at > now()
+          for update
+        `;
+        const row = rows[0];
+        if (!row) return null;
+        await tx`
+          update channel_onboarding_intents
+          set state = 'exchanging', updated_at = now()
+          where id = ${row.id} and state = 'awaiting_bot'
+        `;
+        return { ...row, state: 'exchanging' as const };
       });
-      return { ok: true, accepted: true };
-    } catch (error) {
-      const code = error instanceof TelegramManagedBotError ? error.code : 'channel_custody_unavailable';
-      await pg`
-        update channel_onboarding_intents
-        set state = 'failed', last_error_code = ${code}, updated_at = now()
-        where id = ${intent.id} and state = 'exchanging'
-      `;
-      // Telegram webhooks must acknowledge terminally recorded failures to
-      // avoid replay storms. The authenticated user sees the safe code while polling.
-      return reply.code(200).send({ ok: true, accepted: false });
-    }
-  });
+      if (!intent) return { ok: true, accepted: false };
+      if (await quotaExceeded(intent.account_id, false)) {
+        await pg`
+          update channel_onboarding_intents
+          set state = 'failed', last_error_code = 'channel_quota_exceeded', updated_at = now()
+          where id = ${intent.id} and state = 'exchanging'
+        `;
+        return { ok: true, accepted: false };
+      }
+
+      try {
+        const service = new TelegramManagedBotsService(
+          telegramManager!.botApiClient,
+          new PostgresTelegramManagedBotCustody(
+            { id: intent.id, accountId: intent.account_id },
+            vault,
+          ),
+        );
+        await service.exchangeAndStore({
+          ownerAccountId: intent.account_id,
+          expectedTelegramOwnerId: managed.owner.id,
+          update: raw,
+        });
+        return { ok: true, accepted: true };
+      } catch (error) {
+        const code =
+          error instanceof TelegramManagedBotError
+            ? error.code
+            : 'channel_custody_unavailable';
+        await pg`
+          update channel_onboarding_intents
+          set state = 'failed', last_error_code = ${code}, updated_at = now()
+          where id = ${intent.id} and state = 'exchanging'
+        `;
+        // Telegram webhooks must acknowledge terminally recorded failures to
+        // avoid replay storms. The authenticated user sees the safe code while polling.
+        return reply.code(200).send({ ok: true, accepted: false });
+      }
+    },
+  );
 
   app.post('/connections', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
@@ -2514,7 +2533,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
 
   // Private runtime callbacks. They accept only the existing gateway bearer;
   // no browser cookie and no database credential is available to OpenClaw.
-  app.post('/runtime/messages', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/messages', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = runtimeMessageSchema.parse(req.body);
     const result = await sessionSync.syncMessage({
       ...body,
@@ -2523,7 +2542,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     return { ok: true, ...result };
   });
 
-  app.post('/runtime/pairing', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/pairing', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = runtimePairingSchema.parse(req.body);
     const connectionRows = await pg<
       Array<{ id: string; account_id: string; channel: string; runtime_account_id: string }>
@@ -2629,7 +2648,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     return { ok: true, requestId, expiresAt: expiresAt.toISOString() };
   });
 
-  app.post('/runtime/status', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/status', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = runtimeStatusSchema.parse(req.body);
     const errorCode = body.state === 'error' ? (body.errorCode ?? 'gateway_disconnected') : null;
     const errorMessage = errorCode ? (SAFE_RUNTIME_ERRORS[errorCode] ?? 'Channel runtime error') : null;
@@ -2702,7 +2721,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     return { ok: true };
   });
 
-  app.post('/runtime/turns/reserve', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/turns/reserve', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = reserveTurnSchema.parse(req.body);
     try {
       const result = await turnMetering.reserve(body);
@@ -2734,7 +2753,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     }
   });
 
-  app.post('/runtime/turns/:turnId/settle', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/turns/:turnId/settle', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const { turnId } = turnParamsSchema.parse(req.params);
     const { usage, provider, model, agentRuntime } = settleTurnSchema.parse(req.body ?? {});
     try {
@@ -2762,19 +2781,19 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     }
   });
 
-  app.post('/runtime/turns/:turnId/refund', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/turns/:turnId/refund', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const { turnId } = turnParamsSchema.parse(req.params);
     await turnMetering.refund(turnId);
     return { ok: true, turnId };
   });
 
-  app.post('/runtime/turns/:turnId/delivery-failed', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/turns/:turnId/delivery-failed', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const { turnId } = turnParamsSchema.parse(req.params);
     await turnMetering.refundDeliveryFailure(turnId);
     return { ok: true, turnId };
   });
 
-  app.post('/runtime/turns/:turnId/delivered', { preHandler: requireRuntime }, async (req) => {
+  app.post('/runtime/turns/:turnId/delivered', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const { turnId } = turnParamsSchema.parse(req.params);
     try {
       await turnMetering.markDelivered(turnId);

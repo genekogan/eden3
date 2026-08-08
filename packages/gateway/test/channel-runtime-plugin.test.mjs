@@ -2251,15 +2251,17 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
 
 describe('runtime callback HTTP client', () => {
   it('permits only the fixed local callback transport', () => {
-    expect(validateChannelRuntimeBaseUrl('http://host.docker.internal:4301')).toBe(
-      'http://host.docker.internal:4301',
+    expect(validateChannelRuntimeBaseUrl('http://host.docker.internal:4312')).toBe(
+      'http://host.docker.internal:4312',
     );
     for (const url of [
-      'https://host.docker.internal:4301',
-      'http://example.com:4301',
-      'http://user:pass@127.0.0.1:4301',
-      'http://127.0.0.1:4301/path',
-      'http://127.0.0.1:4301/?redirect=evil',
+      'http://host.docker.internal:4301',
+      'https://host.docker.internal:4312',
+      'http://example.com:4312',
+      'http://user:pass@host.docker.internal:4312',
+      'http://127.0.0.1:4312',
+      'http://host.docker.internal:4312/path',
+      'http://host.docker.internal:4312/?redirect=evil',
     ]) {
       expect(() => validateChannelRuntimeBaseUrl(url)).toThrow(ChannelRuntimeClientError);
     }
@@ -2276,7 +2278,7 @@ describe('runtime callback HTTP client', () => {
       });
     });
     const client = createChannelRuntimeClient({
-      baseUrl: 'http://127.0.0.1:4301',
+      baseUrl: 'http://host.docker.internal:4312',
       bearer,
       fetchFn,
     });
@@ -2295,7 +2297,7 @@ describe('runtime callback HTTP client', () => {
 
   it('rejects missing auth, path injection, and oversized responses with narrow errors', async () => {
     const missing = createChannelRuntimeClient({
-      baseUrl: 'http://127.0.0.1:4301',
+      baseUrl: 'http://host.docker.internal:4312',
       bearer: '',
       fetchFn: vi.fn(),
     });
@@ -2304,7 +2306,7 @@ describe('runtime callback HTTP client', () => {
     });
 
     const client = createChannelRuntimeClient({
-      baseUrl: 'http://127.0.0.1:4301',
+      baseUrl: 'http://host.docker.internal:4312',
       bearer: 'a-valid-test-bearer',
       fetchFn: vi.fn(async () => new Response('x'.repeat(70_000), { status: 200 })),
     });
