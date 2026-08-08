@@ -1,4 +1,8 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
 
 import { loadRootEnv, pg } from '@eden3/db';
 import { afterAll, afterEach, describe, expect, it } from 'vitest';
@@ -15,6 +19,9 @@ loadRootEnv();
 
 let sequence = 0;
 const fixtureExternalPrefix = `eve_reconcile_${Date.now()}`;
+let restorePreexistingPlatform = false;
+const execFileAsync = promisify(execFile);
+const repoRoot = fileURLToPath(new URL('../../../', import.meta.url));
 
 interface Fixture {
   input: EveReconciliationInput;
@@ -31,6 +38,10 @@ async function cleanup(): Promise<void> {
     )
   `;
   await pg`delete from accounts where external_id like ${`${fixtureExternalPrefix}%`}`;
+  if (restorePreexistingPlatform) {
+    restorePreexistingPlatform = false;
+    await ensureEveAssistant({ syncWorkspace: false });
+  }
 }
 
 async function seedFixture(): Promise<Fixture> {
@@ -42,15 +53,22 @@ async function seedFixture(): Promise<Fixture> {
     values ('user', ${`owner_${tag}`}, ${`${fixtureExternalPrefix}_${tag}_owner`})
     returning id
   `;
-  const [platform] = await pg<{ id: string }[]>`
-    insert into accounts (type, username, external_id)
-    values ('agent', 'eden', ${`${fixtureExternalPrefix}_${tag}_platform`})
-    returning id
+  let [platform] = await pg<{ id: string }[]>`
+    select account_id as id from agents where openclaw_id = 'main'
   `;
-  await pg`
-    insert into agents (account_id, owner_id, name, openclaw_id, provision_status)
-    values (${platform!.id}, null, 'Eden', 'main', 'ready')
-  `;
+  if (platform) {
+    restorePreexistingPlatform = true;
+  } else {
+    [platform] = await pg<{ id: string }[]>`
+      insert into accounts (type, username, external_id)
+      values ('agent', 'eden', ${`${fixtureExternalPrefix}_${tag}_platform`})
+      returning id
+    `;
+    await pg`
+      insert into agents (account_id, owner_id, name, openclaw_id, provision_status)
+      values (${platform!.id}, null, 'Eden', 'main', 'ready')
+    `;
+  }
   // Canonicalize the platform agent through the real bootstrap, then recreate
   // the staging precondition: the same main account is still named @eden and
   // a separate user-owned agent owns @eve.
@@ -129,6 +147,29 @@ async function identityRows(fixture: Fixture) {
   `;
 }
 
+function cliArgs(input: EveReconciliationInput, apply = false): string[] {
+  const args = [
+    'eve:reconcile', '--',
+    '--expected-database-name', input.expectedDatabaseName,
+    '--expected-collision-account-id', input.expectedCollisionAccountId,
+    '--expected-collision-owner-id', input.expectedCollisionOwnerId,
+    '--expected-collision-openclaw-id', input.expectedCollisionOpenclawId,
+    '--expected-collision-handle', input.expectedCollisionHandle,
+    '--expected-platform-account-id', input.expectedPlatformAccountId,
+    '--expected-platform-openclaw-id', input.expectedPlatformOpenclawId,
+    '--expected-platform-handle', input.expectedPlatformHandle,
+    '--new-handle', input.newHandle,
+  ];
+  if (apply) args.push('--apply');
+  return args;
+}
+
+function parseCliOutput(stdout: string): Record<string, unknown> {
+  const jsonStart = stdout.indexOf('{');
+  if (jsonStart < 0) throw new Error('Eve reconciliation CLI emitted no JSON object');
+  return JSON.parse(stdout.slice(jsonStart)) as Record<string, unknown>;
+}
+
 afterEach(cleanup);
 afterAll(async () => {
   await cleanup();
@@ -172,8 +213,31 @@ describe('Eve collision reconciliation', () => {
       username: 'eden',
       openclawId: 'main',
     });
+    expect(result.manifest.platformBootstrapCanonical).toBe(true);
     expect(JSON.stringify(result)).not.toContain('preserve persona');
     expect(after).toEqual(before);
+  });
+
+  it('executes the documented root CLI as dry-run then one explicit apply command', async () => {
+    const fixture = await seedFixture();
+    const before = await identityRows(fixture);
+    const dry = await execFileAsync('pnpm', cliArgs(fixture.input), {
+      cwd: repoRoot,
+      env: process.env,
+    });
+    expect(parseCliOutput(dry.stdout)).toMatchObject({ ok: true, dryRun: true, state: 'blocked' });
+    expect(await identityRows(fixture)).toEqual(before);
+
+    const applied = await execFileAsync('pnpm', cliArgs(fixture.input, true), {
+      cwd: repoRoot,
+      env: process.env,
+    });
+    expect(parseCliOutput(applied.stdout)).toMatchObject({
+      ok: true,
+      dryRun: false,
+      state: 'bootstrapped',
+      action: 'renamed-and-bootstrapped',
+    });
   });
 
   it('renames only the user-owned collision, bootstraps the exact main account, and preserves hashes', async () => {
@@ -228,6 +292,26 @@ describe('Eve collision reconciliation', () => {
     expect(await identityRows(fixture)).toEqual(before);
   });
 
+  it('rolls back with a safe error when the replacement handle is claimed concurrently', async () => {
+    const fixture = await seedFixture();
+    const before = await identityRows(fixture);
+    await expect(
+      reconcileEveCollision(fixture.input, {
+        apply: true,
+        beforeRenameCompareAndSet: async () => {
+          await pg`
+            insert into accounts (type, username, external_id)
+            values (
+              'user', ${fixture.newHandle},
+              ${`${fixtureExternalPrefix}_${sequence}_raced_handle`}
+            )
+          `;
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'replacement_handle_raced' } satisfies Partial<EveReconciliationError>);
+    expect(await identityRows(fixture)).toEqual(before);
+  });
+
   it('fails closed on a wrong expected identity without touching the real collision', async () => {
     const fixture = await seedFixture();
     const before = await identityRows(fixture);
@@ -249,6 +333,18 @@ describe('Eve collision reconciliation', () => {
         { apply: true },
       ),
     ).rejects.toMatchObject({ code: 'database_name_mismatch' } satisfies Partial<EveReconciliationError>);
+    expect(await identityRows(fixture)).toEqual(before);
+  });
+
+  it('refuses apply before rename when normal bootstrap would rewrite platform agent data', async () => {
+    const fixture = await seedFixture();
+    await pg`update agents set name = 'Drifted platform profile' where account_id = ${fixture.platformAccountId}`;
+    const dryRun = await reconcileEveCollision(fixture.input);
+    expect(dryRun.manifest.platformBootstrapCanonical).toBe(false);
+    const before = await identityRows(fixture);
+    await expect(reconcileEveCollision(fixture.input, { apply: true })).rejects.toMatchObject({
+      code: 'platform_bootstrap_would_mutate_agent',
+    } satisfies Partial<EveReconciliationError>);
     expect(await identityRows(fixture)).toEqual(before);
   });
 
@@ -333,6 +429,9 @@ describe('Eve collision reconciliation', () => {
 
   it('rejects invalid, reserved, drifted, and differently resumed handles', async () => {
     const fixture = await seedFixture();
+    await expect(
+      reconcileEveCollision({ ...fixture.input, expectedDatabaseName: 'eden3' }),
+    ).rejects.toMatchObject({ code: 'production_database_forbidden' });
     for (const newHandle of ['EVIL SPACE', 'main', 'eve', 'new', 'eden']) {
       await expect(
         reconcileEveCollision({ ...fixture.input, newHandle }),

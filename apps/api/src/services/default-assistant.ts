@@ -37,7 +37,7 @@ export async function isPlatformEveAccountId(accountId: string | null): Promise<
   return row?.isEve ?? false;
 }
 
-const DEFAULT_EVE_PROFILE = {
+export const PLATFORM_EVE_DATABASE_PROFILE = {
   name: 'Eve',
   description:
     'The platform-owned Eden assistant for learning the platform, exploring tools, and shaping new agents.',
@@ -143,9 +143,9 @@ export async function ensureEveAssistant(
         provision_status, provisioned_at
       )
       values (
-        ${account.id}, null, ${DEFAULT_EVE_PROFILE.name},
-        ${DEFAULT_EVE_PROFILE.description}, ${DEFAULT_EVE_PROFILE.persona},
-        true, ${DEFAULT_EVE_PROFILE.greeting}, true, ${DEFAULT_EVE_OPENCLAW_ID},
+        ${account.id}, null, ${PLATFORM_EVE_DATABASE_PROFILE.name},
+        ${PLATFORM_EVE_DATABASE_PROFILE.description}, ${PLATFORM_EVE_DATABASE_PROFILE.persona},
+        true, ${PLATFORM_EVE_DATABASE_PROFILE.greeting}, true, ${DEFAULT_EVE_OPENCLAW_ID},
         ${pg.json(JSON.stringify(PLATFORM_EVE_TOOL_GROUPS))}, true, false, 'ready', now()
       )
       on conflict (account_id) do update set
@@ -191,11 +191,11 @@ export async function syncEveWorkspace(
   const workspaceDir = path.join(dataDir, 'workspace');
   const now = options.now ?? (() => new Date());
   const vars = {
-    NAME: DEFAULT_EVE_PROFILE.name,
+    NAME: PLATFORM_EVE_DATABASE_PROFILE.name,
     USERNAME: DEFAULT_EVE_USERNAME,
-    DESCRIPTION: DEFAULT_EVE_PROFILE.description,
-    PERSONA: DEFAULT_EVE_PROFILE.persona,
-    GREETING: DEFAULT_EVE_PROFILE.greeting,
+    DESCRIPTION: PLATFORM_EVE_DATABASE_PROFILE.description,
+    PERSONA: PLATFORM_EVE_DATABASE_PROFILE.persona,
+    GREETING: PLATFORM_EVE_DATABASE_PROFILE.greeting,
     VOICE: 'clear, practical, product-native',
     THINKING_LEVEL: 'balanced',
     MEMORY_SEED: '',
@@ -266,7 +266,7 @@ async function ensureMainAgentUsesDefaultWorkspace(dataDir: string): Promise<voi
     );
     if (!entry) return;
     const workspace = path.join(dataDir, 'workspace');
-    entry.name = DEFAULT_EVE_PROFILE.name;
+    entry.name = PLATFORM_EVE_DATABASE_PROFILE.name;
     entry.workspace = workspace;
     hardenPlatformEveRuntimeEntry(entry);
   });

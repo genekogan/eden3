@@ -16,6 +16,7 @@
     "etl:verify": "pnpm --filter @eden3/etl etl:verify",
     "etl:snapshot": "node scripts/create-etl-mongo-snapshot.mjs",
     "etl:parity": "bash scripts/etl-parity-db.sh",
+    "eve:reconcile": "pnpm --filter @eden3/api eve:reconcile",
     "autonomy:smoke": "node scripts/autonomy-smoke.mjs",
     "load:gateway": "node scripts/load-gateway.mjs",
     "load:gateway:test": "node --test scripts/load-gateway.test.mjs",
