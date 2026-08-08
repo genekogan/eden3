@@ -204,9 +204,9 @@ function assertExactDevUsers(payload: unknown, fixture: E2EScratchUser): void {
 
 export function assertNoE2EScratchSideEffects(
   counts: E2EScratchSideEffects,
-  phase: 'seed' | 'runtime' = 'runtime',
+  phase: 'seed' | 'runtime' | 'cleanup' = 'runtime',
 ): void {
-  const accountCount = phase === 'seed' ? 1 : 2;
+  const accountCount = phase === 'runtime' ? 2 : 1;
   const agentCount = phase === 'seed' ? 0 : 1;
   if (
     counts.accountCount !== accountCount ||
@@ -290,6 +290,7 @@ export async function cleanupE2EScratchUser(options: {
     const rows = await repository.accountRows({ forUpdate: true });
     if (rows.length === 1) {
       assertE2EScratchRuntimeInventory(rows, fixture, { geneRequired: false });
+      assertNoE2EScratchSideEffects(await repository.sideEffectCounts(), 'cleanup');
       return { fixture, removed: false };
     }
     assertE2EScratchRuntimeInventory(rows, fixture);

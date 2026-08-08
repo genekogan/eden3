@@ -68,24 +68,108 @@ integration('isolated E2E scratch fixture (disposable Postgres)', () => {
         databaseName,
         fetchUsers: async () => (await app.inject({ method: 'GET', url: '/dev/users?q=gene' })).json(),
       }),
-    ).rejects.toThrow(/exact synthetic scratch user/);
+    ).rejects.toThrow(/platform Eve baseline/);
     await pg`update accounts set clerk_user_id = null where id = ${fixtureId}`;
 
-    const [eve] = await pg<{ accountId: string; greeting: string }[]>`
-      select g.account_id::text as "accountId", g.greeting
+    const [eve] = await pg<{
+      accountId: string;
+      name: string;
+      description: string;
+      persona: string;
+      isPersonaPublic: boolean;
+      greeting: string;
+      public: boolean;
+      toolGroups: unknown;
+      isPilot: boolean;
+      isSynthetic: boolean;
+      provisionStatus: string;
+      provisionedAt: Date;
+    }[]>`
+      select g.account_id::text as "accountId", g.name, g.description, g.persona,
+             g.is_persona_public as "isPersonaPublic", g.greeting, g.public,
+             g.tool_groups as "toolGroups", g.is_pilot as "isPilot",
+             g.is_synthetic as "isSynthetic", g.provision_status as "provisionStatus",
+             g.provisioned_at as "provisionedAt"
       from agents g
       where g.openclaw_id = 'main' and g.owner_id is null
     `;
     expect(eve).toBeDefined();
-    await pg`update agents set greeting = ${`${eve!.greeting} drift`} where account_id = ${eve!.accountId}`;
-    await expect(
-      preflightE2EScratchUser({
-        repository: e2eScratchPostgresRepository,
-        databaseName,
-        fetchUsers: async () => (await app.inject({ method: 'GET', url: '/dev/users?q=gene' })).json(),
-      }),
-    ).rejects.toThrow(/platform Eve baseline/);
-    await pg`update agents set greeting = ${eve!.greeting} where account_id = ${eve!.accountId}`;
+    const expectCanonicalDriftRejected = async () =>
+      expect(
+        preflightE2EScratchUser({
+          repository: e2eScratchPostgresRepository,
+          databaseName,
+          fetchUsers: async () =>
+            (await app.inject({ method: 'GET', url: '/dev/users?q=gene' })).json(),
+        }),
+      ).rejects.toThrow(/platform Eve baseline/);
+    const mutations: {
+      field: string;
+      mutate: () => Promise<void>;
+      restore: () => Promise<void>;
+    }[] = [
+      {
+        field: 'name',
+        mutate: async () => void (await pg`update agents set name = 'Eve drift' where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set name = ${eve!.name} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'description',
+        mutate: async () => void (await pg`update agents set description = 'drift' where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set description = ${eve!.description} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'persona',
+        mutate: async () => void (await pg`update agents set persona = 'drift' where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set persona = ${eve!.persona} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'is_persona_public',
+        mutate: async () => void (await pg`update agents set is_persona_public = false where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set is_persona_public = ${eve!.isPersonaPublic} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'greeting',
+        mutate: async () => void (await pg`update agents set greeting = 'drift' where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set greeting = ${eve!.greeting} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'public',
+        mutate: async () => void (await pg`update agents set public = false where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set public = ${eve!.public} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'tool_groups',
+        mutate: async () => void (await pg`update agents set tool_groups = '["group:web"]'::jsonb where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set tool_groups = ${JSON.stringify(eve!.toolGroups)}::jsonb where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'is_pilot',
+        mutate: async () => void (await pg`update agents set is_pilot = false where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set is_pilot = ${eve!.isPilot} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'is_synthetic',
+        mutate: async () => void (await pg`update agents set is_synthetic = true where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set is_synthetic = ${eve!.isSynthetic} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'provision_status',
+        mutate: async () => void (await pg`update agents set provision_status = 'pending' where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set provision_status = ${eve!.provisionStatus} where account_id = ${eve!.accountId}`),
+      },
+      {
+        field: 'provisioned_at',
+        mutate: async () => void (await pg`update agents set provisioned_at = null where account_id = ${eve!.accountId}`),
+        restore: async () => void (await pg`update agents set provisioned_at = ${eve!.provisionedAt} where account_id = ${eve!.accountId}`),
+      },
+    ];
+    for (const mutation of mutations) {
+      await mutation.mutate();
+      await expectCanonicalDriftRejected();
+      await mutation.restore();
+      expect(mutation.field).toBeTruthy();
+    }
   });
 
   it('locks the exact owner row so a concurrent FK writer cannot be laundered by cleanup', async () => {
