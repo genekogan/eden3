@@ -4,7 +4,13 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { createStorageRuntime, storagePolicyIntervalMs } from '../src/services/storage-runtime';
+import {
+  createStorageRuntime,
+  storageCleanupIntervalMs,
+  storagePolicyIntervalMs,
+} from '../src/services/storage-runtime';
+
+const logger = { warn: () => undefined, error: () => undefined };
 
 describe('storage runtime composition', () => {
   const roots: string[] = [];
@@ -24,7 +30,6 @@ describe('storage runtime composition', () => {
     const objectRoot = path.join(base, 'private-objects');
     const cacheRoot = path.join(base, 'private-cache');
     const keyFile = path.join(base, 'private-secrets', 'upload.key');
-    const logger = { warn: () => undefined };
     const first = await createStorageRuntime({
       mediaDir,
       logger,
@@ -36,6 +41,7 @@ describe('storage runtime composition', () => {
       },
     });
     expect(first.objectRoot).toBe(await realpath(objectRoot));
+    expect(first.multipartCleanupWorker).toBeDefined();
     expect(first.cacheRoot).toBe(await realpath(cacheRoot));
     expect(path.relative(mediaDir, objectRoot)).toMatch(/^\.\./);
     expect(path.relative(mediaDir, cacheRoot)).toMatch(/^\.\./);
@@ -67,12 +73,12 @@ describe('storage runtime composition', () => {
     };
     await expect(createStorageRuntime({
       mediaDir,
-      logger: { warn: () => undefined },
+      logger,
       env: { ...common, OBJECT_LOCAL_DIR: path.join(mediaDir, 'objects') },
     })).rejects.toThrow(/outside MEDIA_DIR/);
     await expect(createStorageRuntime({
       mediaDir,
-      logger: { warn: () => undefined },
+      logger,
       env: { ...common, OBJECT_LOCAL_DIR: base },
     })).rejects.toThrow(/outside MEDIA_DIR/);
   });
@@ -81,7 +87,7 @@ describe('storage runtime composition', () => {
     const base = await root();
     await expect(createStorageRuntime({
       mediaDir: path.join(base, 'media'),
-      logger: { warn: () => undefined },
+      logger,
       env: {
         OBJECT_BACKEND: 'r2',
         OBJECT_LOCAL_DIR: path.join(base, 'objects'),
@@ -109,7 +115,7 @@ describe('storage runtime composition', () => {
       };
       await expect(createStorageRuntime({
         mediaDir,
-        logger: { warn: () => undefined },
+        logger,
         env,
       })).rejects.toThrow(/outside MEDIA_DIR/);
       await expect(access(path.join(mediaDir, 'capability.key'))).rejects.toThrow();
@@ -120,5 +126,12 @@ describe('storage runtime composition', () => {
     expect(() => storagePolicyIntervalMs({ UPLOAD_POLICY_INTERVAL_MS: '0' })).toThrow(
       /positive integer/,
     );
+  });
+
+  it('refuses to disable the durable multipart cleanup interval', () => {
+    expect(() => storageCleanupIntervalMs({ UPLOAD_CLEANUP_INTERVAL_MS: '0' })).toThrow(
+      /positive integer/,
+    );
+    expect(storageCleanupIntervalMs({ UPLOAD_CLEANUP_INTERVAL_MS: '15000' })).toBe(15_000);
   });
 });
