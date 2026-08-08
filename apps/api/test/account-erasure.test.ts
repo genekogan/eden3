@@ -61,10 +61,10 @@ describe('account erasure admission', () => {
         },
         repository,
       ),
-    ).rejects.toMatchObject<Partial<ApiError>>({
+    ).rejects.toMatchObject({
       statusCode: 403,
       code: 'protected_account',
-    });
+    } satisfies Partial<ApiError>);
     expect(repository.beginSelfErasure).not.toHaveBeenCalled();
   });
 
@@ -80,10 +80,10 @@ describe('account erasure admission', () => {
         },
         repository,
       ),
-    ).rejects.toMatchObject<Partial<ApiError>>({
+    ).rejects.toMatchObject({
       statusCode: 400,
       code: 'confirmation_mismatch',
-    });
+    } satisfies Partial<ApiError>);
     expect(repository.beginSelfErasure).not.toHaveBeenCalled();
   });
 
@@ -101,9 +101,9 @@ describe('account erasure admission', () => {
         },
         repository,
       ),
-    ).rejects.toMatchObject<Partial<ApiError>>({
+    ).rejects.toMatchObject({
       statusCode: 403,
       code: 'protected_account',
-    });
+    } satisfies Partial<ApiError>);
   });
 });
