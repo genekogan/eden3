@@ -212,17 +212,27 @@ export function ChannelsClient({
     if (!intentId || telegramStep === "attach" || telegramStep === "complete" || telegramStep === "terminal") {
       return;
     }
-    const timer = window.setTimeout(() => {
+    let disposed = false;
+    let inFlight = false;
+    const poll = () => {
+      if (inFlight) return;
+      inFlight = true;
       void api.channels.managedTelegramStatus(intentId).then(
         (status) => {
-          if (alive.current) setTelegramOnboarding(status);
+          if (!disposed && alive.current) setTelegramOnboarding(status);
         },
         (error) => {
-          if (alive.current) setNote(errorCopy(error));
+          if (!disposed && alive.current) setNote(errorCopy(error));
         },
-      );
-    }, 2_000);
-    return () => window.clearTimeout(timer);
+      ).finally(() => {
+        inFlight = false;
+      });
+    };
+    const timer = window.setInterval(poll, 2_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
   }, [telegramOnboarding?.intent.id, telegramOnboarding?.intent.state, telegramStep]);
 
   const selectedAgent = useMemo(
