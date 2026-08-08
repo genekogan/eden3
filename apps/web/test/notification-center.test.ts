@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  applyLatestNotificationLoad,
   dismissNotification,
   markEveryNotificationRead,
   markNotificationRead,
+  NotificationLoadFence,
   notificationCopy,
 } from "../components/notification-model";
 import type { AppNotificationDto } from "../lib/types";
@@ -53,5 +55,38 @@ describe("notification center model", () => {
       items: [all.items[1]],
       unreadCount: 0,
     });
+  });
+
+  it("rejects a delayed tenant A load after fast tenant B becomes current", async () => {
+    const fence = new NotificationLoadFence();
+    let releaseA!: (state: { items: AppNotificationDto[]; unreadCount: number }) => void;
+    const delayedA = new Promise<{ items: AppNotificationDto[]; unreadCount: number }>(
+      (resolve) => {
+        releaseA = resolve;
+      },
+    );
+    const applied: string[][] = [];
+    const aGeneration = fence.begin();
+    const aLoad = applyLatestNotificationLoad(
+      fence,
+      aGeneration,
+      () => delayedA,
+      (state) => applied.push(state.items.map((item) => item.sourceAgent.username)),
+    );
+
+    fence.invalidate(aGeneration);
+    const bGeneration = fence.begin();
+    await applyLatestNotificationLoad(
+      fence,
+      bGeneration,
+      async () => ({
+        items: [{ ...ready, sourceAgent: { ...ready.sourceAgent, username: "tenant-b" } }],
+        unreadCount: 1,
+      }),
+      (state) => applied.push(state.items.map((item) => item.sourceAgent.username)),
+    );
+    releaseA({ items: [ready], unreadCount: 1 });
+    await aLoad;
+    expect(applied).toEqual([["tenant-b"]]);
   });
 });

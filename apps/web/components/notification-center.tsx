@@ -6,9 +6,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { AppNotificationDto } from "@/lib/types";
 import {
+  applyLatestNotificationLoad,
   dismissNotification,
   markEveryNotificationRead,
   markNotificationRead,
+  NotificationLoadFence,
   notificationCopy,
 } from "./notification-model";
 
@@ -43,23 +45,34 @@ export function NotificationCenter({
   });
   const [open, setOpen] = useState(false);
   const root = useRef<HTMLDivElement>(null);
+  const loadFence = useRef(new NotificationLoadFence());
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (generation: number) => {
     try {
-      const response = await api.notifications.list();
-      setState(response);
+      await applyLatestNotificationLoad(
+        loadFence.current,
+        generation,
+        () => api.notifications.list(),
+        setState,
+      );
     } catch {
       // The center stays quiet while signed out or during a degraded API boot.
     }
   }, []);
 
   useEffect(() => {
+    const generation = loadFence.current.begin();
+    setOpen(false);
+    setState({ items: [], unreadCount: 0 });
     if (!accountKey) {
-      setState({ items: [], unreadCount: 0 });
       return;
     }
-    void refresh();
-    return api.notifications.subscribe(() => void refresh());
+    void refresh(generation);
+    const unsubscribe = api.notifications.subscribe(() => void refresh(generation));
+    return () => {
+      loadFence.current.invalidate(generation);
+      unsubscribe();
+    };
   }, [accountKey, refresh]);
 
   useEffect(() => {
@@ -80,17 +93,19 @@ export function NotificationCenter({
 
   const markRead = (id: string) => {
     setState((current) => markNotificationRead(current, id, new Date().toISOString()));
-    void api.notifications.markRead(id).catch(() => void refresh());
+    void api.notifications.markRead(id).catch(() => void refresh(loadFence.current.current()));
   };
 
   const markAllRead = () => {
     setState((current) => markEveryNotificationRead(current, new Date().toISOString()));
-    void api.notifications.markAllRead().catch(() => void refresh());
+    void api.notifications
+      .markAllRead()
+      .catch(() => void refresh(loadFence.current.current()));
   };
 
   const dismiss = (id: string) => {
     setState((current) => dismissNotification(current, id));
-    void api.notifications.dismiss(id).catch(() => void refresh());
+    void api.notifications.dismiss(id).catch(() => void refresh(loadFence.current.current()));
   };
 
   return (

@@ -91,7 +91,11 @@ export function UserArea({ collapsed = false }: { collapsed?: boolean }) {
       ) : null}
 
       <div className={`flex items-center ${collapsed ? "flex-col" : ""}`}>
-        <NotificationCenter accountKey={user?.id ?? null} collapsed={collapsed} />
+        <NotificationCenter
+          key={user?.id ?? "anonymous"}
+          accountKey={user?.id ?? null}
+          collapsed={collapsed}
+        />
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
