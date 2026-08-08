@@ -46,6 +46,7 @@ import {
   replaceAgentSkills,
 } from '../services/agent-skills';
 import { reconcileAgentRuntime } from '../services/agent-runtime-sync';
+import { DEFAULT_EVE_USERNAME, isPlatformEve } from '../services/default-assistant';
 import {
   agentMemorySnapshot,
   agentMemoryStatus,
@@ -93,7 +94,7 @@ const agentUsernameSchema = z
     /^[a-z0-9][a-z0-9_-]{2,31}$/,
     'username must be 3-32 chars: lowercase letters, digits, "-", "_" (must start alphanumeric)',
   )
-  .refine((u) => !['main', 'new', 'builder', 'edit', 'api', 'media'].includes(u), {
+  .refine((u) => !['main', DEFAULT_EVE_USERNAME, 'new', 'builder', 'edit', 'api', 'media'].includes(u), {
     message: 'username is reserved',
   });
 
@@ -244,6 +245,10 @@ interface AgentInteractionRow {
 
 /** Owner/admin gate shared with the workspace routes (routes/workspace.ts). */
 export function canManage(viewer: AuthSession | null, account: Account, agent: Agent): boolean {
+  // Eve is platform-owned, not admin-owned. Returning false here hides every
+  // generic settings affordance and makes every direct configuration alias
+  // hit the same server-side owner denial.
+  if (isPlatformEve(account, agent)) return false;
   if (!viewer) return false;
   if (viewer.isAdmin) return true;
   return viewer.accountId === agent.ownerId || viewer.accountId === account.id;

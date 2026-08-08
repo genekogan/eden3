@@ -13,6 +13,7 @@ import {
   type SkillDefinitionRow,
 } from '../services/agent-skills';
 import { reconcileAgentRuntime } from '../services/agent-runtime-sync';
+import { isPlatformEve } from '../services/default-assistant';
 
 const skillSlugSchema = z
   .string()
@@ -65,6 +66,7 @@ function skillDto(row: SkillDefinitionRow) {
 }
 
 function canManage(viewer: AuthSession | null, account: Account, agent: Agent): boolean {
+  if (isPlatformEve(account, agent)) return false;
   if (!viewer) return false;
   if (viewer.isAdmin) return true;
   return viewer.accountId === agent.ownerId || viewer.accountId === account.id;

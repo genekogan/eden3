@@ -15,6 +15,7 @@ import { ApiError, sendError } from '../errors';
 import type { GatewayGlue } from '../gateway-glue';
 import { triggerDtoFromEntity } from '../route-helpers';
 import { concurrentTurnLimit } from '../services/chat-limits';
+import { isPlatformEve, isPlatformEveAccountId } from '../services/default-assistant';
 import { runScheduledTask } from '../services/scheduled-tasks';
 import { assertTurnAdmissible } from '../services/turns';
 import { nextOccurrence, TaskScheduleError } from '../services/task-schedule';
@@ -269,6 +270,14 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
     }
     const { account: agentAccount, agent } = resolved;
+    if (isPlatformEve(agentAccount, agent)) {
+      return sendError(
+        reply,
+        403,
+        'eve_configuration_hidden',
+        'Eve is platform-owned and cannot be configured with scheduled tasks',
+      );
+    }
     const isOwner = viewer.isAdmin || viewer.accountId === agent.ownerId;
     if (!agent.public && !isOwner) {
       return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
@@ -326,6 +335,14 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     }
     if (!viewer.isAdmin && existing.userId !== viewer.accountId) {
       return sendError(reply, 403, 'forbidden', 'Only the task owner can run it');
+    }
+    if (await isPlatformEveAccountId(existing.agentId)) {
+      return sendError(
+        reply,
+        403,
+        'eve_configuration_hidden',
+        'Eve is platform-owned and cannot run user-configured scheduled tasks',
+      );
     }
     if (!app.gatewayCompat || !app.historySync) {
       throw new ApiError(
@@ -407,6 +424,14 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     }
     if (!viewer.isAdmin && existing.userId !== viewer.accountId) {
       return sendError(reply, 403, 'forbidden', 'Only the task owner can modify it');
+    }
+    if (await isPlatformEveAccountId(existing.agentId)) {
+      return sendError(
+        reply,
+        403,
+        'eve_configuration_hidden',
+        'Eve is platform-owned and cannot be configured with scheduled tasks',
+      );
     }
 
     const updatedId = await pg.begin(async (tx) => {
