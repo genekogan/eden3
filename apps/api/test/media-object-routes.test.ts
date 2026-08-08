@@ -40,9 +40,16 @@ function record(overrides: Partial<MediaObjectRecord> = {}): MediaObjectRecord {
 class FakeRepository implements MediaObjectRepository {
   row: MediaObjectRecord | null = record();
   lastShareTokenHash: string | null = null;
+  activeShareTokenHash: string | null = null;
   async findById(_objectId: string, shareTokenHash: string | null = null) {
     this.lastShareTokenHash = shareTokenHash;
-    return this.row;
+    return this.row && this.activeShareTokenHash !== null
+      ? {
+          ...this.row,
+          shareReferenceActive:
+            this.row.shareReferenceActive && shareTokenHash === this.activeShareTokenHash,
+        }
+      : this.row;
   }
 }
 
@@ -194,6 +201,39 @@ describe('GET /media/:objectId lifecycle boundary', () => {
       url: `/media/share/${SHARE_TOKEN}/${OBJECT_ID}`,
     });
     expect(revoked.statusCode).toBe(404);
+    expect(revoked.headers['cache-control']).toContain('private');
+    expect(revoked.headers['cache-control']).toContain('no-store');
+    expect(revoked.headers['referrer-policy']).toBe('no-referrer');
+    expect(JSON.stringify(revoked.headers)).not.toContain(SHARE_TOKEN);
+    expect(counts().hydrations).toBe(1);
+  });
+
+  it('never makes a token-bearing media capability public-cacheable and rechecks each token', async () => {
+    const { app, repository, counts } = await setup();
+    const otherToken = 'z'.repeat(43);
+    repository.row = record({
+      publicReferenceOwnerAccountId: OWNER,
+      shareReferenceActive: true,
+    });
+    repository.activeShareTokenHash = hashSessionShareToken(SHARE_TOKEN);
+
+    const first = await app.inject({
+      method: 'GET',
+      url: `/media/share/${SHARE_TOKEN}/${OBJECT_ID}`,
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.headers['cache-control']).toContain('private');
+    expect(first.headers['cache-control']).toContain('no-store');
+    expect(first.headers['cache-control']).not.toContain('public');
+    expect(first.headers['surrogate-control']).toBe('no-store');
+    expect(first.headers['referrer-policy']).toBe('no-referrer');
+
+    const crossToken = await app.inject({
+      method: 'HEAD',
+      url: `/media/share/${otherToken}/${OBJECT_ID}`,
+    });
+    expect(crossToken.statusCode).toBe(404);
+    expect(crossToken.headers['cache-control']).toContain('no-store');
     expect(counts().hydrations).toBe(1);
   });
 
@@ -205,6 +245,11 @@ describe('GET /media/:objectId lifecycle boundary', () => {
     expect(source).toContain('c.user_id = o.owner_account_id');
     expect(source).toContain("c.attributes->>'nsfw_score'");
     expect(source).toContain("::double precision < 0.85");
+    expect(source).toContain('s.deleted = false');
+    expect(source).toContain('s.visible is distinct from false');
+    expect(source).toContain('a.id = o.owner_account_id');
+    expect(source).toContain('su.user_account_id = o.owner_account_id');
+    expect(source).toContain('sa.agent_account_id = o.owner_account_id');
   });
 
   it('rejects available rows missing verified metadata before hydration', async () => {

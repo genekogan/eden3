@@ -3,8 +3,10 @@ import type {
   PublicSessionSnapshotDto,
   SessionShareSummaryDto,
 } from '@eden3/shared';
+import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 
+import { sessionShareRoutes } from '../src/routes/session-shares';
 import {
   hashSessionShareToken,
   SessionShareService,
@@ -200,5 +202,45 @@ describe('session share service', () => {
     expect((await service.list(SESSION_ID, OWNER_ID)).items).toContainEqual(
       expect.objectContaining({ id: live.share.id, revokedAt: '2026-08-08T10:00:06.000Z' }),
     );
+  });
+
+  it('revalidates public lookup after revoke and makes success and denial uncacheable', async () => {
+    const repository = new MemoryShareRepository();
+    const token = 'r'.repeat(43);
+    const service = new SessionShareService(repository, {
+      token: () => token,
+      now: () => new Date('2026-08-08T10:00:02.000Z'),
+    });
+    const created = await service.create(SESSION_ID, OWNER_ID, { mode: 'snapshot' });
+    const app = Fastify();
+    app.decorateRequest('account', null);
+    app.decorate('requireAuth', async () => undefined);
+    await app.register(sessionShareRoutes, { repository });
+
+    try {
+      const first = await app.inject({ method: 'GET', url: `/shares/${token}` });
+      expect(first.statusCode).toBe(200);
+      expect(first.headers['cache-control']).toContain('private');
+      expect(first.headers['cache-control']).toContain('no-store');
+      expect(first.headers['surrogate-control']).toBe('no-store');
+      expect(first.headers['referrer-policy']).toBe('no-referrer');
+      expect(first.headers['x-robots-tag']).toContain('noindex');
+
+      await service.revoke(SESSION_ID, created.share.id, OWNER_ID);
+      const revoked = await app.inject({ method: 'GET', url: `/shares/${token}` });
+      expect(revoked.statusCode).toBe(404);
+      expect(revoked.headers['cache-control']).toContain('no-store');
+      expect(revoked.headers['surrogate-control']).toBe('no-store');
+      expect(revoked.headers['referrer-policy']).toBe('no-referrer');
+      expect(revoked.body).not.toContain(token);
+
+      const wrongToken = 'w'.repeat(43);
+      const wrong = await app.inject({ method: 'GET', url: `/shares/${wrongToken}` });
+      expect(wrong.statusCode).toBe(404);
+      expect(wrong.body).not.toContain(wrongToken);
+      expect(JSON.stringify(wrong.headers)).not.toContain(wrongToken);
+    } finally {
+      await app.close();
+    }
   });
 });
