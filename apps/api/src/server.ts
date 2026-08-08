@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 import { getEnv } from '@eden3/core';
+import type { SchemaReadiness } from '@eden3/db';
 import { OpenClawCompatClient, OpenClawToolsClient } from '@eden3/gateway';
 import fastifyCors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
@@ -104,6 +105,10 @@ export interface BuildServerOptions {
   };
   billing?: BillingRoutesOptions;
   channels?: ChannelsRoutesOptions;
+  health?: {
+    /** Production schema gate; tests may inject deterministic readiness. */
+    schemaReadiness?: () => Promise<SchemaReadiness>;
+  };
   storage?: {
     /** Construct the production object/upload runtime. Tests leave this false. */
     enabled?: boolean;
@@ -263,11 +268,45 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     }
   })();
 
-  app.get('/health', async () => ({
-    ok: true,
-    versions: { api: pkg.version, node: process.version, fastify: app.version },
-    database: databaseName,
-  }));
+  app.get('/health', async (request, reply) => {
+    const requireSchema = request.url.includes('?') &&
+      new URL(request.url, 'http://eden3.local').searchParams.get('ready') === '1';
+    let schema: SchemaReadiness | {
+      status: 'unchecked';
+      expectedMigration: null;
+      expectedCount: null;
+      appliedCount: null;
+      missingCount: null;
+    };
+    if (opts.health?.schemaReadiness) {
+      try {
+        schema = await opts.health.schemaReadiness();
+      } catch {
+        schema = {
+          status: 'database_unavailable',
+          expectedMigration: 'unknown',
+          expectedCount: 0,
+          appliedCount: null,
+          missingCount: null,
+        };
+      }
+    } else {
+      schema = {
+        status: 'unchecked',
+        expectedMigration: null,
+        expectedCount: null,
+        appliedCount: null,
+        missingCount: null,
+      };
+    }
+    const ok = schema.status === 'ready' || (schema.status === 'unchecked' && !requireSchema);
+    return reply.code(ok ? 200 : 503).send({
+      ok,
+      versions: { api: pkg.version, node: process.version, fastify: app.version },
+      database: databaseName,
+      schema,
+    });
+  });
 
   // Auth (request.account + app.requireAuth) — root scope, before routes.
   registerAuth(app, opts.auth);

@@ -36,11 +36,49 @@ describe('GET /health', () => {
     const res = await app.inject({ method: 'GET', url: '/health' });
     expect(res.statusCode).toBe(200);
     expect(res.headers['x-request-id']).toBeTruthy();
-    const body = res.json() as { ok: boolean; versions: Record<string, string> };
+    const body = res.json() as {
+      ok: boolean;
+      versions: Record<string, string>;
+      schema: { status: string };
+    };
     expect(body.ok).toBe(true);
+    expect(body.schema.status).toBe('unchecked');
     expect(body.versions.node).toBe(process.version);
     expect(body.versions.fastify).toMatch(/^5\./);
     expect(body.versions.api).toBeTruthy();
+  });
+
+  it('fails closed when production requires a stale or unavailable schema', async () => {
+    const stale = await buildServer({
+      health: {
+        schemaReadiness: async () => ({
+          status: 'missing_migrations',
+          expectedMigration: '0033_session_share_links',
+          expectedCount: 34,
+          appliedCount: 33,
+          missingCount: 1,
+        }),
+      },
+    });
+    try {
+      const response = await stale.inject({ method: 'GET', url: '/health' });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({
+        ok: false,
+        schema: { status: 'missing_migrations', missingCount: 1 },
+      });
+    } finally {
+      await stale.close();
+    }
+
+    const unchecked = await buildServer();
+    try {
+      const response = await unchecked.inject({ method: 'GET', url: '/health?ready=1' });
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toMatchObject({ ok: false, schema: { status: 'unchecked' } });
+    } finally {
+      await unchecked.close();
+    }
   });
 
   it('boots degraded without a host gateway token and still runs native-cron cleanup', async () => {

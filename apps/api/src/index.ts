@@ -2,7 +2,7 @@
 // Env loading happens here (entrypoints only); everything else reads
 // process.env through @eden3/core getEnv().
 import { getEnv } from '@eden3/core';
-import { loadRootEnv } from '@eden3/db';
+import { checkSchemaReadiness, loadRootEnv } from '@eden3/db';
 import { ensureBaseline } from '@eden3/gateway';
 
 import { defaultOpenclawDataDir } from './gateway-glue';
@@ -16,6 +16,7 @@ await refreshActiveConceptInventories();
 
 const app = await buildServer({
   logger: { level: 'info', base: undefined }, // compact: no pid/hostname
+  health: { schemaReadiness: checkSchemaReadiness },
   media: { autoStartWatcher: true },
   storage: { enabled: true, autoStartPolicyWorker: true },
   scheduler: { autoStart: true }, // eden3-side scheduled-task firing
