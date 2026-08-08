@@ -281,6 +281,13 @@
       "when": 1786218235849,
       "tag": "0039_scheduler_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1786221975284,
+      "tag": "0040_account_erasure_lifecycle",
+      "breakpoints": true
     }
   ]
 }

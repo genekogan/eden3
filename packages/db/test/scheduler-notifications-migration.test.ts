@@ -33,7 +33,7 @@ describe('scheduled completion notification migration', () => {
       entries: Array<{ idx: number; tag: string }>;
     };
     journal.entries.forEach((entry, position) => expect(entry.idx).toBe(position));
-    expect(journal.entries.at(-1)).toMatchObject({
+    expect(journal.entries[39]).toMatchObject({
       idx: 39,
       tag: '0039_scheduler_notifications',
     });
