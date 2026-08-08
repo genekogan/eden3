@@ -179,6 +179,10 @@ export type WorkspaceFileContent =
       sizeBytes: number;
       mtime: string;
       sha256: string;
+      /** Present for SOUL.md: shared monotonic Workspace/Settings revision. */
+      doctrineRevision?: number;
+      /** Whether persisted Settings persona bytes equal this exact file. */
+      doctrineSyncState?: "synced" | "conflict";
     }
   | { path: string; kind: "binary"; sizeBytes: number; mtime: string };
 
@@ -192,6 +196,8 @@ export interface WorkspaceSaveInput {
   path: string;
   content: string;
   baseSha256: string;
+  /** Required for SOUL.md; omitted for ordinary SHA-fenced workspace files. */
+  baseRevision?: number;
 }
 
 export interface WorkspaceSaveResponse {
@@ -201,6 +207,8 @@ export interface WorkspaceSaveResponse {
     sizeBytes: number;
     mtime: string;
     sha256: string;
+    doctrineRevision?: number;
+    doctrineSyncState?: "synced" | "conflict";
   };
 }
 
@@ -208,6 +216,7 @@ export interface WorkspaceSaveResponse {
 export interface WorkspaceWriteConflict {
   currentSha256: string | null;
   currentMtime: string | null;
+  currentRevision?: number;
 }
 
 /** GET /api/sessions/:id — messages ascending; permalinks accept 24-hex ids. */

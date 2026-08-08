@@ -9,9 +9,11 @@ import {
 export function DoctrineOwnershipNotice({
   ownership,
   syncState,
+  revision,
 }: {
   ownership: DoctrineFileOwnership;
   syncState?: DoctrineSyncState;
+  revision?: number;
 }) {
   return (
     <div
@@ -30,6 +32,9 @@ export function DoctrineOwnershipNotice({
           >
             {doctrineSyncStateLabel(syncState)}
           </span>
+        ) : null}
+        {revision !== undefined ? (
+          <span className="font-mono text-faint">Revision {revision}</span>
         ) : null}
       </div>
       <p className="mt-2 leading-relaxed text-faint">{ownership.detail}</p>

@@ -13,6 +13,7 @@ import {
   listWorkspaceTree,
   openWorkspaceDownload,
   readWorkspaceFile,
+  sha256Hex,
   workspaceDownloadMime,
   writeWorkspaceFile,
 } from '../services/workspace-files';
@@ -51,7 +52,39 @@ const saveBodySchema = z.object({
   // 'new' = "I am creating this file"; anything else must match the current
   // bytes on disk or the save is rejected (never silently clobber the agent).
   baseSha256: z.string().regex(/^(new|[0-9a-f]{64})$/, 'baseSha256 must be "new" or a sha256 hex'),
+  // Required for the two-way SOUL.md surface. Ordinary workspace files keep
+  // their existing SHA-only contract.
+  baseRevision: z.number().int().nonnegative().optional(),
 });
+
+interface DoctrineRevisionRow {
+  persona: string | null;
+  runtime_sync_version: number;
+}
+
+async function readDoctrineRevision(accountId: string): Promise<DoctrineRevisionRow> {
+  const rows = await pg<DoctrineRevisionRow[]>`
+    select persona, runtime_sync_version
+    from agents
+    where account_id = ${accountId}
+  `;
+  const row = rows[0];
+  if (!row) throw new ApiError(404, 'agent_not_found', 'Agent no longer exists');
+  return row;
+}
+
+function doctrineFileMetadata(
+  file: Awaited<ReturnType<typeof readWorkspaceFile>>,
+  row: DoctrineRevisionRow,
+) {
+  if (file.kind !== 'text' || file.path !== SOUL_WORKSPACE_FILE) return file;
+  return {
+    ...file,
+    doctrineRevision: row.runtime_sync_version,
+    doctrineSyncState:
+      file.sha256 === sha256Hex(row.persona ?? '') ? ('synced' as const) : ('conflict' as const),
+  };
+}
 
 /**
  * SOUL.md IS the agent's persona (single source of truth). Editing it in the
@@ -95,8 +128,15 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
   app.get('/:username/workspace/file', { preHandler: app.requireAuth }, async (req) => {
     const { username } = usernameParamsSchema.parse(req.params);
     const { path: filePath } = filePathQuerySchema.parse(req.query);
-    const { root } = await resolveManagedWorkspace(req, username);
-    return { file: await readWorkspaceFile(root, filePath) };
+    const { account, root } = await resolveManagedWorkspace(req, username);
+    const file = await readWorkspaceFile(root, filePath);
+    if (file.kind !== 'text' || file.path !== SOUL_WORKSPACE_FILE) return { file };
+
+    // The revision is DB-authoritative and the hash is file-authoritative. A
+    // runtime/file write that crosses this read may conservatively surface a
+    // conflict; it can never be mislabeled as synced unless the exact bytes
+    // equal the persisted persona.
+    return { file: doctrineFileMetadata(file, await readDoctrineRevision(account.id)) };
   });
 
   // ---- GET /agents/:username/workspace/download — raw bytes ----------------
@@ -176,6 +216,91 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
         );
       }
     }
+    if (doctrinePolicy.kind === 'two-way-settings' && body.baseRevision === undefined) {
+      throw new ApiError(
+        400,
+        'workspace_revision_required',
+        'SOUL.md saves require the revision that was loaded',
+      );
+    }
+
+    if (doctrinePolicy.kind === 'two-way-settings') {
+      const outcome = await pg.begin(async (tx) => {
+        // Match PATCH /agents/:username's lock namespace and ordering. This
+        // makes Workspace and Settings one serialized desired-state writer.
+        await tx`select pg_advisory_xact_lock(hashtextextended(${account.id}::text, 91))`;
+        const rows = await tx<DoctrineRevisionRow[]>`
+          select persona, runtime_sync_version
+          from agents
+          where account_id = ${account.id}
+          for update
+        `;
+        const current = rows[0];
+        if (!current) throw new ApiError(404, 'agent_not_found', 'Agent no longer exists');
+
+        if (current.runtime_sync_version !== body.baseRevision) {
+          const file = await readWorkspaceFile(root, body.path);
+          return {
+            ok: false as const,
+            currentSha256: file.kind === 'text' ? file.sha256 : null,
+            currentMtime: file.mtime,
+            currentRevision: current.runtime_sync_version,
+          };
+        }
+
+        const result = await writeWorkspaceFile({
+          root,
+          path: body.path,
+          content: body.content,
+          baseSha256: body.baseSha256,
+        });
+        if (!result.ok) {
+          return {
+            ...result,
+            currentRevision: current.runtime_sync_version,
+          };
+        }
+
+        const persona = body.content === '' ? null : body.content;
+        const updated = await tx<{ runtime_sync_version: number }[]>`
+          update agents
+          set persona = ${persona},
+              runtime_sync_version = runtime_sync_version + 1,
+              runtime_sync_claim_token = null,
+              runtime_sync_lease_expires_at = null,
+              runtime_sync_error = null
+          where account_id = ${account.id}
+          returning runtime_sync_version
+        `;
+        const revision = updated[0]?.runtime_sync_version;
+        if (revision === undefined) {
+          throw new ApiError(404, 'agent_not_found', 'Agent no longer exists');
+        }
+        return {
+          ok: true as const,
+          file: {
+            ...result.file,
+            doctrineRevision: revision,
+            doctrineSyncState: 'synced' as const,
+          },
+        };
+      });
+
+      if (!outcome.ok) {
+        return reply.code(409).send({
+          ...errorEnvelope(
+            409,
+            'workspace_write_conflict',
+            'SOUL.md changed in Workspace or Settings — choose a version before saving',
+          ),
+          currentSha256: outcome.currentSha256,
+          currentMtime: outcome.currentMtime,
+          currentRevision: outcome.currentRevision,
+        });
+      }
+      return { file: outcome.file };
+    }
+
     const result = await writeWorkspaceFile({
       root,
       path: body.path,
@@ -194,14 +319,6 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
         currentSha256: result.currentSha256,
         currentMtime: result.currentMtime,
       });
-    }
-
-    // SOUL.md === agents.persona. Mirror the saved bytes back into the DB so the
-    // two never diverge. Empty file -> NULL (matches the create/patch handlers,
-    // which store '' as null and render it back to an empty SOUL.md).
-    if (result.file.path === SOUL_WORKSPACE_FILE) {
-      const persona = body.content === '' ? null : body.content;
-      await pg`update agents set persona = ${persona} where account_id = ${account.id}`;
     }
 
     return { file: result.file };

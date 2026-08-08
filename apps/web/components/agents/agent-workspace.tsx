@@ -158,6 +158,8 @@ type ViewerState =
       draft: string;
       loadedContent: string;
       baseSha256: string;
+      doctrineRevision?: number;
+      doctrineSyncState?: "synced" | "conflict";
       sizeBytes: number;
       mtime: string;
     };
@@ -235,6 +237,8 @@ export function AgentWorkspacePanel({
             draft: file.content,
             loadedContent: file.content,
             baseSha256: file.sha256,
+            doctrineRevision: file.doctrineRevision,
+            doctrineSyncState: file.doctrineSyncState,
             sizeBytes: file.sizeBytes,
             mtime: file.mtime,
           });
@@ -257,11 +261,22 @@ export function AgentWorkspacePanel({
         path: viewer.path,
         content: viewer.draft,
         baseSha256: viewer.baseSha256,
+        ...(viewer.path === "SOUL.md" ? { baseRevision: viewer.doctrineRevision } : {}),
       });
+      if (
+        viewer.path === "SOUL.md" &&
+        (file.doctrineRevision === undefined || file.doctrineSyncState === undefined)
+      ) {
+        throw new Error(
+          "SOUL.md saved but revision confirmation was unavailable; reload the file.",
+        );
+      }
       setViewer({
         ...viewer,
         loadedContent: viewer.draft,
         baseSha256: file.sha256,
+        doctrineRevision: file.doctrineRevision,
+        doctrineSyncState: file.doctrineSyncState,
         sizeBytes: file.sizeBytes,
         mtime: file.mtime,
       });
@@ -278,6 +293,7 @@ export function AgentWorkspacePanel({
         setConflict({
           currentSha256: body.currentSha256 ?? null,
           currentMtime: body.currentMtime ?? null,
+          currentRevision: body.currentRevision,
         });
       } else {
         setActionError(describeApiFailure(error));
@@ -304,7 +320,13 @@ export function AgentWorkspacePanel({
     if (viewer.kind !== "text" || conflict === null) return;
     // Informed choice: the next explicit Save replaces the agent's version.
     if (conflict.currentSha256) {
-      setViewer({ ...viewer, baseSha256: conflict.currentSha256 });
+      setViewer({
+        ...viewer,
+        baseSha256: conflict.currentSha256,
+        ...(conflict.currentRevision !== undefined
+          ? { doctrineRevision: conflict.currentRevision }
+          : {}),
+      });
     }
     setConflict(null);
     setNote("Still editing your version — Save again to replace theirs.");
@@ -370,6 +392,8 @@ export function AgentWorkspacePanel({
 
   const tree = buildWorkspaceTree(entries);
   const dirty = viewer.kind === "text" && viewer.draft !== viewer.loadedContent;
+  const needsDoctrineSync =
+    viewer.kind === "text" && viewer.doctrineSyncState === "conflict";
   const ownership =
     viewer.kind === "idle" || viewer.kind === "loading" || viewer.kind === "error"
       ? null
@@ -380,6 +404,8 @@ export function AgentWorkspacePanel({
       ? undefined
       : conflict
         ? "conflict"
+        : needsDoctrineSync
+          ? "conflict"
         : saving
           ? "saving"
           : dirty
@@ -461,6 +487,9 @@ export function AgentWorkspacePanel({
                   <p className="mt-0.5 text-xs text-faint">
                     {formatBytes(viewer.sizeBytes)} · Last changed{" "}
                     {formatRelativeTime(viewer.mtime)}
+                    {viewer.kind === "text" && viewer.doctrineRevision !== undefined
+                      ? ` · Revision ${viewer.doctrineRevision}`
+                      : ""}
                   </p>
                 </div>
                 <button
@@ -479,7 +508,11 @@ export function AgentWorkspacePanel({
               ) : null}
 
               {ownership ? (
-                <DoctrineOwnershipNotice ownership={ownership} syncState={syncState} />
+                <DoctrineOwnershipNotice
+                  ownership={ownership}
+                  syncState={syncState}
+                  revision={viewer.kind === "text" ? viewer.doctrineRevision : undefined}
+                />
               ) : null}
 
               {conflict ? (
@@ -546,10 +579,14 @@ export function AgentWorkspacePanel({
                       <button
                         type="button"
                         onClick={() => void save()}
-                        disabled={saving || !dirty || conflict !== null}
+                        disabled={saving || (!dirty && !needsDoctrineSync) || conflict !== null}
                         className={primaryButtonClass}
                       >
-                        {saving ? "Saving…" : "Save"}
+                        {saving
+                          ? "Saving…"
+                          : needsDoctrineSync && !dirty
+                            ? "Use file in Settings"
+                            : "Save"}
                       </button>
                       {dirty && !saving ? (
                         <span className="text-xs text-faint">Unsaved changes</span>

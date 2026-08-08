@@ -31,6 +31,8 @@ type EditorState =
       draft: string;
       loadedContent: string;
       baseSha256: string;
+      doctrineRevision: number;
+      doctrineSyncState: "synced" | "conflict";
       mtime: string | null;
     };
 
@@ -53,11 +55,17 @@ export function PersonaEditor({ username }: { username: string }) {
         setState({ kind: "error", text: "SOUL.md is not a text file." });
         return;
       }
+      if (file.doctrineRevision === undefined || file.doctrineSyncState === undefined) {
+        setState({ kind: "error", text: "SOUL.md revision metadata is unavailable." });
+        return;
+      }
       setState({
         kind: "ready",
         draft: file.content,
         loadedContent: file.content,
         baseSha256: file.sha256,
+        doctrineRevision: file.doctrineRevision,
+        doctrineSyncState: file.doctrineSyncState,
         mtime: file.mtime ?? null,
       });
     } catch (error) {
@@ -85,11 +93,17 @@ export function PersonaEditor({ username }: { username: string }) {
         path: SOUL_PATH,
         content: state.draft,
         baseSha256: state.baseSha256,
+        baseRevision: state.doctrineRevision,
       });
+      if (file.doctrineRevision === undefined || file.doctrineSyncState === undefined) {
+        throw new Error("SOUL.md saved but revision confirmation was unavailable; reload the page.");
+      }
       setState({
         ...state,
         loadedContent: state.draft,
         baseSha256: file.sha256,
+        doctrineRevision: file.doctrineRevision,
+        doctrineSyncState: file.doctrineSyncState,
         mtime: file.mtime,
       });
       setConflict(null);
@@ -100,6 +114,7 @@ export function PersonaEditor({ username }: { username: string }) {
         setConflict({
           currentSha256: body.currentSha256 ?? null,
           currentMtime: body.currentMtime ?? null,
+          currentRevision: body.currentRevision,
         });
       } else if (error instanceof ApiError && error.status === 422) {
         setDoctrineError(error.message);
@@ -113,9 +128,13 @@ export function PersonaEditor({ username }: { username: string }) {
 
   const keepEditing = () => {
     if (state.kind !== "ready" || conflict === null) return;
-    if (conflict.currentSha256) {
-      setState({ ...state, baseSha256: conflict.currentSha256 });
-    }
+    setState({
+      ...state,
+      ...(conflict.currentSha256 ? { baseSha256: conflict.currentSha256 } : {}),
+      ...(conflict.currentRevision !== undefined
+        ? { doctrineRevision: conflict.currentRevision }
+        : {}),
+    });
     setConflict(null);
     setToast("Still editing your version — Save again to replace theirs.");
   };
@@ -141,6 +160,7 @@ export function PersonaEditor({ username }: { username: string }) {
   }
 
   const dirty = state.draft !== state.loadedContent;
+  const needsSync = state.doctrineSyncState === "conflict";
 
   return (
     <div className="space-y-4">
@@ -148,6 +168,7 @@ export function PersonaEditor({ username }: { username: string }) {
         <p className="font-mono text-xs text-faint">
           {SOUL_PATH}
           {state.mtime ? ` · updated ${formatRelativeTime(state.mtime)}` : ""}
+          {` · Revision ${state.doctrineRevision}`}
         </p>
         <p className="text-xs text-faint">
           Synced both ways with the file in{" "}
@@ -211,16 +232,18 @@ export function PersonaEditor({ username }: { username: string }) {
               ? "Saving to Workspace…"
               : dirty
                 ? "Unsaved changes"
-                : "Synced with Workspace"}
+                : needsSync
+                  ? "Conflict — file and Settings bytes differ"
+                  : "Synced with Workspace"}
         </p>
         <button
           type="button"
           onClick={() => void save()}
-          disabled={saving || !dirty || conflict !== null}
+          disabled={saving || (!dirty && !needsSync) || conflict !== null}
           className={primaryButtonClass}
         >
           {saving ? <ButtonSpinner /> : null}
-          {saving ? "Saving…" : "Save SOUL.md"}
+          {saving ? "Saving…" : needsSync && !dirty ? "Use file in Settings" : "Save SOUL.md"}
         </button>
       </div>
 

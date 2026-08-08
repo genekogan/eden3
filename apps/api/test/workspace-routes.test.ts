@@ -55,7 +55,16 @@ interface TreeBody {
   truncated: boolean;
 }
 interface TextFileBody {
-  file: { path: string; kind: 'text'; content: string; sizeBytes: number; mtime: string; sha256: string };
+  file: {
+    path: string;
+    kind: 'text';
+    content: string;
+    sizeBytes: number;
+    mtime: string;
+    sha256: string;
+    doctrineRevision?: number;
+    doctrineSyncState?: 'synced' | 'conflict';
+  };
 }
 interface BinaryFileBody {
   file: { path: string; kind: 'binary'; sizeBytes: number; mtime: string; content?: string };
@@ -64,6 +73,7 @@ interface ConflictBody {
   error: { code: string };
   currentSha256: string | null;
   currentMtime: string | null;
+  currentRevision?: number;
 }
 
 function treeUrl(agent: string): string {
@@ -159,6 +169,7 @@ beforeAll(async () => {
   await insertAgentAccount(agentFiles, {
     ownerId,
     name: 'Files Agent',
+    persona: 'You are the Files Agent.',
     public: true,
     openclawId: agentFiles,
     workspacePath: wsFiles,
@@ -635,15 +646,45 @@ describe('PUT /agents/:username/workspace/file', () => {
         await app.inject({ method: 'GET', url: fileUrl(agentFiles, 'SOUL.md'), headers: asOwner })
       ).json() as TextFileBody
     ).file;
+    expect(loaded.doctrineRevision).toBe(0);
+    expect(loaded.doctrineSyncState).toBe('synced');
     const revised = 'You are the Files Agent, REVISED EDITION.';
     const save = await app.inject({
       method: 'PUT',
       url: `${treeUrl(agentFiles)}/file`,
       headers: asOwner,
-      payload: { path: 'SOUL.md', content: revised, baseSha256: loaded.sha256 },
+      payload: {
+        path: 'SOUL.md',
+        content: revised,
+        baseSha256: loaded.sha256,
+        baseRevision: loaded.doctrineRevision,
+      },
     });
     expect(save.statusCode).toBe(200);
-    const savedSha = (save.json() as TextFileBody).file.sha256;
+    const savedFile = (save.json() as TextFileBody).file;
+    const savedSha = savedFile.sha256;
+    expect(savedFile.doctrineRevision).toBe(1);
+    expect(savedFile.doctrineSyncState).toBe('synced');
+
+    // A second editor loaded at revision 0 cannot overwrite the winner even
+    // if it adopts or guesses the new file hash. Both Workspace and Settings
+    // must make the user choose before submitting the returned revision.
+    const stale = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: {
+        path: 'SOUL.md',
+        content: 'stale editor overwrite',
+        baseSha256: savedSha,
+        baseRevision: loaded.doctrineRevision,
+      },
+    });
+    expect(stale.statusCode).toBe(409);
+    const staleBody = stale.json() as ConflictBody;
+    expect(staleBody.currentRevision).toBe(1);
+    expect(staleBody.currentSha256).toBe(savedSha);
+    expect(await readFile(path.join(wsFiles, 'SOUL.md'), 'utf8')).toBe(revised);
 
     // DB persona now matches the saved SOUL.md bytes verbatim.
     const [row] = await pg<{ persona: string | null }[]>`
@@ -675,9 +716,10 @@ describe('PUT /agents/:username/workspace/file', () => {
       method: 'PUT',
       url: `${treeUrl(agentFiles)}/file`,
       headers: asOwner,
-      payload: { path: 'SOUL.md', content: '', baseSha256: savedSha },
+      payload: { path: 'SOUL.md', content: '', baseSha256: savedSha, baseRevision: 1 },
     });
     expect(cleared.statusCode).toBe(200);
+    expect((cleared.json() as TextFileBody).file.doctrineRevision).toBe(2);
     const [afterClear] = await pg<{ persona: string | null }[]>`
       select g.persona from agents g join accounts a on a.id = g.account_id
       where a.username = ${agentFiles}
@@ -703,6 +745,7 @@ describe('PUT /agents/:username/workspace/file', () => {
         path: 'SOUL.md',
         content: 'You are not a chatbot. You are the Files Agent.',
         baseSha256: soul.sha256,
+        baseRevision: soul.doctrineRevision,
       },
     });
     expect(banned.statusCode).toBe(422);
@@ -741,6 +784,109 @@ describe('PUT /agents/:username/workspace/file', () => {
       where a.username = ${agentFiles}
     `;
     expect(row!.persona).toBe(beforeRow!.persona);
+  });
+
+  it('requires the shared revision for SOUL.md but not ordinary workspace files', async () => {
+    const soul = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentFiles, 'SOUL.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    const missing = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: { path: 'SOUL.md', content: soul.content, baseSha256: soul.sha256 },
+    });
+    expect(missing.statusCode).toBe(400);
+    expect((missing.json() as { error: { code: string } }).error.code).toBe(
+      'workspace_revision_required',
+    );
+  });
+
+  it('serializes concurrent Workspace/Settings SOUL saves to one monotonic winner', async () => {
+    const loaded = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentFiles, 'SOUL.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    expect(loaded.doctrineRevision).toEqual(expect.any(Number));
+
+    const save = (content: string) =>
+      app.inject({
+        method: 'PUT',
+        url: `${treeUrl(agentFiles)}/file`,
+        headers: asOwner,
+        payload: {
+          path: 'SOUL.md',
+          content,
+          baseSha256: loaded.sha256,
+          baseRevision: loaded.doctrineRevision,
+        },
+      });
+    const responses = await Promise.all([
+      save('You are the Files Agent. Winner candidate A.'),
+      save('You are the Files Agent. Winner candidate B.'),
+    ]);
+    expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 409]);
+
+    const winner = responses.find((response) => response.statusCode === 200)!;
+    const loser = responses.find((response) => response.statusCode === 409)!;
+    const winnerFile = (winner.json() as TextFileBody).file;
+    const loserBody = loser.json() as ConflictBody;
+    expect(winnerFile.doctrineRevision).toBe(loaded.doctrineRevision! + 1);
+    expect(loserBody.currentRevision).toBe(winnerFile.doctrineRevision);
+    expect(loserBody.currentSha256).toBe(winnerFile.sha256);
+
+    const disk = await readFile(path.join(wsFiles, 'SOUL.md'), 'utf8');
+    const [row] = await pg<{ persona: string | null; runtime_sync_version: number }[]>`
+      select g.persona, g.runtime_sync_version
+      from agents g join accounts a on a.id = g.account_id
+      where a.username = ${agentFiles}
+    `;
+    expect(row!.persona).toBe(disk);
+    expect(row!.runtime_sync_version).toBe(winnerFile.doctrineRevision);
+  });
+
+  it('surfaces file-vs-Settings drift and resolves it only through an explicit save', async () => {
+    const before = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentFiles, 'SOUL.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    expect(before.doctrineSyncState).toBe('synced');
+
+    const externalBytes = 'You are the Files Agent. External workspace revision.';
+    await writeFile(path.join(wsFiles, 'SOUL.md'), externalBytes);
+    const drifted = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentFiles, 'SOUL.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    expect(drifted.content).toBe(externalBytes);
+    expect(drifted.doctrineRevision).toBe(before.doctrineRevision);
+    expect(drifted.doctrineSyncState).toBe('conflict');
+
+    const accept = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: {
+        path: 'SOUL.md',
+        content: drifted.content,
+        baseSha256: drifted.sha256,
+        baseRevision: drifted.doctrineRevision,
+      },
+    });
+    expect(accept.statusCode).toBe(200);
+    const accepted = (accept.json() as TextFileBody).file;
+    expect(accepted.doctrineRevision).toBe(drifted.doctrineRevision! + 1);
+    expect(accepted.doctrineSyncState).toBe('synced');
+    const [row] = await pg<{ persona: string | null }[]>`
+      select g.persona from agents g join accounts a on a.id = g.account_id
+      where a.username = ${agentFiles}
+    `;
+    expect(row!.persona).toBe(externalBytes);
   });
 
   it.each(['IDENTITY.md', 'AGENTS.md', 'USER.md', 'TOOLS.md', 'MEMORY.md', 'HEARTBEAT.md'])(

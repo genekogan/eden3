@@ -65,10 +65,11 @@ describe("doctrine file ownership", () => {
     const ownership = doctrineFileOwnership("SOUL.md", "verdalis");
     expect(ownership).not.toBeNull();
     const html = renderToStaticMarkup(
-      <DoctrineOwnershipNotice ownership={ownership!} syncState={syncState} />,
+      <DoctrineOwnershipNotice ownership={ownership!} syncState={syncState} revision={12} />,
     );
     expect(html).toContain("Linked · Settings → Persona");
     expect(html).toContain(expected);
+    expect(html).toContain("Revision 12");
     expect(html).toContain('href="/agents/verdalis/settings/persona"');
   });
 
