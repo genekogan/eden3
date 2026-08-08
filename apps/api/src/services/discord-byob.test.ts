@@ -154,5 +154,26 @@ describe('DiscordByobService', () => {
     await expect(
       service.connect({ accountId: 'account-1', agentId: null, token: 'synthetic' }),
     ).rejects.toThrow('request-scoped SecretRef');
+    expect(vault.revoke).toHaveBeenCalledWith({
+      connectionId: HANDLE.connectionId,
+      secretRefId: `channel/${HANDLE.connectionId}`,
+    });
+  });
+
+  it('rejects an invalid provider identity before custody', async () => {
+    const vault = custody();
+    const service = new DiscordByobService(
+      {
+        getCurrentBot: vi.fn(async () => ({
+          ok: true,
+          bot: { id: 'not-a-snowflake', username: 'edenbot', displayName: null },
+        }) as const),
+      },
+      vault,
+    );
+    await expect(
+      service.connect({ accountId: 'account-1', agentId: null, token: 'synthetic' }),
+    ).resolves.toMatchObject({ ok: false, code: 'provider_unavailable' });
+    expect(vault.seal).not.toHaveBeenCalled();
   });
 });
