@@ -1094,7 +1094,10 @@ export async function renewMemoryDreamRunClaim(
   const renewed = await dbc
     .update(memoryDreamRuns)
     .set({
-      leaseExpiresAt: sql`now() + (${MEMORY_DREAM_CLAIM_STALE_MS} * interval '1 millisecond')`,
+      leaseExpiresAt: sql`greatest(
+        ${memoryDreamRuns.leaseExpiresAt},
+        now() + (${MEMORY_DREAM_CLAIM_STALE_MS} * interval '1 millisecond')
+      )`,
     })
     .where(
       and(
