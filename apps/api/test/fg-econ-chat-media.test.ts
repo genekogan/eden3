@@ -17,7 +17,10 @@ import {
   verifyPendingStudioMedia,
 } from '../src/services/chat-media-authorization';
 import { MediaPipeline } from '../src/services/media-pipeline';
-import { reserveStudioGeneration } from '../src/services/studio-reservations';
+import {
+  compensateStudioGeneration,
+  reserveStudioGeneration,
+} from '../src/services/studio-reservations';
 
 loadRootEnv();
 
@@ -329,15 +332,6 @@ describe('FG-ECON in-chat media authorization', () => {
       reservationKey: `studio:${turnId}:reserve`,
       dailyCap: 100_000,
     });
-    const exact = await verifyPendingStudioMedia({
-      request: {
-        sessionKey: `agent:main:eden3:studio:${turnId}`,
-        agentId: 'main',
-        tool: 'video_generate',
-        args: { prompt: 'studio clip', duration: 5 },
-      },
-    });
-    expect(exact).toMatchObject({ authorizationId: turnId, tool: 'video_generate' });
     await expect(
       verifyPendingStudioMedia({
         request: {
@@ -348,6 +342,39 @@ describe('FG-ECON in-chat media authorization', () => {
         },
       }),
     ).rejects.toThrow('Studio reservation identity mismatch');
+
+    const exactRequest = {
+      sessionKey: `agent:main:eden3:studio:${turnId}`,
+      agentId: 'main',
+      tool: 'video_generate' as const,
+      args: { prompt: 'studio clip', duration: 5 },
+    };
+    const raced = await Promise.allSettled([
+      verifyPendingStudioMedia({ request: exactRequest }),
+      verifyPendingStudioMedia({ request: exactRequest }),
+    ]);
+    expect(raced.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(raced.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const admitted = raced.find((result) => result.status === 'fulfilled');
+    expect(admitted?.status === 'fulfilled' ? admitted.value : null).toMatchObject({
+      authorizationId: turnId,
+      tool: 'video_generate',
+    });
+    const [providerAdmitted] = await pg<{ status: string }[]>`
+      select status from usage_events
+      where event_type = 'studio_generation' and turn_id = ${turnId}`;
+    expect(providerAdmitted?.status).toBe('provider_admitted');
+    await expect(verifyPendingStudioMedia({ request: exactRequest })).rejects.toThrow(
+      'pending Studio authorization unavailable',
+    );
+    expect(
+      await compensateStudioGeneration({
+        turnId,
+        errorCode: 'test_cleanup',
+        errorMessage: 'provider was not invoked in this admission proof',
+      }),
+    ).toBe('refunded');
+
     await expect(
       verifyPendingStudioMedia({
         request: {
@@ -358,5 +385,63 @@ describe('FG-ECON in-chat media authorization', () => {
         },
       }),
     ).rejects.toThrow('pending Studio authorization unavailable');
+  });
+
+  it('serializes Studio output claims globally so reverse completion cannot cross tenants', async () => {
+    const quote = quoteChatMediaTool('image_generate', { prompt: 'serialized Studio image' });
+    const first = await fixture(quote.manna + 10);
+    const second = await fixture(quote.manna + 10);
+    const firstTurnId = randomUUID();
+    const secondTurnId = randomUUID();
+    const beforeFirst = await getBalance(first.userId);
+    const beforeSecond = await getBalance(second.userId);
+    const reserve = (turnId: string, accountId: string) =>
+      reserveStudioGeneration({
+        turnId,
+        accountId,
+        tool: 'image_generate',
+        quote,
+        reservationKey: `studio:${turnId}:reserve`,
+        dailyCap: 100_000,
+      });
+
+    const raced = await Promise.allSettled([
+      reserve(firstTurnId, first.userId),
+      reserve(secondTurnId, second.userId),
+    ]);
+    expect(raced.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    expect(raced.filter((result) => result.status === 'rejected')).toHaveLength(1);
+    const winner = raced[0]?.status === 'fulfilled'
+      ? { turnId: firstTurnId, accountId: first.userId, loserId: secondTurnId, loserAccountId: second.userId }
+      : { turnId: secondTurnId, accountId: second.userId, loserId: firstTurnId, loserAccountId: first.userId };
+    const [active] = await pg<{ turn_id: string; user_id: string; status: string }[]>`
+      select turn_id, user_id, status from usage_events
+      where event_type = 'studio_generation'
+        and turn_id in (${firstTurnId}, ${secondTurnId})`;
+    expect(active).toEqual({ turn_id: winner.turnId, user_id: winner.accountId, status: 'pending' });
+    expect((await getBalance(winner.accountId)).total).toBe(
+      (winner.accountId === first.userId ? beforeFirst.total : beforeSecond.total) - quote.manna,
+    );
+    expect((await getBalance(winner.loserAccountId)).total).toBe(
+      winner.loserAccountId === first.userId ? beforeFirst.total : beforeSecond.total,
+    );
+
+    expect(
+      await compensateStudioGeneration({
+        turnId: winner.turnId,
+        errorCode: 'test_serial_release',
+        errorMessage: 'release serialized Studio output kind',
+      }),
+    ).toBe('refunded');
+    await expect(reserve(winner.loserId, winner.loserAccountId)).resolves.toMatchObject({
+      turnId: winner.loserId,
+    });
+    expect(
+      await compensateStudioGeneration({
+        turnId: winner.loserId,
+        errorCode: 'test_cleanup',
+        errorMessage: 'provider was not invoked in this serialization proof',
+      }),
+    ).toBe('refunded');
   });
 });

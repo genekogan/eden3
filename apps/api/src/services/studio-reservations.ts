@@ -12,6 +12,15 @@ export const STUDIO_RESERVATION_EVENT_TYPE = 'studio_generation';
 export const STUDIO_RESERVATION_TTL_MS = 60 * 60 * 1000;
 export const STUDIO_RESERVATION_REAPER_INTERVAL_MS = 5 * 60 * 1000;
 
+export class StudioGenerationBusyError extends Error {
+  readonly code = 'studio_generation_busy';
+
+  constructor(readonly outputKind: 'image' | 'video' | 'audio') {
+    super(`studio-reservation: another ${outputKind} generation is already active`);
+    this.name = 'StudioGenerationBusyError';
+  }
+}
+
 export interface StudioAuthorizationQuote {
   action: string;
   provider: string;
@@ -46,6 +55,13 @@ export interface StudioReservation {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function outputKindForStudioTool(tool: string): 'image' | 'video' | 'audio' {
+  if (tool === 'image_generate') return 'image';
+  if (tool === 'video_generate') return 'video';
+  if (tool === 'music_generate' || tool === 'tts') return 'audio';
+  throw new Error(`studio-reservation: unsupported tool ${tool}`);
 }
 
 function readReservationMetadata(value: unknown): StudioReservationMetadata {
@@ -103,6 +119,29 @@ export async function reserveStudioGeneration(options: {
 }): Promise<StudioReservation> {
   const dbc = options.db ?? db;
   return await dbc.transaction(async (tx) => {
+    const outputKind = outputKindForStudioTool(options.tool);
+    // OpenClaw 2026.7.1 exposes no durable task→file identity. Keep exactly
+    // one provider-visible Studio claim per output kind across every API
+    // process, so a later completion can never be FIFO-attributed to another
+    // tenant. The lock is taken before both debit and provider admission.
+    await tx.execute(sql`
+      select pg_advisory_xact_lock(hashtextextended(${'studio-media-output:' + outputKind}, 0))
+    `);
+    const active = (await tx.execute(sql`
+      select turn_id
+      from usage_events
+      where event_type = ${STUDIO_RESERVATION_EVENT_TYPE}
+        and status in ('pending', 'provider_admitted', 'refund_pending')
+        and case ${outputKind}
+          when 'image' then metadata->>'tool' = 'image_generate'
+          when 'video' then metadata->>'tool' = 'video_generate'
+          when 'audio' then metadata->>'tool' in ('music_generate', 'tts')
+          else false
+        end
+      limit 1
+    `)) as unknown as Array<{ turn_id: string | null }>;
+    if (active[0]) throw new StudioGenerationBusyError(outputKind);
+
     const debited = await debit({
       accountId: options.accountId,
       amount: options.quote.manna,
@@ -177,7 +216,7 @@ export async function completeStudioGeneration(
       and(
         eq(usageEvents.eventType, STUDIO_RESERVATION_EVENT_TYPE),
         eq(usageEvents.turnId, options.reservation.turnId),
-        eq(usageEvents.status, 'pending'),
+        inArray(usageEvents.status, ['pending', 'provider_admitted']),
       ),
     )
     .returning({ id: usageEvents.id });
@@ -215,7 +254,11 @@ export async function compensateStudioGeneration(options: {
     `)) as unknown as Array<{ status: string; error_message: string | null; metadata: unknown }>;
     const row = rows[0];
     if (!row || row.status === 'completed' || row.status === 'error') return null;
-    if (row.status !== 'pending' && row.status !== 'refund_pending') {
+    if (
+      row.status !== 'pending' &&
+      row.status !== 'provider_admitted' &&
+      row.status !== 'refund_pending'
+    ) {
       throw new Error(`studio-reservation: unexpected status ${row.status}`);
     }
     const existingMetadata = isRecord(row.metadata) ? row.metadata : {};
@@ -383,7 +426,10 @@ export class StudioReservationReaper {
             isNotNull(usageEvents.turnId),
             or(
               eq(usageEvents.status, 'refund_pending'),
-              and(eq(usageEvents.status, 'pending'), lt(usageEvents.createdAt, cutoff)),
+              and(
+                inArray(usageEvents.status, ['pending', 'provider_admitted']),
+                lt(usageEvents.createdAt, cutoff),
+              ),
             ),
             ...(this.accountScope ? [inArray(usageEvents.userId, this.accountScope)] : []),
           ),

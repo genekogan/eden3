@@ -104,6 +104,8 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
       reservationKey,
       dailyCap: 10_000,
     });
+    await pg`update usage_events set status = 'provider_admitted'
+             where event_type = 'studio_generation' and turn_id = ${turnId}`;
     expect(await getBalance(accountId)).toMatchObject({ balance: 86, subscriptionBalance: 0 });
     const [pending] = await pg<{ metadataText: string }[]>`
       select metadata::text as "metadataText" from usage_events
@@ -179,7 +181,7 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
     });
   });
 
-  it('rolls creation and completed state back together, then reaps the surviving pending debit', async () => {
+  it('rolls creation and completed state back together, then reaps the surviving provider admission', async () => {
     const accountId = await fundedAccount();
     const turnId = randomUUID();
     const reservation = await reserveStudioGeneration({
@@ -190,6 +192,8 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
       reservationKey: `studio:${turnId}:reserve`,
       dailyCap: 10_000,
     });
+    await pg`update usage_events set status = 'provider_admitted'
+             where event_type = 'studio_generation' and turn_id = ${turnId}`;
     const source = path.join(sourceDir, `${turnId}.png`);
     writeFileSync(source, Buffer.from(`fake-png-${turnId}`));
     const pipeline = new MediaPipeline({
@@ -219,7 +223,7 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
     const [usageBefore] = await pg<{ status: string }[]>`
       select status from usage_events
       where event_type = 'studio_generation' and turn_id = ${turnId}`;
-    expect(usageBefore?.status).toBe('pending');
+    expect(usageBefore?.status).toBe('provider_admitted');
     await pg`update usage_events set created_at = now() - interval '2 hours'
              where event_type = 'studio_generation' and turn_id = ${turnId}`;
 
@@ -241,6 +245,8 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
       reservationKey: `studio:${turnId}:reserve`,
       dailyCap: 10_000,
     });
+    await pg`update usage_events set status = 'provider_admitted'
+             where event_type = 'studio_generation' and turn_id = ${turnId}`;
     const source = path.join(sourceDir, `${turnId}.png`);
     writeFileSync(source, Buffer.from(`successful-png-${turnId}`));
     const pipeline = new MediaPipeline({

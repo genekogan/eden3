@@ -41,6 +41,7 @@ const srcDir = mkdtempSync(path.join(tmpdir(), 'eden3-fgecon-studio-src-'));
 let app: FastifyInstance;
 
 let nextClaim: (opts: MediaClaimOptions) => MediaClaim;
+let claimCalls = 0;
 const claimResolving = (file: MediaFileEvent) => (): MediaClaim => ({
   promise: Promise.resolve(file),
   cancel() {},
@@ -52,16 +53,19 @@ const fakeWatcher = {
   },
   async stop(): Promise<void> {},
   claimNext(opts: MediaClaimOptions): MediaClaim {
+    claimCalls += 1;
     return nextClaim(opts);
   },
 };
 
 let invokeCalls: Array<{ tool: string; args?: Record<string, unknown> }> = [];
 let invokeError: Error | null = null;
+let invokeBarrier: Promise<void> | null = null;
 const fakeToolsClient = {
   async invokeTool(params: { tool: string; agentId: string; args: Record<string, unknown>; sessionKey?: string; signal?: AbortSignal }) {
     invokeCalls.push({ tool: params.tool, args: params.args });
     if (invokeError) throw invokeError;
+    if (invokeBarrier) await invokeBarrier;
     return { async: true, taskId: 'task-1', details: {} };
   },
 };
@@ -160,6 +164,7 @@ describe('FG-ECON studio battery (quote == settle, T-BILL deterministic media)',
     const expected = oracleStudioQuote('image_generate', { prompt: 'x' });
     const userId = await makeUser({ durable: expected.manna + 500 });
     invokeCalls = [];
+    claimCalls = 0;
     invokeError = null;
     nextClaim = claimResolving(fakePngFile(`happy-${randomUUID().slice(0, 8)}.png`));
     const before = await getBalance(userId);
@@ -177,26 +182,34 @@ describe('FG-ECON studio battery (quote == settle, T-BILL deterministic media)',
     expect((await getBalance(userId)).total).toBe(before.total - expected.manna);
   });
 
-  // FG-ECON-STUDIO-02: two concurrent generates on a one-quote balance — the
-  // ledger admits exactly one debit and the provider is invoked exactly once;
-  // the loser gets 402 without a charge (studio's upfront debit is race-free
-  // via the ledger's advisory lock + balance guard).
-  it('FG-ECON-STUDIO-02: concurrent double-generate on a one-quote balance charges once, invokes once', async () => {
+  // FG-ECON-STUDIO-02: without provider task→file identity, exactly one
+  // same-kind Studio claim may be active globally. The loser is rejected
+  // before its debit/watcher/provider even when it could afford the quote.
+  it('FG-ECON-STUDIO-02: overlapping same-kind generates admit one provider and reject the loser before debit', async () => {
     const quote = oracleStudioQuote('image_generate', { prompt: 'x' }).manna;
-    const userId = await makeUser({ durable: Math.floor(quote * 1.5) }); // funds one, not two
+    const userId = await makeUser({ durable: quote * 3 });
     invokeCalls = [];
+    claimCalls = 0;
     invokeError = null;
     nextClaim = () => ({ promise: Promise.resolve(fakePngFile(`race-${randomUUID().slice(0, 8)}.png`)), cancel() {} });
+    let releaseInvoke!: () => void;
+    invokeBarrier = new Promise<void>((resolve) => {
+      releaseInvoke = resolve;
+    });
     const fire = () =>
       app.inject({ method: 'POST', url: '/studio/generate', headers: asUser(userId), payload: { tool: 'image_generate', args: { prompt: 'race' } } });
-    const [a, b] = await Promise.all([fire(), fire()]);
-    const codes = [a.statusCode, b.statusCode].sort();
-    expect(codes).toEqual([200, 402]);
-    const the402 = a.statusCode === 402 ? a : b;
-    expect((the402.json() as { error: { code: string } }).error.code).toBe('insufficient_manna');
-    // Exactly one provider invoke and exactly one net debit.
+    const before = await getBalance(userId);
+    const winner = fire();
+    while (invokeCalls.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    const loser = await fire();
+    expect(loser.statusCode).toBe(409);
+    expect((loser.json() as { error: { code: string } }).error.code).toBe('studio_generation_busy');
     expect(invokeCalls).toHaveLength(1);
-    expect((await getBalance(userId)).total).toBe(Math.floor(quote * 1.5) - quote);
+    expect(claimCalls).toBe(1);
+    releaseInvoke();
+    expect((await winner).statusCode).toBe(200);
+    invokeBarrier = null;
+    expect((await getBalance(userId)).total).toBe(before.total - quote);
   });
 
   // FG-ECON-STUDIO-04: studio spend counts against the same daily cap as chat —

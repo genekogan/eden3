@@ -32,6 +32,7 @@ import {
   compensateStudioGeneration,
   completeStudioGeneration,
   reserveStudioGeneration,
+  StudioGenerationBusyError,
 } from '../services/studio-reservations';
 import {
   MediaClaimTimeoutError,
@@ -56,11 +57,10 @@ import {
  * Any failure after the debit enters durable refund_pending compensation;
  * gateway errors map to 502, a missing/late file to 504.
  *
- * Known correlation limit (same as the watcher's): the gateway gives no
- * task→file mapping, so a file from a concurrent generation of the same kind
- * can be claimed by the wrong request. If the tool run fails silently, we
- * time out, refund, and — should the file land even later — the watcher
- * parks it in media_assets. Documented in workers/media-watcher.ts.
+ * OpenClaw still gives no task→file mapping, so Eden durably serializes one
+ * Studio generation per output kind across API processes before debit. A
+ * silently failed tool times out and refunds; a file that lands after that is
+ * parked in media_assets rather than attributed to a later tenant.
  */
 
 // ---------------------------------------------------------------------------
@@ -693,6 +693,14 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           429,
           'daily_manna_cap_exceeded',
           `Daily manna cap reached: ${err.spentToday} of ${err.cap} manna spent today. The cap resets at midnight UTC.`,
+        );
+      }
+      if (err instanceof StudioGenerationBusyError) {
+        return sendError(
+          reply,
+          409,
+          err.code,
+          `Another ${err.outputKind} generation is already running. Please retry when it finishes.`,
         );
       }
       throw err;

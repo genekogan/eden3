@@ -158,8 +158,9 @@ export async function verifyPendingStudioMedia(options: {
   }
   const authorizationId = match[1]!.toLowerCase();
   const quote = quoteChatMediaTool(options.request.tool, options.request.args);
-  const rows = (await (options.db ?? db).execute(sql`
-    select ue.user_id, ue.metadata, mt.id as transaction_id, mt.amount, mt.type,
+  const dbc = options.db ?? db;
+  const rows = (await dbc.execute(sql`
+    select ue.user_id, ue.status, ue.metadata, mt.id as transaction_id, mt.amount, mt.type,
            mt.idempotency_key
     from usage_events ue
     join manna_accounts ma on ma.account_id = ue.user_id
@@ -168,17 +169,17 @@ export async function verifyPendingStudioMedia(options: {
      and mt.id = nullif(ue.metadata->'reservation'->>'transactionId', '')::uuid
     where ue.event_type = ${STUDIO_RESERVATION_EVENT_TYPE}
       and ue.turn_id = ${authorizationId}
-      and ue.status = 'pending'
     limit 2
   `)) as unknown as Array<{
     user_id: string;
+    status: string;
     metadata: unknown;
     transaction_id: string;
     amount: string | number;
     type: string;
     idempotency_key: string | null;
   }>;
-  if (rows.length !== 1) {
+  if (rows.length !== 1 || rows[0]?.status !== 'pending') {
     throw new Error('chat-media-authorization: pending Studio authorization unavailable');
   }
   const row = rows[0]!;
@@ -205,6 +206,21 @@ export async function verifyPendingStudioMedia(options: {
     row.type !== `spend:${quote.action}`
   ) {
     throw new Error('chat-media-authorization: Studio reservation identity mismatch');
+  }
+  const [admitted] = await dbc
+    .update(usageEvents)
+    .set({ status: 'provider_admitted' })
+    .where(
+      and(
+        eq(usageEvents.eventType, STUDIO_RESERVATION_EVENT_TYPE),
+        eq(usageEvents.turnId, authorizationId),
+        eq(usageEvents.status, 'pending'),
+        sql`${usageEvents.metadata} = ${JSON.stringify(row.metadata)}::jsonb`,
+      ),
+    )
+    .returning({ id: usageEvents.id });
+  if (!admitted) {
+    throw new Error('chat-media-authorization: pending Studio authorization unavailable');
   }
   return { authorizationId, tool: options.request.tool, action: quote.action, quote };
 }
