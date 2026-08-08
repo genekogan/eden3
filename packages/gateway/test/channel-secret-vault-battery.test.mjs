@@ -216,6 +216,30 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     ]);
   });
 
+  it('CROSS-ACCOUNT (deployed): a capability whose only difference is the owner account fails closed — zero decrypts', async () => {
+    // Same connection/channel/runtime, DIFFERENT accountId (a capability minted
+    // before an ownership transfer). Forces the deployed accountId binding to be
+    // load-bearing: removing accountId symmetrically from mint+verify turns this
+    // battery case RED.
+    const row = connectionRow();
+    rows = [row];
+    await start();
+    const otherOwnerCap = mintCapabilityId(CAP_KEY, {
+      connectionId: row.id,
+      accountId: randomUUID(), // not row.account_id
+      channel: row.channel,
+      runtimeAccountId: row.runtime_account_id,
+      epoch: 'c1',
+    });
+    const res = await callBridge([otherOwnerCap]);
+    expect(res.values).toEqual({});
+    expect(res.errors[otherOwnerCap]).toBe('secret unavailable');
+    expect(decryptCount).toBe(0);
+    expect(aggregateDenied()).toEqual([
+      expect.objectContaining({ deniedReasons: { capability_forged: 1 } }),
+    ]);
+  });
+
   it('FORGED SCOPE: an attacker without the capability key cannot forge a valid id — zero decrypts', async () => {
     const row = connectionRow();
     rows = [row]; // active target

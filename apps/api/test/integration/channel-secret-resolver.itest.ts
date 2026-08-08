@@ -140,20 +140,22 @@ afterAll(async () => {
 });
 
 describe('channel-secret resolver — deployed wiring (buildResolveRequest) + real Postgres', () => {
-  it('resolves a legitimate capability and writes a real GRANT audit row with zero secret material', async () => {
-    if (!canConnect) {
-      console.warn('[T12-U01 itest] Postgres not reachable — skipping real-path proof');
-      return;
-    }
+  it('resolves a legitimate capability and writes a real GRANT audit row with zero secret material', async (ctx) => {
+    if (!canConnect) return void ctx.skip(); // honest SKIP, not a silent green
     const res = await callBridge([capId]);
     expect(res.values[capId]).toBe(token);
 
-    const rows = await pg<{ metadata: Record<string, unknown> }[]>`
-      select metadata from secret_access_audit_events
+    // Assert the metadata is a REAL jsonb OBJECT (queryable), not a
+    // double-encoded string: `->>'actor'` and `->>'decision'` must resolve.
+    const rows = await pg<{ metadata: Record<string, unknown>; actor: string; decision: string }[]>`
+      select metadata, metadata->>'actor' as actor, metadata->>'decision' as decision
+      from secret_access_audit_events
       where secret_id = ${connectionId} and action = 'runtime_retrieve'
       order by created_at desc limit 1
     `;
     expect(rows).toHaveLength(1);
+    expect(rows[0]!.decision).toBe('granted');
+    expect(rows[0]!.actor).toBe('openclaw_secret_resolver');
     expect(rows[0]!.metadata.decision).toBe('granted');
     // No token/ciphertext/key material in the persisted GRANT row or bridge stderr.
     for (const secret of [token, seededCiphertext, TEST_KEY.toString('base64'), CAP_KEY.toString('base64')]) {
@@ -162,8 +164,8 @@ describe('channel-secret resolver — deployed wiring (buildResolveRequest) + re
     }
   });
 
-  it('denies a forged capability + a bare-legacy id, writing exactly ONE aggregated DENY row (no evidence erased)', async () => {
-    if (!canConnect) return;
+  it('denies a forged capability + a bare-legacy id, writing exactly ONE aggregated DENY row (no evidence erased)', async (ctx) => {
+    if (!canConnect) return void ctx.skip();
     const forged = mintCapabilityId(deriveCapabilityKey(randomBytes(32)), {
       connectionId,
       accountId: ownerAccountId,
