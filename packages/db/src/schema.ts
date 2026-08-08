@@ -762,7 +762,6 @@ export const channelConnections = pgTable(
     tokenIv: text('token_iv').notNull(),
     tokenAuthTag: text('token_auth_tag').notNull(),
     tokenSha256: text('token_sha256').notNull(),
-    tokenPreview: text('token_preview'),
     keyVersion: text('key_version').notNull().default('v1'),
     lastErrorCode: text('last_error_code'),
     lastErrorMessage: text('last_error_message'),

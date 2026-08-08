@@ -104,12 +104,12 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
         insert into channel_connections (
           id, account_id, agent_id, channel, label, runtime_account_id,
           desired_state, observed_state, status, token_ciphertext, token_iv,
-          token_auth_tag, token_sha256, token_preview, key_version,
+          token_auth_tag, token_sha256, key_version,
           last_validated_at, metadata
         ) values (
           ${id}, ${input.accountId}, ${input.agentId}, 'x', ${input.label}, ${runtimeAccountId},
           'active', 'live', 'active', ${encrypted.tokenCiphertext}, ${encrypted.tokenIv},
-          ${encrypted.tokenAuthTag}, ${encrypted.tokenSha256}, null, ${encrypted.keyVersion},
+          ${encrypted.tokenAuthTag}, ${encrypted.tokenSha256}, ${encrypted.keyVersion},
           now(), ${tx.json('{}')}
         )
         returning id, account_id, channel, runtime_account_id,

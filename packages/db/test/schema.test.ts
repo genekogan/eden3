@@ -85,7 +85,9 @@ describe('@eden3/db schema', () => {
   it('models isolated channel lifecycle, sync-back, pairing, and metering state', () => {
     expect(schema.channelConnections.runtimeAccountId.getSQLType()).toBe('text');
     expect(schema.channelConnections.desiredState.getSQLType()).toBe('text');
+    expect(schema.channelConnections).not.toHaveProperty('tokenPreview');
     expect(schema.channelExternalIdentities.peerCiphertext.getSQLType()).toBe('text');
+    expect(schema.channelExternalIdentities.peerPreview.getSQLType()).toBe('text');
     expect(schema.channelPairingRequests.status.getSQLType()).toBe('text');
     expect(schema.channelTurns.reservedManna.getSQLType()).toBe('integer');
     expect(schema.triggers.pendingOccurrenceId.getSQLType()).toBe('uuid');

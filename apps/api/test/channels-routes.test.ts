@@ -302,7 +302,7 @@ afterAll(async () => {
 
 describe('channel custody and validation', () => {
   it('stores only AES ciphertext, exposes no token-derived preview, and audits storage', async () => {
-    const token = `valid_${marker}_secret_1234`;
+    const token = `valid_${marker}_secret_zxqv`;
     const connection = await createConnection({
       token,
       agentUsername: firstAgentUsername,
@@ -325,12 +325,14 @@ describe('channel custody and validation', () => {
         token_auth_tag: string;
         token_sha256: string;
         key_version: string;
+        metadata: Record<string, unknown>;
       }>
     >`
-      select token_ciphertext, token_iv, token_auth_tag, token_sha256, key_version
+      select token_ciphertext, token_iv, token_auth_tag, token_sha256, key_version, metadata
       from channel_connections where id = ${connection.id}
     `;
     expect(JSON.stringify(rows[0])).not.toContain(token);
+    expect(JSON.stringify(rows[0]?.metadata)).not.toContain(token.slice(-4));
     expect(rows[0]!.token_sha256).toBe(createHash('sha256').update(token).digest('hex'));
     expect(
       vault.decrypt(
@@ -357,6 +359,11 @@ describe('channel custody and validation', () => {
     expect(list.body).toContain(connection.id);
     expect(list.body).not.toContain(token);
     expect(list.body).not.toContain('token_ciphertext');
+    const storedAudits = await pg<{ metadata: Record<string, unknown> }[]>`
+      select metadata from secret_access_audit_events where secret_id = ${connection.id}
+    `;
+    expect(JSON.stringify(storedAudits)).not.toContain(token);
+    expect(JSON.stringify(storedAudits)).not.toContain(token.slice(-4));
   });
 
   it('retains an invalid token as a clear error and rotates it safely on retry', async () => {
@@ -368,7 +375,7 @@ describe('channel custody and validation', () => {
       method: 'POST',
       url: `/channels/connections/${connection.id}/retry`,
       headers: { cookie: devCookie(ownerId) },
-      payload: { token: `valid_${marker}_replacement_7777` },
+      payload: { token: `valid_${marker}_replacement_wxyz` },
     });
     expect(retried.statusCode).toBe(200);
     expect(retried.json()).toMatchObject({
@@ -376,7 +383,15 @@ describe('channel custody and validation', () => {
       connection: { observedState: 'verified', lastError: null },
     });
     expect(retried.json().connection).not.toHaveProperty('tokenPreview');
-    expect(retried.body).not.toContain(`valid_${marker}_replacement_7777`);
+    expect(retried.body).not.toContain(`valid_${marker}_replacement_wxyz`);
+    const [rotated] = await pg<{ metadata: Record<string, unknown> }[]>`
+      select metadata from channel_connections where id = ${connection.id}
+    `;
+    expect(JSON.stringify(rotated?.metadata)).not.toContain('wxyz');
+    const rotationAudits = await pg<{ metadata: Record<string, unknown> }[]>`
+      select metadata from secret_access_audit_events where secret_id = ${connection.id}
+    `;
+    expect(JSON.stringify(rotationAudits)).not.toContain('wxyz');
   });
 
   it('discovers Discord destinations only after an audited vault read', async () => {
@@ -460,20 +475,30 @@ describe('X BYO-app custody and posting', () => {
       status: 'active',
       user: { id: '2244994945', username: 'eden_fixture', name: 'Eden Fixture' },
     });
+    expect(connected.json().connection).not.toHaveProperty('tokenPreview');
     for (const secret of Object.values(credentials)) expect(connected.body).not.toContain(secret);
     const connectionId = connected.json().connection.id as string;
 
     const stored = await pg<Array<{
       token_ciphertext: string;
-      token_preview: string | null;
       metadata: Record<string, unknown>;
     }>>`
-      select token_ciphertext, token_preview, metadata
+      select token_ciphertext, metadata
       from channel_connections where id = ${connectionId}
     `;
     expect(stored[0]?.token_ciphertext).not.toContain(marker);
-    expect(stored[0]?.token_preview).toBeNull();
+    for (const secret of Object.values(credentials)) {
+      expect(JSON.stringify(stored[0]?.metadata)).not.toContain(secret);
+      expect(JSON.stringify(stored[0]?.metadata)).not.toContain(secret.slice(-4));
+    }
     expect(JSON.stringify(stored[0]?.metadata)).not.toContain('apiSecret');
+    const xAudits = await pg<{ metadata: Record<string, unknown> }[]>`
+      select metadata from secret_access_audit_events where secret_id = ${connectionId}
+    `;
+    for (const secret of Object.values(credentials)) {
+      expect(JSON.stringify(xAudits)).not.toContain(secret);
+      expect(JSON.stringify(xAudits)).not.toContain(secret.slice(-4));
+    }
 
     const auditsBeforeAdmin = await pg<{ count: number }[]>`
       select count(*)::int as count from secret_access_audit_events
@@ -672,19 +697,25 @@ describe('Telegram Managed Bots onboarding', () => {
     });
     expect(completed.body).not.toContain(managedBotToken);
     expect(completed.body).not.toContain('42424242');
+    expect(completed.json().connection).not.toHaveProperty('tokenPreview');
     const connectionId = completed.json().connection.id as string;
 
     const persisted = await pg<Array<{
       token_ciphertext: string;
-      token_preview: string | null;
       metadata: Record<string, unknown>;
     }>>`
-      select token_ciphertext, token_preview, metadata
+      select token_ciphertext, metadata
       from channel_connections where id = ${connectionId}
     `;
     expect(persisted[0]?.token_ciphertext).not.toContain(managedBotToken);
-    expect(persisted[0]?.token_preview).toBeNull();
+    expect(JSON.stringify(persisted[0]?.metadata)).not.toContain(managedBotToken);
+    expect(JSON.stringify(persisted[0]?.metadata)).not.toContain(managedBotToken.slice(-4));
     expect(JSON.stringify(persisted[0]?.metadata)).not.toContain('42424242');
+    const telegramAudits = await pg<{ metadata: Record<string, unknown> }[]>`
+      select metadata from secret_access_audit_events where secret_id = ${connectionId}
+    `;
+    expect(JSON.stringify(telegramAudits)).not.toContain(managedBotToken);
+    expect(JSON.stringify(telegramAudits)).not.toContain(managedBotToken.slice(-4));
 
     const managedAuditsBeforeAdmin = await pg<{ count: number }[]>`
       select count(*)::int as count from secret_access_audit_events
