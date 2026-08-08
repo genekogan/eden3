@@ -1,10 +1,8 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
-import { AccessGate } from "@/components/AccessGate";
-import { AppShell } from "@/components/shell/app-shell";
-import { DevUserGate } from "@/components/DevUserGate";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { ServiceWorkerRegistration } from "@/components/pwa/service-worker-registration";
+import { RouteShell } from "@/components/shell/route-shell";
 import { ThemeProvider } from "@/components/theme-provider";
 import "./globals.css";
 import "./pwa.css";
@@ -51,13 +49,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       </head>
       <body className="bg-background font-sans text-foreground antialiased">
         <ThemeProvider>
-          <AppShell>
-            <ErrorBoundary>
-              <DevUserGate>
-                <AccessGate>{children}</AccessGate>
-              </DevUserGate>
-            </ErrorBoundary>
-          </AppShell>
+          <ErrorBoundary>
+            <RouteShell>{children}</RouteShell>
+          </ErrorBoundary>
         </ThemeProvider>
         <ServiceWorkerRegistration />
       </body>

@@ -48,6 +48,7 @@ import {
 } from "./conversation-state";
 import type { LocalItem } from "./conversation-state";
 import { Composer, ComposerNotice } from "./composer";
+import { SessionShareDialog } from "./session-share-dialog";
 import {
   InlineError,
   MediaBubble,
@@ -620,6 +621,12 @@ export function SessionConversation({
           <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-accent-soft">
             {channelLabel} · read-only
           </span>
+        ) : null}
+        {session ? (
+          <SessionShareDialog
+            sessionId={session.id}
+            boundaryMessageId={state.serverMessages.at(-1)?.id ?? null}
+          />
         ) : null}
       </header>
 
