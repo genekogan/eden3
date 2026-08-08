@@ -1,15 +1,30 @@
-import { PRICING, debit, getEnv, refund, type LedgerResult } from '@eden3/core';
-import { pg } from '@eden3/db';
+import {
+  debit,
+  getEnv,
+  mannaFromUsd,
+  numericToNumber,
+  reverseReservation,
+  settleReservation,
+  turnAuthorizedMax,
+} from '@eden3/core';
+import { db, pg } from '@eden3/db';
 import { getModelAgentRuntime, type GatewayUsage } from '@eden3/gateway';
 import type { AgentRuntime } from '@eden3/shared';
+import { sql } from 'drizzle-orm';
 
 import { meterChatUsage, type ChatTurnMetering } from './turns';
+import { insertTurnAuthorization, markTurnSettled } from './turn-authorization';
 
 export interface ChannelTurnUsage extends GatewayUsage {
   cacheWriteTokens?: number;
+  /** Authoritative OpenRouter `usage.cost` for this whole turn, in USD. */
+  providerCostUsd?: number;
 }
 
-export type ChannelPricingBasis = 'provider-api' | 'notional-subscription';
+export type ChannelPricingBasis =
+  | 'provider-api'
+  | 'notional-subscription'
+  | 'provider-reported';
 export type ChannelTurnProvenance = 'frozen' | 'recovered_usage_event';
 
 export interface ChannelExecutionReport {
@@ -61,6 +76,11 @@ export interface ChannelTurnRecord extends BillableChannelConnection {
   provenanceStatus: ChannelTurnProvenance;
 }
 
+export interface ChannelAuthorizationResult {
+  balance: number;
+  replayed: boolean;
+}
+
 export interface ReserveChannelTurnInput {
   turnId: string;
   connectionId: string;
@@ -99,15 +119,15 @@ export interface ChannelTurnStoreLike {
   ): Promise<ChannelRefundClaim | null>;
   claimStale(cutoff: Date, limit: number): Promise<string[]>;
   markDelivered(turnId: string): Promise<void>;
-  markReserved(turnId: string): Promise<void>;
   markError(turnId: string, errorCode: string): Promise<void>;
-  settle(
+  authorize(turn: ChannelTurnRecord): Promise<ChannelAuthorizationResult>;
+  settleAuthorized(
     turn: ChannelTurnRecord,
     usage: ChannelTurnUsage | undefined,
     metering: ChatTurnMetering,
     chargedManna: number,
   ): Promise<void>;
-  markRefunded(turnId: string, errorCode?: string | null): Promise<void>;
+  reverseAuthorized(turnId: string, errorCode: string): Promise<void>;
   markRefundFailed(turnId: string, errorCode: string): Promise<void>;
 }
 
@@ -138,8 +158,9 @@ interface TurnRow {
   metered_manna: number | null;
 }
 
-function pricingBasisForRuntime(runtime: AgentRuntime): ChannelPricingBasis {
-  return runtime === 'claude-cli' ? 'notional-subscription' : 'provider-api';
+function pricingBasisForRuntime(runtime: AgentRuntime, model: string): ChannelPricingBasis {
+  if (runtime === 'claude-cli') return 'notional-subscription';
+  return model.startsWith('openrouter/') ? 'provider-reported' : 'provider-api';
 }
 
 export function isBillableChannelTurnProvenance(
@@ -157,7 +178,9 @@ function mapTurn(row: TurnRow): ChannelTurnRecord {
     (row.channel !== 'discord' && row.channel !== 'telegram') ||
     !row.model ||
     (row.agent_runtime !== 'openclaw' && row.agent_runtime !== 'claude-cli') ||
-    (row.pricing_basis !== 'provider-api' && row.pricing_basis !== 'notional-subscription') ||
+    (row.pricing_basis !== 'provider-api' &&
+      row.pricing_basis !== 'notional-subscription' &&
+      row.pricing_basis !== 'provider-reported') ||
     !isBillableChannelTurnProvenance(row.provenance_status)
   ) {
     throw new Error('channel turn provenance unavailable');
@@ -228,7 +251,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
       channel: row.channel,
       model: row.model,
       agentRuntime,
-      pricingBasis: pricingBasisForRuntime(agentRuntime),
+      pricingBasis: pricingBasisForRuntime(agentRuntime, row.model),
     };
   }
 
@@ -353,14 +376,49 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     });
   }
 
-  async markReserved(turnId: string): Promise<void> {
-    const rows = await pg<{ turn_id: string }[]>`
-      update channel_turns
-      set status = 'reserved', error_code = null, updated_at = now()
-      where turn_id = ${turnId} and status = 'reserving'
-      returning turn_id
-    `;
-    if (!rows[0]) throw new Error('channel turn reservation state changed');
+  async authorize(turn: ChannelTurnRecord): Promise<ChannelAuthorizationResult> {
+    const route = modelIdentity(turn.model);
+    return db.transaction(async (tx) => {
+      const debited = await debit({
+        accountId: turn.accountId,
+        amount: turn.reservedManna,
+        type: 'spend:chat:channel',
+        idempotencyKey: channelTurnLedgerKey(turn.turnId),
+        dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
+        db: tx,
+      });
+      const authorization = turnAuthorizedMax(route);
+      const row = await insertTurnAuthorization(tx, {
+        turnId: turn.turnId,
+        accountId: turn.accountId,
+        agentAccountId: turn.agentId,
+        sessionId: turn.sessionId,
+        provider: authorization.provider,
+        model: authorization.model,
+        pricingBasis: turn.pricingBasis,
+        ceilingTableVersion: authorization.tableVersion,
+        authorizedMaxManna: authorization.manna,
+        reservedSubscriptionManna: debited.subscriptionDrawn ?? 0,
+        reservationTxId: debited.transaction.id,
+      });
+      if (
+        !row ||
+        numericToNumber(row.authorizedMaxManna) !== turn.reservedManna ||
+        row.agentAccountId !== turn.agentId ||
+        row.sessionId !== turn.sessionId ||
+        row.ceilingTableVersion !== authorization.tableVersion
+      ) {
+        throw new Error('channel turn authorization conflict');
+      }
+      const updated = (await tx.execute(sql`
+        update channel_turns
+        set status = 'reserved', error_code = null, updated_at = now()
+        where turn_id = ${turn.turnId} and status = 'reserving'
+        returning turn_id
+      `)) as unknown as { turn_id: string }[];
+      if (!updated[0]) throw new Error('channel turn reservation state changed');
+      return { balance: debited.balance.total, replayed: debited.alreadyApplied };
+    });
   }
 
   async markDelivered(turnId: string): Promise<void> {
@@ -387,15 +445,45 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     `;
   }
 
-  async settle(
+  async settleAuthorized(
     turn: ChannelTurnRecord,
     usage: ChannelTurnUsage | undefined,
     metering: ChatTurnMetering,
     chargedManna: number,
   ): Promise<void> {
     const costUsd = metering.costUsd === null ? null : metering.costUsd.toFixed(8);
-    await pg.begin(async (tx) => {
-      await tx`
+    await db.transaction(async (tx) => {
+      const authRows = (await tx.execute(sql`
+        select state, authorized_max_manna, reserved_subscription_manna
+        from turn_authorizations
+        where turn_id = ${turn.turnId}
+        for update
+      `)) as unknown as Array<{
+        state: string;
+        authorized_max_manna: string;
+        reserved_subscription_manna: string;
+      }>;
+      const auth = authRows[0];
+      if (
+        !auth ||
+        auth.state !== 'reserved' ||
+        numericToNumber(auth.authorized_max_manna) !== turn.reservedManna ||
+        chargedManna > turn.reservedManna
+      ) {
+        throw new Error('channel turn authorization is not settleable');
+      }
+      await markTurnSettled(tx, turn.turnId, {
+        chargedManna,
+        overrun: metering.status === 'metered' && metering.manna > turn.reservedManna,
+      });
+      await settleReservation({
+        reservationKey: channelTurnLedgerKey(turn.turnId),
+        chargeManna: chargedManna,
+        reservedSubscriptionManna: numericToNumber(auth.reserved_subscription_manna),
+        type: 'refund:chat:channel:settle',
+        db: tx,
+      });
+      await tx.execute(sql`
         insert into usage_events (
           event_type, status, user_id, agent_id, session_id, turn_id,
           provider, model, pricing_basis, table_version, prompt_tokens,
@@ -409,7 +497,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
           ${usage?.promptTokens ?? null}, ${usage?.completionTokens ?? null},
           ${usage?.cachedTokens ?? null}, ${usage?.cacheWriteTokens ?? null},
           ${usage?.totalTokens ?? null}, ${costUsd}, ${chargedManna},
-          ${tx.json(JSON.stringify({
+          ${JSON.stringify({
             channel: turn.channel,
             connectionId: turn.connectionId,
             runtimeAccountId: turn.runtimeAccountId,
@@ -417,35 +505,75 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
             agentRuntime: turn.agentRuntime,
             pricingBasis: turn.pricingBasis,
             metering,
-          }))}
+            authorization: {
+              authorizedMaxManna: turn.reservedManna,
+              overrun: metering.status === 'metered' && metering.manna > turn.reservedManna,
+            },
+          })}::jsonb
         )
         on conflict (event_type, turn_id) where turn_id is not null do nothing
-      `;
-      const updated = await tx<{ turn_id: string }[]>`
+      `);
+      const updated = (await tx.execute(sql`
         update channel_turns
         set status = 'delivery_pending', metered_manna = ${chargedManna},
             error_code = null, updated_at = now(), completed_at = null
         where turn_id = ${turn.turnId} and status = 'settling'
         returning turn_id
-      `;
+      `)) as unknown as { turn_id: string }[];
       if (!updated[0]) throw new Error('channel turn settlement state changed');
     });
   }
 
-  async markRefunded(turnId: string, errorCode: string | null = null): Promise<void> {
-    const rows = await pg.begin(async (tx) => {
-      const updated = await tx<{ turn_id: string }[]>`
+  async reverseAuthorized(turnId: string, errorCode: string): Promise<void> {
+    await db.transaction(async (tx) => {
+      const authRows = (await tx.execute(sql`
+        select state, reserved_subscription_manna
+        from turn_authorizations
+        where turn_id = ${turnId}
+        for update
+      `)) as unknown as Array<{ state: string; reserved_subscription_manna: string }>;
+      const auth = authRows[0];
+      if (auth && (auth.state === 'reserved' || auth.state === 'settled')) {
+        await reverseReservation({
+          reservationKey: channelTurnLedgerKey(turnId),
+          reservedSubscriptionManna: numericToNumber(auth.reserved_subscription_manna),
+          type: 'refund:chat:channel',
+          db: tx,
+        });
+        await tx.execute(sql`
+          update turn_authorizations
+          set state = 'reversed', charged_manna = 0, updated_at = now()
+          where turn_id = ${turnId} and state in ('reserved', 'settled')
+        `);
+      } else if (!auth) {
+        // Pre-kernel recovery only. New channel reservations always carry an
+        // authorization row; a historical flat reservation must still not be
+        // stranded when the first post-upgrade reaper sees it.
+        const legacyDebits = (await tx.execute(sql`
+          select 1 from manna_transactions
+          where idempotency_key = ${channelTurnLedgerKey(turnId)}
+          limit 1
+        `)) as unknown as unknown[];
+        if (legacyDebits.length > 0) {
+          await reverseReservation({
+            reservationKey: channelTurnLedgerKey(turnId),
+            type: 'refund:chat:channel:legacy',
+            db: tx,
+          });
+        }
+      }
+      const updated = (await tx.execute(sql`
         update channel_turns
         set status = 'refunded', metered_manna = 0,
             error_code = ${errorCode}, updated_at = now(), completed_at = now()
         where turn_id = ${turnId} and status = 'refunding'
         returning turn_id
-      `;
+      `)) as unknown as { turn_id: string }[];
       if (updated[0]) {
         // A post-settlement delivery failure is still a zero-charge terminal
         // result. Keep the billing audit row aligned with the compensated
         // ledger instead of leaving a misleading completed/charged event.
-        await tx`
+        await tx.execute(sql`
           update usage_events
           set status = 'error', manna = 0, error_code = ${errorCode},
               error_message = case
@@ -454,11 +582,9 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
                 else error_message
               end
           where event_type = 'channel_chat' and turn_id = ${turnId}
-        `;
+        `);
       }
-      return updated;
     });
-    if (!rows[0]) throw new Error('channel turn refund state changed');
   }
 
   async markRefundFailed(turnId: string, errorCode: string): Promise<void> {
@@ -470,17 +596,8 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   }
 }
 
-export interface ChannelLedgerLike {
-  debit(accountId: string, amount: number, key: string): Promise<LedgerResult>;
-  refund(key: string): Promise<LedgerResult | null>;
-}
-
 export function channelTurnLedgerKey(turnId: string): string {
   return `channel:${turnId}`;
-}
-
-export function channelTurnSettlementLedgerKey(turnId: string): string {
-  return `${channelTurnLedgerKey(turnId)}:settle`;
 }
 
 export class ChannelExecutionMismatchError extends Error {
@@ -520,21 +637,54 @@ export function assertChannelExecutionMatches(
   }
 }
 
+/**
+ * Channel cost-basis adapter. Direct provider API and subscription turns use
+ * the frozen token price table; OpenRouter uses its authoritative whole-turn
+ * `usage.cost` so reconciliation never substitutes an estimate for the bill.
+ */
+export function meterChannelUsage(
+  usage: ChannelTurnUsage | undefined,
+  model: string,
+): ChatTurnMetering {
+  if (!model.startsWith('openrouter/')) return meterChatUsage(usage, model);
+  const providerCostUsd = usage?.providerCostUsd;
+  if (
+    providerCostUsd === undefined ||
+    !Number.isFinite(providerCostUsd) ||
+    providerCostUsd < 0
+  ) {
+    return {
+      status: 'missing_usage',
+      provider: 'openrouter',
+      model: model.slice('openrouter/'.length),
+      modelSource: 'agent',
+      costUsd: null,
+      manna: null,
+    };
+  }
+  return {
+    status: 'metered',
+    provider: 'openrouter',
+    model: model.slice('openrouter/'.length),
+    modelSource: 'agent',
+    tableVersion: 'openrouter-usage.cost-v1',
+    costUsd: providerCostUsd,
+    manna: mannaFromUsd(providerCostUsd),
+    estimated: false,
+    lineItems: [
+      {
+        unit: 'provider-reported-turn',
+        quantity: 1,
+        usdPerUnit: providerCostUsd,
+        costUsd: providerCostUsd,
+      },
+    ],
+  };
+}
+
 export class ChannelTurnMeteringService {
   constructor(
     private readonly store: ChannelTurnStoreLike = new PostgresChannelTurnStore(),
-    private readonly ledger: ChannelLedgerLike = {
-      debit: (accountId, amount, key) =>
-        debit({
-          accountId,
-          amount,
-          type: 'spend:chat:channel',
-          idempotencyKey: key,
-          dailyCap: { limit: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER },
-        }),
-      refund: (key) =>
-        refund({ originalIdempotencyKey: key, type: 'refund:chat:channel' }),
-    },
   ) {}
 
   async reserve(input: ReserveChannelTurnInput): Promise<{
@@ -549,7 +699,9 @@ export class ChannelTurnMeteringService {
     if (!connection || connection.runtimeAccountId !== input.runtimeAccountId) {
       throw new Error('channel connection unavailable');
     }
-    let turn = await this.store.claimTurn(connection, input, PRICING.chatTurn);
+    const route = modelIdentity(connection.model);
+    const authorization = turnAuthorizedMax(route);
+    let turn = await this.store.claimTurn(connection, input, authorization.manna);
     if (
       turn.connectionId !== connection.connectionId ||
       turn.accountId !== connection.accountId ||
@@ -570,41 +722,27 @@ export class ChannelTurnMeteringService {
       return { turn, balance: null, replayed: true };
     }
     if (turn.status !== 'reserving') throw new Error('channel turn is not reservable');
-    let charged: LedgerResult;
     try {
-      charged = await this.ledger.debit(
-        turn.accountId,
-        turn.reservedManna,
-        channelTurnLedgerKey(turn.turnId),
-      );
+      const authorized = await this.store.authorize(turn);
+      turn = { ...turn, status: 'reserved' };
+      return {
+        turn,
+        balance: authorized.balance,
+        replayed: authorized.replayed,
+      };
     } catch (error) {
       await this.store.markError(turn.turnId, 'reserve_failed');
       throw error;
     }
-    // A crash here leaves `reserving`; the stale reaper or an idempotent retry
-    // completes/refunds the already-recorded ledger debit.
-    await this.store.markReserved(turn.turnId);
-    turn = { ...turn, status: 'reserved' };
-    return { turn, balance: charged.balance.total, replayed: charged.alreadyApplied };
   }
 
   private async refundClaimedTurn(turnId: string, reason: string): Promise<void> {
-    let firstError: unknown;
-    for (const key of [
-      channelTurnSettlementLedgerKey(turnId),
-      channelTurnLedgerKey(turnId),
-    ]) {
-      try {
-        await this.ledger.refund(key);
-      } catch (error) {
-        firstError ??= error;
-      }
-    }
-    if (firstError) {
+    try {
+      await this.store.reverseAuthorized(turnId, reason);
+    } catch (error) {
       await this.store.markRefundFailed(turnId, `${reason}_refund_failed`);
-      throw firstError;
+      throw error;
     }
-    await this.store.markRefunded(turnId, reason);
   }
 
   private async failSettlement(turn: ChannelTurnRecord, reason: string, cause: unknown): Promise<never> {
@@ -640,7 +778,7 @@ export class ChannelTurnMeteringService {
         turn.status === 'delivered')
     ) {
       assertChannelExecutionMatches(turn, execution);
-      const metering = meterChatUsage(usage, turn.model);
+      const metering = meterChannelUsage(usage, turn.model);
       return { chargedManna: turn.meteredManna ?? turn.reservedManna, metering };
     }
     if (!claim.claimed || turn.status !== 'settling') {
@@ -653,31 +791,13 @@ export class ChannelTurnMeteringService {
       return this.failSettlement(turn, 'execution_mismatch', error);
     }
 
-    const metering = meterChatUsage(usage, turn.model);
-    const chargedManna = metering.status === 'metered' ? metering.manna : turn.reservedManna;
-    const adjustment = chargedManna - turn.reservedManna;
+    const metering = meterChannelUsage(usage, turn.model);
+    const chargedManna =
+      metering.status === 'metered'
+        ? Math.min(metering.manna, turn.reservedManna)
+        : turn.reservedManna;
     try {
-      if (adjustment > 0) {
-        await this.ledger.debit(
-          turn.accountId,
-          adjustment,
-          channelTurnSettlementLedgerKey(turn.turnId),
-        );
-      } else if (adjustment < 0) {
-        // Prices are integer-ceiled, so reserve=1 normally only adjusts to
-        // zero. Full linked refund releases cap headroom correctly; if future
-        // pricing permits a positive value below the reserve, re-debit the
-        // exact amount under the settlement key.
-        await this.ledger.refund(channelTurnLedgerKey(turn.turnId));
-        if (chargedManna > 0) {
-          await this.ledger.debit(
-            turn.accountId,
-            chargedManna,
-            channelTurnSettlementLedgerKey(turn.turnId),
-          );
-        }
-      }
-      await this.store.settle(turn, usage, metering, chargedManna);
+      await this.store.settleAuthorized(turn, usage, metering, chargedManna);
     } catch (error) {
       return this.failSettlement(turn, 'settlement_failed', error);
     }

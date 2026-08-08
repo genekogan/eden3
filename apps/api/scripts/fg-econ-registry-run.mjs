@@ -36,6 +36,7 @@ const batteryFiles = [
   'test/turns-usage.test.ts',
   'test/triggers-routes.test.ts',
   'test/studio-routes.test.ts',
+  'test/channel-metering.test.ts',
 ];
 
 const jsonOut = path.join(outDir, 'vitest-fg-econ.json');
