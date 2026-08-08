@@ -9,6 +9,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { buildServer } from '../src/server';
 import { reconcileAgentRuntime } from '../src/services/agent-runtime-sync';
+import { replaceAgentSkills } from '../src/services/agent-skills';
 import {
   deleteFixturesByMarker,
   devCookie,
@@ -172,6 +173,21 @@ describe('skills routes', () => {
       openclawId: `${marker}_agent`,
       skills: [allowed, disallowed],
     });
+    const pendingCollision = `${marker}_owner_workspace_only`;
+    const ownerSkillDir = path.join(workspaceDir, 'skills', pendingCollision);
+    await fs.mkdir(ownerSkillDir, { recursive: true });
+    await fs.writeFile(path.join(ownerSkillDir, 'SKILL.md'), '# Owner workspace only\n', 'utf8');
+    const pending = await app.inject({
+      method: 'POST',
+      url: '/skills/user',
+      headers: { cookie: devCookie(strangerId) },
+      payload: {
+        slug: pendingCollision,
+        name: 'Foreign pending collision',
+        body: '# Pending collision\n\nThis must not claim another agent workspace directory.',
+      },
+    });
+    expect(pending.statusCode).toBe(201);
 
     const onlyAllowed = await app.inject({
       method: 'POST',
@@ -199,6 +215,60 @@ describe('skills routes', () => {
     expect(toolsFile).toContain('Use the allowed path.');
     expect(toolsFile).not.toContain(disallowed);
     expect(toolsFile).not.toContain('This should be removed.');
+    await expect(fs.access(path.join(workspaceDir, 'skills', disallowed))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(fs.readFile(path.join(ownerSkillDir, 'SKILL.md'), 'utf8')).resolves.toBe(
+      '# Owner workspace only\n',
+    );
+  });
+
+  it('rejects noncanonical and duplicate selections before durable mutation', async () => {
+    const [beforeAgent] = await pg<{
+      runtime_sync_version: number;
+      runtime_synced_version: number;
+    }[]>`
+      select runtime_sync_version, runtime_synced_version
+      from agents where account_id = ${agentId}
+    `;
+    const beforeAttached = await pg<{ slug: string; enabled: boolean }[]>`
+      select sd.slug, aks.enabled
+      from agent_skills aks
+      join skill_definitions sd on sd.id = aks.skill_id
+      where aks.agent_id = ${agentId}
+      order by sd.slug
+    `;
+
+    for (const slugs of [
+      [`${marker}_allowed`, `${marker}_ALLOWED`],
+      [`${marker}_allowed`, ` ${marker}_allowed`],
+      [`${marker}_allowed`, `${marker}_allowed`],
+    ]) {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/agents/${marker}_agent/skills`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { slugs },
+      });
+      expect(response.statusCode).toBe(400);
+    }
+
+    const [afterAgent] = await pg<{
+      runtime_sync_version: number;
+      runtime_synced_version: number;
+    }[]>`
+      select runtime_sync_version, runtime_synced_version
+      from agents where account_id = ${agentId}
+    `;
+    const afterAttached = await pg<{ slug: string; enabled: boolean }[]>`
+      select sd.slug, aks.enabled
+      from agent_skills aks
+      join skill_definitions sd on sd.id = aks.skill_id
+      where aks.agent_id = ${agentId}
+      order by sd.slug
+    `;
+    expect(afterAgent).toEqual(beforeAgent);
+    expect(afterAttached).toEqual(beforeAttached);
   });
 
   it('rejecting an attached skill clears it from the agent and resyncs OpenClaw', async () => {
@@ -227,13 +297,20 @@ describe('skills routes', () => {
       skills: [],
     });
 
-    const rows = await pg<{ count: number }[]>`
-      select count(*)::int as count
+    const rows = await pg<{ count: number; enabled_count: number }[]>`
+      select count(*)::int as count,
+             count(*) filter (where aks.enabled)::int as enabled_count
       from agent_skills aks
       join skill_definitions sd on sd.id = aks.skill_id
       where sd.slug = ${slug}
     `;
-    expect(rows[0]!.count).toBe(0);
+    expect(rows[0]).toEqual({ count: 1, enabled_count: 0 });
+    await expect(fs.access(path.join(workspaceDir, 'skills', slug))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    const toolsFile = await fs.readFile(path.join(workspaceDir, 'TOOLS.md'), 'utf8');
+    expect(toolsFile).not.toContain(slug);
+    expect(toolsFile).not.toContain('Temporary approved skill.');
   });
 
   it('keeps a committed skill selection pending when projection fails, then retries it', async () => {
@@ -364,13 +441,23 @@ describe('skills routes', () => {
       `;
       expect(pending!.runtime_sync_version).toBeGreaterThan(pending!.runtime_synced_version);
       expect(pending!.runtime_sync_error).toContain('retry pending');
-      const [attachment] = await pg<{ count: number }[]>`
-        select count(*)::int as count
+      const [attachment] = await pg<{ count: number; enabled_count: number }[]>`
+        select count(*)::int as count,
+               count(*) filter (where aks.enabled)::int as enabled_count
         from agent_skills aks
         join skill_definitions sd on sd.id = aks.skill_id
         where aks.agent_id = ${agentId} and sd.slug = ${slug}
       `;
-      expect(attachment!.count).toBe(0);
+      expect(attachment).toEqual({ count: 1, enabled_count: 0 });
+      // Filesystem cleanup precedes the fallible OpenClaw allowlist sync. A
+      // rejected instruction is unavailable even while the durable runtime
+      // revision truthfully remains pending for retry.
+      await expect(fs.access(path.join(workspaceDir, 'skills', slug))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      const pendingTools = await fs.readFile(path.join(workspaceDir, 'TOOLS.md'), 'utf8');
+      expect(pendingTools).not.toContain(slug);
+      expect(pendingTools).not.toContain('This skill will be rejected during a runtime outage.');
 
       await pg`
         update agents set runtime_sync_lease_expires_at = null
@@ -391,6 +478,74 @@ describe('skills routes', () => {
     } finally {
       skillSync.syncAgentSkills = originalSync;
     }
+  });
+
+  it('serializes direct first-provision projection with concurrent rejection cleanup', async () => {
+    const slug = `${marker}_direct_rejection`;
+    await pg`
+      insert into skill_definitions (slug, name, description, body, source, status)
+      values (
+        ${slug}, 'Direct Rejection', null,
+        '# Direct Rejection\n\nA concurrent rejection must win after projection.',
+        'user', 'approved'
+      )
+    `;
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredSync = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const releaseSync = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const directSync = {
+      async syncAgentSkills() {
+        entered();
+        await releaseSync;
+        return { changed: true };
+      },
+    };
+
+    const projection = replaceAgentSkills({
+      agentId,
+      openclawId: `${marker}_agent`,
+      workspacePath: workspaceDir,
+      slugs: [slug],
+      skillSync: directSync,
+    });
+    await enteredSync;
+    let rejectionSettled = false;
+    const rejection = app
+      .inject({
+        method: 'POST',
+        url: `/skills/${slug}/review`,
+        headers: { cookie: devCookie(adminId) },
+        payload: { status: 'rejected' },
+      })
+      .finally(() => {
+        rejectionSettled = true;
+      });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(rejectionSettled).toBe(false);
+
+    release();
+    await expect(projection).resolves.toMatchObject({ openclaw: { changed: true } });
+    const rejected = await rejection;
+    expect(rejected.statusCode).toBe(200);
+    await expect(fs.access(path.join(workspaceDir, 'skills', slug))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    const [attachment] = await pg<{ status: string; enabled: boolean }[]>`
+      select sd.status, aks.enabled
+      from agent_skills aks
+      join skill_definitions sd on sd.id = aks.skill_id
+      where aks.agent_id = ${agentId} and sd.slug = ${slug}
+    `;
+    expect(attachment).toEqual({ status: 'rejected', enabled: false });
+    expect(skillSync.calls.at(-1)).toEqual({
+      openclawId: `${marker}_agent`,
+      skills: [],
+    });
   });
 
   it('serializes concurrent skill projections so an older runtime write cannot win', async () => {

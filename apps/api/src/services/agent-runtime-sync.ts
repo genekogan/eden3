@@ -14,12 +14,17 @@ import {
   type SkillSyncLike,
   type ToolSyncLike,
 } from '../gateway-glue';
+import {
+  AGENT_RUNTIME_SYNC_LOCK_SEED,
+  agentRuntimeSyncLockKey,
+} from './agent-runtime-lock';
 import { projectApprovedAgentSkills } from './agent-skills';
+
+export { AGENT_RUNTIME_SYNC_LOCK_SEED, agentRuntimeSyncLockKey } from './agent-runtime-lock';
 
 const CLAIM_HEARTBEAT_MS = 60_000;
 const CLAIM_LEASE_MINUTES = 35;
 const FAILURE_RETRY_MS = 5 * 60_000;
-export const AGENT_RUNTIME_SYNC_LOCK_SEED = 92;
 const MAX_IMMEDIATE_REVISIONS = 3;
 
 interface RuntimeSyncLogger {
@@ -89,10 +94,6 @@ function normalizedToolGroups(value: unknown): string[] {
  * session advisory lock is released automatically if the process/connection
  * dies, while the durable claim lease remains the crash-recovery signal.
  */
-export function agentRuntimeSyncLockKey(accountId: string): string {
-  return `eden3:agent-runtime-sync:${accountId}`;
-}
-
 async function withAgentRuntimeSyncLock<T>(
   accountId: string,
   run: () => Promise<T>,
