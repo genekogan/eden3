@@ -327,12 +327,34 @@ describe('Eve collision reconciliation', () => {
   it('refuses a wrong database name before locking or writing', async () => {
     const fixture = await seedFixture();
     const before = await identityRows(fixture);
-    await expect(
-      reconcileEveCollision(
-        { ...fixture.input, expectedDatabaseName: `${fixture.input.expectedDatabaseName}_wrong` },
-        { apply: true },
-      ),
-    ).rejects.toMatchObject({ code: 'database_name_mismatch' } satisfies Partial<EveReconciliationError>);
+    const lock = await pg.reserve();
+    await lock`select pg_advisory_lock(hashtextextended('eden3:platform:eve:reconcile', 0))`;
+    const attempt = reconcileEveCollision(
+      { ...fixture.input, expectedDatabaseName: `${fixture.input.expectedDatabaseName}_wrong` },
+      { apply: true },
+    ).then(
+      () => ({ kind: 'resolved' as const }),
+      (error: unknown) => ({ kind: 'rejected' as const, error }),
+    );
+    let observed: Awaited<typeof attempt> | { kind: 'timeout' };
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      observed = await Promise.race([
+        attempt,
+        new Promise<{ kind: 'timeout' }>((resolve) => {
+          timeout = setTimeout(() => resolve({ kind: 'timeout' }), 250);
+        }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      await lock`select pg_advisory_unlock(hashtextextended('eden3:platform:eve:reconcile', 0))`;
+      lock.release();
+    }
+    expect(observed).toMatchObject({
+      kind: 'rejected',
+      error: { code: 'database_name_mismatch' },
+    });
+    await attempt;
     expect(await identityRows(fixture)).toEqual(before);
   });
 
@@ -424,6 +446,38 @@ describe('Eve collision reconciliation', () => {
     await expect(reconcileEveCollision(fixture.input, { apply: true })).resolves.toMatchObject({
       state: 'bootstrapped',
       phase1: { action: 'already-renamed' },
+    });
+  });
+
+  it('preserves platform drift that lands after phase 1 and refuses bootstrap', async () => {
+    const fixture = await seedFixture();
+    let pending: EveReconciliationError | null = null;
+    try {
+      await reconcileEveCollision(fixture.input, {
+        apply: true,
+        afterPhase1CommitBeforeBootstrap: async () => {
+          await pg`
+            update agents
+            set description = 'concurrent operator edit must survive'
+            where account_id = ${fixture.platformAccountId}
+          `;
+        },
+      });
+    } catch (error) {
+      pending = error as EveReconciliationError;
+    }
+    expect(pending).toMatchObject({
+      code: 'bootstrap_pending',
+      safeDetails: { phase1Action: 'renamed', state: 'reconciled' },
+    });
+    const [platform] = await pg<{ username: string; description: string }[]>`
+      select a.username::text as username, g.description
+      from accounts a join agents g on g.account_id = a.id
+      where a.id = ${fixture.platformAccountId}
+    `;
+    expect(platform).toEqual({
+      username: fixture.input.expectedPlatformHandle,
+      description: 'concurrent operator edit must survive',
     });
   });
 

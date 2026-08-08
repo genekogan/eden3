@@ -59,6 +59,13 @@ export interface EveAssistantResult {
   openclawId: typeof DEFAULT_EVE_OPENCLAW_ID;
 }
 
+export interface EveBootstrapExistingIdentityPrecondition {
+  accountId: string;
+  username: string;
+  accountStableHash: string;
+  agentHash: string;
+}
+
 export interface EnsureEveAssistantOptions {
   /**
    * Also render the OpenClaw default workspace used by agent "main". This is
@@ -68,6 +75,12 @@ export interface EnsureEveAssistantOptions {
   syncWorkspace?: boolean;
   dataDir?: string;
   now?: () => Date;
+  /**
+   * Optional deployment-repair fence. When supplied, the already-existing
+   * OpenClaw main identity must still match this exact snapshot after the
+   * bootstrap advisory lock and row locks are held, before any write occurs.
+   */
+  existingIdentityPrecondition?: EveBootstrapExistingIdentityPrecondition;
 }
 
 const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -82,16 +95,42 @@ export async function ensureEveAssistant(
     await sql`select pg_advisory_xact_lock(hashtextextended('eden3:platform:eve', 0))`;
 
     const [existingRuntime] = await sql<
-      { id: string; type: 'user' | 'agent'; username: string; ownerId: string | null }[]
+      {
+        id: string;
+        type: 'user' | 'agent';
+        username: string;
+        ownerId: string | null;
+        accountStableHash: string;
+        agentHash: string;
+      }[]
     >`
-      select a.id, a.type, a.username::text as username, g.owner_id as "ownerId"
+      select a.id, a.type, a.username::text as username, g.owner_id as "ownerId",
+             md5((to_jsonb(a) - 'username' - 'updated_at')::text) as "accountStableHash",
+             md5(to_jsonb(g)::text) as "agentHash"
       from agents g
       join accounts a on a.id = g.account_id
       where g.openclaw_id = ${DEFAULT_EVE_OPENCLAW_ID}
       for update of a, g
     `;
 
-    let account = existingRuntime;
+    const precondition = options.existingIdentityPrecondition;
+    if (
+      precondition &&
+      (!existingRuntime ||
+        existingRuntime.id !== precondition.accountId ||
+        existingRuntime.username.toLowerCase() !== precondition.username.toLowerCase() ||
+        existingRuntime.accountStableHash !== precondition.accountStableHash ||
+        existingRuntime.agentHash !== precondition.agentHash)
+    ) {
+      throw new Error('platform Eve bootstrap identity changed after reconciliation phase 1');
+    }
+
+    let account: {
+      id: string;
+      type: 'user' | 'agent';
+      username: string;
+      ownerId: string | null;
+    } | undefined = existingRuntime;
     if (account) {
       if (account.type !== 'agent' || account.ownerId !== null) {
         throw new Error('OpenClaw main is not a platform-owned agent; refusing to replace it with Eve');
