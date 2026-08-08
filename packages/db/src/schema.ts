@@ -735,6 +735,87 @@ export const channelConnections = pgTable(
   ],
 );
 
+// ---------------------------------------------------------------------------
+// channel_onboarding_intents — short-lived, hashed-only state for the managed
+// Telegram bot handoff. Provider ids and intent secrets are never persisted in
+// raw form. Migration 0031 owns the state/connection binding trigger.
+// ---------------------------------------------------------------------------
+export const channelOnboardingIntents = pgTable(
+  'channel_onboarding_intents',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'cascade' }),
+    channel: text('channel').notNull().default('telegram'),
+    intentSecretHash: text('intent_secret_hash').notNull(),
+    providerOwnerIdHash: text('provider_owner_id_hash'),
+    suggestedBotUsername: text('suggested_bot_username'),
+    state: text('state', {
+      enum: ['pending_owner', 'awaiting_bot', 'exchanging', 'stored', 'expired', 'failed'],
+    })
+      .notNull()
+      .default('pending_owner'),
+    expiresAt: timestamptz('expires_at').notNull(),
+    connectionId: uuid('connection_id').references(() => channelConnections.id, {
+      onDelete: 'set null',
+    }),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('channel_onboarding_intents_secret_uq').on(t.intentSecretHash),
+    uniqueIndex('channel_onboarding_intents_active_account_uq')
+      .on(t.accountId, t.channel)
+      .where(sql`${t.state} in ('pending_owner', 'awaiting_bot', 'exchanging')`),
+    uniqueIndex('channel_onboarding_intents_active_owner_uq')
+      .on(t.channel, t.providerOwnerIdHash)
+      .where(
+        sql`${t.providerOwnerIdHash} is not null and ${t.state} in ('awaiting_bot', 'exchanging')`,
+      ),
+    index('channel_onboarding_intents_active_expiry_idx')
+      .on(t.state, t.expiresAt)
+      .where(sql`${t.state} in ('pending_owner', 'awaiting_bot', 'exchanging')`),
+    index('channel_onboarding_intents_connection_idx')
+      .on(t.connectionId)
+      .where(sql`${t.connectionId} is not null`),
+    check('channel_onboarding_intents_channel_check', sql`${t.channel} = 'telegram'`),
+    check(
+      'channel_onboarding_intents_state_check',
+      sql`${t.state} in ('pending_owner', 'awaiting_bot', 'exchanging', 'stored', 'expired', 'failed')`,
+    ),
+    check(
+      'channel_onboarding_intents_intent_hash_check',
+      sql`${t.intentSecretHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      'channel_onboarding_intents_owner_hash_check',
+      sql`${t.providerOwnerIdHash} is null or ${t.providerOwnerIdHash} ~ '^[0-9a-f]{64}$'`,
+    ),
+    check(
+      'channel_onboarding_intents_expiry_check',
+      sql`${t.expiresAt} > ${t.createdAt}`,
+    ),
+    check(
+      'channel_onboarding_intents_username_check',
+      sql`${t.suggestedBotUsername} is null or char_length(${t.suggestedBotUsername}) <= 32`,
+    ),
+    check(
+      'channel_onboarding_intents_error_code_check',
+      sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z0-9_:-]{1,64}$'`,
+    ),
+    check(
+      'channel_onboarding_intents_owner_state_check',
+      sql`(${t.state} = 'pending_owner' and ${t.providerOwnerIdHash} is null) or (${t.state} in ('awaiting_bot', 'exchanging', 'stored') and ${t.providerOwnerIdHash} is not null) or ${t.state} in ('expired', 'failed')`,
+    ),
+    check(
+      'channel_onboarding_intents_connection_state_check',
+      sql`${t.connectionId} is null or ${t.state} = 'stored'`,
+    ),
+  ],
+);
+
 /**
  * External identities are connection-scoped: the same provider peer talking
  * to two Eden bots is deliberately two principals. Raw peer ids are encrypted;
@@ -1510,6 +1591,8 @@ export type MannaVoucher = typeof mannaVouchers.$inferSelect;
 export type NewMannaVoucher = typeof mannaVouchers.$inferInsert;
 export type ChannelConnection = typeof channelConnections.$inferSelect;
 export type NewChannelConnection = typeof channelConnections.$inferInsert;
+export type ChannelOnboardingIntent = typeof channelOnboardingIntents.$inferSelect;
+export type NewChannelOnboardingIntent = typeof channelOnboardingIntents.$inferInsert;
 export type ChannelExternalIdentity = typeof channelExternalIdentities.$inferSelect;
 export type NewChannelExternalIdentity = typeof channelExternalIdentities.$inferInsert;
 export type ChannelPairingRequest = typeof channelPairingRequests.$inferSelect;
