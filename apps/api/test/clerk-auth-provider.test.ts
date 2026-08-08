@@ -106,10 +106,15 @@ describe('ClerkAuthProvider', () => {
 
   it('refuses an unknown Clerk subject under closed admission without creating account or ledger state', async () => {
     const clerkUserId = `${marker}_closed_unknown`;
+    let signupAdmissions = 0;
     const provider = new ClerkAuthProvider({
       allowAccountCreation: false,
       seedManna: 77,
       verifyToken: async () => ({ sub: clerkUserId }),
+      signupAdmission: () => {
+        signupAdmissions += 1;
+        return { allowed: true, retryAfterMs: 0 };
+      },
     });
 
     await expect(
@@ -131,6 +136,7 @@ describe('ClerkAuthProvider', () => {
         on mt.manna_account_id = ma.id and mt.type = 'credit:signup'
     `;
     expect(state).toEqual({ accounts: '0', manna_accounts: '0', signup_credits: '0' });
+    expect(signupAdmissions).toBe(0);
   });
 
   it('resolves an existing Clerk-linked account while admission is closed', async () => {
@@ -227,14 +233,22 @@ describe('ClerkAuthProvider', () => {
 
   it('serializes concurrent first sessions to one account and one signup credit', async () => {
     const clerkUserId = `${marker}_concurrent_first`;
+    let signupAdmissions = 0;
     const provider = new ClerkAuthProvider({
       seedManna: 77,
       verifyToken: async () => ({ sub: clerkUserId }),
+      signupAdmission: () => {
+        signupAdmissions += 1;
+        return { allowed: true, retryAfterMs: 0 };
+      },
     });
 
     const sessions = await Promise.all(
       Array.from({ length: 8 }, () =>
-        provider.getSession({ headers: { authorization: 'Bearer valid' } }),
+        provider.getSession({
+          ip: '198.51.100.44',
+          headers: { authorization: 'Bearer valid' },
+        }),
       ),
     );
     expect(new Set(sessions.map((session) => session?.accountId)).size).toBe(1);
@@ -268,6 +282,7 @@ describe('ClerkAuthProvider', () => {
       signup_credits: '1',
       credited: '77.0000',
     });
+    expect(signupAdmissions).toBe(1);
   });
 
   it('resolves an existing migrated account by Clerk subject', async () => {

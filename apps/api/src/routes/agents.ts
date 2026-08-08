@@ -56,6 +56,7 @@ import {
 } from '../services/memory-distillation';
 import { runMemoryRetrievalProbe } from '../services/memory-retrieval';
 import { publishNotificationChanged } from '../services/app-notifications';
+import { assertNativeAgentCreationAllowed } from '../services/native-agent-admission';
 
 /**
  * Agents API.
@@ -341,30 +342,6 @@ function suggestedImportUsername(raw: string | undefined): string {
   const safe = base.length >= 3 ? base : 'agent';
   const suffix = Math.random().toString(36).slice(2, 8);
   return agentUsernameSchema.parse(`${safe}-${suffix}`.slice(0, 32));
-}
-
-async function nativeAgentQuotaError(viewer: AuthSession): Promise<{
-  statusCode: 429;
-  code: 'agent_quota_exceeded';
-  message: string;
-} | null> {
-  const nativeAgentLimit = getEnv().MAX_NATIVE_AGENTS_PER_USER;
-  if (viewer.isAdmin) return null;
-  const [quota] = await pg<{ count: number }[]>`
-    select count(*)::int as count
-    from agents g
-    join accounts a on a.id = g.account_id
-    where g.owner_id = ${viewer.accountId}
-      and a.external_id is null
-      and a.deleted = false`;
-  if ((quota?.count ?? 0) >= nativeAgentLimit) {
-    return {
-      statusCode: 429,
-      code: 'agent_quota_exceeded',
-      message: `Agent creation limit reached (${nativeAgentLimit} native agents)`,
-    };
-  }
-  return null;
 }
 
 export interface AgentsRoutesOptions {
@@ -961,11 +938,6 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     // Fail fast (503) when the gateway is unconfigured — before any rows land.
     void app.gatewayGlue.provisioner;
     const agentRuntime = await runtimeForModel(body.model);
-    const quotaError = await nativeAgentQuotaError(viewer);
-    if (quotaError) {
-      return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
-    }
-
     // Friendly pre-check; the citext unique constraint is the real guard.
     const taken = await resolveAccountByUsername(body.username, { includeDeleted: true });
     if (taken) {
@@ -975,6 +947,14 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     let created: { account: Account; agent: Agent };
     try {
       created = await db.transaction(async (tx) => {
+        // This lock + count + inserts are one transaction. Concurrent create
+        // and import requests for the same owner cannot all pass a stale
+        // route-level count and exceed the durable quota.
+        await assertNativeAgentCreationAllowed(
+          tx,
+          viewer,
+          getEnv().MAX_NATIVE_AGENTS_PER_USER,
+        );
         const [account] = await tx
           .insert(accounts)
           .values({ type: 'agent', username: body.username })
@@ -1034,11 +1014,6 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     const thinkingLevel = bundleAgent.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL;
     const toolGroups = agentToolGroupsSchema.parse(bundleAgent.toolGroups ?? DEFAULT_AGENT_TOOL_GROUPS);
 
-    const quotaError = await nativeAgentQuotaError(viewer);
-    if (quotaError) {
-      return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
-    }
-
     const taken = await resolveAccountByUsername(username, { includeDeleted: true });
     if (taken) {
       return sendError(reply, 409, 'username_taken', `Username "${username}" is taken`);
@@ -1047,6 +1022,11 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     let created: { account: Account; agent: Agent };
     try {
       created = await db.transaction(async (tx) => {
+        await assertNativeAgentCreationAllowed(
+          tx,
+          viewer,
+          getEnv().MAX_NATIVE_AGENTS_PER_USER,
+        );
         const [account] = await tx
           .insert(accounts)
           .values({ type: 'agent', username })

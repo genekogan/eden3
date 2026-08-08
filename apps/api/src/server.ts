@@ -13,14 +13,23 @@ import Fastify, {
 } from 'fastify';
 import { ZodError } from 'zod';
 
-import { registerAuth, type AuthPluginOptions } from './auth-plugin';
+import {
+  authenticateServiceCallbackRequest,
+  isAuthenticatedServiceCallbackRequest,
+  isServiceAuthenticatedCallbackRequest,
+  registerAuth,
+  type AuthPluginOptions,
+} from './auth-plugin';
 import { ApiError, errorEnvelope } from './errors';
 import { EventsBus, sessionEventsRoutes } from './events-bus';
 import { GatewayGlue, defaultOpenclawDataDir, type GatewayGlueOptions } from './gateway-glue';
 import { TurnConcurrencyLimiter } from './services/chat-limits';
 import { ensureBuiltinSkills } from './services/agent-skills';
 import { ensureEveAssistant } from './services/default-assistant';
-import { registerHttpHardening } from './services/http-hardening';
+import {
+  registerAccountRateLimiting,
+  registerHttpHardening,
+} from './services/http-hardening';
 import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './services/history-sync';
 import { AgentProvisioningWorker } from './services/agent-provisioning';
 import { AgentRuntimeSyncScheduler } from './services/agent-runtime-sync';
@@ -187,6 +196,10 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     bodyLimit: env.API_BODY_LIMIT_BYTES,
     disableRequestLogging: true, // replaced by structured redacted logging below
     forceCloseConnections: true, // don't let open SSE sockets block close()
+    // Caddy is the only production ingress and reaches the API on loopback.
+    // Trust no forwarding header from a non-loopback immediate peer.
+    trustProxy: (address) =>
+      address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1',
   });
 
   app.addHook('onRequest', async (req, reply) => {
@@ -262,6 +275,10 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
 
   registerHttpHardening(app, {
     rateLimit: { windowMs: env.API_RATE_LIMIT_WINDOW_MS, max: env.API_RATE_LIMIT_MAX },
+    serviceCallbackAdmission: async (request, reply) =>
+      isServiceAuthenticatedCallbackRequest(request)
+        ? authenticateServiceCallbackRequest(request, reply)
+        : false,
   });
 
   await app.register(fastifyCors, {
@@ -340,6 +357,13 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
 
   // Auth (request.account + app.requireAuth) — root scope, before routes.
   registerAuth(app, opts.auth);
+  registerAccountRateLimiting(app, {
+    rateLimit: {
+      windowMs: env.API_ACCOUNT_RATE_LIMIT_WINDOW_MS,
+      max: env.API_ACCOUNT_RATE_LIMIT_MAX,
+    },
+    bypass: isAuthenticatedServiceCallbackRequest,
+  });
 
   // Per-session SSE bus + its endpoint (GET /sessions/:id/events).
   app.decorate('eventsBus', new EventsBus());

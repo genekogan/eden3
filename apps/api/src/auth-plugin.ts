@@ -5,8 +5,13 @@ import type {
   FastifyRequest,
 } from 'fastify';
 
-import { ClerkAuthProvider, FallbackAuthProvider } from './clerk-auth-provider';
+import {
+  ClerkAuthProvider,
+  ClerkSignupRateLimitError,
+  FallbackAuthProvider,
+} from './clerk-auth-provider';
 import { sendError } from './errors';
+import { FixedWindowRateLimiter } from './services/http-hardening';
 
 /**
  * Auth wiring.
@@ -24,6 +29,7 @@ import { sendError } from './errors';
  */
 
 const SERVICE_CALLBACK_GUARD: unique symbol = Symbol('eden.service-callback-guard');
+const authenticatedServiceCallbacks = new WeakSet<FastifyRequest>();
 type ServiceCallbackGuard = (
   request: FastifyRequest,
   reply: FastifyReply,
@@ -59,6 +65,33 @@ export function serviceAuthenticatedCallback(guard: ServiceCallbackGuard) {
   return {
     config: { [SERVICE_CALLBACK_GUARD]: guard },
   } as const;
+}
+
+/** Read-only check for the opaque route/guard binding; callers cannot mint it. */
+export function isServiceAuthenticatedCallbackRequest(request: FastifyRequest): boolean {
+  return typeof request.routeOptions.config[SERVICE_CALLBACK_GUARD] === 'function';
+}
+
+/**
+ * Execute the opaque route-bound credential guard exactly once. The network
+ * limiter calls this at the root before granting a service-only bypass;
+ * registerAuth calls it as a fallback when no limiter is installed.
+ */
+export async function authenticateServiceCallbackRequest(
+  request: FastifyRequest,
+  reply: FastifyReply,
+): Promise<boolean> {
+  const guard = request.routeOptions.config[SERVICE_CALLBACK_GUARD];
+  if (!guard) return false;
+  if (!authenticatedServiceCallbacks.has(request)) {
+    await guard(request, reply);
+    if (!reply.sent) authenticatedServiceCallbacks.add(request);
+  }
+  return authenticatedServiceCallbacks.has(request);
+}
+
+export function isAuthenticatedServiceCallbackRequest(request: FastifyRequest): boolean {
+  return authenticatedServiceCallbacks.has(request);
 }
 
 /**
@@ -98,12 +131,18 @@ function defaultAuthProvider(opts: { allowAccountCreation: boolean }): AuthProvi
   const dev = new DevAuthProvider({ adminUsernames: env.ADMIN_USERNAMES });
   if (env.AUTH_PROVIDER === 'dev') return dev;
 
+  const signupLimiter = new FixedWindowRateLimiter({
+    windowMs: env.CLERK_SIGNUP_RATE_LIMIT_WINDOW_MS,
+    max: env.CLERK_SIGNUP_RATE_LIMIT_MAX,
+  });
+
   const clerk = new ClerkAuthProvider({
     adminUsernames: env.ADMIN_USERNAMES,
     allowAccountCreation: opts.allowAccountCreation,
     authorizedParties: env.CLERK_AUTHORIZED_PARTIES,
     jwtKey: env.CLERK_JWT_KEY,
     seedManna: env.CLERK_NEW_USER_SEED_MANNA,
+    signupAdmission: ({ clientIp }) => signupLimiter.hit(`signup-ip:${clientIp}`),
   });
   return env.AUTH_PROVIDER === 'hybrid' ? new FallbackAuthProvider([clerk, dev]) : clerk;
 }
@@ -146,15 +185,24 @@ export function registerAuth(app: FastifyInstance, opts: AuthPluginOptions = {})
 
   // DevAuthProvider short-circuits (no DB query) when the cookie is absent,
   // so anonymous traffic pays nothing here.
-  app.addHook('onRequest', async (req) => {
-    req.account = await provider.getSession(req);
+  app.addHook('onRequest', async (req, reply) => {
+    if (reply.sent || isAuthenticatedServiceCallbackRequest(req)) return;
+    try {
+      req.account = await provider.getSession(req);
+    } catch (err) {
+      if (err instanceof ClerkSignupRateLimitError) {
+        reply.header('retry-after', String(Math.max(1, Math.ceil(err.retryAfterMs / 1000))));
+        await sendError(reply, 429, 'rate_limited', 'Too many new accounts; retry later');
+        return;
+      }
+      throw err;
+    }
   });
 
   // Execute the opaque route-bound credential guard at the root, before any
   // plugin/route lifecycle hook can parse, validate, or mutate service data.
   app.addHook('onRequest', async (req, reply) => {
-    const guard = req.routeOptions.config[SERVICE_CALLBACK_GUARD];
-    if (guard) await guard(req, reply);
+    if (!reply.sent) await authenticateServiceCallbackRequest(req, reply);
   });
 
   if (allowlist.size > 0) {

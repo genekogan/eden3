@@ -17,6 +17,12 @@ export interface AuthSession {
 
 /** The subset of an incoming HTTP request auth needs (Fastify-compatible). */
 export interface AuthRequestLike {
+  /**
+   * Proxy-resolved client address when the HTTP framework supplies one.
+   * Callers must configure a narrow trusted-proxy boundary; auth code never
+   * derives this value from a raw forwarding header.
+   */
+  ip?: string;
   headers: {
     cookie?: string | string[] | undefined;
     [header: string]: string | string[] | undefined;

@@ -138,6 +138,14 @@ export const envSchema = z.object({
   API_RATE_LIMIT_WINDOW_MS: positiveIntSchema.default(60_000),
   /** Requests per client per fixed window. */
   API_RATE_LIMIT_MAX: nonnegativeIntSchema.default(600),
+  /** Fixed-window interval for authenticated per-account request admission. */
+  API_ACCOUNT_RATE_LIMIT_WINDOW_MS: positiveIntSchema.default(60_000),
+  /** Requests per authenticated account per fixed window. */
+  API_ACCOUNT_RATE_LIMIT_MAX: nonnegativeIntSchema.default(600),
+  /** Process-local burst window for genuinely new Clerk subjects from one client IP. */
+  CLERK_SIGNUP_RATE_LIMIT_WINDOW_MS: positiveIntSchema.default(60 * 60 * 1_000),
+  /** New Clerk accounts admitted from one client IP per process-local burst window. */
+  CLERK_SIGNUP_RATE_LIMIT_MAX: nonnegativeIntSchema.default(3),
   /** Stripe secret key; optional until billing routes are exercised. */
   STRIPE_SECRET_KEY: z.string().min(1).optional(),
   /** Closed-door billing mode. Live mode is introduced only by the later switch ceremony. */

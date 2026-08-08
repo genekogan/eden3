@@ -54,6 +54,18 @@ export interface ClerkAuthProviderOptions {
   afterAccountCreatedBeforeSeed?: (
     account: { id: string; username: string },
   ) => void | Promise<void>;
+  /** Process-local burst admission for a genuinely new subject. */
+  signupAdmission?: (input: {
+    clerkUserId: string;
+    clientIp: string;
+  }) => { allowed: boolean; retryAfterMs: number };
+}
+
+export class ClerkSignupRateLimitError extends Error {
+  constructor(readonly retryAfterMs: number) {
+    super('clerk_signup_rate_limited');
+    this.name = 'ClerkSignupRateLimitError';
+  }
 }
 
 interface AccountRow {
@@ -210,6 +222,8 @@ async function createClerkAccountWithSeed(
   clerkUserId: string,
   seedManna: number,
   afterAccountCreatedBeforeSeed?: ClerkAuthProviderOptions['afterAccountCreatedBeforeSeed'],
+  signupAdmission?: ClerkAuthProviderOptions['signupAdmission'],
+  clientIp = 'unknown',
 ): Promise<AccountRow> {
   return await db.transaction(async (tx) => {
     // Serialize first-session account creation and its signup grant across API
@@ -227,6 +241,11 @@ async function createClerkAccountWithSeed(
     `)) as unknown as AccountRow[];
     const existing = existingRows[0];
     if (existing) return existing;
+
+    const admission = signupAdmission?.({ clerkUserId, clientIp });
+    if (admission && !admission.allowed) {
+      throw new ClerkSignupRateLimitError(admission.retryAfterMs);
+    }
 
     const base = defaultClerkUsername(clerkUserId);
     for (let i = 0; i < 10; i += 1) {
@@ -276,12 +295,14 @@ export class ClerkAuthProvider implements AuthProvider {
   private readonly seedManna: number;
   private readonly verifyToken: ClerkTokenVerifier;
   private readonly afterAccountCreatedBeforeSeed?: ClerkAuthProviderOptions['afterAccountCreatedBeforeSeed'];
+  private readonly signupAdmission?: ClerkAuthProviderOptions['signupAdmission'];
 
   constructor(opts: ClerkAuthProviderOptions = {}) {
     this.adminUsernames = new Set((opts.adminUsernames ?? []).map((u) => u.toLowerCase()));
     this.allowAccountCreation = opts.allowAccountCreation ?? true;
     this.seedManna = opts.seedManna ?? DEFAULT_CLERK_NEW_USER_SEED_MANNA;
     this.afterAccountCreatedBeforeSeed = opts.afterAccountCreatedBeforeSeed;
+    this.signupAdmission = opts.signupAdmission;
     this.verifyToken =
       opts.verifyToken ??
       createClerkJwtVerifier({
@@ -314,6 +335,8 @@ export class ClerkAuthProvider implements AuthProvider {
         clerkUserId,
         this.seedManna,
         this.afterAccountCreatedBeforeSeed,
+        this.signupAdmission,
+        req.ip ?? 'unknown',
       ));
     if (account.deleted) return null;
 
