@@ -135,6 +135,9 @@ function textLength(args: Record<string, unknown>): number {
   return text.length;
 }
 
+const VIDEO_DURATION_SECONDS = { min: 2, max: 10, default: 5 } as const;
+const MUSIC_DURATION_SECONDS = { min: 5, max: 120, default: 30 } as const;
+
 /**
  * Image model tiers (repriced 2026-07-10): the default is the cheap
  * flux-dev route (34 manna — eden1's `create` averaged ~28 manna, so this
@@ -186,8 +189,13 @@ const STUDIO_METERING: Record<StudioToolName, StudioMeteringSpec> = {
     provider: 'fal',
     model: 'fal-ai/kling-video/v3/pro/text-to-video',
     unit: 'video_second',
-    defaultQuantity: 5,
-    quantityFromArgs: (args) => numericDuration(args, { fallback: 5, min: 2, max: 10 }),
+    defaultQuantity: VIDEO_DURATION_SECONDS.default,
+    quantityFromArgs: (args) =>
+      numericDuration(args, {
+        fallback: VIDEO_DURATION_SECONDS.default,
+        min: VIDEO_DURATION_SECONDS.min,
+        max: VIDEO_DURATION_SECONDS.max,
+      }),
   },
   music_generate: {
     action: 'music',
@@ -311,9 +319,9 @@ export const STUDIO_TOOLS = [
         duration: {
           type: 'number',
           description: 'Clip length in seconds.',
-          minimum: 2,
-          maximum: 10,
-          default: 5,
+          minimum: VIDEO_DURATION_SECONDS.min,
+          maximum: VIDEO_DURATION_SECONDS.max,
+          default: VIDEO_DURATION_SECONDS.default,
         },
       },
       required: ['prompt'],
@@ -332,9 +340,9 @@ export const STUDIO_TOOLS = [
         duration: {
           type: 'number',
           description: 'Track length in seconds.',
-          minimum: 5,
-          maximum: 120,
-          default: 30,
+          minimum: MUSIC_DURATION_SECONDS.min,
+          maximum: MUSIC_DURATION_SECONDS.max,
+          default: MUSIC_DURATION_SECONDS.default,
         },
       },
       required: ['prompt'],
@@ -355,21 +363,105 @@ export const STUDIO_TOOLS = [
 ] as const;
 
 // ---------------------------------------------------------------------------
-// Request schema
+// Request schema + provider-wire projection
 // ---------------------------------------------------------------------------
 
-const generateBodySchema = z.object({
-  tool: z.enum(STUDIO_TOOL_NAMES),
-  args: z
+const promptSchema = z.string().trim().min(1);
+const imageModelKeys = Object.keys(IMAGE_MODEL_OPTIONS) as [ImageModelKey, ...ImageModelKey[]];
+const imageModelKeySchema = z.enum(imageModelKeys);
+
+const generateBodySchema = z.discriminatedUnion('tool', [
+  z
     .object({
-      prompt: z.string().trim().min(1).optional(),
-      text: z.string().trim().min(1).optional(),
+      tool: z.literal('image_generate'),
+      args: z
+        .object({
+          prompt: promptSchema,
+          model: imageModelKeySchema.optional(),
+        })
+        .strict(),
     })
-    .passthrough()
-    .refine((args) => args.prompt !== undefined || args.text !== undefined, {
-      message: 'args.prompt (or args.text for tts) is required',
-    }),
-});
+    .strict(),
+  z
+    .object({
+      tool: z.literal('video_generate'),
+      args: z
+        .object({
+          prompt: promptSchema,
+          duration: z
+            .number()
+            .finite()
+            .min(VIDEO_DURATION_SECONDS.min)
+            .max(VIDEO_DURATION_SECONDS.max)
+            .optional(),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      tool: z.literal('music_generate'),
+      args: z
+        .object({
+          prompt: promptSchema,
+          // Lyria is billed per generated clip, not per second. Duration is
+          // nevertheless bounded to the exact UI contract before forwarding.
+          duration: z
+            .number()
+            .finite()
+            .min(MUSIC_DURATION_SECONDS.min)
+            .max(MUSIC_DURATION_SECONDS.max)
+            .optional(),
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
+      tool: z.literal('tts'),
+      args: z.object({ text: promptSchema }).strict(),
+    })
+    .strict(),
+]);
+
+export type StudioGenerationRequest = z.infer<typeof generateBodySchema>;
+
+/**
+ * The single API boundary for Studio args. Each tool gets a closed schema;
+ * defaults are canonicalized by both the quote and provider-wire projection,
+ * so both see the same duration/model choice. Unknown provider knobs never
+ * survive this function.
+ */
+export function parseStudioGenerationRequest(input: unknown): StudioGenerationRequest {
+  return generateBodySchema.parse(input);
+}
+
+/**
+ * Build the provider payload field-by-field. In particular, image callers
+ * supply only a catalog key; the wire receives only its canonical provider
+ * model reference. Never spread request args into a provider request here.
+ */
+export function studioProviderArgs(body: StudioGenerationRequest): Record<string, unknown> {
+  switch (body.tool) {
+    case 'image_generate':
+      return {
+        prompt: body.args.prompt,
+        model: IMAGE_MODEL_OPTIONS[body.args.model ?? DEFAULT_IMAGE_MODEL].openclawModel,
+      };
+    case 'video_generate':
+      return {
+        prompt: body.args.prompt,
+        duration: body.args.duration ?? VIDEO_DURATION_SECONDS.default,
+      };
+    case 'music_generate':
+      return {
+        prompt: body.args.prompt,
+        duration: body.args.duration ?? MUSIC_DURATION_SECONDS.default,
+      };
+    case 'tts':
+      return { text: body.args.text };
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Injectable dependencies
@@ -527,7 +619,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
 
   // --- POST /studio/quote -------------------------------------------------
   app.post('/quote', async (req, reply) => {
-    const body = generateBodySchema.parse(req.body);
+    const body = parseStudioGenerationRequest(req.body);
     try {
       return { quote: quoteStudioGeneration(body.tool, body.args) };
     } catch (err) {
@@ -543,7 +635,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
 
   // --- POST /studio/generate -----------------------------------------------
   app.post('/generate', { preHandler: app.requireAuth }, async (req, reply) => {
-    const body = generateBodySchema.parse(req.body);
+    const body = parseStudioGenerationRequest(req.body);
     const account = req.account;
     if (!account) return sendError(reply, 401, 'unauthorized', 'Authentication required');
 
@@ -791,15 +883,9 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       timeout.unref();
     });
     try {
-      // Image tier keys map to OpenClaw's per-request `model` override
-      // (provider/model ref) so the routed model matches the billed one.
-      const invokeArgs =
-        body.tool === 'image_generate'
-          ? { ...body.args, model: imageModelOption(body.args).openclawModel }
-          : body.args;
       const invoke = getToolsClient().invokeTool({
         tool: body.tool,
-        args: invokeArgs,
+        args: studioProviderArgs(body),
         agentId,
         sessionKey: gatewaySessionKey,
         signal: controller.signal,
