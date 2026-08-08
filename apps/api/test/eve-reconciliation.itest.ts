@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import { loadRootEnv, pg } from '@eden3/db';
-import { afterAll, afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { parseEveReconciliationArgs } from '../src/eve-reconcile';
 import { ensureEveAssistant } from '../src/services/default-assistant';
@@ -59,14 +59,12 @@ async function seedFixture(): Promise<Fixture> {
   if (platform) {
     restorePreexistingPlatform = true;
   } else {
-    [platform] = await pg<{ id: string }[]>`
-      insert into accounts (type, username, external_id)
-      values ('agent', 'eden', ${`${fixtureExternalPrefix}_${tag}_platform`})
-      returning id
-    `;
+    const created = await ensureEveAssistant({ syncWorkspace: false });
+    platform = { id: created.accountId };
     await pg`
-      insert into agents (account_id, owner_id, name, openclaw_id, provision_status)
-      values (${platform!.id}, null, 'Eden', 'main', 'ready')
+      update accounts
+      set external_id = ${`${fixtureExternalPrefix}_${tag}_platform`}
+      where id = ${platform.id}
     `;
   }
   // Canonicalize the platform agent through the real bootstrap, then recreate
@@ -384,6 +382,21 @@ describe('Eve collision reconciliation', () => {
     expect(await identityRows(fixture)).toEqual(before);
   });
 
+  it('releases local admission when reserving the advisory-lock connection fails', async () => {
+    const fixture = await seedFixture();
+    const reserve = vi.spyOn(pg, 'reserve').mockRejectedValueOnce(new Error('injected reserve outage'));
+    try {
+      await expect(reconcileEveCollision(fixture.input, { apply: true })).rejects.toThrow(
+        'injected reserve outage',
+      );
+    } finally {
+      reserve.mockRestore();
+    }
+    await expect(reconcileEveCollision(fixture.input, { apply: true })).resolves.toMatchObject({
+      state: 'bootstrapped',
+    });
+  });
+
   it('serializes concurrent identical runs and converges on one preserved result', async () => {
     const fixture = await seedFixture();
     let releaseFirst!: () => void;
@@ -398,9 +411,14 @@ describe('Eve collision reconciliation', () => {
       },
     });
     await committed;
-    const second = await reconcileEveCollision(fixture.input, { apply: true });
+    let secondSettled = false;
+    const secondAttempt = reconcileEveCollision(fixture.input, { apply: true }).finally(() => {
+      secondSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(secondSettled).toBe(false);
     releaseFirst();
-    const firstResult = await first;
+    const [firstResult, second] = await Promise.all([first, secondAttempt]);
 
     expect(second.state).toBe('bootstrapped');
     expect(firstResult.state).toBe('bootstrapped');

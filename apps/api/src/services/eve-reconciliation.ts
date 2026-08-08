@@ -38,18 +38,20 @@ async function acquireReconciliationLease(): Promise<() => Promise<void>> {
   });
   await predecessor;
 
-  const connection = await pg.reserve();
+  let connection: Awaited<ReturnType<typeof pg.reserve>> | undefined;
   let locked = false;
   try {
+    connection = await pg.reserve();
     await connection`
       select pg_advisory_lock(hashtextextended(${EVE_RECONCILIATION_ADVISORY_LOCK}, 0))
     `;
     locked = true;
   } catch (error) {
-    connection.release();
+    connection?.release();
     releaseLocal();
     throw error;
   }
+  const heldConnection = connection;
 
   let released = false;
   return async () => {
@@ -57,12 +59,12 @@ async function acquireReconciliationLease(): Promise<() => Promise<void>> {
     released = true;
     try {
       if (locked) {
-        await connection`
+        await heldConnection`
           select pg_advisory_unlock(hashtextextended(${EVE_RECONCILIATION_ADVISORY_LOCK}, 0))
         `;
       }
     } finally {
-      connection.release();
+      heldConnection.release();
       releaseLocal();
     }
   };
@@ -422,14 +424,11 @@ async function loadManifestSnapshot(
       // before this point and is observed, or waits until after this manifest's
       // linearization point.
       await sql`
-        select id from accounts
-        where id in (${input.expectedCollisionAccountId}, ${input.expectedPlatformAccountId})
-        for share
-      `;
-      await sql`
-        select account_id from agents
-        where account_id in (${input.expectedCollisionAccountId}, ${input.expectedPlatformAccountId})
-        for share
+        select a.id
+        from accounts a
+        join agents g on g.account_id = a.id
+        where a.id in (${input.expectedCollisionAccountId}, ${input.expectedPlatformAccountId})
+        for share of a, g
       `;
       return loadManifest(sql, input);
     },
