@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 
 import { loadRootEnv, pg } from '@eden3/db';
 import type { FastifyInstance } from 'fastify';
@@ -46,6 +48,7 @@ let wsNeighbor = '';
 const NOTES_CONTENT = '# Notes\nhello world\n';
 const notesSha = createHash('sha256').update(NOTES_CONTENT).digest('hex');
 const WRONG_SHA = 'a'.repeat(64);
+const execFileAsync = promisify(execFile);
 
 interface TreeBody {
   entries: { path: string; kind: 'file' | 'dir'; sizeBytes: number; mtime: string; sha256?: string }[];
@@ -460,6 +463,40 @@ describe('GET /agents/:username/workspace/export (zip)', () => {
     expect(raw).not.toContain('OUTSIDE SECRET');
     expect(raw).not.toContain('NEIGHBOR SECRET');
   });
+
+  it('exports the latest saved bytes rather than a stale workspace snapshot', async () => {
+    const created = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: { path: 'zip-latest.md', content: 'old bytes\n', baseSha256: 'new' },
+    });
+    expect(created.statusCode).toBe(200);
+    const firstSha = (created.json() as TextFileBody).file.sha256;
+    const latest = 'latest chosen bytes\n';
+    const saved = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentFiles)}/file`,
+      headers: asOwner,
+      payload: { path: 'zip-latest.md', content: latest, baseSha256: firstSha },
+    });
+    expect(saved.statusCode).toBe(200);
+
+    const exported = await app.inject({
+      method: 'GET',
+      url: `${treeUrl(agentFiles)}/export`,
+      headers: asOwner,
+    });
+    expect(exported.statusCode).toBe(200);
+    const archivePath = path.join(parentDir, 'latest-workspace.zip');
+    await writeFile(archivePath, exported.rawPayload);
+    const { stdout } = await execFileAsync('/usr/bin/unzip', [
+      '-p',
+      archivePath,
+      'zip-latest.md',
+    ]);
+    expect(stdout).toBe(latest);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -648,7 +685,7 @@ describe('PUT /agents/:username/workspace/file', () => {
     expect(afterClear!.persona).toBeNull();
   });
 
-  it('rejects doctrine-breaking direct file edits before touching disk or DB', async () => {
+  it('rejects doctrine-breaking SOUL edits and generated doctrine edits before touching disk or DB', async () => {
     const [beforeRow] = await pg<{ persona: string | null }[]>`
       select g.persona from agents g join accounts a on a.id = g.account_id
       where a.username = ${agentFiles}
@@ -693,7 +730,10 @@ describe('PUT /agents/:username/workspace/file', () => {
         baseSha256: identity.sha256,
       },
     });
-    expect(missingAnchors.statusCode).toBe(422);
+    expect(missingAnchors.statusCode).toBe(409);
+    expect((missingAnchors.json() as { error: { code: string } }).error.code).toBe(
+      'workspace_file_managed',
+    );
     expect(await readFile(path.join(wsFiles, 'IDENTITY.md'), 'utf8')).toBe(identity.content);
 
     const [row] = await pg<{ persona: string | null }[]>`
@@ -702,6 +742,24 @@ describe('PUT /agents/:username/workspace/file', () => {
     `;
     expect(row!.persona).toBe(beforeRow!.persona);
   });
+
+  it.each(['IDENTITY.md', 'AGENTS.md', 'USER.md', 'TOOLS.md', 'MEMORY.md', 'HEARTBEAT.md'])(
+    'keeps generated %s read-only while ordinary workspace files remain writable',
+    async (file) => {
+      const before = await readFile(path.join(wsFiles, file), 'utf8');
+      const response = await app.inject({
+        method: 'PUT',
+        url: `${treeUrl(agentFiles)}/file`,
+        headers: asOwner,
+        payload: { path: file, content: `${before}\nworkspace edit`, baseSha256: WRONG_SHA },
+      });
+      expect(response.statusCode).toBe(409);
+      expect((response.json() as { error: { code: string } }).error.code).toBe(
+        'workspace_file_managed',
+      );
+      expect(await readFile(path.join(wsFiles, file), 'utf8')).toBe(before);
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
