@@ -176,6 +176,41 @@ describe('DiscordByobService', () => {
     expect(JSON.stringify(result)).not.toContain('synthetic-secret-token');
   });
 
+  it('maps rejected provider promises to service-owned safe failures', async () => {
+    const service = new DiscordByobService(
+      {
+        getCurrentBot: vi.fn(async () => {
+          throw new Error('synthetic-secret-token');
+        }),
+      },
+      custody(),
+    );
+    const result = await service.connect({
+      accountId: 'account-1',
+      agentId: null,
+      token: 'synthetic-secret-token',
+    });
+    expect(result).toMatchObject({ ok: false, code: 'provider_unavailable' });
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret-token');
+  });
+
+  it('replaces rejected custody messages with a service-owned error', async () => {
+    const vault = custody();
+    vi.mocked(vault.sealScoped).mockRejectedValue(new Error('synthetic-secret-token'));
+    const service = new DiscordByobService(
+      {
+        getCurrentBot: vi.fn(async () => ({
+          ok: true,
+          bot: { id: '123456789', username: 'edenbot', displayName: null },
+        }) as const),
+      },
+      vault,
+    );
+    await expect(
+      service.connect({ accountId: 'account-1', agentId: null, token: 'synthetic-secret-token' }),
+    ).rejects.toThrow('channel credential custody failed');
+  });
+
   it('fails closed when custody returns a legacy unscoped reference', async () => {
     const vault = custody();
     vi.mocked(vault.sealScoped).mockResolvedValue({

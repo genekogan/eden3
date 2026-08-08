@@ -667,12 +667,26 @@ export function ChannelsClient({
           <EmptyState title="Couldn’t load connections" hint={note ?? undefined} action={<button type="button" onClick={() => void load()} className="rounded-lg border border-edge px-3 py-2 text-sm text-muted">Retry</button>} />
         </div>
       ) : agents.length === 0 ? (
-        <div className="mt-10">
+        <div className="mt-10 space-y-8">
           <EmptyState
             title="No agents yet"
-            hint="Connections give one of your agents a bot of its own — create an agent first."
+            hint={unassignedConnections.length || unassignedXConnections.length
+              ? "Create an agent to connect something new. Existing unassigned credentials remain available for revocation below."
+              : "Connections give one of your agents a bot of its own — create an agent first."}
             action={<a href="/agents/new" className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-sm text-accent-soft">Create an agent</a>}
           />
+          {unassignedConnections.length > 0 ? (
+            <section>
+              <h2 className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">Unassigned bot credentials</h2>
+              <ul className="mt-3 space-y-4">{unassignedConnections.map(renderConnection)}</ul>
+            </section>
+          ) : null}
+          {unassignedXConnections.length > 0 ? (
+            <section>
+              <h2 className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">Unassigned X app credentials</h2>
+              <ul className="mt-3 space-y-4">{unassignedXConnections.map(renderXConnection)}</ul>
+            </section>
+          ) : null}
         </div>
       ) : (
         <>

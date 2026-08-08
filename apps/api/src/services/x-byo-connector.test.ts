@@ -172,6 +172,39 @@ describe('XByoConnectorService', () => {
     });
     expect(JSON.stringify(result)).not.toContain('synthetic-api-secret');
   });
+
+  it('maps rejected provider and custody promises to service-owned errors', async () => {
+    const providerFailure = fixtures();
+    vi.mocked(providerFailure.client.validate).mockRejectedValue(
+      new Error('synthetic-api-secret'),
+    );
+    const validation = await new XByoConnectorService(
+      providerFailure.client,
+      providerFailure.custody,
+    ).connect({ accountId: 'account-1', agentId: null, credentials: CREDENTIALS });
+    expect(validation).toMatchObject({ ok: false, code: 'provider_unavailable' });
+    expect(JSON.stringify(validation)).not.toContain('synthetic-api-secret');
+
+    const custodyFailure = fixtures();
+    vi.mocked(custodyFailure.custody.sealScoped).mockRejectedValue(
+      new Error('synthetic-api-secret'),
+    );
+    await expect(
+      new XByoConnectorService(custodyFailure.client, custodyFailure.custody).connect({
+        accountId: 'account-1',
+        agentId: null,
+        credentials: CREDENTIALS,
+      }),
+    ).rejects.toThrow('channel credential custody failed');
+  });
+
+  it('maps rejected posting promises to a service-owned safe failure', async () => {
+    const { custody, client } = fixtures();
+    vi.mocked(client.post).mockRejectedValue(new Error('synthetic-api-secret'));
+    const result = await new XByoConnectorService(client, custody).post(HANDLE, 'hello');
+    expect(result).toMatchObject({ ok: false, code: 'provider_unavailable' });
+    expect(JSON.stringify(result)).not.toContain('synthetic-api-secret');
+  });
 });
 
 describe('FetchXUserClient', () => {
