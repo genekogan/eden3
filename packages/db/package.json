@@ -5,13 +5,13 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./catalog-lock": "./src/catalog-lock.ts",
     "./schema": "./src/schema.ts",
     "./client": "./src/client.ts"
   },
   "scripts": {
     "generate": "drizzle-kit generate",
-    "migrate": "drizzle-kit migrate",
-    "push": "drizzle-kit push",
+    "migrate": "tsx src/migrate.ts",
     "studio": "drizzle-kit studio",
     "ping": "tsx src/ping.ts",
     "ready": "tsx src/ready.ts",
