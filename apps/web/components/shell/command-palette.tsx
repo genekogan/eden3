@@ -13,7 +13,7 @@
 import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
-import type { StudioTool } from "@/lib/types";
+import type { OwnedSearchResultDto, StudioTool } from "@/lib/types";
 import { createOntologyRegistry, resolveOntologyRegistry } from "@/lib/ontology";
 import { isEveConfigurationHref } from "@/lib/eve";
 import { AgentAvatar } from "@/components/agent-avatar";
@@ -23,7 +23,7 @@ import {
   buildPaletteCommands,
   clampPaletteIndex,
   dispatchPaletteCommand,
-  filterPaletteCommands,
+  mergePaletteResults,
   movePaletteIndex,
   type PaletteCommand,
   type PaletteMoveKey,
@@ -50,6 +50,8 @@ export function CommandPalette() {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [tools, setTools] = useState<StudioTool[]>([]);
+  const [contentResults, setContentResults] = useState<OwnedSearchResultDto[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
 
@@ -82,6 +84,37 @@ export function CommandPalette() {
     return () => window.clearTimeout(timer);
   }, [open]);
 
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!open || viewer === null || trimmed.length === 0) {
+      setContentResults([]);
+      setSearchLoading(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    setContentResults([]);
+    setSearchLoading(true);
+    const timer = window.setTimeout(() => {
+      void api.search
+        .owned(trimmed, { signal: controller.signal })
+        .then((response) => {
+          if (!controller.signal.aborted) setContentResults(response.items);
+        })
+        .catch(() => {
+          // Static ontology results remain usable when search is unavailable.
+          if (!controller.signal.aborted) setContentResults([]);
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearchLoading(false);
+        });
+    }, 160);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, query, viewer]);
+
   const commands = useMemo<PaletteCommand[]>(() => {
     const registry = createOntologyRegistry({
       tools: tools.map((tool) => ({
@@ -113,8 +146,8 @@ export function CommandPalette() {
   }, [pathname, username, agents, tools, viewer, canManage]);
 
   const results = useMemo(() => {
-    return filterPaletteCommands(commands, query);
-  }, [query, commands]);
+    return mergePaletteResults(commands, contentResults, query);
+  }, [query, commands, contentResults]);
 
   const clamped = clampPaletteIndex(activeIndex, results.length);
 
@@ -200,6 +233,7 @@ export function CommandPalette() {
           aria-label="Command palette search"
           role="combobox"
           aria-expanded
+          aria-busy={searchLoading || undefined}
           aria-controls="command-palette-list"
           aria-activedescendant={
             results[clamped] ? `command-${results[clamped].item.id}` : undefined
@@ -247,7 +281,7 @@ export function CommandPalette() {
           )}
         </ul>
         <p className="border-t border-edge px-4 py-2 text-[10px] text-faint">
-          ↑↓ navigate · ↵ open · esc close
+          {searchLoading ? "Searching your content…" : "↑↓ navigate · ↵ open · esc close"}
         </p>
       </div>
     </div>

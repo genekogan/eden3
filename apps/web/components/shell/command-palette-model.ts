@@ -1,5 +1,6 @@
 import { fuzzyFilter, type FuzzyResult } from "../../lib/fuzzy";
 import { agentSectionHref } from "../../lib/eve";
+import type { OwnedSearchResultDto } from "../../lib/types";
 import type {
   ResolvedOntologyEntry,
   ResolvedOntologyTarget,
@@ -120,6 +121,57 @@ export function filterPaletteCommands(
   }
   results.sort((left, right) => right.score - left.score);
   return results.slice(0, limit);
+}
+
+const SEARCH_KIND_HINT: Record<OwnedSearchResultDto["kind"], string> = {
+  agent: "Agent",
+  session: "Chat",
+  creation: "Creation",
+  collection: "Collection",
+  task: "Task",
+};
+
+export function searchResultToPaletteCommand(
+  result: OwnedSearchResultDto,
+): PaletteCommand {
+  return {
+    id: `content.${result.kind}.${result.id}`,
+    label: result.label,
+    keywords: result.description ?? "",
+    hint: SEARCH_KIND_HINT[result.kind],
+    target: result.target,
+  };
+}
+
+function commandTargetKey(command: PaletteCommand): string {
+  return command.target.type === "navigate"
+    ? `navigate:${command.target.href}`
+    : `execute:${command.target.action}`;
+}
+
+/** Merge live owned content with ontology rows, ranking before target dedupe. */
+export function mergePaletteResults(
+  commands: readonly PaletteCommand[],
+  content: readonly OwnedSearchResultDto[],
+  query: string,
+  limit = PALETTE_RESULT_LIMIT,
+): FuzzyResult<PaletteCommand>[] {
+  if (limit <= 0) return [];
+  const scored = filterPaletteCommands(
+    [...commands, ...content.map(searchResultToPaletteCommand)],
+    query,
+    commands.length + content.length,
+  );
+  const seenTargets = new Set<string>();
+  const merged: FuzzyResult<PaletteCommand>[] = [];
+  for (const result of scored) {
+    const key = commandTargetKey(result.item);
+    if (seenTargets.has(key)) continue;
+    seenTargets.add(key);
+    merged.push(result);
+    if (merged.length === limit) break;
+  }
+  return merged;
 }
 
 export type PaletteMoveKey = "ArrowDown" | "ArrowUp" | "Home" | "End";

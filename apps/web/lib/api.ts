@@ -65,6 +65,7 @@ import type {
   Paginated,
   OperatorHealth,
   OperatorUsageSummary,
+  OwnedSearchResponseDto,
   UserUsageSummary,
   AgentSkillsResponse,
   SessionDetail,
@@ -491,6 +492,19 @@ export const api = {
     /** GET /api/account/export — complete owner-scoped account ZIP. */
     exportBundle(): Promise<Blob> {
       return apiBlob("/account/export");
+    },
+  },
+
+  search: {
+    /** GET /api/search?q= — committed content owned by the current viewer. */
+    owned(
+      q: string,
+      options: { signal?: AbortSignal; limit?: number } = {},
+    ): Promise<OwnedSearchResponseDto> {
+      return apiFetch<OwnedSearchResponseDto>(
+        `/search${qs({ q, limit: options.limit })}`,
+        { signal: options.signal },
+      );
     },
   },
 

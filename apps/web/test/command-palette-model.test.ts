@@ -4,6 +4,7 @@ import {
   clampPaletteIndex,
   dispatchPaletteCommand,
   filterPaletteCommands,
+  mergePaletteResults,
   movePaletteIndex,
   PALETTE_RESULT_LIMIT,
 } from "../components/shell/command-palette-model";
@@ -107,6 +108,58 @@ describe("command palette model", () => {
     expect(filterPaletteCommands(commands, "")).toHaveLength(PALETTE_RESULT_LIMIT);
     expect(filterPaletteCommands(commands, "shared")).toHaveLength(PALETTE_RESULT_LIMIT);
     expect(filterPaletteCommands(commands, "shared", 7)).toHaveLength(7);
+  });
+
+  it("merges owned content, ranks exact labels, and dedupes canonical targets", () => {
+    const staticCommands = [
+      {
+        id: "static.agent.ada",
+        label: "Open Ada agent",
+        keywords: "ada profile",
+        target: { type: "navigate" as const, href: "/agents/ada/chats" as const },
+      },
+      {
+        id: "static.plan",
+        label: "Planning tools",
+        keywords: "quarterly plan",
+        target: { type: "navigate" as const, href: "/studio" as const },
+      },
+    ];
+    const content = [
+      {
+        id: "00000000-0000-4000-8000-000000000001",
+        kind: "agent" as const,
+        label: "Ada",
+        description: "Research agent",
+        updatedAt: "2026-08-08T00:00:00.000Z",
+        target: { type: "navigate" as const, href: "/agents/ada/chats" as const },
+      },
+      {
+        id: "00000000-0000-4000-8000-000000000002",
+        kind: "collection" as const,
+        label: "Quarterly plan",
+        description: "Reference images",
+        updatedAt: "2026-08-08T00:00:00.000Z",
+        target: {
+          type: "navigate" as const,
+          href: "/collections/00000000-0000-4000-8000-000000000002" as const,
+        },
+      },
+    ];
+
+    const ada = mergePaletteResults(staticCommands, content, "ada");
+    expect(ada[0]?.item.id).toBe("content.agent.00000000-0000-4000-8000-000000000001");
+    expect(
+      ada.filter((result) => result.item.target.type === "navigate" && result.item.target.href === "/agents/ada/chats"),
+    ).toHaveLength(1);
+
+    const plan = mergePaletteResults(staticCommands, content, "quarterly plan");
+    expect(plan[0]?.item.id).toBe(
+      "content.collection.00000000-0000-4000-8000-000000000002",
+    );
+    expect(mergePaletteResults(staticCommands, [], "quarterly plan")).toEqual(
+      filterPaletteCommands(staticCommands, "quarterly plan"),
+    );
   });
 
   it("moves selection across keyboard boundaries, including an empty list", () => {
