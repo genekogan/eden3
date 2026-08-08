@@ -833,10 +833,16 @@ async function runClaimedTurn(
   // none of the shared reservation and must never reverse the winner's money.
   let providerStartAcquired: boolean;
   try {
-    providerStartAcquired = await claimTurnProviderStart(turnId);
+    providerStartAcquired = await claimTurnProviderStart(turnId, {
+      ...(params.fundingFence ? { fence: params.fundingFence } : {}),
+    });
   } catch (err) {
     try {
-      await reverseTurnAuthorization({ turnId, refundType });
+      await reverseTurnAuthorization({
+        turnId,
+        refundType,
+        ...(params.fundingFence ? { fence: params.fundingFence } : {}),
+      });
     } catch (reverseErr) {
       onError(reverseErr, 'turn reservation reversal (provider-start failure)');
     }
@@ -961,6 +967,7 @@ async function runClaimedTurn(
         errorCode: outcome.errorCode ?? 'provider_stream_interrupted_after_output',
         errorMessage:
           outcome.errorMessage ?? 'Provider stream ended after emitting usable output',
+        ...(params.fundingFence ? { fence: params.fundingFence } : {}),
       });
       if (!partial.eligible) return false;
       usageEventRecorded = true;
@@ -1158,7 +1165,9 @@ async function runClaimedTurn(
             // Durable before emit: once value can reach a client, a later
             // explicit error or crash follows full-reserve-v1 instead of
             // returning a useful prefix for free. One DB roundtrip per turn.
-            await markTurnUsableOutput(turnId);
+            await markTurnUsableOutput(turnId, {
+              ...(params.fundingFence ? { fence: params.fundingFence } : {}),
+            });
             usableOutputMarked = true;
           }
           publish({ type: 'token', turnId, delta: event.delta });
