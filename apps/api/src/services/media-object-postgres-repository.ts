@@ -91,6 +91,7 @@ export class PostgresMediaObjectRepository implements MediaObjectRepository {
                      )
                    )
                  )
+             )
              end as share_reference_active
       from storage_objects o
       where o.id = ${objectId}
