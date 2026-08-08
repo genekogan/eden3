@@ -46,7 +46,7 @@ function store(): AccountErasureIntentStore {
       acceptedAt: ACCEPTED_AT,
       state: 'intent_pending' as const,
     })),
-    sealAfterLedgerConfirmation: vi.fn(async () => ({
+    sealUnclaimedAfterLedgerConfirmation: vi.fn(async () => ({
       jobId: JOB_ID,
       accountId: ACTOR_ID,
       status: 'recovery_manifest_pending' as const,
@@ -124,7 +124,7 @@ describe('account erasure admission and ledger ordering', () => {
       calls.push('ledger');
       return { record, confirmedAt: CONFIRMED_AT, sha256: HASH, macSha256: MAC };
     });
-    vi.mocked(repository.sealAfterLedgerConfirmation).mockImplementation(async () => {
+    vi.mocked(repository.sealUnclaimedAfterLedgerConfirmation).mockImplementation(async () => {
       calls.push('seal');
       return {
         jobId: JOB_ID,
@@ -172,7 +172,7 @@ describe('account erasure admission and ledger ordering', () => {
       accountId: ACTOR_ID,
       acceptedAt: ACCEPTED_AT,
     });
-    expect(repository.sealAfterLedgerConfirmation).toHaveBeenCalledWith({
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).toHaveBeenCalledWith({
       jobId: JOB_ID,
       accountId: ACTOR_ID,
       acceptedAt: ACCEPTED_AT,
@@ -199,7 +199,7 @@ describe('account erasure admission and ledger ordering', () => {
     await expect(requestAccountErasure(request(), repository, ledger, recovery)).rejects.toThrow(
       'ledger unavailable',
     );
-    expect(repository.sealAfterLedgerConfirmation).not.toHaveBeenCalled();
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
   });
 
   it('keeps cleanup unclaimable until the separate encrypted recovery manifest confirms', async () => {
@@ -213,9 +213,9 @@ describe('account erasure admission and ledger ordering', () => {
     await expect(
       requestAccountErasure(request(), repository, ledger, recovery),
     ).rejects.toThrow('dedicated recovery sink unavailable');
-    expect(repository.sealAfterLedgerConfirmation).toHaveBeenCalledTimes(1);
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).toHaveBeenCalledTimes(1);
     expect(repository.confirmRecoveryManifestUnclaimed).not.toHaveBeenCalled();
-    expect(JSON.stringify(vi.mocked(repository.sealAfterLedgerConfirmation).mock.calls)).not.toContain(
+    expect(JSON.stringify(vi.mocked(repository.sealUnclaimedAfterLedgerConfirmation).mock.calls)).not.toContain(
       SECRET_LOCATOR,
     );
   });
@@ -256,14 +256,14 @@ describe('account erasure admission and ledger ordering', () => {
       statusCode: 503,
       code: 'erasure_ledger_mismatch',
     } satisfies Partial<ApiError>);
-    expect(repository.sealAfterLedgerConfirmation).not.toHaveBeenCalled();
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
   });
 
   it('converges after a crash between confirmed ledger and transaction 2', async () => {
     const repository = store();
     const ledger = sink();
     const recovery = manifestSink();
-    vi.mocked(repository.sealAfterLedgerConfirmation)
+    vi.mocked(repository.sealUnclaimedAfterLedgerConfirmation)
       .mockRejectedValueOnce(new Error('process died before tx2'))
       .mockResolvedValueOnce({
         jobId: JOB_ID,
@@ -284,7 +284,7 @@ describe('account erasure admission and ledger ordering', () => {
     expect(vi.mocked(ledger.writeAndConfirm).mock.calls[0]?.[0]).toEqual(
       vi.mocked(ledger.writeAndConfirm).mock.calls[1]?.[0],
     );
-    expect(repository.sealAfterLedgerConfirmation).toHaveBeenCalledTimes(2);
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).toHaveBeenCalledTimes(2);
   });
 
   it('rejects malformed integrity evidence before transaction 2', async () => {
@@ -301,7 +301,7 @@ describe('account erasure admission and ledger ordering', () => {
       statusCode: 503,
       code: 'erasure_ledger_mismatch',
     } satisfies Partial<ApiError>);
-    expect(repository.sealAfterLedgerConfirmation).not.toHaveBeenCalled();
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
   });
 
   it('refuses admin self-erasure before intent or sink mutation', async () => {
@@ -400,8 +400,52 @@ describe('account erasure autonomous recovery', () => {
         claimExpiresAt: CLAIM_EXPIRES_AT,
       }),
     );
-    expect(repository.sealAfterLedgerConfirmation).not.toHaveBeenCalled();
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
     expect(repository.recordRecoveryFailure).not.toHaveBeenCalled();
+  });
+
+  it('makes a route stale when a worker claims after the initial WORM write', async () => {
+    const repository = recoveryStore();
+    const routeLedger = sink();
+    const routeManifest = manifestSink();
+    let ledgerWritten!: () => void;
+    const written = new Promise<void>((resolve) => {
+      ledgerWritten = resolve;
+    });
+    let releaseReadback!: () => void;
+    vi.mocked(routeLedger.writeAndConfirm).mockImplementation(
+      (record) =>
+        new Promise((resolve) => {
+          ledgerWritten();
+          releaseReadback = () =>
+            resolve({ record, confirmedAt: CONFIRMED_AT, sha256: HASH, macSha256: MAC });
+        }),
+    );
+    vi.mocked(repository.sealUnclaimedAfterLedgerConfirmation).mockResolvedValue({
+      jobId: JOB_ID,
+      status: 'stale',
+    });
+
+    const route = requestAccountErasure(request(), repository, routeLedger, routeManifest);
+    await written;
+    const worker = new AccountErasureRecoveryWorker(
+      repository,
+      sink(),
+      manifestSink(),
+      1,
+    );
+    await expect(worker.tick()).resolves.toMatchObject({ claimed: 1, sealed: 1, stale: 0 });
+    releaseReadback();
+
+    await expect(route).rejects.toMatchObject({
+      statusCode: 409,
+      code: 'erasure_recovery_claimed',
+    } satisfies Partial<ApiError>);
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).toHaveBeenCalledTimes(1);
+    expect(routeManifest.encryptWriteAndConfirm).not.toHaveBeenCalled();
+    expect(repository.confirmRecoveryManifestUnclaimed).not.toHaveBeenCalled();
+    expect(repository.sealClaimedAfterLedgerConfirmation).toHaveBeenCalledTimes(1);
+    expect(repository.confirmClaimedRecoveryManifest).toHaveBeenCalledTimes(1);
   });
 
   it('records a safe durable failure for autonomous retry without raw errors', async () => {

@@ -100,17 +100,17 @@ export interface AccountErasureIntentStore {
   }): Promise<AccountErasureIntent>;
 
   /**
-   * Transaction 2: verify the confirmed ledger evidence, inventory current
-   * rows, reconcile money, revoke access, and seal the account atomically.
+   * Route-only transaction 2 CAS. It may mutate only exact `intent_pending`
+   * with no live claim token/expiry; a worker-owned or advanced job is stale.
    */
-  sealAfterLedgerConfirmation(input: {
+  sealUnclaimedAfterLedgerConfirmation(input: {
     jobId: string;
     accountId: string;
     acceptedAt: string;
     confirmedAt: string;
     ledgerSha256: string;
     ledgerMacSha256: string;
-  }): Promise<AccountErasureSealedInventory>;
+  }): Promise<AccountErasureClaimResult>;
 
   /** Route-only CAS: refuses a live recovery claim and makes cleanup claimable. */
   confirmRecoveryManifestUnclaimed(input: {
@@ -281,9 +281,12 @@ export async function requestAccountErasure(
   if (intent.accountId !== input.actorAccountId) {
     throw new ApiError(503, 'erasure_intent_mismatch', 'Account erasure intent did not match');
   }
-  const inventory = await store.sealAfterLedgerConfirmation(
+  const inventory = await store.sealUnclaimedAfterLedgerConfirmation(
     await confirmedLedgerInput(intent, ledger),
   );
+  if (inventory.status === 'stale') {
+    throw new ApiError(409, 'erasure_recovery_claimed', 'Account erasure recovery is in progress');
+  }
   const manifestConfirmation = await confirmedRecoveryManifest(
     inventory.recoveryManifest,
     recoveryManifestSink,
