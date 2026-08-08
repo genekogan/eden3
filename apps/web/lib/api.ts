@@ -155,6 +155,7 @@ async function toApiError(res: Response, path: string): Promise<ApiError> {
   } catch {
     /* non-JSON error body */
   }
+  const tokenBearingShareRequest = /^\/shares\/[^/?#]+/.test(path);
   const detail =
     body && typeof body === "object" && "message" in body
       ? String((body as { message: unknown }).message)
@@ -167,7 +168,13 @@ async function toApiError(res: Response, path: string): Promise<ApiError> {
         ? String(((body as { error: { message: unknown } }).error).message)
       : res.statusText;
   const safePath = path.replace(/^\/shares\/[^/?#]+/, "/shares/[redacted]");
-  return new ApiError(res.status, `${res.status} ${safePath}: ${detail}`, body);
+  return new ApiError(
+    res.status,
+    tokenBearingShareRequest
+      ? `${res.status} ${safePath}: share lookup failed`
+      : `${res.status} ${safePath}: ${detail}`,
+    tokenBearingShareRequest ? undefined : body,
+  );
 }
 
 async function apiFetch<T>(

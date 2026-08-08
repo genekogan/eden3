@@ -1,5 +1,5 @@
-import { cache } from "react";
 import type { Metadata } from "next";
+import { unstable_noStore } from "next/cache";
 import { notFound } from "next/navigation";
 
 import { EmptyState } from "@/components/empty-state";
@@ -10,12 +10,24 @@ import { formatDateTime } from "@/lib/format";
 import type { PublicSessionShareDto } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
+export const fetchCache = "force-no-store";
+export const revalidate = 0;
+
+const description = "An unlisted conversation shared from Eden.";
+export const metadata: Metadata = {
+  title: "Shared conversation",
+  description,
+  referrer: "no-referrer",
+  robots: { index: false, follow: false, nocache: true },
+  openGraph: { title: "Shared conversation", description, type: "article" },
+};
 
 type Props = { params: Promise<{ token: string }> };
 
-const loadShare = cache((token: string): Promise<PublicSessionShareDto> => {
+function loadShare(token: string): Promise<PublicSessionShareDto> {
+  unstable_noStore();
   return api.shares.public(token);
-});
+}
 
 function decodeToken(raw: string): string {
   try {
@@ -28,26 +40,6 @@ function decodeToken(raw: string): string {
 function safeTitle(share: PublicSessionShareDto): string {
   const title = share.share.title ?? share.snapshot.sessionTitle ?? "Shared conversation";
   return title.length > 70 ? `${title.slice(0, 69)}…` : title;
-}
-
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const { token } = await params;
-  try {
-    const share = await loadShare(decodeToken(token));
-    const title = safeTitle(share);
-    const description = "An unlisted conversation shared from Eden.";
-    return {
-      title,
-      description,
-      robots: { index: false, follow: false, nocache: true },
-      openGraph: { title, description, type: "article" },
-    };
-  } catch {
-    return {
-      title: "Shared conversation",
-      robots: { index: false, follow: false, nocache: true },
-    };
-  }
 }
 
 export default async function SharedSessionPage({ params }: Props) {

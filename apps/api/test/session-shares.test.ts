@@ -3,6 +3,7 @@ import type {
   PublicSessionSnapshotDto,
   SessionShareSummaryDto,
 } from '@eden3/shared';
+import { readFile } from 'node:fs/promises';
 import Fastify from 'fastify';
 import { describe, expect, it } from 'vitest';
 
@@ -215,6 +216,9 @@ describe('session share service', () => {
     const app = Fastify();
     app.decorateRequest('account', null);
     app.decorate('requireAuth', async () => undefined);
+    app.addHook('onRequest', async (request) => {
+      request.account = { accountId: OWNER_ID, username: 'owner', isAdmin: false };
+    });
     await app.register(sessionShareRoutes, { repository });
 
     try {
@@ -225,6 +229,19 @@ describe('session share service', () => {
       expect(first.headers['surrogate-control']).toBe('no-store');
       expect(first.headers['referrer-policy']).toBe('no-referrer');
       expect(first.headers['x-robots-tag']).toContain('noindex');
+
+      const head = await app.inject({ method: 'HEAD', url: `/shares/${token}` });
+      expect(head.statusCode).toBe(200);
+      expect(head.headers['cache-control']).toContain('no-store');
+      expect(head.body).toBe('');
+
+      const managed = await app.inject({
+        method: 'GET',
+        url: `/sessions/${SESSION_ID}/shares`,
+      });
+      expect(managed.statusCode).toBe(200);
+      expect(managed.headers['cache-control']).toContain('no-store');
+      expect(managed.body).not.toContain(token);
 
       await service.revoke(SESSION_ID, created.share.id, OWNER_ID);
       const revoked = await app.inject({ method: 'GET', url: `/shares/${token}` });
@@ -239,8 +256,27 @@ describe('session share service', () => {
       expect(wrong.statusCode).toBe(404);
       expect(wrong.body).not.toContain(wrongToken);
       expect(JSON.stringify(wrong.headers)).not.toContain(wrongToken);
+
+      const malformed = await app.inject({ method: 'GET', url: '/shares/short' });
+      expect(malformed.statusCode).toBe(404);
+      expect(malformed.headers['cache-control']).toContain('no-store');
+      expect(malformed.body).not.toContain('short');
     } finally {
       await app.close();
     }
+  });
+
+  it('keeps Postgres public resolution bound to active session ownership and creator state', async () => {
+    const source = await readFile(
+      new URL('../src/services/session-shares-postgres.ts', import.meta.url),
+      'utf8',
+    );
+    expect(source).toContain('join sessions s on s.id = sl.session_id');
+    expect(source).toContain('s.deleted = false');
+    expect(source).toContain('s.visible is distinct from false');
+    expect(source).toContain('session_owner.id = s.owner_id');
+    expect(source).toContain('session_owner.deleted = false');
+    expect(source).toContain('creator.id = sl.created_by');
+    expect(source).toContain('creator.deleted = false');
   });
 });

@@ -61,6 +61,7 @@ export class MediaObjectResolver {
     objectId: string,
     viewerAccountId: string | null,
     shareTokenHash: string | null = null,
+    requireShareReference = false,
   ): Promise<ResolvedMediaObject> {
     const row = await this.repository.findById(objectId, shareTokenHash);
     if (
@@ -77,7 +78,9 @@ export class MediaObjectResolver {
       throw notFound();
     }
     const publiclyReferenced = row.publicReferenceOwnerAccountId === row.ownerAccountId;
+    if (requireShareReference && !row.shareReferenceActive) throw notFound();
     if (
+      !requireShareReference &&
       viewerAccountId !== row.ownerAccountId &&
       !publiclyReferenced &&
       !row.shareReferenceActive

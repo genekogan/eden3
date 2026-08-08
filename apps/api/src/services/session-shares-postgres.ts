@@ -94,11 +94,13 @@ async function loadSnapshot(
   capturedAt: string,
 ): Promise<PublicSessionSnapshotDto | null> {
   const [session] = await tx<SessionRow[]>`
-    select id, title
-    from sessions
-    where id = ${sessionId}
-      and deleted = false
-      and visible is distinct from false
+    select s.id, s.title
+    from sessions s
+    join accounts session_owner on session_owner.id = s.owner_id
+      and session_owner.deleted = false
+    where s.id = ${sessionId}
+      and s.deleted = false
+      and s.visible is distinct from false
   `;
   if (!session) return null;
 
@@ -253,9 +255,16 @@ export class PostgresSessionShareRepository implements SessionShareRepository {
   async resolvePublic(tokenHash: string): Promise<PublicSessionShareDto | null> {
     return pg.begin('isolation level repeatable read read only', async (tx) => {
       const [row] = await tx<ShareRow[]>`
-        select id, session_id, mode, title, snapshot_payload, revoked_at, created_at
-        from session_share_links
-        where token_hash = ${tokenHash} and revoked_at is null
+        select sl.id, sl.session_id, sl.mode, sl.title, sl.snapshot_payload,
+               sl.revoked_at, sl.created_at
+        from session_share_links sl
+        join sessions s on s.id = sl.session_id
+          and s.deleted = false
+          and s.visible is distinct from false
+        join accounts session_owner on session_owner.id = s.owner_id
+          and session_owner.deleted = false
+        join accounts creator on creator.id = sl.created_by and creator.deleted = false
+        where sl.token_hash = ${tokenHash} and sl.revoked_at is null
         limit 1
       `;
       if (!row) return null;

@@ -55,8 +55,32 @@ export class PostgresMediaObjectRepository implements MediaObjectRepository {
              case when ${shareTokenHash}::text is null then false else exists (
                select 1
                from session_share_links sl
+               join sessions s on s.id = sl.session_id
+                 and s.deleted = false
+                 and s.visible is distinct from false
+               join accounts creator on creator.id = sl.created_by
+                 and creator.deleted = false
+               join accounts session_owner on session_owner.id = s.owner_id
+                 and session_owner.deleted = false
                where sl.token_hash = ${shareTokenHash}
                  and sl.revoked_at is null
+                 and exists (
+                   select 1 from accounts a
+                   where a.id = o.owner_account_id and a.deleted = false
+                 )
+                 and (
+                   s.owner_id = o.owner_account_id
+                   or exists (
+                     select 1 from session_users su
+                     where su.session_id = s.id
+                       and su.user_account_id = o.owner_account_id
+                   )
+                   or exists (
+                     select 1 from session_agents sa
+                     where sa.session_id = s.id
+                       and sa.agent_account_id = o.owner_account_id
+                   )
+                 )
                  and (
                    (
                      sl.mode = 'snapshot'

@@ -66,7 +66,7 @@ describe("session share journey model", () => {
     expect(error).toBeInstanceOf(ApiError);
     expect((error as Error).message).not.toContain(token);
     expect((error as Error).message).toContain("[redacted]");
-    expect(JSON.stringify((error as ApiError).body)).not.toContain(token);
+    expect(JSON.stringify((error as ApiError).body) ?? "").not.toContain(token);
     expect(requestInit?.cache).toBe("no-store");
   });
 });

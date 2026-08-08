@@ -166,7 +166,7 @@ export class SessionShareService {
   }
 
   async resolvePublic(token: string): Promise<PublicSessionShareDto | null> {
-    if (!/^[A-Za-z0-9_-]{32,}$/.test(token)) return null;
+    if (!/^[A-Za-z0-9_-]{32,200}$/.test(token)) return null;
     const result = await this.repository.resolvePublic(hashSessionShareToken(token));
     if (!result) return null;
     return scopePrivateMediaUrls(publicSessionShareDto.parse({

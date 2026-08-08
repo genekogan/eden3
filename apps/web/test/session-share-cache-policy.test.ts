@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 
 import { describe, expect, it } from "vitest";
 
+import nextConfig from "../next.config";
+
 describe("public session share cache and metadata boundary", () => {
   it("keeps every HTML/RSC render dynamic and token-referrer-safe", async () => {
     const source = await readFile(
@@ -19,13 +21,22 @@ describe("public session share cache and metadata boundary", () => {
   });
 
   it("adds fail-closed response headers to exact and nested token-bearing routes", async () => {
-    const source = await readFile(new URL("../next.config.ts", import.meta.url), "utf8");
-    expect(source).toContain('/share/:token/:path*');
-    expect(source).toContain('/_next/data/:buildId/share/:token.json');
-    expect(source).toContain('private, no-store, no-cache, max-age=0, must-revalidate');
-    expect(source).toContain('Referrer-Policy');
-    expect(source).toContain('no-referrer');
-    expect(source).toContain('X-Robots-Tag');
-    expect(source).toContain('noindex, nofollow, noarchive');
+    const rules = await nextConfig.headers?.();
+    expect(rules).toBeDefined();
+    expect(rules?.map((rule) => rule.source)).toEqual([
+      "/share/:token/:path*",
+      "/_next/data/:buildId/share/:token.json",
+    ]);
+    for (const rule of rules ?? []) {
+      expect(Object.fromEntries(rule.headers.map(({ key, value }) => [key, value]))).toEqual({
+        "Cache-Control": "private, no-store, no-cache, max-age=0, must-revalidate",
+        "CDN-Cache-Control": "no-store",
+        "Surrogate-Control": "no-store",
+        Pragma: "no-cache",
+        Expires: "0",
+        "Referrer-Policy": "no-referrer",
+        "X-Robots-Tag": "noindex, nofollow, noarchive",
+      });
+    }
   });
 });

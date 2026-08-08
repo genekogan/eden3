@@ -193,7 +193,8 @@ describe('GET /media/:objectId lifecycle boundary', () => {
     expect(shared.statusCode).toBe(200);
     expect(shared.body).toBe('0123456789');
     expect(repository.lastShareTokenHash).toBe(hashSessionShareToken(SHARE_TOKEN));
-    expect(shared.headers['cache-control']).toBe('private, no-store');
+    expect(shared.headers['cache-control']).toContain('private');
+    expect(shared.headers['cache-control']).toContain('no-store');
 
     repository.row = record({ shareReferenceActive: false });
     const revoked = await app.inject({

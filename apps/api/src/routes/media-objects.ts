@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { ApiError } from '../errors';
 import type { MediaObjectResolver } from '../services/media-object-repository';
 import { hashSessionShareToken } from '../services/session-shares';
+import { applyPrivateCapabilityHeaders } from '../services/share-cache-policy';
 
 export interface MediaObjectRoutesOptions {
   resolver: MediaObjectResolver;
@@ -18,7 +19,7 @@ const shareParamsSchema = paramsSchema.extend({
 const objectRoute =
   '/media/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
 const sharedObjectRoute =
-  '/media/share/:token(^[A-Za-z0-9_-]{32,200}$)/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
+  '/media/share/:token/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
 
 interface ByteRange {
   start: number;
@@ -49,21 +50,32 @@ function parseRange(value: string | undefined, size: number): ByteRange | null {
 
 export const mediaObjectRoutes: FastifyPluginAsync<MediaObjectRoutesOptions> = async (app, options) => {
   const handle = async (request: FastifyRequest, reply: FastifyReply) => {
-    const { objectId } = paramsSchema.parse(request.params);
     const rawParams = request.params as Record<string, unknown>;
-    const shareTokenHash =
-      typeof rawParams.token === 'string'
-        ? hashSessionShareToken(shareParamsSchema.parse(rawParams).token)
-        : null;
+    const sharedRequest = typeof rawParams.token === 'string';
+    if (sharedRequest) applyPrivateCapabilityHeaders(reply);
+    const { objectId } = paramsSchema.parse(request.params);
+    const sharedParams = sharedRequest ? shareParamsSchema.safeParse(rawParams) : null;
+    if (sharedRequest && !sharedParams?.success) {
+      throw new ApiError(404, 'media_object_not_found', 'Media object not found');
+    }
+    const shareTokenHash = sharedParams?.success
+      ? hashSessionShareToken(sharedParams.data.token)
+      : null;
     const resolved = await options.resolver.resolve(
       objectId,
       request.account?.accountId ?? null,
       shareTokenHash,
+      sharedRequest,
     );
     reply.header('accept-ranges', 'bytes');
     reply.header('content-type', resolved.mime);
     reply.header('etag', `"${resolved.sha256}"`);
-    reply.header('cache-control', resolved.publiclyReferenced ? 'public, max-age=31536000, immutable' : 'private, no-store');
+    if (!sharedRequest) {
+      reply.header(
+        'cache-control',
+        resolved.publiclyReferenced ? 'public, max-age=31536000, immutable' : 'private, no-store',
+      );
+    }
     const rawRange = request.headers.range;
     const range = parseRange(Array.isArray(rawRange) ? rawRange[0] : rawRange, resolved.sizeBytes);
     if (request.method === 'HEAD') {
