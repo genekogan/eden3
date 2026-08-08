@@ -91,6 +91,7 @@ let invokeCalls: Array<{
 let invokeError: Error | null = null;
 let invokeHang = false;
 let reversalError: Error | null = null;
+let forcedRequestId: string | null = null;
 let nextTtsFallback: TtsFallbackGenerator | null = null;
 const fakeToolsClient = {
   async invokeTool(params: {
@@ -189,6 +190,7 @@ beforeAll(async () => {
         if (reversalError) throw reversalError;
         return await reverseReservation(params);
       },
+      requestId: () => forcedRequestId ?? randomUUID(),
       ttsFallback: (params) => {
         if (nextTtsFallback === null) throw new Error('unexpected tts fallback');
         return nextTtsFallback(params);
@@ -676,13 +678,39 @@ describe('POST /studio/generate', () => {
           and error_code = 'refund_pending'
         order by created_at desc limit 1`;
       expect(usage).toEqual({
-        status: 'error',
+        status: 'refund_pending',
         manna: imageQuote.manna,
         errorCode: 'refund_pending',
       });
     } finally {
       invokeError = null;
       reversalError = null;
+    }
+  });
+
+  it('never reaches the provider when the durable authorization row is refused', async () => {
+    forcedRequestId = randomUUID();
+    invokeCalls = [];
+    const before = await getBalance(richUserId);
+    try {
+      await pg`
+        insert into usage_events (event_type, status, user_id, turn_id)
+        values ('studio_generation', 'error', ${richUserId}, ${forcedRequestId})`;
+      const res = await app.inject({
+        method: 'POST',
+        url: '/studio/generate',
+        headers: asUser(richUserId),
+        payload: { tool: 'image_generate', args: { prompt: 'must never run' } },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(invokeCalls).toHaveLength(0);
+      expect((await getBalance(richUserId)).total).toBe(before.total);
+      const [ledger] = await pg<{ count: string }[]>`
+        select count(*) from manna_transactions
+        where idempotency_key = ${`studio:${forcedRequestId}:reserve`}`;
+      expect(Number(ledger?.count ?? -1)).toBe(0);
+    } finally {
+      forcedRequestId = null;
     }
   });
 
