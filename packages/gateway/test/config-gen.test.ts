@@ -23,7 +23,9 @@ import {
   SANDBOX_EGRESS_NETWORK,
   SANDBOX_EGRESS_PROXY_URL,
   SANDBOX_MEDIA_IMAGE,
+  SANDBOX_MEMORY_LIMIT,
   SANDBOX_NO_PROXY,
+  SANDBOX_PIDS_LIMIT,
   SANDBOX_PRUNE_IDLE_HOURS,
   SANDBOX_PRUNE_MAX_AGE_DAYS,
   SANDBOX_SHARED_ASSETS_CONTAINER_DIR,
@@ -376,6 +378,9 @@ describe('ensureBaseline', () => {
             docker: {
               image: SANDBOX_MEDIA_IMAGE,
               network: SANDBOX_EGRESS_NETWORK,
+              memory: SANDBOX_MEMORY_LIMIT,
+              memorySwap: SANDBOX_MEMORY_LIMIT,
+              pidsLimit: SANDBOX_PIDS_LIMIT,
               dangerouslyAllowExternalBindSources: true,
               env: {
                 HTTP_PROXY: SANDBOX_EGRESS_PROXY_URL,
@@ -695,6 +700,9 @@ describe('ensureBaseline', () => {
     expect(agents.defaults.sandbox.docker.network).toBe(SANDBOX_EGRESS_NETWORK);
     expect(agents.defaults.sandbox.docker).toMatchObject({
       image: SANDBOX_MEDIA_IMAGE,
+      memory: SANDBOX_MEMORY_LIMIT,
+      memorySwap: SANDBOX_MEMORY_LIMIT,
+      pidsLimit: SANDBOX_PIDS_LIMIT,
       dangerouslyAllowExternalBindSources: true,
       binds: [
         `${resolveSandboxAssetsDir(dataDir)}:${SANDBOX_SHARED_ASSETS_CONTAINER_DIR}:ro`,
