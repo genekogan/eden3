@@ -146,6 +146,23 @@ describe('ChannelTurnMeteringService economic authorization', () => {
     ).toThrow('replay conflict');
   });
 
+  it('never turns an existing authorization into a reusable provider ticket', async () => {
+    for (const status of ['reserved', 'settled', 'delivery_pending', 'delivered'] as const) {
+      const record = turn(status);
+      const persistence = store({ claimTurn: vi.fn(async () => record) });
+      await expect(
+        new ChannelTurnMeteringService(persistence).reserve({
+          turnId: record.turnId,
+          connectionId: record.connectionId,
+          runtimeAccountId: record.runtimeAccountId,
+          sessionId: record.sessionId,
+          externalMessageId: record.externalMessageId,
+        }),
+      ).rejects.toThrow('replay denied');
+      expect(persistence.authorize).not.toHaveBeenCalled();
+    }
+  });
+
   it('FG-ECON-CHANNEL-02 never charges above authorized-max and records the clamped settlement', async () => {
     const record = turn('settling');
     const persistence = store({

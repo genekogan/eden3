@@ -773,7 +773,10 @@ export class ChannelTurnMeteringService {
       turn.status === 'delivery_pending' ||
       turn.status === 'delivered'
     ) {
-      return { turn, balance: null, replayed: true };
+      // An authorization is one provider ticket, not a reusable balance
+      // receipt. A repeated native run id must never get provider permission
+      // against the same debit (the channel form of DEBT-004).
+      throw new Error('channel turn reservation replay denied');
     }
     if (turn.status !== 'reserving') throw new Error('channel turn is not reservable');
     try {
