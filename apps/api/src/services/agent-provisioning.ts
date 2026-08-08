@@ -372,7 +372,9 @@ export class AgentProvisioningWorker {
           ${claim.ownerAccountId}, 'agent_build_ready', ${claim.agentAccountId},
           ${`/agents/${claim.username}`}
         )
-        on conflict (account_id, kind, source_agent_id) do nothing
+        on conflict (account_id, kind, source_agent_id)
+        where kind in ('agent_build_ready', 'agent_build_failed')
+        do nothing
         returning id
       `;
       return inserted[0]?.id ?? null;
@@ -418,7 +420,9 @@ export class AgentProvisioningWorker {
           ${claim.ownerAccountId}, 'agent_build_failed', ${claim.agentAccountId},
           ${`/agents/${claim.username}`}
         )
-        on conflict (account_id, kind, source_agent_id) do nothing
+        on conflict (account_id, kind, source_agent_id)
+        where kind in ('agent_build_ready', 'agent_build_failed')
+        do nothing
         returning id
       `;
       return inserted[0]?.id ?? null;
