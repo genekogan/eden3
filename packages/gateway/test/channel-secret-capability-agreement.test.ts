@@ -22,51 +22,76 @@ import {
 /**
  * The deployed resolver sidecar (server.mjs) re-implements the capability
  * primitives in plain Node (no bundler into the container). This test is the
- * anti-drift contract: the two implementations MUST agree bit-for-bit.
+ * anti-drift contract: the two implementations MUST agree bit-for-bit across a
+ * table of grant + every fail-closed vector, with EXACT reason parity.
  */
 describe('capability implementations agree (gateway TS ↔ deployed server.mjs)', () => {
   const vaultKey = randomBytes(32);
+  const capKey = deriveCapabilityKey(vaultKey);
 
-  it('derive the same capability key and default epoch', () => {
+  it('derive the same capability key (byte-for-byte) and default epoch', () => {
     expect((mjsDeriveKey(vaultKey) as Buffer).equals(deriveCapabilityKey(vaultKey))).toBe(true);
+    expect((mjsDeriveKey(vaultKey.toString('hex')) as Buffer).equals(capKey)).toBe(true);
     expect(MJS_EPOCH).toBe(CAPABILITY_EPOCH_DEFAULT);
   });
 
-  it('parse ids identically', () => {
-    const id = mintCapabilityId(deriveCapabilityKey(vaultKey), {
+  it('parse capability, legacy, and malformed ids identically', () => {
+    const id = mintCapabilityId(capKey, {
       connectionId: randomUUID(),
+      accountId: randomUUID(),
       channel: 'telegram',
       runtimeAccountId: 'eden-x',
       epoch: CAPABILITY_EPOCH_DEFAULT,
     });
-    expect(mjsParse(id)).toEqual(parseSecretId(id));
-    expect(mjsParse('channel/../x')).toEqual(parseSecretId('channel/../x'));
+    for (const probe of [id, `channel/${randomUUID()}`, 'channel/../x', 'channel/*', 'nonsense']) {
+      expect(mjsParse(probe)).toEqual(parseSecretId(probe));
+    }
   });
 
-  it('a TS-minted capability verifies under the deployed resolver and vice-versa', () => {
-    const capKey = deriveCapabilityKey(vaultKey);
-    const scope = {
-      connectionId: randomUUID(),
-      channel: 'discord',
-      runtimeAccountId: 'eden-agent',
-      epoch: CAPABILITY_EPOCH_DEFAULT,
+  // Each vector: mint (TS) an id for `mintScope`, present it against `row`, and
+  // require BOTH verifiers return the exact same {ok, reason}. This is the
+  // mutation guard — if either implementation's check drifts, a row here fails.
+  const base = () => {
+    const connectionId = randomUUID();
+    const accountId = randomUUID();
+    return {
+      connectionId,
+      accountId,
+      channel: 'discord' as const,
+      runtimeAccountId: `eden-${connectionId}`,
+      epoch: 'c1',
     };
-    const id = mintCapabilityId(capKey, scope);
-    const row = { ...scope };
+  };
 
-    const tsVerdict = verifySecretId({ id, capKey, row, allowLegacyUnscoped: false });
-    const mjsVerdict = mjsVerify({ id, capKey, row, allowLegacyUnscoped: false });
-    expect(tsVerdict).toEqual({ ok: true, connectionId: scope.connectionId, reason: 'granted' });
-    expect(mjsVerdict).toEqual(tsVerdict);
+  it.each<[string, () => { mint: any; row: any; capKey: Buffer; expectOk: boolean; reason: string }]>([
+    ['grant (exact match)', () => { const s = base(); return { mint: s, row: { ...s }, capKey, expectOk: true, reason: 'granted' }; }],
+    ['forged MAC (wrong key)', () => { const s = base(); return { mint: s, row: { ...s }, capKey: deriveCapabilityKey(randomBytes(32)), expectOk: false, reason: 'capability_forged' }; }],
+    ['cross-connection swap', () => { const s = base(); const b = base(); return { mint: s, row: { ...b }, capKey, expectOk: false, reason: 'capability_forged' }; }],
+    ['cross-account (owner changed)', () => { const s = base(); return { mint: s, row: { ...s, accountId: randomUUID() }, capKey, expectOk: false, reason: 'capability_forged' }; }],
+    ['cross-channel', () => { const s = base(); return { mint: s, row: { ...s, channel: 'telegram' }, capKey, expectOk: false, reason: 'capability_forged' }; }],
+    ['cross-runtime', () => { const s = base(); return { mint: s, row: { ...s, runtimeAccountId: 'eden-other' }, capKey, expectOk: false, reason: 'capability_forged' }; }],
+    ['stale epoch', () => { const s = base(); return { mint: s, row: { ...s, epoch: 'c2' }, capKey, expectOk: false, reason: 'capability_epoch_revoked' }; }],
+    ['null runtime', () => { const s = base(); return { mint: s, row: { ...s, runtimeAccountId: null }, capKey, expectOk: false, reason: 'capability_forged' }; }],
+    ['null account', () => { const s = base(); return { mint: s, row: { ...s, accountId: null }, capKey, expectOk: false, reason: 'capability_forged' }; }],
+  ])('agree on: %s', (_name, make) => {
+    const { mint, row, capKey: verifyKey, expectOk, reason } = make();
+    // Mint always with the true capKey (an attacker's forged case overrides verifyKey).
+    const mintKey = _name.includes('forged') ? verifyKey : capKey;
+    const id = mintCapabilityId(mintKey, mint);
+    const ts = verifySecretId({ id, capKey, row, allowLegacyUnscoped: false });
+    const mjs = mjsVerify({ id, capKey, row, allowLegacyUnscoped: false });
+    expect(ts).toEqual(mjs);
+    expect(ts.ok).toBe(expectOk);
+    expect(ts.reason).toBe(reason);
   });
 
-  it('both reject a forged MAC and a cross-connection swap', () => {
-    const capKey = deriveCapabilityKey(vaultKey);
-    const a = { connectionId: randomUUID(), channel: 'discord', runtimeAccountId: 'a', epoch: 'c1' };
-    const b = { connectionId: randomUUID(), channel: 'discord', runtimeAccountId: 'b', epoch: 'c1' };
-    const forged = mintCapabilityId(capKey, a).replace(a.connectionId, b.connectionId);
-    const row = { ...b };
-    expect(mjsVerify({ id: forged, capKey, row, allowLegacyUnscoped: false }).ok).toBe(false);
-    expect(verifySecretId({ id: forged, capKey, row, allowLegacyUnscoped: false }).ok).toBe(false);
+  it('agree on legacy id under both strict and break-glass', () => {
+    const s = base();
+    const legacy = `channel/${s.connectionId}`;
+    for (const allow of [false, true]) {
+      expect(mjsVerify({ id: legacy, capKey, row: { ...s }, allowLegacyUnscoped: allow })).toEqual(
+        verifySecretId({ id: legacy, capKey, row: { ...s }, allowLegacyUnscoped: allow }),
+      );
+    }
   });
 });

@@ -202,6 +202,8 @@ export interface HostedChannelAccountOptions extends ConfigGenOptions {
   runtimeAccountId: string;
   /** UUID of channel_connections; the resolver uses only this opaque id. */
   connectionId: string;
+  /** channel_connections.account_id (owner) — bound into the capability MAC. */
+  accountId: string;
   label?: string | null;
   bindAgentId: string;
   dmPolicy: HostedChannelDmPolicy;
@@ -312,6 +314,7 @@ export function hostedChannelSecretRef(
     provider: EDEN_CHANNEL_SECRET_PROVIDER_ID,
     id: mintCapabilityId(capKey, {
       connectionId: scope.connectionId,
+      accountId: scope.accountId,
       channel: scope.channel,
       runtimeAccountId: scope.runtimeAccountId,
       epoch: scope.epoch ?? CAPABILITY_EPOCH_DEFAULT,
@@ -336,6 +339,7 @@ function hostedCapabilityKey(): Buffer {
 function scopeOf(options: HostedChannelAccountOptions): Omit<CapabilityScope, 'epoch'> {
   return {
     connectionId: options.connectionId,
+    accountId: options.accountId,
     channel: options.channel,
     runtimeAccountId: options.runtimeAccountId,
   };

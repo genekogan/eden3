@@ -25,6 +25,7 @@ const AGREEMENT_CAP_KEY = deriveCapabilityKey(AGREEMENT_KEY);
 function capId(row, epoch = 'c1') {
   return mintCapabilityId(AGREEMENT_CAP_KEY, {
     connectionId: row.id,
+    accountId: row.account_id,
     channel: row.channel,
     runtimeAccountId: row.runtime_account_id,
     epoch,
@@ -83,7 +84,7 @@ describe('channel secret resolver sidecar', () => {
     const missingId = randomUUID();
     const events = [];
     const activeCap = capId(active);
-    const missingCap = capId({ id: missingId, channel: 'discord', runtime_account_id: 'eden-x' });
+    const missingCap = capId({ id: missingId, account_id: randomUUID(), channel: 'discord', runtime_account_id: 'eden-x' });
     const result = await resolveSecretRequest(
       { protocolVersion: 1, provider: 'eden-channel-vault', ids: [activeCap, missingCap] },
       {

@@ -209,6 +209,7 @@ export class ChannelSecretResolver {
         capKey: this.capKey,
         row: {
           connectionId: secret.id,
+          accountId: secret.accountId,
           channel: secret.channel,
           runtimeAccountId: secret.runtimeAccountId,
           epoch: secret.capabilityEpoch,

@@ -38,6 +38,7 @@ function record(overrides: Partial<ResolvableChannelSecret> = {}): ResolvableCha
 function capIdFor(secret: ResolvableChannelSecret): string {
   return mintCapabilityId(CAP_KEY, {
     connectionId: secret.id,
+    accountId: secret.accountId,
     channel: secret.channel,
     runtimeAccountId: secret.runtimeAccountId!,
     epoch: secret.capabilityEpoch,
@@ -83,6 +84,7 @@ describe('ChannelSecretResolver (capability-bound)', () => {
 
     const forged = mintCapabilityId(deriveCapabilityKey(randomBytes(32)), {
       connectionId: a.id,
+      accountId: a.accountId,
       channel: a.channel,
       runtimeAccountId: a.runtimeAccountId!,
       epoch: 'c1',
@@ -103,6 +105,55 @@ describe('ChannelSecretResolver (capability-bound)', () => {
     expect(store.audit).toHaveBeenCalledWith(
       expect.objectContaining({ decision: 'denied', deniedCount: 2 }),
     );
+  });
+
+  it('fails closed for a missing/inactive connection and a corrupt decrypt, leaking no diagnostic', async () => {
+    const missing = record();
+    const corrupt = record();
+    const store: ChannelSecretStoreLike = {
+      getActive: vi.fn(async (id) => (id === corrupt.id ? corrupt : null)),
+      audit: vi.fn(async () => {}),
+    };
+    const vault: SecretVaultLike = {
+      encrypt: vi.fn(),
+      decrypt: vi.fn(() => {
+        throw new Error('ciphertext diagnostic must not escape');
+      }),
+    };
+    const resolver = new ChannelSecretResolver(store, vault, { capKey: CAP_KEY });
+    const missingId = capIdFor(missing);
+    const corruptId = capIdFor(corrupt);
+
+    const result = await resolver.resolve({
+      protocolVersion: 1,
+      provider: CHANNEL_SECRET_PROVIDER,
+      ids: [missingId, corruptId],
+    });
+
+    expect(result.values).toEqual({});
+    expect(result.errors).toEqual({
+      [missingId]: 'secret unavailable',
+      [corruptId]: 'secret unavailable',
+    });
+    expect(JSON.stringify(result)).not.toContain('ciphertext diagnostic');
+    // Only the aggregated denial is audited (no per-id existence oracle).
+    expect(store.audit).toHaveBeenCalledTimes(1);
+    expect(store.audit).toHaveBeenCalledWith(
+      expect.objectContaining({ decision: 'denied', deniedCount: 2 }),
+    );
+  });
+
+  it('the vault binds v2 ciphertext to context: wrong or missing context throws', () => {
+    const key = randomBytes(32).toString('base64');
+    const context = channelTokenSecretContext({
+      connectionId: randomUUID(),
+      accountId: randomUUID(),
+      channel: 'discord',
+    });
+    const vault = new AesGcmSecretVault({ key });
+    const encrypted = vault.encrypt('bound-token', context);
+    expect(() => vault.decrypt(encrypted, `${context}-tampered`)).toThrow();
+    expect(() => vault.decrypt(encrypted)).toThrow('context');
   });
 
   it('fails a bare legacy id closed by default; the break-glass flag admits it', async () => {

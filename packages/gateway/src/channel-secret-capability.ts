@@ -52,6 +52,8 @@ const UUID_RE = new RegExp(`^${UUID}$`, 'i');
 export interface CapabilityScope {
   /** channel_connections.id (PK). */
   connectionId: string;
+  /** channel_connections.account_id — the owning account (binds ownership). */
+  accountId: string;
   /** channel_connections.channel — 'discord' | 'telegram'. */
   channel: string;
   /** channel_connections.runtime_account_id — the stable named-account key. */
@@ -103,6 +105,7 @@ function canonicalScope(scope: CapabilityScope): string {
   const parts = [
     SCOPE_DOMAIN,
     scope.connectionId,
+    scope.accountId,
     scope.channel,
     scope.runtimeAccountId,
     scope.epoch,
@@ -158,7 +161,7 @@ export interface VerifyResult {
 /**
  * Verify a requested id against the connection's ACTUAL scope from the DB.
  *
- * The MAC is recomputed over the row's own (connectionId, channel,
+ * The MAC is recomputed over the row's own (connectionId, accountId, channel,
  * runtimeAccountId) at the id's claimed epoch and constant-time compared to the
  * presented MAC — so a capability minted for one connection can never release
  * another connection's token, and a forged MAC (no capKey) never matches. The
@@ -169,7 +172,13 @@ export interface VerifyResult {
 export function verifySecretId(params: {
   id: unknown;
   capKey: Buffer;
-  row: { connectionId: string; channel: string; runtimeAccountId: string | null; epoch: string };
+  row: {
+    connectionId: string;
+    accountId: string | null;
+    channel: string;
+    runtimeAccountId: string | null;
+    epoch: string;
+  };
   allowLegacyUnscoped: boolean;
 }): VerifyResult {
   const parsed = parseSecretId(params.id);
@@ -183,15 +192,21 @@ export function verifySecretId(params: {
   }
 
   // capability
-  const { connectionId, channel, runtimeAccountId } = params.row;
+  const { connectionId, accountId, channel, runtimeAccountId } = params.row;
   const presented = b64urlDecode(parsed.mac);
-  if (!presented || presented.length !== CAPABILITY_MAC_BYTES || runtimeAccountId === null) {
+  if (
+    !presented ||
+    presented.length !== CAPABILITY_MAC_BYTES ||
+    runtimeAccountId === null ||
+    accountId === null
+  ) {
     return { ok: false, connectionId: parsed.connectionId, reason: 'capability_forged' };
   }
   let expected: Buffer;
   try {
     expected = capabilityMac(params.capKey, {
       connectionId,
+      accountId,
       channel,
       runtimeAccountId,
       epoch: parsed.epoch,

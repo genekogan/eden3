@@ -20,6 +20,7 @@ const VAULT_KEY = randomBytes(32);
 function scope(overrides: Partial<CapabilityScope> = {}): CapabilityScope {
   return {
     connectionId: randomUUID(),
+    accountId: randomUUID(),
     channel: 'discord',
     runtimeAccountId: 'eden-agent-one',
     epoch: CAPABILITY_EPOCH_DEFAULT,
@@ -30,6 +31,7 @@ function scope(overrides: Partial<CapabilityScope> = {}): CapabilityScope {
 function rowOf(s: CapabilityScope) {
   return {
     connectionId: s.connectionId,
+    accountId: s.accountId,
     channel: s.channel,
     runtimeAccountId: s.runtimeAccountId,
     epoch: s.epoch,
@@ -67,7 +69,14 @@ describe('known-answer vector (independent encoding oracle, anti-drift)', () => 
   // this fails — the two implementations must both match this fixed layout.
   const FIXED_KEY = Buffer.alloc(32, 7); // 0x07 * 32
   const FIXED_UUID = '11111111-1111-4111-8111-111111111111';
-  const scope = { connectionId: FIXED_UUID, channel: 'discord', runtimeAccountId: 'eden-kat', epoch: 'c1' };
+  const FIXED_ACCT = '22222222-2222-4222-8222-222222222222';
+  const scope = {
+    connectionId: FIXED_UUID,
+    accountId: FIXED_ACCT,
+    channel: 'discord',
+    runtimeAccountId: 'eden-kat',
+    epoch: 'c1',
+  };
 
   it('mintCapabilityId matches an independently computed HMAC over the frozen canonical layout', () => {
     const capKey = Buffer.from(
@@ -79,7 +88,7 @@ describe('known-answer vector (independent encoding oracle, anti-drift)', () => 
         32,
       ),
     );
-    const canonical = ['eden3-channel-cap-v1', FIXED_UUID, 'discord', 'eden-kat', 'c1'].join('\0');
+    const canonical = ['eden3-channel-cap-v1', FIXED_UUID, FIXED_ACCT, 'discord', 'eden-kat', 'c1'].join('\0');
     const mac = createHmac('sha256', capKey).update(canonical, 'utf8').digest().subarray(0, 16);
     const macB64url = mac.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 
@@ -135,6 +144,7 @@ describe('capabilityMac binds every scope field', () => {
 
   it.each<[string, CapabilityScope]>([
     ['connectionId', { ...base, connectionId: randomUUID() }],
+    ['accountId', { ...base, accountId: randomUUID() }],
     ['channel', { ...base, channel: 'telegram' }],
     ['runtimeAccountId', { ...base, runtimeAccountId: 'eden-agent-two' }],
     ['epoch', { ...base, epoch: 'c2' }],
@@ -168,6 +178,28 @@ describe('verifySecretId — fail closed unless the capability is exact', () => 
     const v = verifySecretId({ id: forged, capKey, row: rowOf(b), allowLegacyUnscoped: false });
     expect(v.ok).toBe(false);
     expect(v.reason).toBe('capability_forged');
+  });
+
+  it('DENIES cross-account: a capability minted for owner A cannot release the connection after ownership changes to B', () => {
+    const s = scope({ accountId: randomUUID() });
+    const id = mintCapabilityId(capKey, s);
+    const transferredRow = { ...rowOf(s), accountId: randomUUID() }; // owner changed
+    expect(
+      verifySecretId({ id, capKey, row: transferredRow, allowLegacyUnscoped: false }).reason,
+    ).toBe('capability_forged');
+  });
+
+  it('DENIES when the row has no account_id to bind against', () => {
+    const s = scope();
+    const id = mintCapabilityId(capKey, s);
+    expect(
+      verifySecretId({
+        id,
+        capKey,
+        row: { ...rowOf(s), accountId: null },
+        allowLegacyUnscoped: false,
+      }).ok,
+    ).toBe(false);
   });
 
   it('DENIES cross-channel: a discord capability presented against a telegram row', () => {

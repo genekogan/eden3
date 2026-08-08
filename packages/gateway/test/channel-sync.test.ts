@@ -192,6 +192,8 @@ describe('disableDiscordChannel', () => {
 describe('hosted named channel accounts', () => {
   const connectionA = '11111111-1111-4111-8111-111111111111';
   const connectionB = '22222222-2222-4222-8222-222222222222';
+  const accountA = 'aaaaaaaa-1111-4111-8111-111111111111';
+  const accountB = 'bbbbbbbb-2222-4222-8222-222222222222';
   const hostedAgents = (agentIds: string[]) => ({
     agents: {
       defaults: {
@@ -211,6 +213,7 @@ describe('hosted named channel accounts', () => {
         channel: index % 2 === 0 ? 'discord' as const : 'telegram' as const,
         runtimeAccountId: `concurrent-${index}`,
         connectionId: `aaaaaaaa-aaaa-4aaa-8aaa-${suffix}`,
+        accountId: `bbbbbbbb-bbbb-4bbb-8bbb-${suffix}`,
       };
     });
     await seedConfig({
@@ -273,6 +276,7 @@ describe('hosted named channel accounts', () => {
       channel: 'discord',
       runtimeAccountId: 'agent-one',
       connectionId: connectionA,
+        accountId: accountA,
       label: 'First bot',
       bindAgentId: 'agent-one',
       dmPolicy: 'allowlist',
@@ -283,6 +287,7 @@ describe('hosted named channel accounts', () => {
       channel: 'discord',
       runtimeAccountId: 'agent-two',
       connectionId: connectionB,
+        accountId: accountB,
       label: 'Second bot',
       bindAgentId: 'agent-two',
       dmPolicy: 'pairing',
@@ -336,7 +341,7 @@ describe('hosted named channel accounts', () => {
       enabled: true,
       name: 'First bot',
       token: hostedChannelSecretRef(
-        { connectionId: connectionA, channel: 'discord', runtimeAccountId: 'agent-one' },
+        { connectionId: connectionA, accountId: accountA, channel: 'discord', runtimeAccountId: 'agent-one' },
         TEST_CAP_KEY,
       ),
       dmPolicy: 'allowlist',
@@ -347,7 +352,7 @@ describe('hosted named channel accounts', () => {
     expect(accounts['agent-two']).toMatchObject({
       enabled: true,
       token: hostedChannelSecretRef(
-        { connectionId: connectionB, channel: 'discord', runtimeAccountId: 'agent-two' },
+        { connectionId: connectionB, accountId: accountB, channel: 'discord', runtimeAccountId: 'agent-two' },
         TEST_CAP_KEY,
       ),
       dmPolicy: 'pairing',
@@ -394,6 +399,7 @@ describe('hosted named channel accounts', () => {
       channel: 'discord',
       runtimeAccountId: 'agent-two',
       connectionId: connectionB,
+        accountId: accountB,
       label: 'Second bot',
       bindAgentId: 'agent-two',
       dmPolicy: 'pairing',
@@ -412,6 +418,7 @@ describe('hosted named channel accounts', () => {
       channel: 'telegram',
       runtimeAccountId: 'telegram-agent',
       connectionId: connectionA,
+        accountId: accountA,
       label: 'Telegram bot',
       bindAgentId: 'telegram-agent',
       dmPolicy: 'pairing',
@@ -429,7 +436,7 @@ describe('hosted named channel accounts', () => {
       (telegram.accounts as Record<string, Record<string, unknown>>)['telegram-agent'],
     ).toMatchObject({
       botToken: hostedChannelSecretRef(
-        { connectionId: connectionA, channel: 'telegram', runtimeAccountId: 'telegram-agent' },
+        { connectionId: connectionA, accountId: accountA, channel: 'telegram', runtimeAccountId: 'telegram-agent' },
         TEST_CAP_KEY,
       ),
       dmPolicy: 'pairing',
@@ -444,15 +451,16 @@ describe('hosted named channel accounts', () => {
 
   it('pauses and deletes only the selected account while keeping the other bot routed', async () => {
     await seedConfig(hostedAgents(['agent-one', 'agent-two']));
-    for (const [runtimeAccountId, connectionId] of [
-      ['agent-one', connectionA],
-      ['agent-two', connectionB],
+    for (const [runtimeAccountId, connectionId, accountId] of [
+      ['agent-one', connectionA, accountA],
+      ['agent-two', connectionB, accountB],
     ] as const) {
       await ensureHostedChannelAccount({
         dataDir,
         channel: 'discord',
         runtimeAccountId,
         connectionId,
+        accountId,
         bindAgentId: runtimeAccountId,
         dmPolicy: 'pairing',
         allowFrom: [],
@@ -509,6 +517,7 @@ describe('hosted named channel accounts', () => {
         channel: 'discord',
         runtimeAccountId: '../escape',
         connectionId: connectionA,
+        accountId: accountA,
         bindAgentId: 'agent',
         dmPolicy: 'pairing',
         allowFrom: [],
@@ -520,6 +529,7 @@ describe('hosted named channel accounts', () => {
         channel: 'discord',
         runtimeAccountId: 'agent',
         connectionId: connectionA,
+        accountId: accountA,
         bindAgentId: 'agent',
         dmPolicy: 'pairing',
         allowFrom: [],
@@ -534,6 +544,7 @@ describe('hosted named channel accounts', () => {
         channel: 'telegram',
         runtimeAccountId: 'agent',
         connectionId: connectionA,
+        accountId: accountA,
         bindAgentId: 'agent',
         dmPolicy: 'allowlist',
         allowFrom: [],

@@ -24,14 +24,19 @@ const VAULT_KEY = randomBytes(32);
 const CAP_KEY = deriveCapabilityKey(VAULT_KEY);
 
 /**
- * FG-VAULT (gap 45) — the channel-token custody attack battery, exercised
- * through the DEPLOYED path: the real OpenClaw bridge → a real Unix socket →
+ * FG-VAULT (gap 45) — the channel-token custody attack battery, through the
+ * DEPLOYED path: the real OpenClaw bridge → a real Unix socket →
  * createResolverServer → resolveSecretRequest, with REAL AES decrypt and REAL
- * capability MACs. Synthetic sentinel tokens are minted in-test; no real secret
- * ever appears.
+ * capability MACs. Synthetic sentinel tokens are minted in-test and kept
+ * OUT-OF-BAND (never in the row objects the resolver sees), so a broken
+ * decryptor that echoes a row field cannot pass. Every denial path is asserted
+ * to perform ZERO real decryptions.
  */
 
-// Build a faithful channel_connections row with a real AES-GCM v2 token.
+const tokensById = new Map(); // connectionId -> plaintext sentinel (out-of-band)
+
+// A faithful channel_connections row with a real AES-GCM v2 token. The plaintext
+// is stored out-of-band; the row carries ONLY ciphertext, as the DB would.
 function connectionRow(overrides = {}) {
   const id = overrides.id ?? randomUUID();
   const account_id = overrides.account_id ?? randomUUID();
@@ -42,13 +47,12 @@ function connectionRow(overrides = {}) {
   const cipher = createCipheriv('aes-256-gcm', VAULT_KEY, iv);
   cipher.setAAD(Buffer.from(channelTokenSecretContext({ id, account_id, channel }), 'utf8'));
   const ciphertext = Buffer.concat([cipher.update(token, 'utf8'), cipher.final()]);
+  tokensById.set(id, token);
   return {
     id,
     account_id,
     channel,
     runtime_account_id,
-    metadata: overrides.metadata ?? null,
-    token,
     token_ciphertext: ciphertext.toString('base64'),
     token_iv: iv.toString('base64'),
     token_auth_tag: cipher.getAuthTag().toString('base64'),
@@ -56,9 +60,10 @@ function connectionRow(overrides = {}) {
   };
 }
 
-function capIdFor(row, epoch = 'c1') {
-  return mintCapabilityId(CAP_KEY, {
+function capIdFor(row, epoch = 'c1', key = CAP_KEY) {
+  return mintCapabilityId(key, {
     connectionId: row.id,
+    accountId: row.account_id,
     channel: row.channel,
     runtimeAccountId: row.runtime_account_id,
     epoch,
@@ -71,39 +76,48 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
   let server;
   let auditLog;
   let rows;
+  let decryptCount;
+  let loadActiveCalls;
 
-  /** Start the deployed resolver bound to a real socket over an in-memory store. */
-  async function start({ allowLegacyUnscoped = false } = {}) {
+  async function start({ allowLegacyUnscoped = false, resolveOverride } = {}) {
     auditLog = [];
+    decryptCount = 0;
+    loadActiveCalls = 0;
     const byId = new Map(rows.map((r) => [r.id, r]));
-    const resolveRequest = (request) =>
-      resolveSecretRequest(request, {
-        capKey: CAP_KEY,
-        allowLegacyUnscoped,
-        loadActive: async (ids) => ids.map((id) => byId.get(id)).filter(Boolean),
-        decrypt: (row) => decryptStoredSecret(row, VAULT_KEY),
-        // Mirror the production audit SQL projection (server.mjs main): identity
-        // + decision only. Storing the raw row (with ciphertext) would be a
-        // TEST leak, not a resolver leak — so the harness projects exactly what
-        // the deployed INSERT persists, and the leak scan checks that.
-        audit: async (event) =>
-          auditLog.push(
-            event.decision === 'granted'
-              ? {
-                  decision: 'granted',
-                  reason: event.reason,
-                  connectionId: event.connectionId,
-                  channel: event.row.channel,
-                  runtimeAccountId: event.row.runtime_account_id,
-                }
-              : {
-                  decision: 'denied',
-                  reason: 'request_denied',
-                  deniedCount: event.deniedCount,
-                  deniedReasons: event.deniedReasons,
-                },
-          ),
-      });
+    const resolveRequest =
+      resolveOverride ??
+      ((request) =>
+        resolveSecretRequest(request, {
+          capKey: CAP_KEY,
+          allowLegacyUnscoped,
+          loadActive: async (ids) => {
+            loadActiveCalls += 1;
+            return ids.map((id) => byId.get(id)).filter(Boolean);
+          },
+          decrypt: (row) => {
+            decryptCount += 1;
+            return decryptStoredSecret(row, VAULT_KEY);
+          },
+          // Mirror the production audit SQL projection (server.mjs main): identity
+          // + decision only — storing the raw row would be a TEST leak.
+          audit: async (event) =>
+            auditLog.push(
+              event.decision === 'granted'
+                ? {
+                    decision: 'granted',
+                    reason: event.reason,
+                    connectionId: event.connectionId,
+                    channel: event.row.channel,
+                    runtimeAccountId: event.row.runtime_account_id,
+                  }
+                : {
+                    decision: 'denied',
+                    reason: 'request_denied',
+                    deniedCount: event.deniedCount,
+                    deniedReasons: event.deniedReasons,
+                  },
+            ),
+        }));
     server = createResolverServer(resolveRequest);
     await new Promise((resolve, reject) => {
       server.once('error', reject);
@@ -111,7 +125,7 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     });
   }
 
-  /** Drive a request through the real OpenClaw bridge script (real subprocess). */
+  /** Drive a request through the real OpenClaw bridge; capture stdout AND stderr. */
   function callBridge(ids) {
     return new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [BRIDGE, '--socket', socketPath], {
@@ -124,11 +138,11 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
       child.on('error', reject);
       child.on('exit', (code) => {
         if (code !== 0) {
-          reject(new Error(`bridge exited ${code}: ${err.trim()}`));
+          reject(Object.assign(new Error(`bridge exited ${code}`), { code, stderr: err }));
           return;
         }
         try {
-          resolve(JSON.parse(out));
+          resolve({ ...JSON.parse(out), _stderr: err });
         } catch (e) {
           reject(e);
         }
@@ -138,10 +152,13 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     });
   }
 
+  const aggregateDenied = () => auditLog.filter((e) => e.decision === 'denied');
+
   beforeEach(async () => {
     dir = await mkdtemp(path.join(tmpdir(), 'eden3-vault-battery-'));
     socketPath = path.join(dir, 'channel-secrets.sock');
     rows = [];
+    tokensById.clear();
   });
 
   afterEach(async () => {
@@ -150,38 +167,42 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('POSITIVE CONTROL: a legitimate capability resolves the correct token and audits a GRANT', async () => {
+  it('POSITIVE CONTROL: a legitimate capability resolves the correct token, decrypts exactly once, audits a GRANT', async () => {
     const row = connectionRow();
     rows = [row];
     await start();
     const id = capIdFor(row);
     const res = await callBridge([id]);
-    expect(res.values[id]).toBe(row.token);
+    expect(res.values[id]).toBe(tokensById.get(row.id));
     expect(res.errors).toBeUndefined();
+    expect(decryptCount).toBe(1);
     expect(auditLog).toEqual([
       expect.objectContaining({ decision: 'granted', reason: 'granted', connectionId: row.id }),
     ]);
   });
 
-  it('CROSS-AGENT: a capability minted for A cannot release B (connectionId swap)', async () => {
+  it('CROSS-AGENT: a capability minted for active A cannot release active B (connectionId swap) — zero decrypts', async () => {
     const a = connectionRow({ runtime_account_id: 'eden-A' });
     const b = connectionRow({ runtime_account_id: 'eden-B' });
-    rows = [a, b];
+    rows = [a, b]; // BOTH active, so denial is at MAC, not row-missing
     await start();
     const forged = capIdFor(a).replace(a.id, b.id);
     const res = await callBridge([forged]);
     expect(res.values).toEqual({});
     expect(res.errors[forged]).toBe('secret unavailable');
-    expect(auditLog.every((e) => e.decision === 'denied')).toBe(true);
+    expect(decryptCount).toBe(0);
+    expect(aggregateDenied()).toEqual([
+      { decision: 'denied', reason: 'request_denied', deniedCount: 1, deniedReasons: { capability_forged: 1 } },
+    ]);
   });
 
-  it('CROSS-CHANNEL: a discord capability cannot release a telegram row of the same connection scope', async () => {
+  it('CROSS-CHANNEL: a discord capability cannot release a telegram row — zero decrypts', async () => {
     const tg = connectionRow({ channel: 'telegram' });
     rows = [tg];
     await start();
-    // Mint a capability claiming discord for this connection id + runtime id.
     const discordCap = mintCapabilityId(CAP_KEY, {
       connectionId: tg.id,
+      accountId: tg.account_id,
       channel: 'discord',
       runtimeAccountId: tg.runtime_account_id,
       epoch: 'c1',
@@ -189,24 +210,27 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     const res = await callBridge([discordCap]);
     expect(res.values).toEqual({});
     expect(res.errors[discordCap]).toBe('secret unavailable');
+    expect(decryptCount).toBe(0);
+    expect(aggregateDenied()).toEqual([
+      expect.objectContaining({ deniedReasons: { capability_forged: 1 } }),
+    ]);
   });
 
-  it('FORGED SCOPE: an attacker without the capability key cannot forge a valid id', async () => {
+  it('FORGED SCOPE: an attacker without the capability key cannot forge a valid id — zero decrypts', async () => {
     const row = connectionRow();
-    rows = [row];
+    rows = [row]; // active target
     await start();
-    const forged = mintCapabilityId(deriveCapabilityKey(randomBytes(32)), {
-      connectionId: row.id,
-      channel: row.channel,
-      runtimeAccountId: row.runtime_account_id,
-      epoch: 'c1',
-    });
+    const forged = capIdFor(row, 'c1', deriveCapabilityKey(randomBytes(32)));
     const res = await callBridge([forged]);
     expect(res.values).toEqual({});
     expect(res.errors[forged]).toBe('secret unavailable');
+    expect(decryptCount).toBe(0);
+    expect(aggregateDenied()).toEqual([
+      expect.objectContaining({ deniedReasons: { capability_forged: 1 } }),
+    ]);
   });
 
-  it('LEGACY/STRIPPED: a bare unscoped id fails closed in strict mode', async () => {
+  it('LEGACY/STRIPPED: a bare unscoped id fails closed in strict mode — zero decrypts', async () => {
     const row = connectionRow();
     rows = [row];
     await start({ allowLegacyUnscoped: false });
@@ -214,116 +238,137 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     const res = await callBridge([bare]);
     expect(res.values).toEqual({});
     expect(res.errors[bare]).toBe('secret unavailable');
-    // Denials aggregate into one audit event carrying the reason breakdown.
-    expect(auditLog).toEqual([
-      expect.objectContaining({
-        decision: 'denied',
-        deniedCount: 1,
-        deniedReasons: { legacy_unscoped_denied: 1 },
-      }),
+    expect(decryptCount).toBe(0);
+    expect(aggregateDenied()).toEqual([
+      { decision: 'denied', reason: 'request_denied', deniedCount: 1, deniedReasons: { legacy_unscoped_denied: 1 } },
     ]);
   });
 
-  // NOTE: epoch-revocation is proven at the pure-unit level
-  // (channel-secret-capability.test.ts) because the deployed resolver pins the
-  // epoch to a constant in T12-U01 — a durable rotation column is T12-U02.
-
-  it('ENUMERATION: a 128-id batch of forged capabilities yields nothing; one valid among them still resolves alone', async () => {
-    const valid = connectionRow();
-    rows = [valid];
-    await start();
-    const validId = capIdFor(valid);
-    const forgedIds = Array.from({ length: 127 }, () => {
-      const decoy = connectionRow();
-      return mintCapabilityId(deriveCapabilityKey(randomBytes(32)), {
-        connectionId: decoy.id,
-        channel: decoy.channel,
-        runtimeAccountId: decoy.runtime_account_id,
-        epoch: 'c1',
-      });
-    });
-    const res = await callBridge([validId, ...forgedIds]);
-    // Exactly one token resolves; no aggregation across the batch.
-    expect(Object.keys(res.values)).toEqual([validId]);
-    expect(res.values[validId]).toBe(valid.token);
-    expect(Object.keys(res.errors)).toHaveLength(127);
-  });
-
-  it('ENUMERATION BY CONSTRUCTION: a wildcard / list-all id fails the whole request closed', async () => {
-    // The malformed id is rejected by the deployed server, which closes the
-    // connection with no response; the bridge then fails closed (exit 1) after
-    // its own no-response timeout. (Charset-level rejection of every wildcard
-    // form is also proven synchronously in channel-secret-capability.test.ts.)
-    rows = [connectionRow()];
-    await start();
-    await expect(callBridge(['channel/*'])).rejects.toBeTruthy();
-  }, 8000);
-
-  it('LEAK SCAN: no token / ciphertext / key material appears in responses or audit metadata across the battery', async () => {
+  it('EPOCH REVOCATION (deployed): a correctly-MACed stale-epoch capability fails closed against the deployed resolver — zero decrypts', async () => {
+    // Row exists and is active; the deployed resolver pins the epoch to the c1
+    // constant, so a genuine c2-minted capability (valid MAC for the c2 scope)
+    // is rejected at the deployed epoch check (server.mjs), not the TS one.
     const row = connectionRow();
     rows = [row];
     await start();
-    const grantRes = await callBridge([capIdFor(row)]);
+    const staleCap = capIdFor(row, 'c2'); // correctly MACed for epoch c2
+    const res = await callBridge([staleCap]);
+    expect(res.values).toEqual({});
+    expect(res.errors[staleCap]).toBe('secret unavailable');
+    expect(decryptCount).toBe(0);
+    expect(aggregateDenied()).toEqual([
+      expect.objectContaining({ deniedReasons: { capability_epoch_revoked: 1 } }),
+    ]);
+  });
+
+  it('ENUMERATION: 127 ACTIVE decoy rows with wrong-key capabilities + 1 valid → only the valid resolves; one decrypt; 127 forged denied', async () => {
+    const valid = connectionRow();
+    const wrongKey = deriveCapabilityKey(randomBytes(32));
+    const decoys = Array.from({ length: 127 }, () => connectionRow());
+    rows = [valid, ...decoys]; // ALL active — denial must come from MAC verification
+    await start();
+    const validId = capIdFor(valid);
+    const forgedIds = decoys.map((d) => capIdFor(d, 'c1', wrongKey));
+    const res = await callBridge([validId, ...forgedIds]);
+    expect(Object.keys(res.values)).toEqual([validId]);
+    expect(res.values[validId]).toBe(tokensById.get(valid.id));
+    expect(Object.keys(res.errors)).toHaveLength(127);
+    expect(decryptCount).toBe(1); // only the valid capability reached decrypt
+    expect(aggregateDenied()).toEqual([
+      expect.objectContaining({ deniedCount: 127, deniedReasons: { capability_forged: 127 } }),
+    ]);
+  });
+
+  it('BATCH BOUND (deployed): a 129-id request fails the whole request closed with zero backend calls', async () => {
+    rows = [connectionRow()];
+    await start();
+    const ids = Array.from({ length: 129 }, () => capIdFor(connectionRow()));
+    await expect(callBridge(ids)).rejects.toBeTruthy();
+    expect(loadActiveCalls).toBe(0);
+    expect(decryptCount).toBe(0);
+  });
+
+  it('ENUMERATION BY CONSTRUCTION: a wildcard / list-all id fails closed with zero backend calls', async () => {
+    // Positive control first: the same server resolves a valid cap, proving the
+    // wildcard failure is the malformed rejection, not an unrelated breakage.
+    const row = connectionRow();
+    rows = [row];
+    await start();
+    expect((await callBridge([capIdFor(row)])).values).toHaveProperty(capIdFor(row));
+    const backendBefore = loadActiveCalls;
+    await expect(callBridge(['channel/*'])).rejects.toBeTruthy();
+    expect(loadActiveCalls).toBe(backendBefore); // malformed rejected before any backend hit
+  }, 8000);
+
+  it('LEAK SCAN: no token / ciphertext / iv / tag / key material appears in responses, bridge stderr, or audit projection', async () => {
+    const row = connectionRow();
+    rows = [row];
+    await start();
+    const grantId = capIdFor(row);
+    const grantRes = await callBridge([grantId]);
     const denyRes = await callBridge([`channel/${row.id}`]); // legacy → deny
-    const haystack = JSON.stringify({ grantRes, denyRes, auditLog });
-    // The plaintext token appears ONLY as the intended grant value, nowhere else.
-    expect(grantRes.values[capIdFor(row)]).toBe(row.token);
+    const forgedRes = await callBridge([capIdFor(row, 'c1', deriveCapabilityKey(randomBytes(32)))]);
+    const token = tokensById.get(row.id);
+    const haystack = JSON.stringify({ grantRes, denyRes, forgedRes, auditLog });
+    const stderrs = `${grantRes._stderr}${denyRes._stderr}${forgedRes._stderr}`;
+
+    expect(grantRes.values[grantId]).toBe(token); // the ONLY place the token may appear
     for (const secret of [
+      token,
       row.token_ciphertext,
       row.token_auth_tag,
       row.token_iv,
       VAULT_KEY.toString('base64'),
+      VAULT_KEY.toString('hex'),
       CAP_KEY.toString('base64'),
+      CAP_KEY.toString('hex'),
     ]) {
-      expect(haystack).not.toContain(secret);
+      // The token appears once, as the intended grant value; strip that single
+      // occurrence, then require zero remaining sentinel hits anywhere.
+      const scrubbed = haystack.replace(JSON.stringify(token), '""');
+      expect(scrubbed).not.toContain(secret);
+      expect(stderrs).not.toContain(secret);
     }
-    // Audit records carry identity + decision only — never the token bytes.
     for (const e of auditLog) {
-      expect(JSON.stringify(e)).not.toContain(row.token);
+      expect(JSON.stringify(e)).not.toContain(token);
       expect(e).toHaveProperty('decision');
     }
   });
 
-  it('KNOWN RESIDUAL (documented, DEBT): an intact capability is a bearer token — the resolver has no requester identity to bind', async () => {
-    // The single shared gateway is the only socket peer and OpenClaw passes no
-    // requester context, so a VALID capability replayed from any presentation
-    // context still resolves. Blind forgery/enumeration/cross-scope are closed;
-    // full requester-binding needs a broker-with-requester-context or gateway
-    // sharding (escalated: DECISIONS D-005; owner T12-U02+). This test pins the
-    // boundary honestly — it is NOT a green FG-VAULT closure.
+  it('INTEGRITY META-CHECK: a genuine MAC-BYPASS resolver leaks the SAME forged-cap stimulus (battery is non-vacuous)', async () => {
+    // A mutant resolver that skips capability verification (authorizes by row
+    // existence alone — the pre-fix behavior) DOES release the token for a
+    // wrong-key capability against an active row. This proves the FORGED case
+    // above fails on a broken implementation, so its denial is meaningful.
+    const victim = connectionRow();
+    rows = [victim];
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const brokenResolve = async (request) => {
+      const values = {};
+      for (const id of request.ids) {
+        const connectionId = id.split('/')[1].split('.')[0];
+        const row = byId.get(connectionId);
+        if (row) values[id] = decryptStoredSecret(row, VAULT_KEY); // NO verify
+      }
+      return { protocolVersion: 1, values };
+    };
+    await start({ resolveOverride: brokenResolve });
+    const forged = capIdFor(victim, 'c1', deriveCapabilityKey(randomBytes(32)));
+    const res = await callBridge([forged]);
+    expect(res.values[forged]).toBe(tokensById.get(victim.id)); // leaks → real check is load-bearing
+  });
+
+  it('KNOWN RESIDUAL (documented, DEBT-012): an intact capability is a bearer token — the resolver has no requester identity', async () => {
+    // Blind forgery/enumeration/cross-scope are closed; full requester-binding
+    // needs a broker-with-requester-context or gateway sharding (D-005). This
+    // pins the boundary honestly — NOT a green FG-VAULT closure.
     const row = connectionRow();
     rows = [row];
     await start();
     const id = capIdFor(row);
     const first = await callBridge([id]);
-    const replay = await callBridge([id]); // exact replay — same bearer, resolves again
-    expect(first.values[id]).toBe(row.token);
-    expect(replay.values[id]).toBe(row.token);
-  });
-
-  it('INTEGRITY META-CHECK: the same battery request WOULD leak on a resolver that ignores the MAC', async () => {
-    // Proves the battery is not vacuous: a broken (pre-fix) resolver that
-    // authorizes by connection id alone returns a cross-agent token.
-    const a = connectionRow();
-    const b = connectionRow();
-    rows = [a, b];
-    const byId = new Map(rows.map((r) => [r.id, r]));
-    const brokenResolve = (request) =>
-      resolveSecretRequest(request, {
-        capKey: CAP_KEY,
-        allowLegacyUnscoped: true, // old behavior: bare ids honored
-        loadActive: async (ids) => ids.map((id) => byId.get(id)).filter(Boolean),
-        decrypt: (rowIn) => decryptStoredSecret(rowIn, VAULT_KEY),
-        audit: async () => {},
-      });
-    server = createResolverServer(brokenResolve);
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socketPath, resolve);
-    });
-    // Bare id (bulk-enumeration primitive) succeeds under the broken config.
-    const bare = `channel/${b.id}`;
-    const res = await callBridge([bare]);
-    expect(res.values[bare]).toBe(b.token);
+    const replay = await callBridge([id]);
+    expect(first.values[id]).toBe(tokensById.get(row.id));
+    expect(replay.values[id]).toBe(tokensById.get(row.id));
   });
 });
