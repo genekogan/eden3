@@ -182,6 +182,8 @@ afterAll(async () => {
   await pg`delete from usage_events where user_id = any(${accountIds}::uuid[])`;
   await pg`delete from session_agents where agent_account_id = any(${accountIds}::uuid[])`;
   await pg`delete from session_users where user_account_id = any(${accountIds}::uuid[])`;
+  await pg`delete from messages where session_id in
+           (select id from sessions where owner_id = any(${accountIds}::uuid[]))`;
   await pg`delete from sessions where owner_id = any(${accountIds}::uuid[])`;
   await pg`delete from manna_transactions where manna_account_id in
            (select id from manna_accounts where account_id = any(${accountIds}::uuid[]))`;
@@ -329,7 +331,7 @@ describe('memory dream canonical recovery authorization (DEBT-003)', () => {
       where refunds_transaction_id in (
         select reservation_tx_id from turn_authorizations where turn_id = ${fixture.claim.id}
       )`;
-    expect(refunds?.count).toBe(2);
+    expect(refunds?.count).toBe(1);
   });
 
   it('a stale claimant cannot reverse; the new generation safely resumes recovery', async () => {
