@@ -24,6 +24,7 @@ import { registerHttpHardening } from './services/http-hardening';
 import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './services/history-sync';
 import { AgentProvisioningWorker } from './services/agent-provisioning';
 import { AgentRuntimeSyncScheduler } from './services/agent-runtime-sync';
+import { startBackgroundWorkerLoop } from './services/background-worker-loop';
 import { MediaPipeline } from './services/media-pipeline';
 import {
   EdenMemoryDreamAgentRunner,
@@ -69,9 +70,11 @@ import { workspaceRoutes } from './routes/workspace';
 import { uploadsRoutes } from './routes/uploads';
 import {
   createStorageRuntime,
+  storageCleanupIntervalMs,
   storagePolicyIntervalMs,
   type StorageRuntime,
 } from './services/storage-runtime';
+import type { MultipartCleanupTickResult } from './services/upload-multipart-cleanup';
 
 const requireCjs = createRequire(import.meta.url);
 const pkg = requireCjs('../package.json') as { version: string };
@@ -604,6 +607,42 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       app.addHook('onClose', async () => {
         if (timer) clearInterval(timer);
       });
+
+      const hasCleanupActivity = (result: MultipartCleanupTickResult): boolean =>
+        result.expiredEnqueued > 0 ||
+        result.recovered > 0 ||
+        result.recoveryFailed > 0 ||
+        result.claimed > 0 ||
+        result.succeeded > 0 ||
+        result.retried > 0 ||
+        result.terminalFailed > 0 ||
+        result.stale > 0 ||
+        result.metrics.pending > 0 ||
+        result.metrics.claimed > 0 ||
+        result.metrics.failed > 0 ||
+        result.metrics.oldestPendingAgeMs > 0 ||
+        result.metrics.maxAttemptCount > 0;
+      const cleanupLoop = await startBackgroundWorkerLoop({
+        intervalMs: storageCleanupIntervalMs(),
+        tick: () => storageRuntime.multipartCleanupWorker.tick(),
+        onResult: (result) => {
+          if (!hasCleanupActivity(result)) return;
+          const context = { multipartCleanup: result };
+          if (
+            result.recoveryFailed > 0 ||
+            result.retried > 0 ||
+            result.terminalFailed > 0 ||
+            result.stale > 0 ||
+            result.metrics.failed > 0
+          ) {
+            app.log.warn(context, 'multipart cleanup tick requires attention');
+          } else {
+            app.log.info(context, 'multipart cleanup tick');
+          }
+        },
+        onError: (err) => app.log.error({ err }, 'multipart cleanup tick failed'),
+      });
+      app.addHook('onClose', async () => cleanupLoop.stop());
     }
   }
   // Existing generated media keeps its content-addressed filename URLs. This
