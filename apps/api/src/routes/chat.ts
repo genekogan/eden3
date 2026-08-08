@@ -120,6 +120,7 @@ async function ensureChattableAgent(
     return {
       accountId: account.id,
       username: account.username,
+      ownerId: agent.ownerId,
       openclawId: agent.openclawId,
       model: agent.model,
       agentRuntime: await gatewayGlue.modelRuntime.getRuntime(agent.model),
@@ -190,6 +191,7 @@ async function ensureChattableAgent(
     return {
       accountId: account.id,
       username: account.username,
+      ownerId: agent.ownerId,
       openclawId,
       model: agent.model,
       agentRuntime: await gatewayGlue.modelRuntime.getRuntime(agent.model),
@@ -266,6 +268,7 @@ async function resolveExisting(
   const rows = await db
     .select({
       accountId: agents.accountId,
+      ownerId: agents.ownerId,
       openclawId: agents.openclawId,
       model: agents.model,
       thinkingLevel: agents.thinkingLevel,
@@ -284,6 +287,7 @@ async function resolveExisting(
     const chattable = await ensureChattableAgent(resolved, gatewayGlue);
     provisioned = {
       accountId: chattable.accountId,
+      ownerId: chattable.ownerId ?? resolved.agent.ownerId,
       username: chattable.username,
       openclawId: chattable.openclawId,
       model: chattable.model ?? DEFAULT_AGENT_MODEL,
@@ -309,6 +313,7 @@ async function resolveExisting(
     agent: {
       accountId: provisioned.accountId,
       username: provisioned.username,
+      ownerId: provisioned.ownerId,
       openclawId: provisioned.openclawId!,
       model: provisioned.model,
       agentRuntime: await gatewayGlue.modelRuntime.getRuntime(

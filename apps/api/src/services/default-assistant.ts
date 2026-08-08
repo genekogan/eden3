@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { pg, type Account, type Agent } from '@eden3/db';
+import { pg } from '@eden3/db';
 import {
   BOOTSTRAP_FILENAME,
   WORKSPACE_STATE_FILENAME,
@@ -11,20 +11,19 @@ import {
   renderTemplate,
   workspaceBootstrapStatus,
 } from '@eden3/gateway';
+import {
+  DEFAULT_EVE_OPENCLAW_ID,
+  DEFAULT_EVE_USERNAME,
+  hardenPlatformEveRuntimeEntry,
+  PLATFORM_EVE_TOOL_GROUPS,
+} from './platform-eve';
+
+export { DEFAULT_EVE_OPENCLAW_ID, DEFAULT_EVE_USERNAME, isPlatformEve } from './platform-eve';
 
 /**
  * Eve is the one platform-owned assistant. Her database account may be
  * renamed during upgrades, but the shared-gateway identity must never move.
  */
-export const DEFAULT_EVE_USERNAME = 'eve';
-export const DEFAULT_EVE_OPENCLAW_ID = 'main';
-
-export function isPlatformEve(_account: Account, agent: Agent): boolean {
-  // The runtime binding is the durable identity. Keep the guard closed even
-  // if a damaged/manual database edit temporarily drifts the display handle.
-  return agent.openclawId === DEFAULT_EVE_OPENCLAW_ID && agent.ownerId === null;
-}
-
 export async function isPlatformEveAccountId(accountId: string | null): Promise<boolean> {
   if (accountId === null) return false;
   const [row] = await pg<{ isEve: boolean }[]>`
@@ -140,14 +139,14 @@ export async function ensureEveAssistant(
     await sql`
       insert into agents (
         account_id, owner_id, name, description, persona, is_persona_public,
-        greeting, public, openclaw_id, is_pilot, is_synthetic, provision_status,
-        provisioned_at
+        greeting, public, openclaw_id, tool_groups, is_pilot, is_synthetic,
+        provision_status, provisioned_at
       )
       values (
         ${account.id}, null, ${DEFAULT_EVE_PROFILE.name},
         ${DEFAULT_EVE_PROFILE.description}, ${DEFAULT_EVE_PROFILE.persona},
         true, ${DEFAULT_EVE_PROFILE.greeting}, true, ${DEFAULT_EVE_OPENCLAW_ID},
-        true, false, 'ready', now()
+        ${pg.json(JSON.stringify(PLATFORM_EVE_TOOL_GROUPS))}, true, false, 'ready', now()
       )
       on conflict (account_id) do update set
         owner_id = null,
@@ -158,6 +157,7 @@ export async function ensureEveAssistant(
         greeting = excluded.greeting,
         public = true,
         openclaw_id = excluded.openclaw_id,
+        tool_groups = excluded.tool_groups,
         is_pilot = true,
         is_synthetic = false,
         provision_status = 'ready',
@@ -268,5 +268,6 @@ async function ensureMainAgentUsesDefaultWorkspace(dataDir: string): Promise<voi
     const workspace = path.join(dataDir, 'workspace');
     entry.name = DEFAULT_EVE_PROFILE.name;
     entry.workspace = workspace;
+    hardenPlatformEveRuntimeEntry(entry);
   });
 }

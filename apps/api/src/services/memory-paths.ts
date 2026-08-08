@@ -1,6 +1,8 @@
 import path from 'node:path';
 
-const ACCOUNT_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
+// Canonical Eden UUIDs and legacy ids are lowercase. Refusing uppercase here
+// prevents aliases on case-insensitive workspace filesystems.
+const ACCOUNT_ID_RE = /^[a-z0-9][a-z0-9_-]{0,127}$/;
 
 /** Stable display portion for a per-peer memory filename (identity is the id). */
 export function safeMemoryPeerName(name: string): string {
@@ -10,6 +12,7 @@ export function safeMemoryPeerName(name: string): string {
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/\.{2,}/g, '-')
     .replace(/^[._-]+/, '')
     .replace(/[._-]+$/, '')
     .slice(0, 48);
