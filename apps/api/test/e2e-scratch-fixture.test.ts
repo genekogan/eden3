@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   assertE2EScratchAccountInventory,
+  assertE2EScratchRuntimeInventory,
   assertNoE2EScratchSideEffects,
   cleanupE2EScratchUser,
   e2eScratchUser,
@@ -18,7 +19,7 @@ import {
 const databaseName = 'eden3_runtime_e2e_20260808t210520z';
 const databaseUrl = `postgres://eden3:eden3@127.0.0.1:5433/${databaseName}`;
 
-const noSideEffects = (): E2EScratchSideEffects => ({
+const seedBaseline = (): E2EScratchSideEffects => ({
   accountCount: 1,
   agentCount: 0,
   sessionCount: 0,
@@ -28,9 +29,28 @@ const noSideEffects = (): E2EScratchSideEffects => ({
   mannaTransactionCount: 0,
 });
 
+const runtimeBaseline = (): E2EScratchSideEffects => ({
+  ...seedBaseline(),
+  accountCount: 2,
+  agentCount: 1,
+});
+
+const platformEve = {
+  id: '00000000-0000-4000-8000-000000000001',
+  type: 'agent',
+  username: 'eve',
+  externalId: null,
+  clerkUserId: null,
+  userImage: null,
+  deleted: false,
+  ownerId: null,
+  openclawId: 'main',
+  bootstrapCanonical: true,
+} as const;
+
 class MemoryFixtureRepository implements E2EScratchFixtureRepository {
   rows: unknown[] = [];
-  counts = noSideEffects();
+  counts = seedBaseline();
   lockModes: boolean[] = [];
   deleteInputs: E2EScratchUser[] = [];
   inTransaction = false;
@@ -69,8 +89,8 @@ class MemoryFixtureRepository implements E2EScratchFixtureRepository {
     this.deleteInputs.push(structuredClone(fixture));
     const exact = this.rows.find((row) => (row as { id?: string }).id === fixture.id);
     if (!exact) return [];
-    this.rows = [];
-    this.counts.accountCount = 0;
+    this.rows = this.rows.filter((row) => (row as { id?: string }).id !== fixture.id);
+    this.counts.accountCount = this.rows.length;
     return [fixture.id];
   }
 }
@@ -131,6 +151,27 @@ describe('isolated E2E scratch user fixture', () => {
     expect(e2eScratchUser(`${databaseName}_other`).id).not.toBe(fixture.id);
   });
 
+  it('accepts only exact Gene plus one canonical platform Eve after API startup', () => {
+    const fixture = e2eScratchUser(databaseName);
+    expect(() => assertE2EScratchRuntimeInventory([platformEve, fixture], fixture)).not.toThrow();
+    expect(() =>
+      assertE2EScratchRuntimeInventory([platformEve], fixture, { geneRequired: false }),
+    ).not.toThrow();
+    for (const rows of [
+      [fixture],
+      [fixture, { ...platformEve, username: 'eve-lookalike' }],
+      [fixture, { ...platformEve, type: 'user' }],
+      [fixture, { ...platformEve, ownerId: fixture.id }],
+      [fixture, { ...platformEve, openclawId: 'not-main' }],
+      [fixture, { ...platformEve, deleted: true }],
+      [fixture, { ...platformEve, bootstrapCanonical: false }],
+      [fixture, platformEve, { ...fixture, id: e2eScratchUser(`${databaseName}_other`).id }],
+      [fixture, platformEve, { ...platformEve, id: '00000000-0000-4000-8000-000000000002' }],
+    ]) {
+      expect(() => assertE2EScratchRuntimeInventory(rows, fixture)).toThrow(/platform Eve baseline/);
+    }
+  });
+
   it('permits only an empty inventory or the exact idempotent fixture row', () => {
     const fixture = e2eScratchUser(databaseName);
     expect(assertE2EScratchAccountInventory([], fixture)).toBe('insert');
@@ -173,8 +214,8 @@ describe('isolated E2E scratch user fixture', () => {
       readSideEffects: vi.fn(async () => {
         calls.push('side-effects');
         return {
-          accountCount: 1,
-          agentCount: 0,
+          accountCount: 2,
+          agentCount: 1,
           sessionCount: 0,
           usageCount: 0,
           providerRunCount: 0,
@@ -190,8 +231,8 @@ describe('isolated E2E scratch user fixture', () => {
   it('fails closed on an absent/ambiguous user or any pre-Playwright side effect', async () => {
     const fixture = e2eScratchUser(databaseName);
     const readSideEffects = vi.fn(async () => ({
-      accountCount: 1,
-      agentCount: 0,
+      accountCount: 2,
+      agentCount: 1,
       sessionCount: 0,
       usageCount: 0,
       providerRunCount: 0,
@@ -215,12 +256,13 @@ describe('isolated E2E scratch user fixture', () => {
       'mannaAccountCount',
       'mannaTransactionCount',
     ] as const) {
+      const baseline = runtimeBaseline();
       expect(() =>
-        assertNoE2EScratchSideEffects({ ...noSideEffects(), [key]: 1 }),
+        assertNoE2EScratchSideEffects({ ...baseline, [key]: baseline[key] + 1 }),
       ).toThrow(/side effects/);
     }
     expect(() =>
-      assertNoE2EScratchSideEffects({ ...noSideEffects(), accountCount: 2 }),
+      assertNoE2EScratchSideEffects({ ...runtimeBaseline(), accountCount: 3 }),
     ).toThrow(/side effects/);
   });
 
@@ -230,6 +272,9 @@ describe('isolated E2E scratch user fixture', () => {
     expect(seeded.action).toBe('insert');
     expect(repository.rows).toEqual([seeded.fixture]);
     expect((await seedE2EScratchUser({ repository, databaseName })).action).toBe('existing');
+
+    repository.rows.push(platformEve);
+    repository.counts = runtimeBaseline();
 
     const preflight = await preflightE2EScratchUser({
       repository,
@@ -252,13 +297,15 @@ describe('isolated E2E scratch user fixture', () => {
     expect(cleaned).toEqual({ fixture: seeded.fixture, removed: true });
     expect(repository.lockModes).toContain(true);
     expect(repository.deleteInputs).toEqual([seeded.fixture]);
+    expect(repository.rows).toEqual([platformEve]);
     expect((await cleanupE2EScratchUser({ repository, databaseName })).removed).toBe(false);
   });
 
   it('rechecks Clerk identity in Postgres even when the HTTP projection looks exact', async () => {
     const repository = new MemoryFixtureRepository();
     const fixture = e2eScratchUser(databaseName);
-    repository.rows = [{ ...fixture, clerkUserId: 'clerk_subject' }];
+    repository.rows = [{ ...fixture, clerkUserId: 'clerk_subject' }, platformEve];
+    repository.counts = runtimeBaseline();
     await expect(
       preflightE2EScratchUser({
         repository,
@@ -275,6 +322,6 @@ describe('isolated E2E scratch user fixture', () => {
           ],
         }),
       }),
-    ).rejects.toThrow(/exact synthetic scratch user/);
+    ).rejects.toThrow(/exact Gene and platform Eve baseline/);
   });
 });
