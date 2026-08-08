@@ -685,6 +685,29 @@ export const turnAuthorizations = pgTable(
   ],
 );
 
+/**
+ * One-shot provider handoff + durable usable-output checkpoint for a turn.
+ * Inserting this 1:1 row is the exclusive provider-start transition. The
+ * first non-whitespace output timestamp is monotonic and drives the
+ * full-reserve-v1 crash/error settlement rule.
+ */
+export const turnProviderRuns = pgTable(
+  'turn_provider_runs',
+  {
+    turnId: uuid('turn_id')
+      .primaryKey()
+      .references(() => turnAuthorizations.turnId, { onDelete: 'cascade' }),
+    providerStartedAt: timestamptz('provider_started_at').notNull().defaultNow(),
+    usableOutputAt: timestamptz('usable_output_at'),
+  },
+  (t) => [
+    check(
+      'turn_provider_runs_output_after_start_chk',
+      sql`${t.usableOutputAt} is null or ${t.usableOutputAt} >= ${t.providerStartedAt}`,
+    ),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // billing — Stripe subscription state + Eden voucher inventory.
 // ---------------------------------------------------------------------------
@@ -1854,6 +1877,8 @@ export type MannaTransaction = typeof mannaTransactions.$inferSelect;
 export type NewMannaTransaction = typeof mannaTransactions.$inferInsert;
 export type TurnAuthorization = typeof turnAuthorizations.$inferSelect;
 export type NewTurnAuthorization = typeof turnAuthorizations.$inferInsert;
+export type TurnProviderRun = typeof turnProviderRuns.$inferSelect;
+export type NewTurnProviderRun = typeof turnProviderRuns.$inferInsert;
 export type BillingSubscription = typeof billingSubscriptions.$inferSelect;
 export type NewBillingSubscription = typeof billingSubscriptions.$inferInsert;
 export type MannaVoucher = typeof mannaVouchers.$inferSelect;
