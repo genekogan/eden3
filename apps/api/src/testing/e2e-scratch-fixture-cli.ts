@@ -2,6 +2,13 @@ import { pg } from '@eden3/db';
 import { pathToFileURL } from 'node:url';
 
 import {
+  DEFAULT_EVE_OPENCLAW_ID,
+  DEFAULT_EVE_USERNAME,
+  PLATFORM_EVE_DATABASE_PROFILE,
+} from '../services/default-assistant';
+import { PLATFORM_EVE_TOOL_GROUPS } from '../services/platform-eve';
+
+import {
   cleanupE2EScratchUser,
   parseE2EScratchApiUrl,
   parseE2EScratchDatabaseUrl,
@@ -49,30 +56,68 @@ export function postgresRepository(
       return row.databaseName;
     },
     async accountRows(options = {}) {
-      const select = `
-        select id::text,
-               type,
-               username::text,
-               external_id as "externalId",
-               clerk_user_id as "clerkUserId",
-               user_image as "userImage",
-               deleted
-        from accounts
-        order by id`;
       return options.forUpdate
         ? await sql`
-            select id::text,
-                   type,
-                   username::text,
-                   external_id as "externalId",
-                   clerk_user_id as "clerkUserId",
-                   user_image as "userImage",
-                   deleted
-            from accounts
-            order by id
-            for update
+            select a.id::text,
+                   a.type,
+                   a.username::text,
+                   a.external_id as "externalId",
+                   a.clerk_user_id as "clerkUserId",
+                   a.user_image as "userImage",
+                   a.deleted,
+                   g.owner_id as "ownerId",
+                   g.openclaw_id as "openclawId",
+                   (
+                     a.username = ${DEFAULT_EVE_USERNAME}
+                     and g.owner_id is null
+                     and g.name = ${PLATFORM_EVE_DATABASE_PROFILE.name}
+                     and g.description = ${PLATFORM_EVE_DATABASE_PROFILE.description}
+                     and g.persona = ${PLATFORM_EVE_DATABASE_PROFILE.persona}
+                     and g.is_persona_public = true
+                     and g.greeting = ${PLATFORM_EVE_DATABASE_PROFILE.greeting}
+                     and g.public = true
+                     and g.openclaw_id = ${DEFAULT_EVE_OPENCLAW_ID}
+                     and g.tool_groups = ${JSON.stringify(PLATFORM_EVE_TOOL_GROUPS)}::jsonb
+                     and g.is_pilot = true
+                     and g.is_synthetic = false
+                     and g.provision_status = 'ready'
+                     and g.provisioned_at is not null
+                   ) as "bootstrapCanonical"
+            from accounts a
+            left join agents g on g.account_id = a.id
+            order by a.id
+            for update of a
           `
-        : await sql.unsafe(select);
+        : await sql`
+            select a.id::text,
+                   a.type,
+                   a.username::text,
+                   a.external_id as "externalId",
+                   a.clerk_user_id as "clerkUserId",
+                   a.user_image as "userImage",
+                   a.deleted,
+                   g.owner_id as "ownerId",
+                   g.openclaw_id as "openclawId",
+                   (
+                     a.username = ${DEFAULT_EVE_USERNAME}
+                     and g.owner_id is null
+                     and g.name = ${PLATFORM_EVE_DATABASE_PROFILE.name}
+                     and g.description = ${PLATFORM_EVE_DATABASE_PROFILE.description}
+                     and g.persona = ${PLATFORM_EVE_DATABASE_PROFILE.persona}
+                     and g.is_persona_public = true
+                     and g.greeting = ${PLATFORM_EVE_DATABASE_PROFILE.greeting}
+                     and g.public = true
+                     and g.openclaw_id = ${DEFAULT_EVE_OPENCLAW_ID}
+                     and g.tool_groups = ${JSON.stringify(PLATFORM_EVE_TOOL_GROUPS)}::jsonb
+                     and g.is_pilot = true
+                     and g.is_synthetic = false
+                     and g.provision_status = 'ready'
+                     and g.provisioned_at is not null
+                   ) as "bootstrapCanonical"
+            from accounts a
+            left join agents g on g.account_id = a.id
+            order by a.id
+          `;
     },
     async insertUser(fixture) {
       await sql`

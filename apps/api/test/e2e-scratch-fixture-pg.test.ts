@@ -70,6 +70,22 @@ integration('isolated E2E scratch fixture (disposable Postgres)', () => {
       }),
     ).rejects.toThrow(/exact synthetic scratch user/);
     await pg`update accounts set clerk_user_id = null where id = ${fixtureId}`;
+
+    const [eve] = await pg<{ accountId: string; greeting: string }[]>`
+      select g.account_id::text as "accountId", g.greeting
+      from agents g
+      where g.openclaw_id = 'main' and g.owner_id is null
+    `;
+    expect(eve).toBeDefined();
+    await pg`update agents set greeting = ${`${eve!.greeting} drift`} where account_id = ${eve!.accountId}`;
+    await expect(
+      preflightE2EScratchUser({
+        repository: e2eScratchPostgresRepository,
+        databaseName,
+        fetchUsers: async () => (await app.inject({ method: 'GET', url: '/dev/users?q=gene' })).json(),
+      }),
+    ).rejects.toThrow(/platform Eve baseline/);
+    await pg`update agents set greeting = ${eve!.greeting} where account_id = ${eve!.accountId}`;
   });
 
   it('locks the exact owner row so a concurrent FK writer cannot be laundered by cleanup', async () => {
@@ -113,10 +129,11 @@ integration('isolated E2E scratch fixture (disposable Postgres)', () => {
     releaseCleanup();
     await expect(cleanup).resolves.toMatchObject({ removed: true });
     await expect(writer).rejects.toThrow();
-    const [counts] = await pg<{ accounts: number; usage: number }[]>`
+    const [counts] = await pg<{ accounts: number; agents: number; usage: number }[]>`
       select (select count(*)::int from accounts) as accounts,
+             (select count(*)::int from agents) as agents,
              (select count(*)::int from usage_events) as usage
     `;
-    expect(counts).toEqual({ accounts: 0, usage: 0 });
+    expect(counts).toEqual({ accounts: 1, agents: 1, usage: 0 });
   });
 });

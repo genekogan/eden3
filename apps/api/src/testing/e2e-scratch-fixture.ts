@@ -13,6 +13,19 @@ export interface E2EScratchUser {
   deleted: false;
 }
 
+export interface E2EScratchPlatformEve {
+  id: string;
+  type: 'agent';
+  username: 'eve';
+  externalId: null;
+  clerkUserId: null;
+  userImage: null;
+  deleted: false;
+  ownerId: null;
+  openclawId: 'main';
+  bootstrapCanonical: true;
+}
+
 export interface E2EScratchSideEffects {
   accountCount: number;
   agentCount: number;
@@ -121,6 +134,23 @@ function exactScratchAccount(row: unknown, fixture: E2EScratchUser): boolean {
   );
 }
 
+function exactPlatformEve(row: unknown): row is E2EScratchPlatformEve {
+  if (row === null || typeof row !== 'object' || Array.isArray(row)) return false;
+  const candidate = row as Record<string, unknown>;
+  return (
+    typeof candidate.id === 'string' &&
+    candidate.type === 'agent' &&
+    candidate.username === 'eve' &&
+    candidate.externalId === null &&
+    candidate.clerkUserId === null &&
+    candidate.userImage === null &&
+    candidate.deleted === false &&
+    candidate.ownerId === null &&
+    candidate.openclawId === 'main' &&
+    candidate.bootstrapCanonical === true
+  );
+}
+
 export function assertE2EScratchAccountInventory(
   rows: readonly unknown[],
   fixture: E2EScratchUser,
@@ -128,6 +158,24 @@ export function assertE2EScratchAccountInventory(
   if (rows.length === 0) return 'insert';
   if (rows.length === 1 && exactScratchAccount(rows[0], fixture)) return 'existing';
   throw new Error('scratch database must contain only the exact synthetic scratch user');
+}
+
+export function assertE2EScratchRuntimeInventory(
+  rows: readonly unknown[],
+  fixture: E2EScratchUser,
+  options: { geneRequired?: boolean } = {},
+): void {
+  const geneRows = rows.filter((row) => exactScratchAccount(row, fixture));
+  const eveRows = rows.filter(exactPlatformEve);
+  const geneRequired = options.geneRequired !== false;
+  const expectedLength = geneRequired ? 2 : 1;
+  if (
+    rows.length !== expectedLength ||
+    geneRows.length !== (geneRequired ? 1 : 0) ||
+    eveRows.length !== 1
+  ) {
+    throw new Error('scratch database must contain only the exact Gene and platform Eve baseline');
+  }
 }
 
 function assertExactDevUsers(payload: unknown, fixture: E2EScratchUser): void {
@@ -154,10 +202,15 @@ function assertExactDevUsers(payload: unknown, fixture: E2EScratchUser): void {
   }
 }
 
-export function assertNoE2EScratchSideEffects(counts: E2EScratchSideEffects): void {
+export function assertNoE2EScratchSideEffects(
+  counts: E2EScratchSideEffects,
+  phase: 'seed' | 'runtime' = 'runtime',
+): void {
+  const accountCount = phase === 'seed' ? 1 : 2;
+  const agentCount = phase === 'seed' ? 0 : 1;
   if (
-    counts.accountCount !== 1 ||
-    counts.agentCount !== 0 ||
+    counts.accountCount !== accountCount ||
+    counts.agentCount !== agentCount ||
     counts.sessionCount !== 0 ||
     counts.usageCount !== 0 ||
     counts.providerRunCount !== 0 ||
@@ -203,7 +256,7 @@ export async function seedE2EScratchUser(options: {
     ) {
       throw new Error('scratch fixture insert did not converge');
     }
-    assertNoE2EScratchSideEffects(await repository.sideEffectCounts());
+    assertNoE2EScratchSideEffects(await repository.sideEffectCounts(), 'seed');
     return { action, fixture };
   });
 }
@@ -219,12 +272,7 @@ export async function preflightE2EScratchUser(options: {
     fixture,
     fetchUsers: options.fetchUsers,
     readSideEffects: async () => {
-      if (
-        assertE2EScratchAccountInventory(await options.repository.accountRows(), fixture) !==
-        'existing'
-      ) {
-        throw new Error('scratch fixture account disappeared before preflight');
-      }
+      assertE2EScratchRuntimeInventory(await options.repository.accountRows(), fixture);
       return options.repository.sideEffectCounts();
     },
   });
@@ -240,18 +288,19 @@ export async function cleanupE2EScratchUser(options: {
     // FOR UPDATE conflicts with the FOR KEY SHARE check every FK insert takes.
     // Once held, no owner-side row can appear between the inventory and DELETE.
     const rows = await repository.accountRows({ forUpdate: true });
-    if (rows.length === 0) return { fixture, removed: false };
-    if (assertE2EScratchAccountInventory(rows, fixture) !== 'existing') {
-      throw new Error('scratch fixture cleanup identity mismatch');
+    if (rows.length === 1) {
+      assertE2EScratchRuntimeInventory(rows, fixture, { geneRequired: false });
+      return { fixture, removed: false };
     }
+    assertE2EScratchRuntimeInventory(rows, fixture);
     assertNoE2EScratchSideEffects(await repository.sideEffectCounts());
     const deleted = await repository.deleteExactUser(fixture);
     if (deleted.length !== 1 || deleted[0] !== fixture.id) {
       throw new Error('scratch fixture cleanup did not delete the exact user');
     }
-    if ((await repository.accountRows()).length !== 0) {
-      throw new Error('scratch fixture cleanup left an account behind');
-    }
+    assertE2EScratchRuntimeInventory(await repository.accountRows(), fixture, {
+      geneRequired: false,
+    });
     return { fixture, removed: true };
   });
 }
