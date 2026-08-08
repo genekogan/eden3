@@ -15,6 +15,7 @@ import { EmptyState } from "@/components/empty-state";
 import { MediaThumb } from "@/components/media";
 import { Skeleton } from "@/components/skeleton";
 import { describeApiFailure } from "@/components/agents/agent-utils";
+import { UploadPanel } from "@/components/uploads/upload-panel";
 
 type Scope = "agent" | "mine";
 
@@ -83,10 +84,12 @@ export function LibraryClient({ username }: { username: string }) {
 
   return (
     <div>
+      <UploadPanel />
+
       <div
         role="group"
         aria-label="Library scope"
-        className="flex w-fit overflow-hidden rounded-lg border border-edge"
+        className="mt-8 flex w-fit overflow-hidden rounded-lg border border-edge"
       >
         {(
           [

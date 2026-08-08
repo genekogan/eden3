@@ -17,8 +17,8 @@ export default async function AgentLibraryPage({
       </p>
       <h1 className="mt-3 text-3xl font-light tracking-tight md:text-4xl">Library</h1>
       <p className="mt-2 max-w-2xl text-sm text-muted">
-        Everything this agent has created — or switch to all of your creations,
-        Studio output included.
+        Upload private files, browse what this agent has created, or switch to all
+        of your creations, Studio output included.
       </p>
       <div className="mt-8">
         <LibraryClient username={decoded} />
