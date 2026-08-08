@@ -44,7 +44,12 @@ describe('netspend refunds-correlation index migration (T08-U01, RUNBOOK §12)',
 
     // Drizzle runs migrations transactionally; a concurrent build here would be
     // broken. The concurrent path lives outside the migration (ops runbook).
-    expect(sql).not.toMatch(/concurrently/i);
+    // Comments are stripped first — the file may (should) explain this rule.
+    const executable = sql
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n');
+    expect(executable).not.toMatch(/concurrently/i);
   });
 
   it('changes the snapshot by exactly one index and is journaled as idx 27', async () => {
@@ -64,7 +69,7 @@ describe('netspend refunds-correlation index migration (T08-U01, RUNBOOK §12)',
 
     // Remove the one expected addition; everything else must be identical to
     // 0026 (no generator drift riding along).
-    delete nextTables['public.manna_transactions'].indexes[INDEX_NAME];
+    delete nextTables['public.manna_transactions']?.indexes[INDEX_NAME];
     expect(nextTables).toEqual(prev.tables);
     for (const key of Object.keys(next)) {
       if (key === 'tables' || key === 'id' || key === 'prevId') continue;

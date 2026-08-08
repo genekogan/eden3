@@ -68,7 +68,9 @@ function scratchClient(dbName: string) {
   if (PROTECTED_DBS.has(dbName) || !dbName.startsWith('t08u01_mig_')) {
     throw new Error(`refusing DDL connection to non-scratch database "${dbName}"`);
   }
-  return postgres(urlForDb(dbName), { max: 2, onnotice: () => {} });
+  // max:1 so session-level statements (BEGIN/LOCK, SET lock_timeout) share the
+  // exact connection that runs the migration statement under test.
+  return postgres(urlForDb(dbName), { max: 1, onnotice: () => {} });
 }
 
 afterAll(async () => {
@@ -126,9 +128,9 @@ describe('scratch-DB migration paths (DDL confined to self-created databases)', 
 
       let rows = await indexRow(client);
       expect(rows).toHaveLength(1);
-      expect(rows[0].indexdef).toBe(EXPECTED_INDEXDEF);
-      expect(rows[0].indisvalid).toBe(true);
-      const oid = rows[0].oid;
+      expect(rows[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
+      expect(rows[0]?.indisvalid).toBe(true);
+      const oid = rows[0]?.oid;
 
       // Journal recorded exactly the 28-migration chain, newest hash = our file.
       const journal = await client`
@@ -139,14 +141,14 @@ describe('scratch-DB migration paths (DDL confined to self-created databases)', 
       // Re-running the migrator is a journal-level no-op.
       await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
       const journalAfter = await client`select count(*)::int as n from drizzle.__drizzle_migrations`;
-      expect(journalAfter[0].n).toBe(journal.length);
+      expect(journalAfter[0]?.n).toBe(journal.length);
 
       // Replaying the migration statement itself is harmless (exists-path).
       await client.unsafe(await migrationSql());
       rows = await indexRow(client);
       expect(rows).toHaveLength(1);
-      expect(rows[0].oid).toBe(oid);
-      expect(rows[0].indexdef).toBe(EXPECTED_INDEXDEF);
+      expect(rows[0]?.oid).toBe(oid);
+      expect(rows[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
     } finally {
       await client.end();
     }
@@ -179,8 +181,8 @@ describe('scratch-DB migration paths (DDL confined to self-created databases)', 
 
       const after = await indexRow(client);
       expect(after).toHaveLength(1);
-      expect(after[0].oid).toBe(before[0].oid); // untouched, not rebuilt
-      expect(after[0].indexdef).toBe(EXPECTED_INDEXDEF);
+      expect(after[0]?.oid).toBe(before[0]?.oid); // untouched, not rebuilt
+      expect(after[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
     } finally {
       await writer.end().catch(() => {});
       await client.end();
@@ -236,8 +238,8 @@ describe('shared-DB read-only verification (target = DATABASE_URL)', () => {
     try {
       const rows = await indexRow(client);
       expect(rows, `index missing on ${target}`).toHaveLength(1);
-      expect(rows[0].indexdef).toBe(EXPECTED_INDEXDEF);
-      expect(rows[0].indisvalid).toBe(true);
+      expect(rows[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
+      expect(rows[0]?.indisvalid).toBe(true);
 
       const expectedHash = createHash('sha256').update(await migrationSql()).digest('hex');
       const journal = await client`

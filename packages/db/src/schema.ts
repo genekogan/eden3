@@ -547,6 +547,16 @@ export const mannaTransactions = pgTable(
       .on(t.stripeEventId, t.stripeEventType)
       .where(sql`${t.stripeEventId} is not null`),
     index('manna_transactions_account_created_idx').on(t.mannaAccountId, t.createdAt.desc()),
+    // Refund-correlation index behind netSpendSince's lateral (the per-turn
+    // daily/rolling-cap computation): without it every spend row seq-scans the
+    // whole ledger (5.6s/query at 1.14M rows → 10s+ pre-stream latency).
+    // Name deliberately breaks the local `<table>_*_idx` convention: it must
+    // match the index created live on the prod box on 2026-08-05 (RUNBOOK §12
+    // "Missing ledger index"), so migration 0027's exists-guard recognizes it
+    // instead of forcing a drop/recreate on a live database. (T08-U01)
+    index('idx_manna_tx_refunds_tx')
+      .on(t.refundsTransactionId)
+      .where(sql`${t.refundsTransactionId} is not null`),
   ],
 );
 
