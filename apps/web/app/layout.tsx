@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 import { Sidebar } from "@/components/Sidebar";
+import { AccessGate } from "@/components/AccessGate";
 import { DevUserGate } from "@/components/DevUserGate";
 import { ErrorBoundary } from "@/components/error-boundary";
 import "./globals.css";
@@ -23,7 +24,9 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <Sidebar />
           <main className="relative min-w-0 flex-1 pt-14 sm:pt-0">
             <ErrorBoundary>
-              <DevUserGate>{children}</DevUserGate>
+              <DevUserGate>
+                <AccessGate>{children}</AccessGate>
+              </DevUserGate>
             </ErrorBoundary>
           </main>
         </div>

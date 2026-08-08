@@ -452,6 +452,7 @@ function toAuthMe(data: unknown): AuthMeResponse {
       rawManna && typeof rawManna === "object"
         ? toMannaSummary(rawManna)
         : null,
+    accessGated: obj.accessGated === true,
   };
 }
 

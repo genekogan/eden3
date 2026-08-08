@@ -14,6 +14,7 @@ export interface ClerkJs {
   mountUserButton(el: HTMLElement, opts?: Record<string, unknown>): void;
   unmountUserButton?(el: HTMLElement): void;
   addListener?(listener: () => void): () => void;
+  signOut?(): Promise<void>;
 }
 
 declare global {

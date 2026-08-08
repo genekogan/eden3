@@ -2,9 +2,14 @@ import { getBalance } from '@eden3/core';
 import { pg } from '@eden3/db';
 import type { FastifyPluginAsync } from 'fastify';
 
+import { isAccessGated } from '../auth-plugin';
+
 export const authRoutes: FastifyPluginAsync = async (app) => {
   app.get('/me', async (req) => {
-    if (!req.account) return { user: null, manna: null };
+    // Closed-alpha gate state rides along so the web can render the
+    // closed-beta panel (with identity) instead of a wall of 403s.
+    const accessGated = isAccessGated(app.accessAllowlist, req.account);
+    if (!req.account) return { user: null, manna: null, accessGated };
 
     const accountId = req.account.accountId;
     const [row] = await pg<{ type: 'user' | 'agent'; userImage: string | null }[]>`
@@ -31,6 +36,7 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
         isAdmin: req.account.isAdmin ?? false,
       },
       manna,
+      accessGated,
     };
   });
 };
