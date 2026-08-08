@@ -58,6 +58,16 @@ export interface AccountErasureIntentStore {
   }): Promise<AccountErasureRequestResult>;
 }
 
+export interface AccountErasureRecoveryStore extends AccountErasureIntentStore {
+  /** Claim one due intent/backup target with a fenced lease, or null when idle. */
+  claimIntentForRecovery(): Promise<AccountErasureIntent | null>;
+  /** Persist only a safe code and release/attention the exact claim. */
+  recordRecoveryFailure(input: {
+    jobId: string;
+    errorCode: 'erasure_recovery_failed';
+  }): Promise<void>;
+}
+
 export interface AccountErasureLedgerSink {
   /** Canonically encode, MAC, WORM-write, then HEAD/read back the exact record. */
   writeAndConfirm(
@@ -90,6 +100,31 @@ function exactLedgerConfirmation(
   );
 }
 
+async function confirmAndSealIntent(
+  intent: AccountErasureIntent,
+  store: Pick<AccountErasureIntentStore, 'sealAfterLedgerConfirmation'>,
+  ledger: AccountErasureLedgerSink,
+): Promise<AccountErasureRequestResult> {
+  const record: AccountErasureLedgerRecord = {
+    schemaVersion: ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
+    jobId: intent.jobId,
+    accountId: intent.accountId,
+    acceptedAt: intent.acceptedAt,
+  };
+  const evidence = await ledger.writeAndConfirm(record);
+  if (!exactLedgerConfirmation(record, evidence)) {
+    throw new ApiError(503, 'erasure_ledger_mismatch', 'Account erasure ledger confirmation failed');
+  }
+  return store.sealAfterLedgerConfirmation({
+    jobId: intent.jobId,
+    accountId: intent.accountId,
+    acceptedAt: intent.acceptedAt,
+    confirmedAt: evidence.confirmedAt,
+    ledgerSha256: evidence.sha256,
+    ledgerMacSha256: evidence.macSha256,
+  });
+}
+
 /**
  * Coordinate the two database transactions around the mandatory WORM ledger
  * confirmation. No account mutation is reachable before exact readback.
@@ -114,23 +149,52 @@ export async function requestAccountErasure(
   if (intent.accountId !== input.actorAccountId) {
     throw new ApiError(503, 'erasure_intent_mismatch', 'Account erasure intent did not match');
   }
-  const record: AccountErasureLedgerRecord = {
-    schemaVersion: ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
-    jobId: intent.jobId,
-    accountId: intent.accountId,
-    acceptedAt: intent.acceptedAt,
-  };
-  const evidence = await ledger.writeAndConfirm(record);
-  if (!exactLedgerConfirmation(record, evidence)) {
-    throw new ApiError(503, 'erasure_ledger_mismatch', 'Account erasure ledger confirmation failed');
+  return confirmAndSealIntent(intent, store, ledger);
+}
+
+export interface AccountErasureRecoveryTickResult {
+  claimed: number;
+  sealed: number;
+  attention: number;
+}
+
+/** Provider-free recovery for intents stranded before transaction 2. */
+export class AccountErasureRecoveryWorker {
+  private running = false;
+
+  constructor(
+    private readonly store: AccountErasureRecoveryStore,
+    private readonly ledger: AccountErasureLedgerSink,
+    private readonly batchSize = 25,
+  ) {
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 100) {
+      throw new Error('Account erasure recovery batch size must be between 1 and 100');
+    }
   }
 
-  return store.sealAfterLedgerConfirmation({
-    jobId: intent.jobId,
-    accountId: intent.accountId,
-    acceptedAt: intent.acceptedAt,
-    confirmedAt: evidence.confirmedAt,
-    ledgerSha256: evidence.sha256,
-    ledgerMacSha256: evidence.macSha256,
-  });
+  async tick(): Promise<AccountErasureRecoveryTickResult> {
+    if (this.running) return { claimed: 0, sealed: 0, attention: 0 };
+    this.running = true;
+    const result: AccountErasureRecoveryTickResult = { claimed: 0, sealed: 0, attention: 0 };
+    try {
+      for (let index = 0; index < this.batchSize; index += 1) {
+        const intent = await this.store.claimIntentForRecovery();
+        if (!intent) break;
+        result.claimed += 1;
+        try {
+          await confirmAndSealIntent(intent, this.store, this.ledger);
+          result.sealed += 1;
+        } catch {
+          await this.store.recordRecoveryFailure({
+            jobId: intent.jobId,
+            errorCode: 'erasure_recovery_failed',
+          });
+          result.attention += 1;
+        }
+      }
+      return result;
+    } finally {
+      this.running = false;
+    }
+  }
 }

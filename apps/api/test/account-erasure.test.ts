@@ -3,10 +3,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../src/errors';
 import {
   ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
+  AccountErasureRecoveryWorker,
   accountErasureRequestSchema,
   requestAccountErasure,
   type AccountErasureIntentStore,
   type AccountErasureLedgerSink,
+  type AccountErasureRecoveryStore,
 } from '../src/services/account-erasure';
 
 const ACTOR_ID = '11111111-1111-4111-8111-111111111111';
@@ -209,5 +211,70 @@ describe('account erasure admission and ledger ordering', () => {
       code: 'protected_account',
     } satisfies Partial<ApiError>);
     expect(ledger.writeAndConfirm).not.toHaveBeenCalled();
+  });
+});
+
+describe('account erasure autonomous recovery', () => {
+  function recoveryStore(): AccountErasureRecoveryStore {
+    const intent = {
+      jobId: JOB_ID,
+      accountId: ACTOR_ID,
+      acceptedAt: ACCEPTED_AT,
+      state: 'intent_pending' as const,
+    };
+    let claimed = false;
+    return {
+      ...store(),
+      claimIntentForRecovery: vi.fn(async () => {
+        if (claimed) return null;
+        claimed = true;
+        return intent;
+      }),
+      recordRecoveryFailure: vi.fn(async () => undefined),
+    };
+  }
+
+  it('finishes an accepted intent without any caller retry', async () => {
+    const repository = recoveryStore();
+    const ledger = sink();
+    const worker = new AccountErasureRecoveryWorker(repository, ledger);
+    await expect(worker.tick()).resolves.toEqual({ claimed: 1, sealed: 1, attention: 0 });
+    expect(ledger.writeAndConfirm).toHaveBeenCalledTimes(1);
+    expect(repository.sealAfterLedgerConfirmation).toHaveBeenCalledTimes(1);
+    expect(repository.recordRecoveryFailure).not.toHaveBeenCalled();
+  });
+
+  it('records a safe durable failure for autonomous retry without raw errors', async () => {
+    const repository = recoveryStore();
+    const ledger = sink();
+    vi.mocked(ledger.writeAndConfirm).mockRejectedValue(
+      new Error('secret provider response must not be persisted'),
+    );
+    const worker = new AccountErasureRecoveryWorker(repository, ledger);
+    await expect(worker.tick()).resolves.toEqual({ claimed: 1, sealed: 0, attention: 1 });
+    expect(repository.recordRecoveryFailure).toHaveBeenCalledWith({
+      jobId: JOB_ID,
+      errorCode: 'erasure_recovery_failed',
+    });
+  });
+
+  it('coalesces overlapping recovery ticks', async () => {
+    const repository = recoveryStore();
+    const ledger = sink();
+    let release!: () => void;
+    vi.mocked(ledger.writeAndConfirm).mockImplementation(
+      (record) =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({ record, confirmedAt: CONFIRMED_AT, sha256: HASH, macSha256: MAC });
+        }),
+    );
+    const worker = new AccountErasureRecoveryWorker(repository, ledger);
+    const first = worker.tick();
+    const second = worker.tick();
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    release();
+    await expect(first).resolves.toEqual({ claimed: 1, sealed: 1, attention: 0 });
+    await expect(second).resolves.toEqual({ claimed: 0, sealed: 0, attention: 0 });
   });
 });
