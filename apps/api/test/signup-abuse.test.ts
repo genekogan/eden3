@@ -3,6 +3,8 @@ import Fastify, {
   type FastifyReply,
   type FastifyRequest,
 } from 'fastify';
+import { sql, type SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -23,6 +25,35 @@ import {
   assertNativeAgentCreationAllowed,
   type NativeAgentAdmissionTransaction,
 } from '../src/services/native-agent-admission';
+
+const quotaSqlDialect = new PgDialect();
+
+function classifyExactNativeQuotaStatement(
+  query: SQL,
+  ownerAccountId: string,
+): 'blocking-owner-lock' | 'owner-count' {
+  const rendered = quotaSqlDialect.sqlToQuery(query);
+  const normalized = rendered.sql.replace(/\s+/g, ' ').trim();
+  const ownerLockKey = `native-agent-quota:${ownerAccountId}`;
+  if (
+    normalized === 'select pg_advisory_xact_lock( hashtextextended($1, 0) )' &&
+    rendered.params.length === 1 &&
+    rendered.params[0] === ownerLockKey
+  ) {
+    return 'blocking-owner-lock';
+  }
+  if (
+    normalized ===
+      'select count(*)::int as count from agents g join accounts a on a.id = g.account_id where g.owner_id = $1 and a.external_id is null and a.deleted = false' &&
+    rendered.params.length === 1 &&
+    rendered.params[0] === ownerAccountId
+  ) {
+    return 'owner-count';
+  }
+  throw new Error(
+    `native-agent admission issued an unexpected or non-blocking SQL statement: ${normalized}`,
+  );
+}
 
 const trustLoopback = (address: string) =>
   address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
@@ -272,9 +303,12 @@ describe('FG-SIGNUP-ABUSE durable native-agent quota contract', () => {
       private calls = 0;
       private unlock: (() => void) | null = null;
 
-      async execute(): Promise<unknown> {
+      async execute(query: SQL): Promise<unknown> {
         this.calls += 1;
-        if (this.calls === 1) {
+        const statement = classifyExactNativeQuotaStatement(query, 'owner-a');
+
+        if (statement === 'blocking-owner-lock') {
+          expect(this.calls).toBe(1);
           const prior = lockTail;
           lockTail = new Promise<void>((resolve) => {
             this.unlock = resolve;
@@ -282,7 +316,11 @@ describe('FG-SIGNUP-ABUSE durable native-agent quota contract', () => {
           await prior;
           return [];
         }
-        return [{ count: durableCount }];
+        if (statement === 'owner-count') {
+          expect(this.calls).toBe(2);
+          return [{ count: durableCount }];
+        }
+        throw new Error('unreachable native-agent admission statement');
       }
 
       release(): void {
@@ -299,7 +337,8 @@ describe('FG-SIGNUP-ABUSE durable native-agent quota contract', () => {
         durableCount += 1;
         return 'created';
       } catch (error) {
-        expect(error).toMatchObject({ statusCode: 429, code: 'agent_quota_exceeded' });
+        if (!(error instanceof ApiError) || error.code !== 'agent_quota_exceeded') throw error;
+        expect(error).toMatchObject({ statusCode: 429 });
         return 'rejected';
       } finally {
         tx.release();
@@ -310,6 +349,18 @@ describe('FG-SIGNUP-ABUSE durable native-agent quota contract', () => {
     expect(results.filter((result) => result === 'created')).toHaveLength(2);
     expect(results.filter((result) => result === 'rejected')).toHaveLength(6);
     expect(durableCount).toBe(2);
+  });
+
+  it('rejects try-lock and no-op mutations in the concurrency harness', () => {
+    expect(() =>
+      classifyExactNativeQuotaStatement(
+        sql`select pg_try_advisory_xact_lock(hashtextextended(${'native-agent-quota:owner-a'}, 0))`,
+        'owner-a',
+      ),
+    ).toThrow(/unexpected or non-blocking SQL statement/);
+    expect(() => classifyExactNativeQuotaStatement(sql`select 1`, 'owner-a')).toThrow(
+      /unexpected or non-blocking SQL statement/,
+    );
   });
 
   it('does not make one owner consume another owner quota', async () => {
