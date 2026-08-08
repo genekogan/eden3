@@ -547,17 +547,22 @@ export class UploadService {
         });
       if (!inspection) throw new Error('Completed backend object is missing');
       let reason: string | null = null;
+      let verifiedMime: string | null = null;
       if (inspection.sizeBytes !== upload.declaredSizeBytes) reason = 'full_size_mismatch';
       else if (!equalText(inspection.checksumSha256, upload.declaredSha256)) reason = 'full_checksum_mismatch';
       else if (!Buffer.isBuffer(inspection.policyBytes) || inspection.policyBytes.length !== inspection.sizeBytes) {
         reason = 'full_policy_bytes_unavailable';
-      } else reason = verifyUploadHeader(inspection.policyBytes, upload.declaredMime).quarantineReason;
+      } else {
+        const verification = verifyUploadHeader(inspection.policyBytes, upload.declaredMime);
+        reason = verification.quarantineReason;
+        verifiedMime = verification.detectedMime;
+      }
       if (!reason && this.policyScanner) {
         reason = (await this.policyScanner({
           uploadId,
           objectId: upload.objectId,
           ownerAccountId,
-          mime: upload.declaredMime,
+          mime: verifiedMime!,
           sizeBytes: inspection.sizeBytes,
           sha256: inspection.checksumSha256,
           header: inspection.header,
@@ -568,10 +573,9 @@ export class UploadService {
         await this.quarantine(upload, reason);
         throw quarantineError(reason);
       }
-      const detected = verifyUploadHeader(inspection.header, upload.declaredMime).detectedMime;
       const available = await this.repository.markAvailable(uploadId, ownerAccountId, {
         sizeBytes: inspection.sizeBytes,
-        mime: detected,
+        mime: verifiedMime!,
         sha256: inspection.checksumSha256,
       });
       if (!available) throw new Error('Upload verification state changed unexpectedly');

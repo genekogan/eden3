@@ -21,6 +21,41 @@ function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
+function crc32(bytes: Buffer): number {
+  let crc = 0xffff_ffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ ((crc & 1) === 1 ? 0xedb8_8320 : 0);
+    }
+  }
+  return (crc ^ 0xffff_ffff) >>> 0;
+}
+
+function pngChunk(type: string, data = Buffer.alloc(0)): Buffer {
+  const chunk = Buffer.alloc(12 + data.length);
+  chunk.writeUInt32BE(data.length, 0);
+  chunk.write(type, 4, 'ascii');
+  data.copy(chunk, 8);
+  chunk.writeUInt32BE(crc32(chunk.subarray(4, 8 + data.length)), 8 + data.length);
+  return chunk;
+}
+
+function benignPng(): Buffer {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(1, 0);
+  ihdr.writeUInt32BE(1, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  return Buffer.concat([
+    signature,
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', Buffer.from([0])),
+    pngChunk('IEND'),
+  ]);
+}
+
 class MemoryMultipartBackend implements MultipartUploadBackend {
   readonly parts = new Map<string, Map<number, Buffer>>();
   readonly objects = new Map<string, Buffer>();
@@ -159,6 +194,37 @@ describe('upload.resumable@v1 security boundary', () => {
     expect(backend.completeCalls).toBe(1);
   });
 
+  it('promotes a generic browser declaration only with its canonical byte-verified MIME', async () => {
+    let scannedMime: string | null = null;
+    const { service: uploadService } = service(
+      () => new Date('2026-08-08T12:00:00.000Z'),
+      {
+        policyScanner: async ({ mime }) => {
+          scannedMime = mime;
+          return { quarantineReason: null };
+        },
+      },
+    );
+    const bytes = benignPng();
+    const reservation = await reserveAndPut(
+      uploadService,
+      OWNER_A,
+      bytes,
+      'application/octet-stream',
+    );
+    const completed = await uploadService.complete(OWNER_A, reservation.uploadId);
+    expect(completed.object).toMatchObject({
+      state: 'available',
+      verifiedMime: 'image/png',
+      verifiedSizeBytes: bytes.length,
+      verifiedSha256: sha256(bytes),
+    });
+    expect(scannedMime).toBe('image/png');
+    expect((await uploadService.status(OWNER_A, reservation.uploadId)).declaredMime).toBe(
+      'application/octet-stream',
+    );
+  });
+
   it('recovers after provider completion succeeds but the process dies before the DB terminal write', async () => {
     const repository = new InMemoryUploadRepository();
     const backend = new MemoryMultipartBackend();
@@ -255,6 +321,7 @@ describe('upload.resumable@v1 security boundary', () => {
     const reservation = await reserveAndPut(uploadService, OWNER_A, bytes, mime);
     await expect(uploadService.complete(OWNER_A, reservation.uploadId)).rejects.toMatchObject({
       code: 'upload_quarantined',
+      message: 'Upload quarantined',
     });
     expect((await uploadService.status(OWNER_A, reservation.uploadId)).objectUrl).toBeNull();
   });
