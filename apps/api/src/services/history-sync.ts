@@ -9,6 +9,10 @@ import {
 import { historyMessageText, type GatewayHistoryMessage, type SessionsHistoryParams, type SessionsHistoryResult } from '@eden3/gateway';
 import { desc, eq, sql } from 'drizzle-orm';
 
+import { PEER_CONTEXT_HEADER, PRIMER_HEADER } from './peer-context-markers';
+
+export { PEER_CONTEXT_HEADER, PRIMER_HEADER } from './peer-context-markers';
+
 /**
  * History sync — pull a session's transcript out of the gateway
  * (`sessions_history` tool) and persist any messages we do not have yet.
@@ -66,23 +70,6 @@ import { desc, eq, sql } from 'drizzle-orm';
  */
 
 export const GATEWAY_EXTERNAL_ID_PREFIX = 'gw:';
-
-/**
- * First line of the continue-old-conversation primer block turns.ts prepends
- * to the first gateway message of a migrated session. Lives HERE (not in
- * turns.ts) because it is the dedupe coupling point: the row we persist holds
- * the user's verbatim text while the gateway transcript holds primer+text, so
- * a gateway user message that starts with this marker and ENDS WITH an
- * existing row's content is that row, not a new message.
- */
-export const PRIMER_HEADER = '[Resumed Eden conversation — recent transcript:]';
-
-/**
- * First line of the trusted current-peer envelope prepended to every web turn.
- * Like the migration primer, this is gateway-only context: Postgres keeps the
- * user's verbatim message, so transcript reconciliation must suffix-match it.
- */
-export const PEER_CONTEXT_HEADER = '[Eden trusted current-peer context:]';
 
 /** Lines like `MEDIA:<path>` (live shape) or `Attachment: <path>` (spike shape). */
 const ATTACHMENT_LINE_RE = /^\s*(?:MEDIA|Attachment):\s*(\S[^\r\n]*?)\s*$/gim;
