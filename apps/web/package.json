@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "next dev -p 4300",
     "build": "next build",
-    "start": "next start -p 4300",
+    "start": "next start -p 4300 -H 127.0.0.1",
     "test": "vitest run --passWithNoTests",
     "typecheck": "tsc --noEmit"
   },

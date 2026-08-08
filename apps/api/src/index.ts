@@ -6,11 +6,13 @@ import { checkSchemaReadiness, loadRootEnv } from '@eden3/db';
 import { ensureBaseline } from '@eden3/gateway';
 
 import { defaultOpenclawDataDir } from './gateway-glue';
+import { assertProductionBoundary } from './production-boundary';
 import { buildServer } from './server';
 import { refreshActiveConceptInventories } from './services/concepts';
 
 loadRootEnv();
 const env = getEnv();
+assertProductionBoundary(env);
 await ensureBaseline({ dataDir: defaultOpenclawDataDir() });
 await refreshActiveConceptInventories();
 
