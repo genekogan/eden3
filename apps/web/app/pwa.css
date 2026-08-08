@@ -1,0 +1,30 @@
+:root {
+  --eden-safe-top: env(safe-area-inset-top, 0px);
+  --eden-safe-right: env(safe-area-inset-right, 0px);
+  --eden-safe-bottom: env(safe-area-inset-bottom, 0px);
+  --eden-safe-left: env(safe-area-inset-left, 0px);
+}
+
+/*
+ * Keep the application chrome inside an installed device's safe rectangle.
+ * The fixed mobile header and navigation sheet do not inherit parent padding,
+ * so their viewport edges are pinned to the same inset variables explicitly.
+ */
+.pwa-safe-area-shell {
+  padding-block: var(--eden-safe-top) var(--eden-safe-bottom);
+  padding-inline: var(--eden-safe-left) var(--eden-safe-right);
+}
+
+.pwa-safe-area-shell > header {
+  inset-inline: var(--eden-safe-left) var(--eden-safe-right);
+  top: var(--eden-safe-top);
+}
+
+.pwa-safe-area-shell > #mobile-navigation-sheet {
+  inset-inline: var(--eden-safe-left) var(--eden-safe-right);
+  top: calc(3.5rem + var(--eden-safe-top));
+}
+
+.pwa-safe-area-shell > aside {
+  height: calc(100dvh - var(--eden-safe-top) - var(--eden-safe-bottom));
+}
