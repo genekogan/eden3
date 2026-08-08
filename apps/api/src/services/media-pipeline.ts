@@ -1,10 +1,7 @@
 import path from 'node:path';
 
 import {
-  InsufficientMannaError,
   LocalMediaStore,
-  debit,
-  defaultChatMediaManna,
   type DbHandle,
   type LedgerResult,
   type MediaStore,
@@ -23,6 +20,10 @@ import {
 import type { SessionEvent } from '@eden3/shared';
 import { eq, sql } from 'drizzle-orm';
 
+import {
+  completePendingChatMedia,
+  hasPendingChatMediaAuthorization,
+} from './chat-media-authorization';
 import { stripAttachmentLines } from './history-sync';
 
 /**
@@ -42,17 +43,18 @@ import { stripAttachmentLines } from './history-sync';
  *      `attachments: [{url, mime, kind, creationId, width?, height?}]` and
  *      publishes `media.attached` (+ `manna.updated` after the debit) on the
  *      per-session events bus,
- *   5. debits manna from the session owner (PRICING by tool kind) with the
- *      refund-safe idempotency key `media:<sha256>:<sessionId>` — re-ingesting
- *      the same file into the same session can never double-charge.
+ *   5. settles the exact durable chat-media authorization that the gateway's
+ *      before_tool_call hook committed before provider execution. Settlement,
+ *      usage attribution, creation, message, and asset correlation share one
+ *      transaction; a file without that authorization is parked, never gifted.
  *
  * Deliberate policy decisions (documented, not accidental):
  * - Studio generations are debited UP FRONT by the route (before the tool is
  *   invoked, so failures can be refunded); sessionless ingests therefore never
  *   debit here.
- * - A failed in-chat debit (insufficient manna, db hiccup) does NOT abort the
- *   ingest: the provider already spent real money making the file, so we keep
- *   the artifact and surface `debitError` instead of throwing.
+ * - Chat media is never post-billed. A missing/consumed authorization parks
+ *   the file without a session, creation, or message. The provider hook fails
+ *   closed, and the stale reservation reaper refunds provider/file failures.
  * - Dedupe: one `media_assets` row per sha256. Re-observing an already-fully-
  *   ingested file in the same correlation context is a no-op (`deduped:
  *   true`). A file parked WITHOUT a session that is later correlated (e.g. by
@@ -218,9 +220,12 @@ export interface IngestFileResult {
   sha256: string;
   /** Session owner that was debited (null when nothing was charged). */
   billedAccountId: string | null;
+  /** Durable chat-media authorization consumed by this artifact. */
+  mediaAuthorizationId: string | null;
+  /** @deprecated Chat media is pre-authorized; retained for DTO compatibility. */
   debit: LedgerResult | null;
-  /** Set instead of throwing when the in-chat debit could not be applied. */
-  debitError: 'insufficient_manna' | 'debit_failed' | null;
+  /** @deprecated Missing authorization parks the file instead of post-billing. */
+  debitError: null;
   /** True when this exact content was already ingested in this context. */
   deduped: boolean;
 }
@@ -248,7 +253,7 @@ export class MediaPipeline {
     const put = await this.store.put(hostPath, { mime });
     const kind = attachmentKindForMime(put.mime);
 
-    // --- resolve session + billed owner --------------------------------
+    // --- resolve session + pre-provider authorization ------------------
     let sessionId = opts.sessionId ?? null;
     let sessionOwnerId: string | null = null;
     if (sessionId) {
@@ -265,6 +270,19 @@ export class MediaPipeline {
       } else {
         sessionOwnerId = session.ownerId;
       }
+    }
+    const action = pricedActionForTool(opts.tool, kind);
+    if (
+      sessionId &&
+      (!action ||
+        action === 'chatTurn' ||
+        !(await hasPendingChatMediaAuthorization({ sessionId, action, db: this.db })))
+    ) {
+      this.log.warn(
+        `media-pipeline: no pending authorization for ${action ?? 'unknown'} in session ${sessionId} — parking ${hostPath}`,
+      );
+      sessionId = null;
+      sessionOwnerId = null;
     }
     const creationUserId = sessionId ? sessionOwnerId : (opts.userId ?? null);
     const correlated = sessionId !== null || (opts.userId ?? null) !== null;
@@ -338,6 +356,7 @@ export class MediaPipeline {
             kind,
             sha256: put.sha256,
             billedAccountId: null,
+            mediaAuthorizationId: null,
             debit: null,
             debitError: null,
             deduped: true,
@@ -363,6 +382,7 @@ export class MediaPipeline {
           kind,
           sha256: put.sha256,
           billedAccountId: null,
+          mediaAuthorizationId: null,
           debit: null,
           debitError: null,
           deduped: true,
@@ -526,10 +546,27 @@ export class MediaPipeline {
         .returning();
       if (!assetRow) throw new Error('media-pipeline: media_assets update returned no row');
 
+      const mediaAuthorization =
+        sessionId && action && action !== 'chatTurn'
+          ? await completePendingChatMedia(tx, {
+              sessionId,
+              action,
+              messageId: messageRow?.id ?? null,
+              creationId: creationRow?.id ?? null,
+              observedTool: opts.tool ?? null,
+            })
+          : null;
+      if (sessionId && !mediaAuthorization) {
+        throw new Error(
+          `media-pipeline: pending ${action ?? 'unknown'} authorization disappeared for session ${sessionId}`,
+        );
+      }
+
       const result = {
         asset: assetRow,
         creation: creationRow,
         message: messageRow,
+        mediaAuthorization,
         raced: false as const,
       };
       await opts.finalizeTransaction?.(tx, result);
@@ -537,42 +574,8 @@ export class MediaPipeline {
     });
     const { asset, creation, message } = txResult;
 
-    // --- manna debit (in-chat media only; studio debits up front) --------
-    let ledger: LedgerResult | null = null;
-    let debitError: IngestFileResult['debitError'] = null;
-    let billedAccountId: string | null = null;
-    const action = pricedActionForTool(opts.tool, kind);
-    if (sessionId && sessionOwnerId && action && action !== 'chatTurn') {
-      // Metered default-route price (flux image 34 / kling-5s video 608 / …)
-      // — the pipeline can't know the exact model/duration, so it bills the
-      // gateway's configured default route instead of the old flat legacy
-      // prices that undercharged real provider cost by up to 20×.
-      const amount = defaultChatMediaManna(action);
-      try {
-        ledger = await debit({
-          accountId: sessionOwnerId,
-          amount,
-          type: `spend:${action}`,
-          idempotencyKey: mediaDebitIdempotencyKey(put.sha256, sessionId),
-          db: this.db,
-        });
-        billedAccountId = sessionOwnerId;
-      } catch (err) {
-        // Keep the artifact: the provider cost is already sunk. Surface the
-        // failure instead of throwing so the watcher loop stays alive.
-        if (err instanceof InsufficientMannaError) {
-          debitError = 'insufficient_manna';
-          this.log.warn(
-            `media-pipeline: session owner ${sessionOwnerId} could not cover ${amount} manna for ${put.sha256} (insufficient balance) — media kept, not charged`,
-          );
-        } else {
-          debitError = 'debit_failed';
-          this.log.error(
-            `media-pipeline: debit failed for ${put.sha256} in session ${sessionId}: ${String(err)}`,
-          );
-        }
-      }
-    }
+    const mediaAuthorization = 'mediaAuthorization' in txResult ? txResult.mediaAuthorization : null;
+    const billedAccountId = mediaAuthorization?.accountId ?? null;
 
     // --- SSE fan-out ------------------------------------------------------
     if (this.bus && sessionId && message && creation) {
@@ -585,11 +588,11 @@ export class MediaPipeline {
           mime: put.mime,
           creationId: creation.id,
         });
-        if (ledger && !ledger.alreadyApplied && billedAccountId) {
+        if (mediaAuthorization && billedAccountId) {
           this.bus.publish(sessionId, {
             type: 'manna.updated',
             accountId: billedAccountId,
-            balance: ledger.balance.total,
+            balance: mediaAuthorization.balance,
           });
         }
       } catch (err) {
@@ -606,8 +609,9 @@ export class MediaPipeline {
       kind,
       sha256: put.sha256,
       billedAccountId,
-      debit: ledger,
-      debitError,
+      mediaAuthorizationId: mediaAuthorization?.authorizationId ?? null,
+      debit: null,
+      debitError: null,
       // A concurrent double-ingest that lost the sha256 race wrote no new
       // creation/message — report it as deduped, like a plain re-ingest.
       deduped: txResult.raced,

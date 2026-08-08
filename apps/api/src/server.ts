@@ -40,6 +40,7 @@ import {
 import { TurnRegistry } from './services/turn-registry';
 import { TurnReservationReaper } from './services/turn-reservation-reaper';
 import { StudioReservationReaper } from './services/studio-reservations';
+import { ChatMediaReservationReaper } from './services/chat-media-authorization';
 import type { SessionShareRepository } from './services/session-shares';
 import { PostgresSessionShareRepository } from './services/session-shares-postgres';
 import type { CompatClientLike } from './services/turns';
@@ -57,6 +58,7 @@ import { devRoutes } from './routes/dev';
 import { feedRoutes } from './routes/feed';
 import { mannaRoutes } from './routes/manna';
 import { mediaObjectRoutes } from './routes/media-objects';
+import { mediaRuntimeRoutes } from './routes/media-runtime';
 import { notificationsRoutes, type NotificationsRoutesOptions } from './routes/notifications';
 import { operatorRoutes } from './routes/operator';
 import { searchRoutes } from './routes/search';
@@ -159,6 +161,8 @@ declare module 'fastify' {
     turnReservationReaper: TurnReservationReaper;
     /** Orphaned Studio generation compensation loop (DEBT-010). */
     studioReservationReaper: StudioReservationReaper;
+    /** Orphaned in-chat media compensation loop (DEBT-007). */
+    chatMediaReservationReaper: ChatMediaReservationReaper;
     /** Eden-managed, activity-gated native deep + metered REM loop. */
     memoryDreamScheduler: MemoryDreamScheduler | null;
     /** Durable, fenced async agent-build worker (tests may drive tick()). */
@@ -508,6 +512,15 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   });
   if (opts.scheduler?.autoStart === true) studioReservationReaper.start();
 
+  const chatMediaReservationReaper = new ChatMediaReservationReaper({
+    onError: (err, context) => app.log.error({ err, context }, 'chat-media reaper side-error'),
+  });
+  app.decorate('chatMediaReservationReaper', chatMediaReservationReaper);
+  app.addHook('onClose', async () => {
+    chatMediaReservationReaper.stop();
+  });
+  if (opts.scheduler?.autoStart === true) chatMediaReservationReaper.start();
+
   const memoryDreamScheduler =
     gatewayClients && historySync
       ? new MemoryDreamScheduler(
@@ -568,6 +581,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(collectionsRoutes);
   await app.register(billingRoutes, { prefix: '/billing', ...(opts.billing ?? {}) });
   await app.register(channelsRoutes, { prefix: '/channels', ...(opts.channels ?? {}) });
+  // Gateway-only fail-closed media authorization callbacks. These exact POST
+  // routes authenticate the gateway bearer before any allowlist bypass.
+  await app.register(mediaRuntimeRoutes, { prefix: '/media' });
   await app.register(mannaRoutes, { prefix: '/manna' });
   // /usage — the tenant view of consumption (own balance/spend/activity).
   // Distinct from /operator (admin platform view); never exposes cost_usd.
