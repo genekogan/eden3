@@ -155,7 +155,7 @@ export async function requestAccountErasure(
 export interface AccountErasureRecoveryTickResult {
   claimed: number;
   sealed: number;
-  attention: number;
+  failed: number;
 }
 
 /** Provider-free recovery for intents stranded before transaction 2. */
@@ -173,9 +173,9 @@ export class AccountErasureRecoveryWorker {
   }
 
   async tick(): Promise<AccountErasureRecoveryTickResult> {
-    if (this.running) return { claimed: 0, sealed: 0, attention: 0 };
+    if (this.running) return { claimed: 0, sealed: 0, failed: 0 };
     this.running = true;
-    const result: AccountErasureRecoveryTickResult = { claimed: 0, sealed: 0, attention: 0 };
+    const result: AccountErasureRecoveryTickResult = { claimed: 0, sealed: 0, failed: 0 };
     try {
       for (let index = 0; index < this.batchSize; index += 1) {
         const intent = await this.store.claimIntentForRecovery();
@@ -189,7 +189,9 @@ export class AccountErasureRecoveryWorker {
             jobId: intent.jobId,
             errorCode: 'erasure_recovery_failed',
           });
-          result.attention += 1;
+          // The store applies bounded backoff and moves the target to attention
+          // only at the frozen threshold; one failed attempt is not attention.
+          result.failed += 1;
         }
       }
       return result;

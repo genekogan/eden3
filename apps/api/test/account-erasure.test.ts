@@ -238,7 +238,7 @@ describe('account erasure autonomous recovery', () => {
     const repository = recoveryStore();
     const ledger = sink();
     const worker = new AccountErasureRecoveryWorker(repository, ledger);
-    await expect(worker.tick()).resolves.toEqual({ claimed: 1, sealed: 1, attention: 0 });
+    await expect(worker.tick()).resolves.toEqual({ claimed: 1, sealed: 1, failed: 0 });
     expect(ledger.writeAndConfirm).toHaveBeenCalledTimes(1);
     expect(repository.sealAfterLedgerConfirmation).toHaveBeenCalledTimes(1);
     expect(repository.recordRecoveryFailure).not.toHaveBeenCalled();
@@ -251,7 +251,7 @@ describe('account erasure autonomous recovery', () => {
       new Error('secret provider response must not be persisted'),
     );
     const worker = new AccountErasureRecoveryWorker(repository, ledger);
-    await expect(worker.tick()).resolves.toEqual({ claimed: 1, sealed: 0, attention: 1 });
+    await expect(worker.tick()).resolves.toEqual({ claimed: 1, sealed: 0, failed: 1 });
     expect(repository.recordRecoveryFailure).toHaveBeenCalledWith({
       jobId: JOB_ID,
       errorCode: 'erasure_recovery_failed',
@@ -274,7 +274,7 @@ describe('account erasure autonomous recovery', () => {
     const second = worker.tick();
     await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     release();
-    await expect(first).resolves.toEqual({ claimed: 1, sealed: 1, attention: 0 });
-    await expect(second).resolves.toEqual({ claimed: 0, sealed: 0, attention: 0 });
+    await expect(first).resolves.toEqual({ claimed: 1, sealed: 1, failed: 0 });
+    await expect(second).resolves.toEqual({ claimed: 0, sealed: 0, failed: 0 });
   });
 });
