@@ -5,8 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "eve:reconcile": "tsx src/eve-reconcile.ts",
     "start": "tsx src/index.ts",
     "test": "vitest run --passWithNoTests",
+    "test:eve-reconciliation": "vitest run --config vitest.eve-reconciliation.config.ts",
     "test:integration": "bash ../../scripts/with-docker-env.sh vitest run --config vitest.integration.config.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit"
