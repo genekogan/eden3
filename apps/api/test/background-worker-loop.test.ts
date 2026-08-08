@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { startBackgroundWorkerLoop } from '../src/services/background-worker-loop';
+import {
+  MAX_NODE_INTERVAL_MS,
+  startBackgroundWorkerLoop,
+} from '../src/services/background-worker-loop';
 
 describe('background worker loop', () => {
   it('awaits the first tick, coalesces overlap, unrefs, and stops cleanly', async () => {
@@ -76,5 +79,26 @@ describe('background worker loop', () => {
     expect(onError).toHaveBeenCalledWith(error);
     expect(scheduled).toBe(true);
     await loop.stop();
+  });
+
+  it('accepts the maximum Node interval and rejects the overflowing value', async () => {
+    const schedule = vi.fn(() => ({ unref: () => undefined }) as unknown as ReturnType<typeof setInterval>);
+    const loop = await startBackgroundWorkerLoop({
+      intervalMs: MAX_NODE_INTERVAL_MS,
+      tick: async () => undefined,
+      onResult: () => undefined,
+      onError: () => undefined,
+      schedule,
+      cancel: () => undefined,
+    });
+    expect(schedule).toHaveBeenCalledWith(expect.any(Function), MAX_NODE_INTERVAL_MS);
+    await loop.stop();
+
+    await expect(startBackgroundWorkerLoop({
+      intervalMs: MAX_NODE_INTERVAL_MS + 1,
+      tick: async () => undefined,
+      onResult: () => undefined,
+      onError: () => undefined,
+    })).rejects.toThrow(/between 1 and 2147483647/);
   });
 });

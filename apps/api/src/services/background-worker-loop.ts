@@ -11,6 +11,8 @@ export interface BackgroundWorkerLoop {
   stop(): Promise<void>;
 }
 
+export const MAX_NODE_INTERVAL_MS = 2_147_483_647;
+
 /**
  * Run one worker immediately, then on an unref'd interval. An interval firing
  * while the prior tick is still active is intentionally coalesced.
@@ -18,8 +20,12 @@ export interface BackgroundWorkerLoop {
 export async function startBackgroundWorkerLoop<T>(
   options: BackgroundWorkerLoopOptions<T>,
 ): Promise<BackgroundWorkerLoop> {
-  if (!Number.isSafeInteger(options.intervalMs) || options.intervalMs <= 0) {
-    throw new Error('background worker interval must be a positive integer');
+  if (
+    !Number.isSafeInteger(options.intervalMs) ||
+    options.intervalMs <= 0 ||
+    options.intervalMs > MAX_NODE_INTERVAL_MS
+  ) {
+    throw new Error(`background worker interval must be an integer between 1 and ${MAX_NODE_INTERVAL_MS}`);
   }
 
   const schedule = options.schedule ?? setInterval;

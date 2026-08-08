@@ -253,12 +253,16 @@ export async function createStorageRuntime(options: CreateStorageRuntimeOptions)
 
 export function storagePolicyIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
   const interval = integer(env.UPLOAD_POLICY_INTERVAL_MS, 30_000, 'UPLOAD_POLICY_INTERVAL_MS');
-  if (interval === 0) throw new Error('UPLOAD_POLICY_INTERVAL_MS must be a positive integer');
+  if (interval === 0 || interval > 2_147_483_647) {
+    throw new Error('UPLOAD_POLICY_INTERVAL_MS must be an integer between 1 and 2147483647');
+  }
   return interval;
 }
 
 export function storageCleanupIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
   const interval = integer(env.UPLOAD_CLEANUP_INTERVAL_MS, 60_000, 'UPLOAD_CLEANUP_INTERVAL_MS');
-  if (interval === 0) throw new Error('UPLOAD_CLEANUP_INTERVAL_MS must be a positive integer');
+  if (interval === 0 || interval > 2_147_483_647) {
+    throw new Error('UPLOAD_CLEANUP_INTERVAL_MS must be an integer between 1 and 2147483647');
+  }
   return interval;
 }

@@ -124,14 +124,22 @@ describe('storage runtime composition', () => {
 
   it('refuses to disable the mandatory production policy worker interval', () => {
     expect(() => storagePolicyIntervalMs({ UPLOAD_POLICY_INTERVAL_MS: '0' })).toThrow(
-      /positive integer/,
+      /between 1 and 2147483647/,
+    );
+    expect(storagePolicyIntervalMs({ UPLOAD_POLICY_INTERVAL_MS: '2147483647' })).toBe(2_147_483_647);
+    expect(() => storagePolicyIntervalMs({ UPLOAD_POLICY_INTERVAL_MS: '2147483648' })).toThrow(
+      /between 1 and 2147483647/,
     );
   });
 
   it('refuses to disable the durable multipart cleanup interval', () => {
     expect(() => storageCleanupIntervalMs({ UPLOAD_CLEANUP_INTERVAL_MS: '0' })).toThrow(
-      /positive integer/,
+      /between 1 and 2147483647/,
     );
     expect(storageCleanupIntervalMs({ UPLOAD_CLEANUP_INTERVAL_MS: '15000' })).toBe(15_000);
+    expect(storageCleanupIntervalMs({ UPLOAD_CLEANUP_INTERVAL_MS: '2147483647' })).toBe(2_147_483_647);
+    expect(() => storageCleanupIntervalMs({ UPLOAD_CLEANUP_INTERVAL_MS: '2147483648' })).toThrow(
+      /between 1 and 2147483647/,
+    );
   });
 });
