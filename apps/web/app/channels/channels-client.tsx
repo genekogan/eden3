@@ -8,6 +8,7 @@ import type {
   ChannelConnectionDto,
   ChannelKind,
   ChannelPairingRequestDto,
+  TelegramManagedBotOnboardingStatus,
   XByoCredentialsInput,
   XConnectionDto,
 } from "@/lib/types";
@@ -20,6 +21,8 @@ import {
   channelClientDeepLink,
   connectionHealthLabel,
   discordInviteUrl,
+  telegramManagedStep,
+  trustedTelegramUrl,
   xClientDeepLink,
   xFailureAction,
 } from "./connector-ui";
@@ -122,6 +125,10 @@ export function ChannelsClient({
     accessTokenSecret: "",
   });
   const [xLabel, setXLabel] = useState("");
+  const [telegramSuggestedUsername, setTelegramSuggestedUsername] = useState("");
+  const [telegramOwnerBindingUrl, setTelegramOwnerBindingUrl] = useState<string | null>(null);
+  const [telegramOnboarding, setTelegramOnboarding] =
+    useState<TelegramManagedBotOnboardingStatus | null>(null);
   const alive = useRef(true);
 
   const mergeConnection = useCallback((connection: ChannelConnectionDto) => {
@@ -198,6 +205,26 @@ export function ChannelsClient({
     };
   }, [load]);
 
+  const telegramStep = telegramManagedStep(telegramOnboarding?.intent.state ?? "");
+
+  useEffect(() => {
+    const intentId = telegramOnboarding?.intent.id;
+    if (!intentId || telegramStep === "attach" || telegramStep === "complete" || telegramStep === "terminal") {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void api.channels.managedTelegramStatus(intentId).then(
+        (status) => {
+          if (alive.current) setTelegramOnboarding(status);
+        },
+        (error) => {
+          if (alive.current) setNote(errorCopy(error));
+        },
+      );
+    }, 2_000);
+    return () => window.clearTimeout(timer);
+  }, [telegramOnboarding?.intent.id, telegramOnboarding?.intent.state, telegramStep]);
+
   const selectedAgent = useMemo(
     () => agents.find((agent) => agent.id === selectedAgentId) ?? null,
     [agents, selectedAgentId],
@@ -257,11 +284,34 @@ export function ChannelsClient({
 
   const create = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const cleanToken = token.trim();
     if (!selectedAgent) {
       setNote("Pick one of your agents first.");
       return;
     }
+    if (channel === "telegram") {
+      setBusy("telegram:start");
+      setNote(null);
+      try {
+        const suggestedBotUsername = telegramSuggestedUsername.trim().replace(/^@/, "");
+        const started = await api.channels.startManagedTelegram(
+          suggestedBotUsername ? { suggestedBotUsername } : {},
+        );
+        if (!alive.current) return;
+        setTelegramOwnerBindingUrl(trustedTelegramUrl(started.ownerBindingUrl));
+        setTelegramOnboarding({
+          intent: started.intent,
+          managedBotUrl: null,
+          connection: null,
+        });
+        setNote("Onboarding started. Open Telegram to confirm that you own this Eden account.");
+      } catch (error) {
+        if (alive.current) setNote(errorCopy(error));
+      } finally {
+        if (alive.current) setBusy(null);
+      }
+      return;
+    }
+    const cleanToken = token.trim();
     if (!cleanToken) {
       setNote("A bot token is required.");
       return;
@@ -285,6 +335,49 @@ export function ChannelsClient({
           ? connection.lastError.message
           : "Token verified. Configure access below, then activate the connection.",
       );
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const attachManagedTelegram = async () => {
+    if (!selectedAgent || !telegramOnboarding || telegramStep !== "attach") return;
+    setBusy("telegram:attach");
+    setNote(null);
+    try {
+      const connection = await api.channels.attachManagedTelegram(
+        telegramOnboarding.intent.id,
+        {
+          agentUsername: selectedAgent.username,
+          ...(label.trim() ? { label: label.trim() } : {}),
+        },
+      );
+      if (!alive.current) return;
+      mergeConnection(connection);
+      setTelegramOnboarding(null);
+      setTelegramOwnerBindingUrl(null);
+      setTelegramSuggestedUsername("");
+      setLabel("");
+      setNote("Telegram bot attached. Configure access below, then activate the connection.");
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
+  const cancelManagedTelegram = async () => {
+    if (!telegramOnboarding) return;
+    setBusy("telegram:cancel");
+    setNote(null);
+    try {
+      await api.channels.cancelManagedTelegram(telegramOnboarding.intent.id);
+      if (!alive.current) return;
+      setTelegramOnboarding(null);
+      setTelegramOwnerBindingUrl(null);
+      setNote("Telegram onboarding cancelled. No bot was attached.");
     } catch (error) {
       if (alive.current) setNote(errorCopy(error));
     } finally {
@@ -620,6 +713,9 @@ export function ChannelsClient({
     );
   };
 
+  const ownerBindingLink = trustedTelegramUrl(telegramOwnerBindingUrl);
+  const managedBotLink = trustedTelegramUrl(telegramOnboarding?.managedBotUrl);
+
   return (
     <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-6xl px-6 py-14 md:px-10"}>
       {fixedAgent ? null : (
@@ -702,26 +798,67 @@ export function ChannelsClient({
                 </select>
               </FormField>
               {channel === "discord" ? (
+                <>
+                  <div className="rounded-lg border border-edge bg-background/50 p-3 text-xs text-muted">
+                    <p className="font-medium text-foreground">Discord BYOB walkthrough</p>
+                    <ol className="mt-2 list-decimal space-y-1.5 pl-4">
+                      <li><a href={DISCORD_DEVELOPER_PORTAL} target="_blank" rel="noreferrer" className="text-accent-soft underline underline-offset-2">Open the Discord developer portal</a> and create an application.</li>
+                      <li>Open Bot, add a bot, then copy its token. Never paste a user token.</li>
+                      <li>Save below. Eden validates it with Discord’s bot identity endpoint.</li>
+                      <li>After validation, use the fixed-permission invite shown on the connection.</li>
+                    </ol>
+                  </div>
+                  <FormField label="Bot token">
+                    <input value={token} onChange={(event) => setToken(event.target.value)} type="password" autoComplete="off" placeholder="••••••••" className={inputClass} />
+                  </FormField>
+                </>
+              ) : (
                 <div className="rounded-lg border border-edge bg-background/50 p-3 text-xs text-muted">
-                  <p className="font-medium text-foreground">Discord BYOB walkthrough</p>
+                  <p className="font-medium text-foreground">Telegram Managed Bots</p>
                   <ol className="mt-2 list-decimal space-y-1.5 pl-4">
-                    <li><a href={DISCORD_DEVELOPER_PORTAL} target="_blank" rel="noreferrer" className="text-accent-soft underline underline-offset-2">Open the Discord developer portal</a> and create an application.</li>
-                    <li>Open Bot, add a bot, then copy its token. Never paste a user token.</li>
-                    <li>Save below. Eden validates it with Discord’s bot identity endpoint.</li>
-                    <li>After validation, use the fixed-permission invite shown on the connection.</li>
+                    <li className={telegramStep === "bind_owner" ? "text-foreground" : undefined}>Confirm your Eden account in Telegram.</li>
+                    <li className={telegramStep === "choose_bot" ? "text-foreground" : undefined}>Choose or create a bot in the managed onboarding chat.</li>
+                    <li className={telegramStep === "attach" ? "text-foreground" : undefined}>Attach the securely stored bot to this agent.</li>
                   </ol>
+                  {telegramOnboarding ? (
+                    <p className="mt-3 font-mono text-[10px] uppercase tracking-wider text-faint">
+                      {telegramOnboarding.intent.state.replaceAll("_", " ")} · expires {formatRelativeTime(telegramOnboarding.intent.expiresAt)}
+                    </p>
+                  ) : null}
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {ownerBindingLink && telegramStep === "bind_owner" ? (
+                      <a href={ownerBindingLink} target="_blank" rel="noreferrer" className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft">Confirm ownership in Telegram</a>
+                    ) : null}
+                    {managedBotLink && telegramStep === "choose_bot" ? (
+                      <a href={managedBotLink} target="_blank" rel="noreferrer" className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft">Open Managed Bots</a>
+                    ) : null}
+                    {telegramStep === "attach" ? (
+                      <button type="button" onClick={() => void attachManagedTelegram()} disabled={busy === "telegram:attach" || !selectedAgent} className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-accent-soft disabled:opacity-50">{busy === "telegram:attach" ? "Attaching…" : "Attach to agent"}</button>
+                    ) : null}
+                    {telegramOnboarding && telegramStep !== "terminal" ? (
+                      <button type="button" onClick={() => void cancelManagedTelegram()} disabled={busy === "telegram:cancel"} className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50">Cancel</button>
+                    ) : null}
+                  </div>
                 </div>
+              )}
+              {channel === "telegram" && !telegramOnboarding ? (
+                <FormField label="Suggested bot username (optional)">
+                  <input value={telegramSuggestedUsername} onChange={(event) => setTelegramSuggestedUsername(event.target.value)} placeholder="my_eden_bot" maxLength={32} autoComplete="off" className={inputClass} />
+                </FormField>
               ) : null}
-              <FormField label="Bot token">
-                <input value={token} onChange={(event) => setToken(event.target.value)} type="password" autoComplete="off" placeholder="••••••••" className={inputClass} />
-              </FormField>
               <FormField label="Label (optional)">
                 <input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Community bot" maxLength={120} className={inputClass} />
               </FormField>
             </div>
-            <button type="submit" disabled={busy === "create" || !selectedAgent} className="mt-5 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white hover:bg-accent/85 disabled:opacity-50">
-              {busy === "create" ? "Validating…" : "Save & validate"}
-            </button>
+            {channel === "discord" ? (
+              <button type="submit" disabled={busy === "create" || !selectedAgent} className="mt-5 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white hover:bg-accent/85 disabled:opacity-50">
+                {busy === "create" ? "Validating…" : "Save & validate"}
+              </button>
+            ) : !telegramOnboarding ? (
+              <button type="submit" disabled={busy === "telegram:start" || !selectedAgent} className="mt-5 rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white hover:bg-accent/85 disabled:opacity-50">
+                {busy === "telegram:start" ? "Starting…" : "Start managed onboarding"}
+              </button>
+            ) : null}
           </form>
 
           <div>
