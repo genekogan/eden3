@@ -59,6 +59,8 @@ const activeRuntimeAccounts = new Set<string>();
 let ensureFailuresRemaining = 0;
 let ensurePause: Promise<void> | null = null;
 let ensureEntered: (() => void) | null = null;
+let removePause: Promise<void> | null = null;
+let removeEntered: (() => void) | null = null;
 let providerValidationPause: Promise<void> | null = null;
 let providerValidationEntered: (() => void) | null = null;
 const fakeChannelSync = {
@@ -77,6 +79,10 @@ const fakeChannelSync = {
   },
   async removeHostedChannelAccount(opts: Record<string, unknown>) {
     removeCalls.push(opts);
+    if (removePause) {
+      removeEntered?.();
+      await removePause;
+    }
     activeRuntimeAccounts.delete(String(opts.runtimeAccountId));
     return { changed: true };
   },
@@ -257,6 +263,21 @@ async function runtimeCoordinates(connectionId: string): Promise<{
   `;
   expect(rows[0]?.binding_id).toMatch(/^[0-9a-f-]{36}$/);
   return { agentId: rows[0]!.agent_id, bindingId: rows[0]!.binding_id! };
+}
+
+async function resolvesWithin(promise: Promise<unknown>, timeoutMs = 2_000): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 beforeAll(async () => {
@@ -1280,6 +1301,87 @@ describe('named-account lifecycle', () => {
       last_error_code: 'delivery_ack_lost',
     });
   });
+
+  it('revokes fatal runtime status before awaiting hosted-config cleanup', async () => {
+    const connection = await createConnection({
+      token: `valid_${marker}_fatal_status_order`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    const runtime = await runtimeCoordinates(connection.id);
+    let releaseRemove!: () => void;
+    let signalRemoveEntered!: () => void;
+    removePause = new Promise<void>((resolve) => {
+      releaseRemove = resolve;
+    });
+    const removeWasEntered = new Promise<void>((resolve) => {
+      signalRemoveEntered = resolve;
+    });
+    removeEntered = signalRemoveEntered;
+    const status = app.inject({
+      method: 'POST',
+      url: '/channels/runtime/status',
+      headers: { authorization: `Bearer ${runtimeToken}` },
+      payload: {
+        connectionId: connection.id,
+        runtimeAccountId: connection.runtimeAccountId,
+        ...runtime,
+        state: 'error',
+        errorCode: 'invalid_token',
+      },
+    });
+    expect(await resolvesWithin(removeWasEntered)).toBe(true);
+    const sessionCalls = sessionSync.syncMessage.mock.calls.length;
+    const reserveCalls = turnMetering.reserve.mock.calls.length;
+    try {
+      const state = await pg<{ desired_state: string }[]>`
+        select desired_state from channel_connections where id = ${connection.id}
+      `;
+      expect(state).toEqual([{ desired_state: 'inactive' }]);
+      const message = await app.inject({
+        method: 'POST',
+        url: '/channels/runtime/messages',
+        headers: { authorization: `Bearer ${runtimeToken}` },
+        payload: {
+          connectionId: connection.id,
+          runtimeAccountId: connection.runtimeAccountId,
+          ...runtime,
+          gatewaySessionKey: `agent:${marker}:discord:${connection.runtimeAccountId}:direct:987654`,
+          peerId: '987654',
+          externalMessageId: `${marker}:fatal-status-message`,
+          role: 'user',
+          content: 'must be revoked before cleanup',
+          createdAt: new Date().toISOString(),
+        },
+      });
+      const reserve = await app.inject({
+        method: 'POST',
+        url: '/channels/runtime/turns/reserve',
+        headers: { authorization: `Bearer ${runtimeToken}` },
+        payload: {
+          turnId: randomUUID(),
+          connectionId: connection.id,
+          runtimeAccountId: connection.runtimeAccountId,
+          ...runtime,
+        },
+      });
+      expect(message.statusCode).toBe(404);
+      expect(reserve.statusCode).toBe(404);
+      expect(sessionSync.syncMessage).toHaveBeenCalledTimes(sessionCalls);
+      expect(turnMetering.reserve).toHaveBeenCalledTimes(reserveCalls);
+    } finally {
+      releaseRemove();
+      removePause = null;
+      removeEntered = null;
+    }
+    expect((await status).statusCode).toBe(200);
+  });
 });
 
 describe('pairing claim and verified identity linkage', () => {
@@ -1819,6 +1921,8 @@ describe('Postgres channel group identity isolation', () => {
         event: {
           connectionId: connection.id,
           runtimeAccountId: connection.runtimeAccountId,
+          agentId: snapshot!.runtimeAgentId,
+          ...(snapshot!.bindingId ? { bindingId: snapshot!.bindingId } : {}),
           gatewaySessionKey,
           conversationScope: 'direct',
           externalMessageId: `${marker}:stale-session-message`,
@@ -1981,6 +2085,7 @@ describe('channel money crash boundaries against Postgres', () => {
       payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
     });
     expect(activated.statusCode).toBe(200);
+    const runtime = await runtimeCoordinates(connection.id);
     await credit({
       accountId: ownerId,
       amount: 1_000,
@@ -1996,10 +2101,10 @@ describe('channel money crash boundaries against Postgres', () => {
       authorizeEntered = resolve;
     });
     class PausedAuthorizationStore extends PostgresChannelTurnStore {
-      override async authorize(turn: Parameters<PostgresChannelTurnStore['authorize']>[0]) {
+      override async authorize(...args: Parameters<PostgresChannelTurnStore['authorize']>) {
         authorizeEntered();
         await pauseAuthorize;
-        return super.authorize(turn);
+        return super.authorize(...args);
       }
     }
     const service = new ChannelTurnMeteringService(
@@ -2011,8 +2116,9 @@ describe('channel money crash boundaries against Postgres', () => {
       turnId,
       connectionId: connection.id,
       runtimeAccountId: connection.runtimeAccountId,
+      ...runtime,
     });
-    await entered;
+    expect(await resolvesWithin(entered)).toBe(true);
     await pg`
       update channel_connections set desired_state = 'inactive', updated_at = now()
       where id = ${connection.id}
