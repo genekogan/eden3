@@ -1022,7 +1022,12 @@ export async function reverseReservation(
     );
     const leg = await refundLeg({
       originalIdempotencyKey: params.reservationKey,
-      amount: remainder,
+      // When another caller already completed the full reversal, remainder is
+      // zero. Omit the amount only in that terminal case so refundLeg can
+      // validate and return the matching existing leg as an idempotent replay;
+      // passing `0` would incorrectly compare it with the positive applied
+      // amount. Positive remainders keep exact amount validation.
+      ...(remainder > 0 ? { amount: remainder } : {}),
       type: params.type ?? 'refund',
       toSubscription,
       db: tx,
