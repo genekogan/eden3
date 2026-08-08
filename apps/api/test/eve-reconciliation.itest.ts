@@ -481,6 +481,49 @@ describe('Eve collision reconciliation', () => {
     });
   });
 
+  it('blocks ordinary startup across repair and never lets it erase failed-repair drift', async () => {
+    const fixture = await seedFixture();
+    let startupSettled = false;
+    let startupOutcome: Promise<{ kind: 'resolved' } | { kind: 'rejected'; error: unknown }> | null = null;
+    let pending: EveReconciliationError | null = null;
+    try {
+      await reconcileEveCollision(fixture.input, {
+        apply: true,
+        afterPhase1CommitBeforeBootstrap: async () => {
+          await pg`
+            update agents
+            set description = 'startup must not heal this operator drift'
+            where account_id = ${fixture.platformAccountId}
+          `;
+          startupOutcome = ensureEveAssistant({ syncWorkspace: false }).then(
+            () => ({ kind: 'resolved' as const }),
+            (error: unknown) => ({ kind: 'rejected' as const, error }),
+          ).finally(() => {
+            startupSettled = true;
+          });
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          expect(startupSettled).toBe(false);
+        },
+      });
+    } catch (error) {
+      pending = error as EveReconciliationError;
+    }
+    expect(pending).toMatchObject({ code: 'bootstrap_pending' });
+    expect(await startupOutcome).toMatchObject({
+      kind: 'rejected',
+      error: { message: 'OpenClaw main profile drifted before Eve handle bootstrap' },
+    });
+    const [platform] = await pg<{ username: string; description: string }[]>`
+      select a.username::text as username, g.description
+      from accounts a join agents g on g.account_id = a.id
+      where a.id = ${fixture.platformAccountId}
+    `;
+    expect(platform).toEqual({
+      username: fixture.input.expectedPlatformHandle,
+      description: 'startup must not heal this operator drift',
+    });
+  });
+
   it('rejects invalid, reserved, drifted, and differently resumed handles', async () => {
     const fixture = await seedFixture();
     await expect(
