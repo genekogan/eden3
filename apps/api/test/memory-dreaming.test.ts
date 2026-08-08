@@ -16,6 +16,7 @@ import {
   MEMORY_DREAM_CLAIM_STALE_MS,
   PostgresMemoryDreamStore,
   ensureMemoryDreamSession,
+  isSettledPartialOutputDreamFailure,
   materializeMemoryRemResponse,
   parseMemoryRemResponse,
   renderMemoryRemPrompt,
@@ -1017,6 +1018,83 @@ describe('memory dream crash safety', () => {
         providerStatus: 'terminal',
       });
       expect(providerCalls).toBe(0);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts only exact settled full-reserve-v1 dream failures as terminal charged errors', async () => {
+    const workspace = await mkdtemp(path.join(tmpdir(), 'eden3-memory-partial-charged-'));
+    const runId = randomUUID();
+    const max = 61;
+    try {
+      const evidence: MemoryDreamDurableEvidence = {
+        checkpoint: {
+          schema: 'eden-memory-dream-v1',
+          phase: 'provider_started',
+          date: '2026-07-31',
+          previousSha256: null,
+          promotion: { ...execution.promotion, agentId: 'memory-test-agent' },
+          previousDreamDiarySha256: null,
+          previousRemReportSha256: null,
+          agentRuntime: 'openclaw',
+        },
+        providerStatus: 'started',
+        usage: {
+          id: randomUUID(),
+          status: 'error',
+          pricingBasis: 'provider-api',
+          sessionId: runId,
+          agentId: activeCandidate(workspace).agentAccountId,
+          messageId: null,
+          manna: max,
+          errorCode: 'gateway_stream_error',
+          metadata: {
+            partialOutputSettlement: { rule: 'full-reserve-v1', chargedManna: max },
+          },
+        },
+        debitKeys: [runId],
+        authorization: {
+          state: 'settled',
+          authorizedMaxManna: max,
+          chargedManna: max,
+        },
+      };
+      expect(isSettledPartialOutputDreamFailure(evidence)).toBe(true);
+      expect(
+        isSettledPartialOutputDreamFailure({
+          ...evidence,
+          usage: { ...evidence.usage!, metadata: null },
+        }),
+      ).toBe(false);
+
+      const durability = new FakeDurability(evidence);
+      let reversals = 0;
+      let providerCalls = 0;
+      const runner = makeRunner(durability, {
+        reverse: async () => {
+          reversals += 1;
+          throw new Error('settled partial output must never reverse');
+        },
+        providerCalled: () => {
+          providerCalls += 1;
+        },
+      });
+      await expect(
+        runner.run(activeCandidate(workspace), 'sweep-1', {
+          id: runId,
+          sweepId: 'sweep-1',
+          claimToken: randomUUID(),
+          lastActivityAt: new Date('2026-07-31T05:00:00.000Z'),
+          isRecovery: true,
+        }),
+      ).rejects.toThrow('full authorized reserve remains charged');
+      expect(reversals).toBe(0);
+      expect(providerCalls).toBe(0);
+      expect(durability.saves.at(-1)).toMatchObject({
+        checkpoint: { phase: 'provider_terminal' },
+        providerStatus: 'terminal',
+      });
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }

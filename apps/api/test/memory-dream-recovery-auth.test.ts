@@ -7,6 +7,8 @@ import { eq } from 'drizzle-orm';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import {
+  isSettledPartialOutputDreamFailure,
+  PostgresMemoryDreamDurability,
   recordMemoryDreamRecoveryUsage,
   renewMemoryDreamRunClaim,
   type MemoryDreamRunClaim,
@@ -290,6 +292,62 @@ describe('memory dream canonical recovery authorization (DEBT-003)', () => {
     expect((await reverseWithClaim(replacement)).reversed).toBe(true);
     await recordMemoryDreamRecoveryUsage(replacement);
     expect((await getBalance(fixture.ownerId)).total).toBe(61);
+  });
+
+  it('persists exact settled full-reserve truth for a dream stream that errors after output', async () => {
+    const fixture = await seedReservation({ durable: 61, subscription: 0, reserve: false });
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        yield { type: 'token', delta: 'usable REM prefix' };
+        yield {
+          type: 'error',
+          code: 'gateway_stream_error',
+          message: 'dream stream interrupted',
+        };
+      },
+    };
+    const outcome = await runTurn(deps(compat), {
+      session: fixture.session,
+      agent: {
+        accountId: fixture.agentId,
+        username: fixture.agentUsername,
+        openclawId: fixture.openclawId,
+        model: 'anthropic/claude-haiku-4-5',
+        agentRuntime: 'openclaw',
+      },
+      user: {
+        accountId: fixture.ownerId,
+        username: fixture.ownerUsername,
+        isAdmin: false,
+      },
+      content: 'dream prefix',
+      source: { kind: 'memory_dream', sweepId: fixture.claim.sweepId, runId: fixture.claim.id },
+      beginStream: () => ({ emit() {}, end() {} }),
+      turnId: fixture.claim.id,
+      fundingFence: (tx) => renewMemoryDreamRunClaim(fixture.claim, tx),
+      beforeProvider: () => renewMemoryDreamRunClaim(fixture.claim),
+      beforeTerminal: () => renewMemoryDreamRunClaim(fixture.claim),
+    });
+    expect(outcome.errorCode).toBe('gateway_stream_error');
+    expect(outcome.assistantMessageId).toBeNull();
+    expect((await getBalance(fixture.ownerId)).total).toBe(0);
+
+    const evidence = await new PostgresMemoryDreamDurability().inspect(fixture.claim.id);
+    expect(isSettledPartialOutputDreamFailure(evidence)).toBe(true);
+    expect(evidence).toMatchObject({
+      usage: {
+        status: 'error',
+        manna: 61,
+        errorCode: 'gateway_stream_error',
+        messageId: null,
+      },
+      authorization: {
+        state: 'settled',
+        authorizedMaxManna: 61,
+        chargedManna: 61,
+      },
+    });
   });
 
   it('restores mixed subscription/durable pots once under concurrent crash retries', async () => {
