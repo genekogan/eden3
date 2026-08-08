@@ -104,6 +104,172 @@ describe('ClerkAuthProvider', () => {
     await cleanup();
   });
 
+  it('refuses an unknown Clerk subject under closed admission without creating account or ledger state', async () => {
+    const clerkUserId = `${marker}_closed_unknown`;
+    const provider = new ClerkAuthProvider({
+      allowAccountCreation: false,
+      seedManna: 77,
+      verifyToken: async () => ({ sub: clerkUserId }),
+    });
+
+    await expect(
+      provider.getSession({ headers: { authorization: 'Bearer valid' } }),
+    ).resolves.toBeNull();
+    await expect(
+      provider.getSession({ headers: { authorization: 'Bearer valid' } }),
+    ).resolves.toBeNull();
+
+    const [state] = await pg<{ accounts: string; manna_accounts: string; signup_credits: string }[]>`
+      select
+        count(distinct a.id)::int8 as accounts,
+        count(distinct ma.id)::int8 as manna_accounts,
+        count(distinct mt.id)::int8 as signup_credits
+      from (select 1) sentinel
+      left join accounts a on a.clerk_user_id = ${clerkUserId}
+      left join manna_accounts ma on ma.account_id = a.id
+      left join manna_transactions mt
+        on mt.manna_account_id = ma.id and mt.type = 'credit:signup'
+    `;
+    expect(state).toEqual({ accounts: '0', manna_accounts: '0', signup_credits: '0' });
+  });
+
+  it('resolves an existing Clerk-linked account while admission is closed', async () => {
+    const clerkUserId = `${marker}_closed_existing`;
+    const username = `${marker}_closed_gene`;
+    const [account] = await pg<{ id: string }[]>`
+      insert into accounts (type, username, clerk_user_id, external_id)
+      values ('user', ${username}, ${clerkUserId}, ${`${marker}_closed_external`})
+      returning id
+    `;
+    const provider = new ClerkAuthProvider({
+      allowAccountCreation: false,
+      adminUsernames: [username],
+      seedManna: 77,
+      verifyToken: async () => ({ sub: clerkUserId }),
+    });
+
+    await expect(
+      provider.getSession({ headers: { authorization: 'Bearer valid' } }),
+    ).resolves.toEqual({ accountId: account!.id, username, isAdmin: true });
+
+    const [state] = await pg<{ accounts: string; signup_credits: string }[]>`
+      select
+        count(distinct a.id)::int8 as accounts,
+        count(distinct mt.id)::int8 as signup_credits
+      from accounts a
+      left join manna_accounts ma on ma.account_id = a.id
+      left join manna_transactions mt
+        on mt.manna_account_id = ma.id and mt.type = 'credit:signup'
+      where a.clerk_user_id = ${clerkUserId}
+    `;
+    expect(state).toEqual({ accounts: '1', signup_credits: '0' });
+  });
+
+  it('atomically rolls back a new account when seeding faults, then retries to one account and credit', async () => {
+    const clerkUserId = `${marker}_atomic_seed`;
+    let faultOnce = true;
+    const provider = new ClerkAuthProvider({
+      seedManna: 77,
+      verifyToken: async () => ({ sub: clerkUserId }),
+      afterAccountCreatedBeforeSeed: async () => {
+        if (!faultOnce) return;
+        faultOnce = false;
+        throw new Error('injected failure after account insert before signup credit');
+      },
+    });
+
+    await expect(
+      provider.getSession({ headers: { cookie: '__session=valid' } }),
+    ).rejects.toThrow('injected failure after account insert before signup credit');
+
+    const [rolledBack] = await pg<{ accounts: string; signup_credits: string }[]>`
+      select
+        count(distinct a.id)::int8 as accounts,
+        count(distinct mt.id)::int8 as signup_credits
+      from (select 1) sentinel
+      left join accounts a on a.clerk_user_id = ${clerkUserId}
+      left join manna_accounts ma on ma.account_id = a.id
+      left join manna_transactions mt
+        on mt.manna_account_id = ma.id and mt.type = 'credit:signup'
+    `;
+    expect(rolledBack).toEqual({ accounts: '0', signup_credits: '0' });
+
+    const session = await provider.getSession({ headers: { cookie: '__session=valid' } });
+    expect(session).toMatchObject({ username: defaultClerkUsername(clerkUserId) });
+
+    const [recovered] = await pg<{
+      accounts: string;
+      manna_accounts: string;
+      balance: string | null;
+      signup_credits: string;
+      credited: string | null;
+    }[]>`
+      select
+        count(distinct a.id)::int8 as accounts,
+        count(distinct ma.id)::int8 as manna_accounts,
+        max(ma.balance)::text as balance,
+        count(distinct mt.id)::int8 as signup_credits,
+        sum(mt.amount)::text as credited
+      from accounts a
+      left join manna_accounts ma on ma.account_id = a.id
+      left join manna_transactions mt
+        on mt.manna_account_id = ma.id and mt.type = 'credit:signup'
+      where a.clerk_user_id = ${clerkUserId}
+    `;
+    expect(recovered).toEqual({
+      accounts: '1',
+      manna_accounts: '1',
+      balance: '77.0000',
+      signup_credits: '1',
+      credited: '77.0000',
+    });
+  });
+
+  it('serializes concurrent first sessions to one account and one signup credit', async () => {
+    const clerkUserId = `${marker}_concurrent_first`;
+    const provider = new ClerkAuthProvider({
+      seedManna: 77,
+      verifyToken: async () => ({ sub: clerkUserId }),
+    });
+
+    const sessions = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        provider.getSession({ headers: { authorization: 'Bearer valid' } }),
+      ),
+    );
+    expect(new Set(sessions.map((session) => session?.accountId)).size).toBe(1);
+    expect(sessions.every((session) => session?.username === defaultClerkUsername(clerkUserId))).toBe(
+      true,
+    );
+
+    const [state] = await pg<{
+      accounts: string;
+      manna_accounts: string;
+      balance: string | null;
+      signup_credits: string;
+      credited: string | null;
+    }[]>`
+      select
+        count(distinct a.id)::int8 as accounts,
+        count(distinct ma.id)::int8 as manna_accounts,
+        max(ma.balance)::text as balance,
+        count(distinct mt.id)::int8 as signup_credits,
+        sum(mt.amount)::text as credited
+      from accounts a
+      left join manna_accounts ma on ma.account_id = a.id
+      left join manna_transactions mt
+        on mt.manna_account_id = ma.id and mt.type = 'credit:signup'
+      where a.clerk_user_id = ${clerkUserId}
+    `;
+    expect(state).toEqual({
+      accounts: '1',
+      manna_accounts: '1',
+      balance: '77.0000',
+      signup_credits: '1',
+      credited: '77.0000',
+    });
+  });
+
   it('resolves an existing migrated account by Clerk subject', async () => {
     const clerkUserId = `${marker}_existing`;
     const username = `${marker}_gene`;
