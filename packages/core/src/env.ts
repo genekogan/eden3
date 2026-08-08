@@ -28,6 +28,9 @@ const authProviderSchema = z
   .enum(['dev', 'clerk', 'hybrid'])
   .default('dev');
 
+/** Active closed-cohort signup grant from MVP.md (1,000 manna = $1 peg). */
+export const DEFAULT_CLERK_NEW_USER_SEED_MANNA = 100;
+
 function databaseNameFromUrl(raw: string): string | null {
   try {
     const parsed = new URL(raw);
@@ -100,7 +103,9 @@ export const envSchema = z.object({
   CLERK_JWT_KEY: z.string().min(1).optional(),
   CLERK_AUTHORIZED_PARTIES: csvSchema,
   /** Seed manna credited once when a brand-new Clerk subject first signs in. */
-  CLERK_NEW_USER_SEED_MANNA: nonnegativeIntSchema.default(1_000),
+  CLERK_NEW_USER_SEED_MANNA: nonnegativeIntSchema.default(
+    DEFAULT_CLERK_NEW_USER_SEED_MANNA,
+  ),
   /** Base64/hex 32-byte AES-GCM key for user channel token custody. */
   CHANNEL_TOKEN_ENCRYPTION_KEY: z.string().min(1).optional(),
   /** Eden3-native agents a non-admin user may create; migrated agents are grandfathered. */

@@ -2,6 +2,7 @@ import { createHash, createPublicKey, createVerify, type KeyObject } from 'node:
 
 import {
   credit,
+  DEFAULT_CLERK_NEW_USER_SEED_MANNA,
   parseCookieHeader,
   type AuthProvider,
   type AuthRequestLike,
@@ -229,7 +230,7 @@ export class ClerkAuthProvider implements AuthProvider {
 
   constructor(opts: ClerkAuthProviderOptions = {}) {
     this.adminUsernames = new Set((opts.adminUsernames ?? []).map((u) => u.toLowerCase()));
-    this.seedManna = opts.seedManna ?? 1_000;
+    this.seedManna = opts.seedManna ?? DEFAULT_CLERK_NEW_USER_SEED_MANNA;
     this.verifyToken =
       opts.verifyToken ??
       createClerkJwtVerifier({
