@@ -49,9 +49,11 @@ export const PARTIAL_OUTPUT_SETTLEMENT_RULE = 'full-reserve-v1' as const;
  */
 export async function claimTurnProviderStart(
   turnId: string,
-  dbc: DbHandle = db,
+  options: { db?: DbHandle; fence?: (tx: DbHandle) => Promise<void> } = {},
 ): Promise<boolean> {
+  const dbc = options.db ?? db;
   return await dbc.transaction(async (tx) => {
+    await options.fence?.(tx);
     // Lock the parent first so a terminal transition racing this claim yields
     // a clean false, not a trigger error after a stale state read.
     const parent = (await tx.execute(sql`
@@ -75,9 +77,11 @@ export async function claimTurnProviderStart(
  */
 export async function markTurnUsableOutput(
   turnId: string,
-  dbc: DbHandle = db,
+  options: { db?: DbHandle; fence?: (tx: DbHandle) => Promise<void> } = {},
 ): Promise<boolean> {
+  const dbc = options.db ?? db;
   return await dbc.transaction(async (tx) => {
+    await options.fence?.(tx);
     // Preserve the global auth-row -> dependent-row lock order used by every
     // settle/reverse path; the DB trigger rechecks the same parent invariant.
     await tx.execute(sql`
@@ -126,9 +130,12 @@ export async function settlePartialOutputAuthorization(options: {
   errorCode: string;
   errorMessage: string;
   db?: DbHandle;
+  /** Caller-owned generation fence, checked in the settlement transaction. */
+  fence?: (tx: DbHandle) => Promise<void>;
 }): Promise<PartialOutputSettlementResult> {
   const dbc = options.db ?? db;
   return await dbc.transaction(async (tx) => {
+    await options.fence?.(tx);
     await tx.execute(sql`
       select turn_id from turn_authorizations where turn_id = ${options.turnId} for update
     `);
