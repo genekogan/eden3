@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import CookieNoticePage from "../app/(public)/legal/cookies/page";
 import ContentPolicyPage from "../app/(public)/legal/content/page";
-import { legalDocuments } from "../app/(public)/legal/_content";
+import { legalDocument, legalDocuments } from "../app/(public)/legal/_content";
 import LegalIndexPage from "../app/(public)/legal/page";
 import PrivacyPage from "../app/(public)/legal/privacy/page";
 import TermsPage from "../app/(public)/legal/terms/page";
@@ -92,7 +92,23 @@ describe("pre-live legal routes", () => {
     expect(new Set(hrefs)).toEqual(
       new Set(["/legal", "/legal/terms", "/legal/privacy", "/legal/content", "/legal/cookies"]),
     );
-    expect(routeText).not.toMatch(/accept (?:these )?terms|sign up now|buy manna|checkout now/i);
+    expect(routeText).not.toMatch(
+      /accept (?:these )?terms|sign up now|buy manna|checkout now|enforce these drafts/i,
+    );
+  });
+
+  it("keeps the test-enforcement clause non-operative and aligned with the long-form Terms", () => {
+    const root = resolve(process.cwd(), "../..");
+    const longFormTerms = readFileSync(resolve(root, "docs/legal/TERMS-DRAFT.md"), "utf8");
+    const webTerms = legalDocument("terms").sections
+      .flatMap((section) => section.paragraphs ?? [])
+      .join("\n");
+
+    expect(longFormTerms).toContain("enforce an approved policy");
+    expect(webTerms).toContain("enforce an approved policy");
+    expect(`${longFormTerms}\n${webTerms}`).not.toMatch(
+      /enforce these drafts|these terms (?:are|become) effective|by using .*agree to (?:these|the) terms/i,
+    );
   });
 
   it("does not disclose internal topology, secrets, or unsupported compliance claims", () => {

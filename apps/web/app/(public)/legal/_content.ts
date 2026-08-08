@@ -69,7 +69,7 @@ export const legalDocuments: readonly LegalDocument[] = [
       {
         heading: "Sharing, moderation, and removal",
         paragraphs: [
-          "You control whether supported content is private, shared by an unlisted link, or public, subject to product controls. Eden may restrict access or remove content or accounts to protect people or the service, respond to reports, enforce these drafts during testing, or comply with law. The final appeal and notice process is unresolved.",
+          "You control whether supported content is private, shared by an unlisted link, or public, subject to product controls. Eden may restrict access or remove content or accounts to protect people or the service, respond to reports, enforce an approved policy, or comply with law. The final appeal and notice process is unresolved.",
         ],
       },
       {
