@@ -300,6 +300,22 @@ describe('hosted channel account mapping', () => {
 });
 
 describe('OpenClaw hosted-channel lifecycle bridge', () => {
+  it('preserves an authoritative provider cost for provider-reported settlement', () => {
+    expect(
+      channelRuntimeBridgeInternals.normalizeUsage({
+        input: 3,
+        output: 2,
+        total: 5,
+        cost: 0.0123,
+      }),
+    ).toEqual({
+      promptTokens: 3,
+      completionTokens: 2,
+      totalTokens: 5,
+      providerCostUsd: 0.0123,
+    });
+  });
+
   it('syncs inbound, injects canonical memory, reserves before work, settles exact usage, and mirrors output', async () => {
     const { bridge, calls } = mockBridge();
     receiveA(bridge);
@@ -707,6 +723,25 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     ).resolves.toMatchObject({ outcome: 'block', category: 'policy' });
     expect(calls.some((call) => call.path === '/channels/runtime/messages')).toBe(false);
     expect(calls.some((call) => call.path.endsWith('/reserve'))).toBe(false);
+
+    const contextAttachment = mockBridge();
+    receiveA(contextAttachment.bridge, {
+      context: {
+        attachments: [{ mimeType: 'application/x-msdownload', name: 'payload.exe' }],
+      },
+    });
+    await expect(
+      contextAttachment.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'open it', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block', category: 'policy' });
+    expect(
+      contextAttachment.calls.some((call) => call.path === '/channels/runtime/messages'),
+    ).toBe(false);
+    expect(
+      contextAttachment.calls.some((call) => call.path.endsWith('/reserve')),
+    ).toBe(false);
 
     const allowed = mockBridge();
     receiveA(allowed.bridge, {
@@ -1256,7 +1291,10 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       },
     );
 
-    const dmTarget = 'channel:963544662646354001';
+    // Discord's DM channel id is opaque and ordinarily differs from the
+    // sender's user id. Exact run-id + event/context target correlation is
+    // sufficient; the channel id must not be compared to the peer user id.
+    const dmTarget = 'channel:777777777777777777';
     await bridge.onMessageSent(
       { to: dmTarget, content: 'assistant answer', runId: RUN_A, success: true },
       {
