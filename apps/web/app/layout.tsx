@@ -45,6 +45,13 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
+        <link rel="alternate" type="text/plain" href="/llms.txt" title="Eden for LLMs" />
+        <link
+          rel="alternate"
+          type="text/plain"
+          href="/llms-full.txt"
+          title="Eden full guide for LLMs"
+        />
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT }} />
       </head>
       <body className="bg-background font-sans text-foreground antialiased">
