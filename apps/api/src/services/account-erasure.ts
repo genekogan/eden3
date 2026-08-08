@@ -3,6 +3,8 @@ import { z } from 'zod';
 import { ApiError } from '../errors';
 
 export const ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION = 'eden3.account-erasure@v1' as const;
+export const ACCOUNT_ERASURE_RECOVERY_MANIFEST_SCHEMA_VERSION =
+  'eden3.account-erasure-recovery@v1' as const;
 
 export const accountErasureRequestSchema = z
   .object({
@@ -37,6 +39,59 @@ export interface AccountErasureRequestResult {
   status: 'pending';
 }
 
+export interface AccountErasureRecoveryLocator {
+  kind: 'clerk_identity' | 'stripe_customer' | 'channel_runtime' | 'agent_runtime';
+  resourceId: string;
+  /** Ephemeral plaintext passed only to the dedicated encrypting sink. */
+  locator: string;
+}
+
+export interface AccountErasureRecoveryManifest {
+  schemaVersion: typeof ACCOUNT_ERASURE_RECOVERY_MANIFEST_SCHEMA_VERSION;
+  jobId: string;
+  accountId: string;
+  inventoriedAt: string;
+  inventorySha256: string;
+  locators: readonly AccountErasureRecoveryLocator[];
+}
+
+export interface AccountErasureSealedInventory {
+  jobId: string;
+  accountId: string;
+  status: 'recovery_manifest_pending';
+  recoveryManifest: AccountErasureRecoveryManifest;
+}
+
+export interface AccountErasureRecoveryManifestConfirmation {
+  /** Read-back binding only; plaintext locators are never returned or persisted in SQL. */
+  schemaVersion: typeof ACCOUNT_ERASURE_RECOVERY_MANIFEST_SCHEMA_VERSION;
+  jobId: string;
+  accountId: string;
+  inventorySha256: string;
+  confirmedAt: string;
+  ciphertextSha256: string;
+  macSha256: string;
+  keyVersion: number;
+}
+
+export interface AccountErasureManifestPendingIntent {
+  jobId: string;
+  accountId: string;
+  acceptedAt: string;
+  state: 'manifest_pending';
+  recoveryManifest: AccountErasureRecoveryManifest;
+}
+
+export interface ClaimedAccountErasureIntent {
+  intent: AccountErasureIntent | AccountErasureManifestPendingIntent;
+  claimToken: string;
+  claimExpiresAt: string;
+}
+
+export type AccountErasureClaimResult =
+  | AccountErasureSealedInventory
+  | { jobId: string; status: 'stale' };
+
 export interface AccountErasureIntentStore {
   /** Transaction 1: row-lock/revalidate self and converge on one accepted intent. */
   acceptIntent(input: {
@@ -55,17 +110,45 @@ export interface AccountErasureIntentStore {
     confirmedAt: string;
     ledgerSha256: string;
     ledgerMacSha256: string;
-  }): Promise<AccountErasureRequestResult>;
+  }): Promise<AccountErasureSealedInventory>;
+
+  /** Route-only CAS: refuses a live recovery claim and makes cleanup claimable. */
+  confirmRecoveryManifestUnclaimed(input: {
+    jobId: string;
+    accountId: string;
+    confirmation: AccountErasureRecoveryManifestConfirmation;
+  }): Promise<AccountErasureRequestResult | { jobId: string; status: 'stale' }>;
 }
 
 export interface AccountErasureRecoveryStore extends AccountErasureIntentStore {
   /** Claim one due intent/backup target with a fenced lease, or null when idle. */
-  claimIntentForRecovery(): Promise<AccountErasureIntent | null>;
+  claimIntentForRecovery(): Promise<ClaimedAccountErasureIntent | null>;
+  /** Transaction 2 for a worker; token/expiry CAS makes a late lease stale. */
+  sealClaimedAfterLedgerConfirmation(input: {
+    jobId: string;
+    accountId: string;
+    acceptedAt: string;
+    confirmedAt: string;
+    ledgerSha256: string;
+    ledgerMacSha256: string;
+    claimToken: string;
+    claimExpiresAt: string;
+  }): Promise<AccountErasureClaimResult>;
+  /** Worker-only CAS; exact live claim must still own the manifest-pending job. */
+  confirmClaimedRecoveryManifest(input: {
+    jobId: string;
+    accountId: string;
+    confirmation: AccountErasureRecoveryManifestConfirmation;
+    claimToken: string;
+    claimExpiresAt: string;
+  }): Promise<AccountErasureRequestResult | { jobId: string; status: 'stale' }>;
   /** Persist only a safe code and release/attention the exact claim. */
   recordRecoveryFailure(input: {
     jobId: string;
+    claimToken: string;
+    claimExpiresAt: string;
     errorCode: 'erasure_recovery_failed';
-  }): Promise<void>;
+  }): Promise<'retried' | 'attention' | 'stale'>;
 }
 
 export interface AccountErasureLedgerSink {
@@ -73,6 +156,16 @@ export interface AccountErasureLedgerSink {
   writeAndConfirm(
     record: AccountErasureLedgerRecord,
   ): Promise<AccountErasureLedgerConfirmation>;
+}
+
+export interface AccountErasureRecoveryManifestSink {
+  /**
+   * Encrypt with a separate erasure key, WORM-write with separate credentials,
+   * then read back. Implementations must never log or retain plaintext locators.
+   */
+  encryptWriteAndConfirm(
+    manifest: AccountErasureRecoveryManifest,
+  ): Promise<AccountErasureRecoveryManifestConfirmation>;
 }
 
 export interface AccountErasureAdmission {
@@ -100,11 +193,17 @@ function exactLedgerConfirmation(
   );
 }
 
-async function confirmAndSealIntent(
+async function confirmedLedgerInput(
   intent: AccountErasureIntent,
-  store: Pick<AccountErasureIntentStore, 'sealAfterLedgerConfirmation'>,
   ledger: AccountErasureLedgerSink,
-): Promise<AccountErasureRequestResult> {
+): Promise<{
+  jobId: string;
+  accountId: string;
+  acceptedAt: string;
+  confirmedAt: string;
+  ledgerSha256: string;
+  ledgerMacSha256: string;
+}> {
   const record: AccountErasureLedgerRecord = {
     schemaVersion: ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
     jobId: intent.jobId,
@@ -115,14 +214,46 @@ async function confirmAndSealIntent(
   if (!exactLedgerConfirmation(record, evidence)) {
     throw new ApiError(503, 'erasure_ledger_mismatch', 'Account erasure ledger confirmation failed');
   }
-  return store.sealAfterLedgerConfirmation({
+  return {
     jobId: intent.jobId,
     accountId: intent.accountId,
     acceptedAt: intent.acceptedAt,
     confirmedAt: evidence.confirmedAt,
     ledgerSha256: evidence.sha256,
     ledgerMacSha256: evidence.macSha256,
-  });
+  };
+}
+
+function exactRecoveryManifestConfirmation(
+  expected: AccountErasureRecoveryManifest,
+  actual: AccountErasureRecoveryManifestConfirmation,
+): boolean {
+  return (
+    actual.schemaVersion === expected.schemaVersion &&
+    actual.jobId === expected.jobId &&
+    actual.accountId === expected.accountId &&
+    actual.inventorySha256 === expected.inventorySha256 &&
+    Number.isFinite(Date.parse(actual.confirmedAt)) &&
+    lowercaseSha256.test(actual.ciphertextSha256) &&
+    lowercaseSha256.test(actual.macSha256) &&
+    Number.isSafeInteger(actual.keyVersion) &&
+    actual.keyVersion >= 1
+  );
+}
+
+async function confirmedRecoveryManifest(
+  manifest: AccountErasureRecoveryManifest,
+  sink: AccountErasureRecoveryManifestSink,
+): Promise<AccountErasureRecoveryManifestConfirmation> {
+  const confirmation = await sink.encryptWriteAndConfirm(manifest);
+  if (!exactRecoveryManifestConfirmation(manifest, confirmation)) {
+    throw new ApiError(
+      503,
+      'erasure_recovery_manifest_mismatch',
+      'Account erasure recovery manifest confirmation failed',
+    );
+  }
+  return confirmation;
 }
 
 /**
@@ -133,6 +264,7 @@ export async function requestAccountErasure(
   input: AccountErasureAdmission,
   store: AccountErasureIntentStore,
   ledger: AccountErasureLedgerSink,
+  recoveryManifestSink: AccountErasureRecoveryManifestSink,
 ): Promise<AccountErasureRequestResult> {
   if (input.actorIsAdmin) {
     throw new ApiError(403, 'protected_account', 'Administrator accounts cannot be deleted');
@@ -149,13 +281,30 @@ export async function requestAccountErasure(
   if (intent.accountId !== input.actorAccountId) {
     throw new ApiError(503, 'erasure_intent_mismatch', 'Account erasure intent did not match');
   }
-  return confirmAndSealIntent(intent, store, ledger);
+  const inventory = await store.sealAfterLedgerConfirmation(
+    await confirmedLedgerInput(intent, ledger),
+  );
+  const manifestConfirmation = await confirmedRecoveryManifest(
+    inventory.recoveryManifest,
+    recoveryManifestSink,
+  );
+  const completed = await store.confirmRecoveryManifestUnclaimed({
+    jobId: inventory.jobId,
+    accountId: inventory.accountId,
+    confirmation: manifestConfirmation,
+  });
+  if (completed.status === 'stale') {
+    throw new ApiError(409, 'erasure_recovery_claimed', 'Account erasure recovery is in progress');
+  }
+  return completed;
 }
 
 export interface AccountErasureRecoveryTickResult {
   claimed: number;
   sealed: number;
-  failed: number;
+  retried: number;
+  attention: number;
+  stale: number;
 }
 
 /** Provider-free recovery for intents stranded before transaction 2. */
@@ -165,6 +314,7 @@ export class AccountErasureRecoveryWorker {
   constructor(
     private readonly store: AccountErasureRecoveryStore,
     private readonly ledger: AccountErasureLedgerSink,
+    private readonly recoveryManifestSink: AccountErasureRecoveryManifestSink,
     private readonly batchSize = 25,
   ) {
     if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 100) {
@@ -173,25 +323,62 @@ export class AccountErasureRecoveryWorker {
   }
 
   async tick(): Promise<AccountErasureRecoveryTickResult> {
-    if (this.running) return { claimed: 0, sealed: 0, failed: 0 };
+    if (this.running) return { claimed: 0, sealed: 0, retried: 0, attention: 0, stale: 0 };
     this.running = true;
-    const result: AccountErasureRecoveryTickResult = { claimed: 0, sealed: 0, failed: 0 };
+    const result: AccountErasureRecoveryTickResult = {
+      claimed: 0,
+      sealed: 0,
+      retried: 0,
+      attention: 0,
+      stale: 0,
+    };
     try {
       for (let index = 0; index < this.batchSize; index += 1) {
-        const intent = await this.store.claimIntentForRecovery();
-        if (!intent) break;
+        const claim = await this.store.claimIntentForRecovery();
+        if (!claim) break;
         result.claimed += 1;
         try {
-          await confirmAndSealIntent(intent, this.store, this.ledger);
-          result.sealed += 1;
+          let inventory: AccountErasureSealedInventory | { jobId: string; status: 'stale' };
+          if (claim.intent.state === 'manifest_pending') {
+            inventory = {
+              jobId: claim.intent.jobId,
+              accountId: claim.intent.accountId,
+              status: 'recovery_manifest_pending',
+              recoveryManifest: claim.intent.recoveryManifest,
+            };
+          } else {
+            const confirmed = await confirmedLedgerInput(claim.intent, this.ledger);
+            inventory = await this.store.sealClaimedAfterLedgerConfirmation({
+              ...confirmed,
+              claimToken: claim.claimToken,
+              claimExpiresAt: claim.claimExpiresAt,
+            });
+          }
+          if (inventory.status === 'stale') {
+            result.stale += 1;
+            continue;
+          }
+          const manifestConfirmation = await confirmedRecoveryManifest(
+            inventory.recoveryManifest,
+            this.recoveryManifestSink,
+          );
+          const completed = await this.store.confirmClaimedRecoveryManifest({
+            jobId: inventory.jobId,
+            accountId: inventory.accountId,
+            confirmation: manifestConfirmation,
+            claimToken: claim.claimToken,
+            claimExpiresAt: claim.claimExpiresAt,
+          });
+          if (completed.status === 'stale') result.stale += 1;
+          else result.sealed += 1;
         } catch {
-          await this.store.recordRecoveryFailure({
-            jobId: intent.jobId,
+          const failure = await this.store.recordRecoveryFailure({
+            jobId: claim.intent.jobId,
+            claimToken: claim.claimToken,
+            claimExpiresAt: claim.claimExpiresAt,
             errorCode: 'erasure_recovery_failed',
           });
-          // The store applies bounded backoff and moves the target to attention
-          // only at the frozen threshold; one failed attempt is not attention.
-          result.failed += 1;
+          result[failure] += 1;
         }
       }
       return result;
