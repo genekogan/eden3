@@ -91,6 +91,8 @@ import type {
   WorkspaceSaveInput,
   WorkspaceSaveResponse,
   WorkspaceTreeResponse,
+  XConnectionCreateInput,
+  XConnectionDto,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -932,6 +934,27 @@ export const api = {
         await post<unknown>("/channels/connections", input),
         "connection",
       );
+    },
+
+    /** GET /api/channels/x/connections — safe metadata; never raw app credentials. */
+    async listX(): Promise<Paginated<XConnectionDto>> {
+      return toPaginated<XConnectionDto>(
+        await get<unknown>("/channels/x/connections"),
+        "connections",
+      );
+    },
+
+    /** Validate a user-owned X app, then hand its four secrets to channel custody. */
+    async connectX(input: XConnectionCreateInput): Promise<XConnectionDto> {
+      return unwrap<XConnectionDto>(
+        await post<unknown>("/channels/x/connections", input),
+        "connection",
+      );
+    },
+
+    /** Revoke Eden access; provider-side app/token revocation remains user-owned. */
+    revokeX(id: string): Promise<{ ok: true }> {
+      return post<{ ok: true }>(`/channels/x/connections/${enc(id)}/revoke`, {});
     },
 
     /** POST /api/channels/connections/:id/mock-message — sandbox route test. */

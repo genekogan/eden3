@@ -1,0 +1,66 @@
+import type { ChannelConnectionDto, XConnectionDto } from '@/lib/types';
+
+export const DISCORD_DEVELOPER_PORTAL = 'https://discord.com/developers/applications';
+export const X_DEVELOPER_PORTAL = 'https://developer.x.com/en/portal/dashboard';
+export const DISCORD_BOT_PERMISSIONS = 68_608;
+
+export function discordInviteUrl(clientId: string): string | null {
+  if (!/^\d{3,25}$/.test(clientId)) return null;
+  const url = new URL('https://discord.com/oauth2/authorize');
+  url.searchParams.set('client_id', clientId);
+  url.searchParams.set('permissions', String(DISCORD_BOT_PERMISSIONS));
+  url.searchParams.set('scope', 'bot applications.commands');
+  return url.toString();
+}
+
+export function channelClientDeepLink(connection: ChannelConnectionDto): string | null {
+  if (connection.channel === 'telegram' && connection.bot?.username) {
+    return `https://t.me/${encodeURIComponent(connection.bot.username.replace(/^@/, ''))}`;
+  }
+  if (connection.channel === 'discord' && connection.bot?.id && /^\d{3,25}$/.test(connection.bot.id)) {
+    return `https://discord.com/users/${connection.bot.id}`;
+  }
+  return null;
+}
+
+export function xClientDeepLink(connection: XConnectionDto): string | null {
+  const username = connection.user?.username.replace(/^@/, '');
+  return username ? `https://x.com/${encodeURIComponent(username)}` : null;
+}
+
+export function connectionHealthLabel(
+  connection: Pick<ChannelConnectionDto, 'observedState' | 'lastError'>,
+): string {
+  if (connection.lastError) return `Needs attention: ${connection.lastError.message}`;
+  switch (connection.observedState) {
+    case 'live':
+      return 'Healthy — receiving messages';
+    case 'verified':
+      return 'Verified — ready to activate';
+    case 'validating':
+      return 'Checking provider credentials';
+    case 'starting':
+      return 'Runtime is starting';
+    case 'stopped':
+      return 'Inactive';
+    case 'error':
+      return 'Needs attention';
+    default:
+      return 'Status not reported yet';
+  }
+}
+
+export function xFailureAction(code: string | null): string | null {
+  switch (code) {
+    case 'invalid_credentials':
+      return 'Check all four values against the Keys and tokens tab, then try again.';
+    case 'revoked':
+      return 'Generate a new access token in X, then replace the revoked credentials.';
+    case 'rate_limited':
+      return 'Wait for the provider limit to reset before retrying.';
+    case 'provider_unavailable':
+      return 'X could not be reached. Your saved connection is unchanged; retry shortly.';
+    default:
+      return null;
+  }
+}
