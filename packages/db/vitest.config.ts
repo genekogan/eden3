@@ -1,0 +1,14 @@
+import { defineConfig } from 'vitest/config';
+
+// Unit tests only — pure file/schema assertions, no live database. Integration
+// tests (test/integration/*.itest.ts) exercise real Postgres DDL on scratch
+// databases and run via `pnpm test:integration` — the explicit exclude matters
+// because the default `*.test.ts` glob would also match `*.itest.ts` (`*`
+// matches dots).
+export default defineConfig({
+  test: {
+    include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
+    exclude: ['**/node_modules/**', '**/*.itest.ts'],
+    passWithNoTests: true,
+  },
+});

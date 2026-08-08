@@ -43,7 +43,9 @@ describe('scheduled-task claim-generation migration', () => {
     expect(snapshot.tables['public.triggers']?.checkConstraints).toHaveProperty(
       'triggers_pending_occurrence_claim_shape_check',
     );
-    expect(journal.entries.at(-1)).toMatchObject({
+    // Located by idx (not tail position) — later additive migrations must not
+    // invalidate this assertion. Re-anchored by T08-U01 when 0027 landed.
+    expect(journal.entries.find((entry) => entry.idx === 26)).toMatchObject({
       idx: 26,
       tag: '0026_smart_prima',
     });

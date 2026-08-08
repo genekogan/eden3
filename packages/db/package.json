@@ -15,6 +15,7 @@
     "studio": "drizzle-kit studio",
     "ping": "tsx src/ping.ts",
     "test": "vitest run --passWithNoTests",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit"
   },
