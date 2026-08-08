@@ -135,6 +135,9 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
     const restarted = new StudioReservationReaper({ accountScope: [accountId] });
     expect((await restarted.runOnce()).reaped).toBe(0);
     expect((await getBalance(accountId)).total).toBe(120);
+    // Test-only release of the indefinite late-output quarantine so later
+    // independent cases can exercise the same output kind.
+    await pg`delete from usage_events where turn_id = ${turnId}`;
   });
 
   it('keeps refund_pending durable and preserves the original failure truth when retry succeeds', async () => {
@@ -232,6 +235,7 @@ describe('Studio durable reservation and crash reaper (DEBT-010)', () => {
     });
     expect((await reaper.runOnce()).reaped).toBe(1);
     expect((await getBalance(accountId)).total).toBe(120);
+    await pg`delete from usage_events where turn_id = ${turnId}`;
   });
 
   it('never refunds a creation whose completed state committed in the same transaction', async () => {
