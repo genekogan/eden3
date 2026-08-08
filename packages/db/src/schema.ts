@@ -560,6 +560,63 @@ export const mannaTransactions = pgTable(
   ],
 );
 
+/**
+ * Turn economic authorizations — the durable state machine behind the
+ * worst-case-reserve kernel (MVP gap 42, T08-U02). One row per metered LLM
+ * turn, inserted in the SAME transaction as the reservation debit, before any
+ * provider call or emitted byte. Money truth lives in `state`:
+ *
+ *   reserved  -> the worst-case reservation is committed; the provider may run.
+ *   settled   -> actual cost (<= authorized max) charged, unused refunded, and
+ *                the assistant/usage rows persisted — one transaction.
+ *   reversed  -> the turn failed; the reservation was fully reversed.
+ *   reaped    -> the compensation reaper reversed an orphaned reservation
+ *                (process died between reserve and terminal persistence).
+ *
+ * The reaper acts ONLY on `state='reserved'` + age; it never infers from
+ * usage-event rows (a swallowed telemetry insert must not move money).
+ */
+export const turnAuthorizations = pgTable(
+  'turn_authorizations',
+  {
+    /** The turn uuid — also the reservation debit's idempotency key. */
+    turnId: uuid('turn_id').primaryKey(),
+    /** Paying user account (`accounts.id`). */
+    accountId: uuid('account_id')
+      .notNull()
+      .references(() => accounts.id),
+    agentAccountId: uuid('agent_account_id').references(() => accounts.id),
+    sessionId: uuid('session_id'),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    pricingBasis: text('pricing_basis').notNull(),
+    /** Ceiling-table version the max was computed from. */
+    ceilingTableVersion: text('ceiling_table_version').notNull(),
+    /** Worst-case manna reserved up front — settle may never exceed it. */
+    authorizedMaxManna: numeric('authorized_max_manna', { precision: 20, scale: 4 }).notNull(),
+    /** Exact share of the reservation drawn from the subscription pot. */
+    reservedSubscriptionManna: numeric('reserved_subscription_manna', {
+      precision: 20,
+      scale: 4,
+    }).notNull(),
+    /** The reservation's `manna_transactions` row. */
+    reservationTxId: uuid('reservation_tx_id')
+      .notNull()
+      .references(() => mannaTransactions.id),
+    state: text('state', { enum: ['reserved', 'settled', 'reversed', 'reaped'] }).notNull(),
+    /** Actual charge at settlement (null until settled). */
+    chargedManna: numeric('charged_manna', { precision: 20, scale: 4 }),
+    /** True when metered actual exceeded the ceiling (clamped; platform ate it). */
+    overrun: boolean('overrun').notNull().default(false),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    // The reaper's scan: old rows still in 'reserved'.
+    index('turn_authorizations_state_created_idx').on(t.state, t.createdAt),
+  ],
+);
+
 // ---------------------------------------------------------------------------
 // billing — Stripe subscription state + Eden voucher inventory.
 // ---------------------------------------------------------------------------
@@ -1256,6 +1313,8 @@ export type MannaAccount = typeof mannaAccounts.$inferSelect;
 export type NewMannaAccount = typeof mannaAccounts.$inferInsert;
 export type MannaTransaction = typeof mannaTransactions.$inferSelect;
 export type NewMannaTransaction = typeof mannaTransactions.$inferInsert;
+export type TurnAuthorization = typeof turnAuthorizations.$inferSelect;
+export type NewTurnAuthorization = typeof turnAuthorizations.$inferInsert;
 export type BillingSubscription = typeof billingSubscriptions.$inferSelect;
 export type NewBillingSubscription = typeof billingSubscriptions.$inferInsert;
 export type MannaVoucher = typeof mannaVouchers.$inferSelect;
