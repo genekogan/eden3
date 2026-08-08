@@ -73,23 +73,6 @@ function CreationTile({ creation }: { creation: CreationDto }) {
   );
 }
 
-function HeartIcon({ filled }: { filled: boolean }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill={filled ? "currentColor" : "none"}
-      stroke="currentColor"
-      strokeWidth={1.7}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-      className="size-4"
-    >
-      <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7z" />
-    </svg>
-  );
-}
-
 function AgentCreations({
   username,
   seed,
@@ -279,12 +262,12 @@ function AboutSection({
 
 function skillBadgeClass(status: string): string {
   if (status === "approved") {
-    return "border-emerald-400/25 bg-emerald-400/10 text-emerald-300";
+    return "border-success/25 bg-success/10 text-success-soft";
   }
   if (status === "rejected") {
-    return "border-rose-400/25 bg-rose-400/10 text-rose-300";
+    return "border-danger/25 bg-danger/10 text-danger-soft";
   }
-  return "border-amber-400/25 bg-amber-400/10 text-amber-300";
+  return "border-warning/25 bg-warning/10 text-warning-soft";
 }
 
 function InstalledSkill({ skill }: { skill: AgentSkillDto }) {
@@ -304,7 +287,7 @@ function InstalledSkill({ skill }: { skill: AgentSkillDto }) {
   );
 }
 
-function AgentSkillsPanel({
+export function AgentSkillsPanel({
   username,
   canManage,
 }: {
@@ -433,7 +416,7 @@ function AgentSkillsPanel({
 // Memory tab
 // ---------------------------------------------------------------------------
 
-function AgentMemoryPanel({
+export function AgentMemoryPanel({
   username,
   seed,
   canManage,
@@ -655,8 +638,6 @@ export function AgentProfile({ username }: { username: string }) {
   const [reloadKey, setReloadKey] = useState(0);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
-  const [likeBusy, setLikeBusy] = useState(false);
-  const [likeError, setLikeError] = useState<string | null>(null);
   const [repairing, setRepairing] = useState(false);
   const [repairNote, setRepairNote] = useState<string | null>(null);
   const seq = useRef(0);
@@ -780,8 +761,6 @@ export function AgentProfile({ username }: { username: string }) {
   // a dormant migrated agent (lazy provisioning). Only block during an active
   // warm-up or after a failure.
   const chatBlocked = warming || failed;
-  const liked = Boolean(agent.viewerHasLiked);
-  const likeCount = agent.likeCount ?? 0;
   const tabs = canManage
     ? (["creations", "about", "concepts", "skills", "memory", "files"] as const)
     : (["creations", "about", "concepts", "skills"] as const);
@@ -823,27 +802,23 @@ export function AgentProfile({ username }: { username: string }) {
     }
   };
 
-  const toggleAgentLike = async () => {
-    if (likeBusy) return;
-    setLikeBusy(true);
-    setLikeError(null);
-    try {
-      const updated = liked
-        ? await api.agents.unlike(agent.username)
-        : await api.agents.like(agent.username);
-      setProfile((prev) =>
-        prev && prev.agent.id === updated.id ? { ...prev, agent: updated } : prev,
-      );
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        setLikeError("Sign in to like agents.");
-      } else {
-        setLikeError(describeApiFailure(error));
-      }
-    } finally {
-      setLikeBusy(false);
-    }
-  };
+  // Single-user cockpit: only agents you manage have a surface here.
+  if (!canManage) {
+    return (
+      <div className="flex min-h-[60vh] items-center justify-center px-6">
+        <EmptyState
+          title={`@${agent.username} isn't yours`}
+          hint="This cockpit only shows your own agents."
+          action={
+            <Link href="/agents" className={quietButtonClass}>
+              Your agents
+            </Link>
+          }
+          className="w-full max-w-md"
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="mx-auto w-full min-w-0 max-w-5xl overflow-x-clip px-3 py-6 sm:px-6 sm:py-10 md:px-10">
@@ -892,34 +867,19 @@ export function AgentProfile({ username }: { username: string }) {
                 Chat
               </Link>
             )}
-            <button
-              type="button"
-              aria-pressed={liked}
-              onClick={() => void toggleAgentLike()}
-              disabled={likeBusy}
-              className={`inline-flex items-center gap-2 rounded-md border px-3.5 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                liked
-                  ? "border-rose-300/50 bg-rose-300/10 text-rose-200"
-                  : "border-edge text-muted hover:border-accent/50 hover:text-foreground"
-              }`}
-            >
-              <HeartIcon filled={liked} />
-              <span>{liked ? "Liked" : "Like"}</span>
-              <span className="font-mono text-[11px] text-faint">{likeCount}</span>
-            </button>
             {isOwner ? (
               <>
                 <Link
-                  href={agentHref(agent.username, "edit")}
+                  href={agentHref(agent.username, "settings")}
                   className={quietButtonClass}
                 >
-                  Edit
+                  Settings
                 </Link>
                 <Link
-                  href={`/channels?agent=${encodeURIComponent(agent.username)}`}
+                  href={agentHref(agent.username, "gateway")}
                   className={quietButtonClass}
                 >
-                  Connections
+                  Gateway
                 </Link>
                 <button
                   type="button"
@@ -962,13 +922,8 @@ export function AgentProfile({ username }: { username: string }) {
             </details>
           ) : null}
           {exportError ? (
-            <p className="mt-3 rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
+            <p className="mt-3 rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs text-danger">
               {exportError}
-            </p>
-          ) : null}
-          {likeError ? (
-            <p className="mt-3 rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
-              {likeError}
             </p>
           ) : null}
         </div>
@@ -987,7 +942,7 @@ export function AgentProfile({ username }: { username: string }) {
           Setting up this agent's runtime — chat unlocks the moment it's ready.
         </div>
       ) : failed ? (
-        <div className="mt-8 rounded-xl border border-red-400/25 bg-red-400/5 px-4 py-3 text-sm text-muted">
+        <div className="mt-8 rounded-xl border border-danger/25 bg-danger/5 px-4 py-3 text-sm text-muted">
           Provisioning failed. The agent's profile and persona are saved — try
           again later or contact an admin.
         </div>
@@ -1009,7 +964,7 @@ export function AgentProfile({ username }: { username: string }) {
             className={`min-w-0 rounded-lg border-b-2 px-1 py-2 text-xs capitalize transition-colors sm:-mb-px sm:rounded-none sm:pb-2.5 sm:pt-0 sm:text-sm ${
               tab === key
                 ? "border-accent bg-accent/10 text-foreground sm:bg-transparent"
-                : "border-transparent text-muted hover:bg-white/[0.03] hover:text-foreground sm:hover:bg-transparent"
+                : "border-transparent text-muted hover:bg-foreground/[0.03] hover:text-foreground sm:hover:bg-transparent"
             }`}
           >
             {key}

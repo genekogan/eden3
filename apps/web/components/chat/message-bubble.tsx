@@ -427,7 +427,7 @@ export function MediaPendingBubble({
   return (
     <AgentRow sender={sender} showAvatar={false}>
       <div className="w-64 max-w-full">
-        <div className="relative aspect-square animate-pulse overflow-hidden rounded-xl border border-edge/70 bg-white/[0.04]" />
+        <div className="relative aspect-square animate-pulse overflow-hidden rounded-xl border border-edge/70 bg-foreground/[0.04]" />
         <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-faint">
           <span className="relative flex size-1.5">
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent/60" />
@@ -466,11 +466,11 @@ export function InlineError({
 }) {
   return (
     <div className="flex justify-center">
-      <div className="flex max-w-lg flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border border-red-500/25 bg-red-500/[0.06] px-4 py-2.5 text-xs text-red-200/90">
+      <div className="flex max-w-lg flex-wrap items-center gap-x-3 gap-y-1.5 rounded-xl border border-danger/25 bg-danger/[0.06] px-4 py-2.5 text-xs text-danger-soft/90">
         <span className="min-w-0 break-words">
           {item.message || "The turn failed."}
           {item.code ? (
-            <span className="ml-1.5 font-mono text-[10px] text-red-200/50">
+            <span className="ml-1.5 font-mono text-[10px] text-danger-soft/50">
               {item.code}
             </span>
           ) : null}
@@ -480,7 +480,7 @@ export function InlineError({
             <button
               type="button"
               onClick={() => onRetry(item.retryContent ?? "")}
-              className="rounded-md border border-red-400/30 px-2 py-1 transition-colors hover:border-red-300/60 hover:text-red-100"
+              className="rounded-md border border-danger/30 px-2 py-1 transition-colors hover:border-danger-soft/60 hover:text-danger-soft"
             >
               Retry
             </button>
@@ -489,7 +489,7 @@ export function InlineError({
             type="button"
             onClick={onDismiss}
             aria-label="Dismiss error"
-            className="rounded-md px-1.5 py-1 text-red-200/60 transition-colors hover:text-red-100"
+            className="rounded-md px-1.5 py-1 text-danger-soft/60 transition-colors hover:text-danger-soft"
           >
             ✕
           </button>

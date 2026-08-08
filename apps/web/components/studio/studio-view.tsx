@@ -62,9 +62,16 @@ type QuoteState =
 
 const IDLE: Phase = { kind: "idle", notice: null };
 
-export function StudioView() {
+export function StudioView({
+  initialTool,
+  hidePicker = false,
+}: {
+  initialTool?: string;
+  /** Sidebar-driven mode: the tool list lives in the shell, not in-page. */
+  hidePicker?: boolean;
+} = {}) {
   const [toolsState, setToolsState] = useState<ToolsState>({ status: "loading" });
-  const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [selectedName, setSelectedName] = useState<string | null>(initialTool ?? null);
   const [prompt, setPrompt] = useState("");
   const [duration, setDuration] = useState("");
   // "" = the tool's default model tier; a key from tool.models otherwise.
@@ -269,12 +276,14 @@ export function StudioView() {
         </p>
       ) : null}
 
-      <ToolPicker
-        tools={tools}
-        selectedName={selected?.name ?? null}
-        onSelect={selectTool}
-        disabled={phase.kind === "generating"}
-      />
+      {hidePicker ? null : (
+        <ToolPicker
+          tools={tools}
+          selectedName={selected?.name ?? null}
+          onSelect={selectTool}
+          disabled={phase.kind === "generating"}
+        />
+      )}
 
       <div className="mt-4">
         {phase.kind === "generating" && selected ? (
@@ -401,7 +410,7 @@ export function StudioView() {
                   <span>
                     Not enough manna for this tool.{" "}
                     <Link
-                      href="/manna"
+                      href="/account/manna"
                       className="text-accent-soft transition-colors hover:text-accent"
                     >
                       Top up &rarr;
@@ -445,7 +454,7 @@ function ErrorPanel({
 }) {
   return (
     <div className="rounded-xl border border-edge bg-surface p-6">
-      <p className="text-sm font-medium text-rose-300">{failure.title}</p>
+      <p className="text-sm font-medium text-danger-soft">{failure.title}</p>
       {failure.detail ? (
         <p className="mt-1.5 text-sm leading-relaxed text-muted">
           {failure.detail}
@@ -473,7 +482,7 @@ function ErrorPanel({
         </button>
         {failure.insufficient ? (
           <Link
-            href="/manna"
+            href="/account/manna"
             className="ml-auto text-xs text-accent-soft transition-colors hover:text-accent"
           >
             Top up manna &rarr;

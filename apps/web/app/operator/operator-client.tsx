@@ -61,11 +61,11 @@ function errorCopy(error: unknown): { title: string; hint: string } {
 function HealthDot({ tone }: { tone: "ok" | "warn" | "bad" | "muted" }) {
   const color =
     tone === "ok"
-      ? "bg-emerald-400"
+      ? "bg-success"
       : tone === "warn"
-        ? "bg-amber-400"
+        ? "bg-warning"
         : tone === "bad"
-          ? "bg-rose-400"
+          ? "bg-danger"
           : "bg-faint";
   return <span aria-hidden className={`inline-block size-2 rounded-full ${color}`} />;
 }
@@ -181,7 +181,7 @@ function ModelRuntimePanel({
             reconciliation.
           </p>
         </div>
-        {error ? <p className="text-xs text-rose-300">{error}</p> : null}
+        {error ? <p className="text-xs text-danger-soft">{error}</p> : null}
       </div>
       <div className="mt-4 grid gap-3 md:grid-cols-2">
         {models.map((row) => {
@@ -257,7 +257,7 @@ function StatusRow({ row }: { row: OperatorStatusBreakdown }) {
       <span className="min-w-0 truncate">
         <span
           className={`mr-2 inline-block size-1.5 rounded-full ${
-            error ? "bg-rose-400" : "bg-emerald-400"
+            error ? "bg-danger" : "bg-success"
           }`}
         />
         {row.status}
@@ -369,7 +369,7 @@ function RecentActivity({ rows }: { rows: OperatorRecentUsageEvent[] }) {
                       <div className="flex min-w-0 items-center gap-2">
                         <span
                           className={`inline-block size-1.5 rounded-full ${
-                            errored ? "bg-rose-400" : "bg-emerald-400"
+                            errored ? "bg-danger" : "bg-success"
                           }`}
                         />
                         <span className="truncate">{row.eventType}</span>

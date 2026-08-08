@@ -369,7 +369,7 @@ export function AgentWorkspacePanel({
         <p className="font-mono text-[11px] uppercase tracking-[0.25em] text-faint">
           Workspace
           {truncated ? (
-            <span className="ml-2 normal-case tracking-normal text-amber-300/80">
+            <span className="ml-2 normal-case tracking-normal text-warning-soft/80">
               showing the first 2,000 entries
             </span>
           ) : null}
@@ -395,7 +395,7 @@ export function AgentWorkspacePanel({
       </div>
 
       {actionError ? (
-        <p className="mt-3 rounded-lg border border-red-400/25 bg-red-400/5 px-3 py-2 text-xs text-red-400">
+        <p className="mt-3 rounded-lg border border-danger/25 bg-danger/5 px-3 py-2 text-xs text-danger">
           {actionError}
         </p>
       ) : null}
@@ -455,8 +455,8 @@ export function AgentWorkspacePanel({
               ) : null}
 
               {conflict ? (
-                <div className="rounded-xl border border-amber-400/25 bg-amber-400/5 px-4 py-3 text-sm">
-                  <p className="font-medium text-amber-200">
+                <div className="rounded-xl border border-warning/25 bg-warning/5 px-4 py-3 text-sm">
+                  <p className="font-medium text-warning-soft">
                     The agent changed this file while you were editing.
                   </p>
                   <p className="mt-1 text-xs text-faint">

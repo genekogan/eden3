@@ -494,8 +494,10 @@ export const api = {
   },
 
   sessions: {
-    /** GET /api/sessions?cursor */
-    async list(params: { cursor?: string } = {}): Promise<Paginated<SessionDto>> {
+    /** GET /api/sessions?cursor&agent — agent filters to that agent's sessions. */
+    async list(
+      params: { cursor?: string; agent?: string } = {},
+    ): Promise<Paginated<SessionDto>> {
       return toPaginated<SessionDto>(
         await get<unknown>(`/sessions${qs(params)}`),
         "sessions",
@@ -538,9 +540,13 @@ export const api = {
   },
 
   agents: {
-    /** GET /api/agents?q&cursor&scope — scope "mine" lists the viewer's own agents (incl. private) */
+    /**
+     * GET /api/agents?q&cursor&scope — the cockpit only ever lists the
+     * viewer's own agents (scope "mine"; the public directory is out of
+     * scope for this app — cross-user browsing returns as a separate app).
+     */
     async list(
-      params: { q?: string; cursor?: string; scope?: "public" | "mine" } = {},
+      params: { q?: string; cursor?: string; scope?: "mine" } = {},
     ): Promise<Paginated<AgentDto>> {
       return toPaginated<AgentDto>(
         await get<unknown>(`/agents${qs(params)}`),
@@ -668,29 +674,19 @@ export const api = {
       );
     },
 
-    /** POST /api/agents/:username/like */
-    async like(username: string): Promise<AgentDto> {
-      return unwrap<AgentDto>(await post<unknown>(`/agents/${enc(username)}/like`), "agent");
-    },
-
-    /** DELETE /api/agents/:username/like */
-    async unlike(username: string): Promise<AgentDto> {
-      return unwrap<AgentDto>(
-        await apiFetch<unknown>(`/agents/${enc(username)}/like`, { method: "DELETE" }),
-        "agent",
-      );
-    },
   },
 
   feed: {
-    /** GET /api/feed/creations?cursor&agent&user&favorites -> {creations[], nextCursor} */
+    /**
+     * GET /api/feed/creations?cursor&agent&user -> {creations[], nextCursor}.
+     * `user: "me"` = the signed-in viewer's own creations incl. non-public rows.
+     */
     async creations(
       params: {
         q?: string;
         cursor?: string;
         agent?: string;
         user?: string;
-        favorites?: "mine";
       } = {},
     ): Promise<Paginated<CreationDto>> {
       return toPaginated<CreationDto>(
@@ -709,18 +705,6 @@ export const api = {
       );
     },
 
-    /** POST /api/creations/:id/like */
-    async like(id: string): Promise<CreationDto> {
-      return unwrap<CreationDto>(await post<unknown>(`/creations/${enc(id)}/like`), "creation");
-    },
-
-    /** DELETE /api/creations/:id/like */
-    async unlike(id: string): Promise<CreationDto> {
-      return unwrap<CreationDto>(
-        await apiFetch<unknown>(`/creations/${enc(id)}/like`, { method: "DELETE" }),
-        "creation",
-      );
-    },
   },
 
   collections: {
@@ -1002,8 +986,11 @@ export const api = {
     /**
      * GET /api/usage/summary — the signed-in viewer's OWN balance, spend, and
      * recent activity. Never admin-gated and never carries provider cost_usd.
+     * `agent` filters spend + recent to one agent (balance stays global).
      */
-    async summary(params: { limit?: number } = {}): Promise<UserUsageSummary> {
+    async summary(
+      params: { limit?: number; agent?: string } = {},
+    ): Promise<UserUsageSummary> {
       return get<UserUsageSummary>(`/usage/summary${qs(params)}`);
     },
   },
@@ -1039,10 +1026,10 @@ export const api = {
   },
 
   tasks: {
-    /** GET /api/tasks — scheduled prompts (triggers) for the current user. */
-    async list(): Promise<Paginated<TriggerDto>> {
+    /** GET /api/tasks?agent — scheduled prompts (triggers) for the current user. */
+    async list(params: { agent?: string } = {}): Promise<Paginated<TriggerDto>> {
       return toPaginated<TriggerDto>(
-        await get<unknown>("/tasks"),
+        await get<unknown>(`/tasks${qs(params)}`),
         "tasks",
         "triggers",
       );

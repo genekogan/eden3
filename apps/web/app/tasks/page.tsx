@@ -1,8 +1,6 @@
-import type { Metadata } from "next";
-import { TasksClient } from "./tasks-client";
+import { redirectToAgentSub } from "@/lib/last-agent-server";
 
-export const metadata: Metadata = { title: "Tasks" };
-
-export default function TasksPage() {
-  return <TasksClient />;
+/** Legacy /tasks — scheduling lives with each agent now (Schedule). */
+export default async function LegacyTasksPage() {
+  await redirectToAgentSub("schedule");
 }

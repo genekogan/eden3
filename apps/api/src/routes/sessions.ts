@@ -1,4 +1,10 @@
-import { resolveSession } from '@eden3/core';
+import {
+  isHex24,
+  isUuid,
+  resolveAccount,
+  resolveAccountByUsername,
+  resolveSession,
+} from '@eden3/core';
 import {
   accounts,
   db,
@@ -248,7 +254,16 @@ export async function canAccessSession(
 const listQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   limit: z.coerce.number().int().min(1).max(100).default(30),
+  /** Filter to sessions this agent participates in (username, uuid, or legacy 24-hex id). */
+  agent: z.string().trim().min(1).max(200).optional(),
 });
+
+/** Resolve an agent reference to an accounts.id, or null when unknown. */
+async function resolveAgentRef(ref: string): Promise<string | null> {
+  if (isUuid(ref)) return ref.toLowerCase();
+  if (isHex24(ref)) return (await resolveAccount(ref))?.id ?? null;
+  return (await resolveAccountByUsername(ref))?.id ?? null;
+}
 
 const detailQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
@@ -258,9 +273,15 @@ const detailQuerySchema = z.object({
 export const sessionsRoutes: FastifyPluginAsync = async (app) => {
   // GET /sessions — the caller's sessions, newest activity first.
   app.get('/', { preHandler: app.requireAuth }, async (req) => {
-    const { cursor: rawCursor, limit } = listQuerySchema.parse(req.query);
+    const { cursor: rawCursor, limit, agent } = listQuerySchema.parse(req.query);
     const me = req.account!.accountId;
     const cursor = rawCursor ? decodeSessionListCursor(rawCursor) : null;
+
+    let agentId: string | null = null;
+    if (agent !== undefined) {
+      agentId = await resolveAgentRef(agent);
+      if (agentId === null) return { sessions: [], nextCursor: null };
+    }
 
     const conditions = [
       eq(sessions.deleted, false),
@@ -271,6 +292,15 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
           and ${sessionUsers.userAccountId} = ${me}
       ))`,
     ];
+    if (agentId !== null) {
+      conditions.push(
+        sql`exists (
+          select 1 from ${sessionAgents}
+          where ${sessionAgents.sessionId} = ${sessions.id}
+            and ${sessionAgents.agentAccountId} = ${agentId}
+        )`,
+      );
+    }
     if (cursor) {
       // Keyset over (last_message_at desc nulls last, id desc).
       conditions.push(
