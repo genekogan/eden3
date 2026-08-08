@@ -122,6 +122,8 @@ export function ChannelsClient() {
   const [telegramOnboarding, setTelegramOnboarding] =
     useState<TelegramManagedBotOnboardingStatus | null>(null);
   const alive = useRef(true);
+  const activeTelegramIntent = useRef<string | null>(null);
+  const telegramMutationInFlight = useRef(false);
 
   const mergeConnection = useCallback((connection: ChannelConnectionDto) => {
     setConnections((current) =>
@@ -188,6 +190,7 @@ export function ChannelsClient() {
     void load();
     return () => {
       alive.current = false;
+      activeTelegramIntent.current = null;
     };
   }, [load]);
 
@@ -201,12 +204,13 @@ export function ChannelsClient() {
     let disposed = false;
     let inFlight = false;
     const poll = () => {
-      if (inFlight) return;
+      if (inFlight || activeTelegramIntent.current !== intentId) return;
       inFlight = true;
       void api.channels.managedTelegramStatus(intentId).then(
         (status) => {
-          if (disposed || !alive.current) return;
+          if (disposed || !alive.current || activeTelegramIntent.current !== intentId) return;
           if (status.connection) {
+            activeTelegramIntent.current = null;
             mergeConnection(status.connection);
             setTelegramOnboarding(null);
             setTelegramOwnerBindingUrl(null);
@@ -293,6 +297,8 @@ export function ChannelsClient() {
       return;
     }
     if (channel === "telegram") {
+      if (telegramMutationInFlight.current) return;
+      telegramMutationInFlight.current = true;
       setBusy("telegram:start");
       setNote(null);
       try {
@@ -301,6 +307,7 @@ export function ChannelsClient() {
           suggestedBotUsername ? { suggestedBotUsername } : {},
         );
         if (!alive.current) return;
+        activeTelegramIntent.current = started.intent.id;
         setTelegramOwnerBindingUrl(trustedTelegramUrl(started.ownerBindingUrl));
         setTelegramOnboarding({
           intent: started.intent,
@@ -311,6 +318,7 @@ export function ChannelsClient() {
       } catch (error) {
         if (alive.current) setNote(errorCopy(error));
       } finally {
+        telegramMutationInFlight.current = false;
         if (alive.current) setBusy(null);
       }
       return;
@@ -347,12 +355,15 @@ export function ChannelsClient() {
   };
 
   const attachManagedTelegram = async () => {
-    if (!selectedAgent || !telegramOnboarding || telegramStep !== "attach") return;
+    if (!selectedAgent || !telegramOnboarding || telegramStep !== "attach" || telegramMutationInFlight.current) return;
+    const intentId = telegramOnboarding.intent.id;
+    telegramMutationInFlight.current = true;
+    activeTelegramIntent.current = null;
     setBusy("telegram:attach");
     setNote(null);
     try {
       const connection = await api.channels.attachManagedTelegram(
-        telegramOnboarding.intent.id,
+        intentId,
         {
           agentUsername: selectedAgent.username,
           ...(label.trim() ? { label: label.trim() } : {}),
@@ -366,30 +377,42 @@ export function ChannelsClient() {
       setLabel("");
       setNote("Telegram bot attached. Configure access below, then activate the connection.");
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error));
+      if (alive.current) {
+        activeTelegramIntent.current = intentId;
+        setNote(errorCopy(error));
+      }
     } finally {
+      telegramMutationInFlight.current = false;
       if (alive.current) setBusy(null);
     }
   };
 
   const cancelManagedTelegram = async () => {
-    if (!telegramOnboarding) return;
+    if (!telegramOnboarding || telegramMutationInFlight.current) return;
+    const intentId = telegramOnboarding.intent.id;
+    telegramMutationInFlight.current = true;
+    activeTelegramIntent.current = null;
     setBusy("telegram:cancel");
     setNote(null);
     try {
-      await api.channels.cancelManagedTelegram(telegramOnboarding.intent.id);
+      await api.channels.cancelManagedTelegram(intentId);
       if (!alive.current) return;
       setTelegramOnboarding(null);
       setTelegramOwnerBindingUrl(null);
       setNote("Telegram onboarding cancelled. No bot was attached.");
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error));
+      if (alive.current) {
+        activeTelegramIntent.current = intentId;
+        setNote(errorCopy(error));
+      }
     } finally {
+      telegramMutationInFlight.current = false;
       if (alive.current) setBusy(null);
     }
   };
 
   const resetManagedTelegram = () => {
+    activeTelegramIntent.current = null;
     setTelegramOnboarding(null);
     setTelegramOwnerBindingUrl(null);
     setNote("Start a new Telegram onboarding when you’re ready.");
