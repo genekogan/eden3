@@ -271,6 +271,8 @@ export interface MediaWatcherOptions {
   /** @deprecated Never used for file attribution; retained for source compatibility. */
   turnRegistry?: TurnRegistryLike;
   historySync?: MediaHistorySync | null;
+  /** Durable Studio late-output fence; failure is treated as quarantined. */
+  isStudioKindQuarantined?: (kind: AttachmentKind) => Promise<boolean>;
   logger?: MediaLogger;
   /** Test hook: called after every routed file. */
   onOutcome?: (outcome: MediaWatcherOutcome) => void;
@@ -307,6 +309,7 @@ export class MediaWatcher {
   private readonly stablePolls: number;
   private readonly log: MediaLogger;
   private readonly historySync: MediaHistorySync | null;
+  private readonly isStudioKindQuarantined: ((kind: AttachmentKind) => Promise<boolean>) | null;
   private readonly onOutcome: ((outcome: MediaWatcherOutcome) => void) | null;
 
   private watcher: FSWatcher | null = null;
@@ -325,6 +328,7 @@ export class MediaWatcher {
     this.pollIntervalMs = opts.pollIntervalMs ?? 1500;
     this.stablePolls = opts.stablePolls ?? 2;
     this.historySync = opts.historySync ?? null;
+    this.isStudioKindQuarantined = opts.isStudioKindQuarantined ?? null;
     this.log = opts.logger ?? console;
     this.onOutcome = opts.onOutcome ?? null;
   }
@@ -497,6 +501,22 @@ export class MediaWatcher {
       mime,
       kind: attachmentKindForMime(mime),
     };
+
+    // A failed provider-admitted Studio run can still emit after its HTTP
+    // timeout/refund. With no task→file identity, the only safe action is to
+    // bypass every claim/history attribution and park the same-kind file.
+    if (this.isStudioKindQuarantined) {
+      let quarantined = true;
+      try {
+        quarantined = await this.isStudioKindQuarantined(file.kind);
+      } catch (err) {
+        this.log.warn(`media-watcher: Studio quarantine check failed closed: ${String(err)}`);
+      }
+      if (quarantined) {
+        await this.ingest(file, 'parked', { tool: toolFromPath(file.path, file.kind) });
+        return;
+      }
+    }
 
     // 1. Claims (studio) — FIFO, first kind-match wins.
     const claimIdx = this.claims.findIndex((c) => !c.kinds || c.kinds.has(file.kind));

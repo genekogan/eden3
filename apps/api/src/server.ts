@@ -39,7 +39,10 @@ import {
 } from './services/task-scheduler';
 import { TurnRegistry } from './services/turn-registry';
 import { TurnReservationReaper } from './services/turn-reservation-reaper';
-import { StudioReservationReaper } from './services/studio-reservations';
+import {
+  isStudioOutputKindQuarantined,
+  StudioReservationReaper,
+} from './services/studio-reservations';
 import { ChatMediaReservationReaper } from './services/chat-media-authorization';
 import type { SessionShareRepository } from './services/session-shares';
 import { PostgresSessionShareRepository } from './services/session-shares-postgres';
@@ -382,6 +385,10 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   const mediaWatcher = new MediaWatcher({
     pipeline: mediaPipeline,
     logger: app.log,
+    isStudioKindQuarantined: (outputKind) =>
+      outputKind === 'file'
+        ? Promise.resolve(false)
+        : isStudioOutputKindQuarantined({ outputKind }),
   });
   if (historySync) {
     historySync.setAttachmentCallback(

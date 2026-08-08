@@ -11,13 +11,23 @@ import { and, asc, eq, inArray, isNotNull, lt, or, sql } from 'drizzle-orm';
 export const STUDIO_RESERVATION_EVENT_TYPE = 'studio_generation';
 export const STUDIO_RESERVATION_TTL_MS = 60 * 60 * 1000;
 export const STUDIO_RESERVATION_REAPER_INTERVAL_MS = 5 * 60 * 1000;
+export type StudioOutputKind = 'image' | 'video' | 'audio';
 
 export class StudioGenerationBusyError extends Error {
   readonly code = 'studio_generation_busy';
 
-  constructor(readonly outputKind: 'image' | 'video' | 'audio') {
+  constructor(readonly outputKind: StudioOutputKind) {
     super(`studio-reservation: another ${outputKind} generation is already active`);
     this.name = 'StudioGenerationBusyError';
+  }
+}
+
+export class StudioOutputQuarantinedError extends Error {
+  readonly code = 'studio_output_quarantined';
+
+  constructor(readonly outputKind: StudioOutputKind) {
+    super(`studio-reservation: ${outputKind} output is quarantined pending operator drain`);
+    this.name = 'StudioOutputQuarantinedError';
   }
 }
 
@@ -46,6 +56,11 @@ export interface StudioReservationMetadata {
   refundAttemptedAt?: string;
   failureCode?: string;
   failureLatencyMs?: number;
+  outputQuarantine?: {
+    version: 1;
+    outputKind: StudioOutputKind;
+    markedAt: string;
+  };
 }
 
 export interface StudioReservation {
@@ -57,11 +72,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function outputKindForStudioTool(tool: string): 'image' | 'video' | 'audio' {
+function outputKindForStudioTool(tool: string): StudioOutputKind {
   if (tool === 'image_generate') return 'image';
   if (tool === 'video_generate') return 'video';
   if (tool === 'music_generate' || tool === 'tts') return 'audio';
   throw new Error(`studio-reservation: unsupported tool ${tool}`);
+}
+
+export async function isStudioOutputKindQuarantined(options: {
+  outputKind: StudioOutputKind;
+  db?: DbHandle;
+}): Promise<boolean> {
+  const rows = (await (options.db ?? db).execute(sql`
+    select 1
+    from usage_events
+    where event_type = ${STUDIO_RESERVATION_EVENT_TYPE}
+      and metadata->'outputQuarantine'->>'outputKind' = ${options.outputKind}
+    limit 1
+  `)) as unknown as Array<{ '?column?': number }>;
+  return rows.length > 0;
+}
+
+/** Consume the direct-Studio provider ticket exactly once (used by TTS). */
+export async function admitStudioGeneration(options: {
+  reservation: StudioReservation;
+  db?: DbHandle;
+}): Promise<void> {
+  const [admitted] = await (options.db ?? db)
+    .update(usageEvents)
+    .set({ status: 'provider_admitted' })
+    .where(
+      and(
+        eq(usageEvents.eventType, STUDIO_RESERVATION_EVENT_TYPE),
+        eq(usageEvents.turnId, options.reservation.turnId),
+        eq(usageEvents.status, 'pending'),
+        sql`${usageEvents.metadata} = ${JSON.stringify(options.reservation.metadata)}::jsonb`,
+      ),
+    )
+    .returning({ id: usageEvents.id });
+  if (!admitted) {
+    throw new Error(`studio-reservation: provider admission unavailable for ${options.reservation.turnId}`);
+  }
 }
 
 function readReservationMetadata(value: unknown): StudioReservationMetadata {
@@ -127,20 +178,29 @@ export async function reserveStudioGeneration(options: {
     await tx.execute(sql`
       select pg_advisory_xact_lock(hashtextextended(${'studio-media-output:' + outputKind}, 0))
     `);
-    const active = (await tx.execute(sql`
-      select turn_id
+    const conflicts = (await tx.execute(sql`
+      select turn_id,
+             case when metadata->'outputQuarantine'->>'outputKind' = ${outputKind}
+                  then true else false end as quarantined
       from usage_events
       where event_type = ${STUDIO_RESERVATION_EVENT_TYPE}
-        and status in ('pending', 'provider_admitted', 'refund_pending')
-        and case ${outputKind}
-          when 'image' then metadata->>'tool' = 'image_generate'
-          when 'video' then metadata->>'tool' = 'video_generate'
-          when 'audio' then metadata->>'tool' in ('music_generate', 'tts')
-          else false
-        end
+        and (
+          metadata->'outputQuarantine'->>'outputKind' = ${outputKind}
+          or (
+            status in ('pending', 'provider_admitted', 'refund_pending')
+            and case ${outputKind}
+              when 'image' then metadata->>'tool' = 'image_generate'
+              when 'video' then metadata->>'tool' = 'video_generate'
+              when 'audio' then metadata->>'tool' in ('music_generate', 'tts')
+              else false
+            end
+          )
+        )
+      order by quarantined desc
       limit 1
-    `)) as unknown as Array<{ turn_id: string | null }>;
-    if (active[0]) throw new StudioGenerationBusyError(outputKind);
+    `)) as unknown as Array<{ turn_id: string | null; quarantined: boolean }>;
+    if (conflicts[0]?.quarantined) throw new StudioOutputQuarantinedError(outputKind);
+    if (conflicts[0]) throw new StudioGenerationBusyError(outputKind);
 
     const debited = await debit({
       accountId: options.accountId,
@@ -262,6 +322,16 @@ export async function compensateStudioGeneration(options: {
       throw new Error(`studio-reservation: unexpected status ${row.status}`);
     }
     const existingMetadata = isRecord(row.metadata) ? row.metadata : {};
+    const outputQuarantine =
+      row.status === 'provider_admitted'
+        ? {
+            outputQuarantine: {
+              version: 1 as const,
+              outputKind: outputKindForStudioTool(readReservationMetadata(row.metadata).tool),
+              markedAt: new Date().toISOString(),
+            },
+          }
+        : {};
     const effective = {
       errorCode:
         row.status === 'refund_pending' && typeof existingMetadata.failureCode === 'string'
@@ -286,6 +356,7 @@ export async function compensateStudioGeneration(options: {
           refundAttemptedAt: new Date().toISOString(),
           failureCode: effective.errorCode,
           ...(effective.latencyMs !== undefined ? { failureLatencyMs: effective.latencyMs } : {}),
+          ...outputQuarantine,
         })}::jsonb`,
       })
       .where(

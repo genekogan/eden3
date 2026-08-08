@@ -592,6 +592,47 @@ describe('POST /studio/generate', () => {
     nextTtsFallback = null;
   });
 
+  it('durably admits direct Studio TTS before provider work and quarantines a failed output', async () => {
+    invokeCalls = [];
+    nextClaim = claimUnused;
+    let admittedTurnId: string | null = null;
+    nextTtsFallback = async () => {
+      const [admitted] = await pg<{ turnId: string; status: string }[]>`
+        select turn_id as "turnId", status
+        from usage_events
+        where user_id = ${richUserId}
+          and event_type = 'studio_generation'
+          and metadata->>'tool' = 'tts'
+        order by created_at desc limit 1`;
+      expect(admitted?.status).toBe('provider_admitted');
+      admittedTurnId = admitted?.turnId ?? null;
+      throw new Error('synthetic ElevenLabs failure after admission');
+    };
+    const before = await getBalance(richUserId);
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/studio/generate',
+        headers: asUser(richUserId),
+        payload: { tool: 'tts', args: { text: 'Quarantine this failed speech.' } },
+      });
+      expect(res.statusCode).toBe(502);
+      expect(invokeCalls).toHaveLength(0);
+      expect((await getBalance(richUserId)).total).toBe(before.total);
+      expect(admittedTurnId).toBeTruthy();
+      const [terminal] = await pg<{ status: string; outputKind: string | null }[]>`
+        select status, metadata->'outputQuarantine'->>'outputKind' as "outputKind"
+        from usage_events where turn_id = ${admittedTurnId}`;
+      expect(terminal).toEqual({ status: 'error', outputKind: 'audio' });
+    } finally {
+      nextTtsFallback = null;
+      if (admittedTurnId) {
+        // Test-only operator-quarantine cleanup; production has no automatic clear.
+        await pg`delete from usage_events where turn_id = ${admittedTurnId}`;
+      }
+    }
+  });
+
   it('502s and refunds when the gateway invoke fails', async () => {
     invokeError = new GatewayToolError('fal exploded', 'image_generate');
     nextClaim = claimUnused;

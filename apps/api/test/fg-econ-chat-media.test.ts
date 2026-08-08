@@ -444,4 +444,74 @@ describe('FG-ECON in-chat media authorization', () => {
       }),
     ).toBe('refunded');
   });
+
+  it('quarantines a Studio output kind durably after provider-admitted failure', async () => {
+    const quote = quoteChatMediaTool('image_generate', { prompt: 'late Studio image' });
+    const first = await fixture(quote.manna + 10);
+    const second = await fixture(quote.manna + 10);
+    const firstTurnId = randomUUID();
+    const secondTurnId = randomUUID();
+    const secondBefore = await getBalance(second.userId);
+    const reserve = (turnId: string, accountId: string) =>
+      reserveStudioGeneration({
+        turnId,
+        accountId,
+        tool: 'image_generate',
+        quote,
+        reservationKey: `studio:${turnId}:reserve`,
+        dailyCap: 100_000,
+      });
+    try {
+      await reserve(firstTurnId, first.userId);
+      await verifyPendingStudioMedia({
+        request: {
+          sessionKey: `agent:main:eden3:studio:${firstTurnId}`,
+          agentId: 'main',
+          tool: 'image_generate',
+          args: { prompt: 'late Studio image' },
+        },
+      });
+      expect(
+        await compensateStudioGeneration({
+          turnId: firstTurnId,
+          errorCode: 'generation_timeout',
+          errorMessage: 'provider admitted but no attributable file arrived',
+        }),
+      ).toBe('refunded');
+      const [quarantined] = await pg<{ status: string; output_kind: string | null }[]>`
+        select status, metadata->'outputQuarantine'->>'outputKind' as output_kind
+        from usage_events
+        where event_type = 'studio_generation' and turn_id = ${firstTurnId}`;
+      expect(quarantined).toEqual({ status: 'error', output_kind: 'image' });
+
+      await expect(reserve(secondTurnId, second.userId)).rejects.toMatchObject({
+        code: 'studio_output_quarantined',
+        outputKind: 'image',
+      });
+      // A new transaction/process sees the durable terminal marker too; no
+      // in-memory lease or wall-clock expiry may reopen the output kind.
+      await expect(reserve(secondTurnId, second.userId)).rejects.toMatchObject({
+        code: 'studio_output_quarantined',
+      });
+      expect((await getBalance(second.userId)).total).toBe(secondBefore.total);
+      const [loserRows] = await pg<{ count: string }[]>`
+        select count(*) from usage_events where turn_id = ${secondTurnId}`;
+      expect(Number(loserRows?.count ?? -1)).toBe(0);
+    } finally {
+      // Test-only cleanup of the indefinite operator quarantine. Production
+      // deliberately has no automatic/time-based clear path at M3.
+      const [secondUsage] = await pg<{ count: string }[]>`
+        select count(*) from usage_events where turn_id = ${secondTurnId}`;
+      if (Number(secondUsage?.count ?? 0) > 0) {
+        await compensateStudioGeneration({
+          turnId: secondTurnId,
+          errorCode: 'test_cleanup',
+          errorMessage: 'clean up failing-first loser',
+        });
+      }
+      await pg`delete from usage_events
+               where event_type = 'studio_generation'
+                 and turn_id in (${firstTurnId}, ${secondTurnId})`;
+    }
+  });
 });

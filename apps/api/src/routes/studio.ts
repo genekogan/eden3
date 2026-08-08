@@ -29,10 +29,13 @@ import { z } from 'zod';
 import { ApiError, sendError } from '../errors';
 import { MediaPipeline, type AttachmentKind } from '../services/media-pipeline';
 import {
+  admitStudioGeneration,
   compensateStudioGeneration,
   completeStudioGeneration,
   reserveStudioGeneration,
   StudioGenerationBusyError,
+  StudioOutputQuarantinedError,
+  isStudioOutputKindQuarantined,
 } from '../services/studio-reservations';
 import {
   MediaClaimTimeoutError,
@@ -593,7 +596,14 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
   let watcher = deps.watcher ?? null;
   const ownWatcher = watcher === null;
   if (watcher === null) {
-    watcher = new MediaWatcher({ pipeline, logger: app.log });
+    watcher = new MediaWatcher({
+      pipeline,
+      logger: app.log,
+      isStudioKindQuarantined: (outputKind) =>
+        outputKind === 'file'
+          ? Promise.resolve(false)
+          : isStudioOutputKindQuarantined({ outputKind }),
+    });
   }
   const claimSource = watcher;
   if (ownWatcher) {
@@ -703,6 +713,14 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           `Another ${err.outputKind} generation is already running. Please retry when it finishes.`,
         );
       }
+      if (err instanceof StudioOutputQuarantinedError) {
+        return sendError(
+          reply,
+          409,
+          err.code,
+          `${err.outputKind} generation is temporarily unavailable pending an operator safety check.`,
+        );
+      }
       throw err;
     }
 
@@ -809,6 +827,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       }
       if (ttsFallback !== null && isMissingTtsInvoke(err, body.tool)) {
         try {
+          await admitStudioGeneration({ reservation });
           file = await ttsFallback({ args: body.args, requestId, timeoutMs });
         } catch (fallbackErr) {
           const detail =
