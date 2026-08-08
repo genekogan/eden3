@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -1067,6 +1067,46 @@ describe('PUT /agents/:username/workspace/file', () => {
       reconcileAgentRuntime(agentRaceId, { provisioner, toolSync, dataDir: parentDir }),
     ).resolves.toEqual({ status: 'synced', version: saved.doctrineRevision });
     expect(await readFile(path.join(wsRace, 'SOUL.md'), 'utf8')).toBe(winnerPersona);
+  });
+
+  it('preserves an orphaned durable runtime claim for its own lease recovery', async () => {
+    const loaded = (
+      (
+        await app.inject({ method: 'GET', url: fileUrl(agentRace, 'SOUL.md'), headers: asOwner })
+      ).json() as TextFileBody
+    ).file;
+    const claimToken = randomUUID();
+    await pg`
+      update agents
+      set runtime_sync_claim_token = ${claimToken}::uuid,
+          runtime_sync_lease_expires_at = now() + interval '30 minutes'
+      where account_id = ${agentRaceId}
+    `;
+
+    const persona = 'You are the Files Agent. Owner save with orphaned claim.';
+    const response = await app.inject({
+      method: 'PUT',
+      url: `${treeUrl(agentRace)}/file`,
+      headers: asOwner,
+      payload: {
+        path: 'SOUL.md',
+        content: persona,
+        baseSha256: loaded.sha256,
+        baseRevision: loaded.doctrineRevision,
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    const [row] = await pg<{
+      persona: string | null;
+      runtime_sync_claim_token: string | null;
+      runtime_sync_lease_expires_at: Date | null;
+    }[]>`
+      select persona, runtime_sync_claim_token, runtime_sync_lease_expires_at
+      from agents where account_id = ${agentRaceId}
+    `;
+    expect(row!.persona).toBe(persona);
+    expect(row!.runtime_sync_claim_token).toBe(claimToken);
+    expect(row!.runtime_sync_lease_expires_at).not.toBeNull();
   });
 });
 
