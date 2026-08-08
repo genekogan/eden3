@@ -19,6 +19,7 @@ describe('pinned OpenClaw channel SecretRef error redaction', () => {
     await writeFile(
       bundle,
       [
+        'this.refId = params.refId;',
         'message: `Exec provider "${params.providerName}" failed for id "${id}" (${entry.message.trim()}).`',
         'message: `Exec provider "${params.providerName}" failed for id "${id}".`',
         'message: `Exec provider "${params.providerName}" response missing id "${id}".`',
@@ -42,6 +43,9 @@ describe('pinned OpenClaw channel SecretRef error redaction', () => {
       expect(patched).toContain('failed for a protected channel credential');
       expect(patched).toContain('response omitted a protected channel credential');
       expect(patched).toContain('params.providerName === "eden-channel-vault"');
+      expect(patched).toContain(
+        'this.refId = params.provider === "eden-channel-vault" ? "protected-channel-credential" : params.refId;',
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
