@@ -2800,17 +2800,6 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       ) {
         throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
       }
-      if (fatalCredentialError) {
-        try {
-          await sync.removeHostedChannelAccount({
-            channel: connection.channel,
-            runtimeAccountId: connection.runtime_account_id,
-            deleteAccount: false,
-          });
-        } catch {
-          // The desired-state revocation below still cuts off secret resolution.
-        }
-      }
       const rows = await pg<{ id: string }[]>`
         update channel_connections
         set desired_state = case
@@ -2853,6 +2842,17 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         returning id
       `;
       if (!rows[0]) throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
+      if (fatalCredentialError) {
+        try {
+          await sync.removeHostedChannelAccount({
+            channel: connection.channel,
+            runtimeAccountId: connection.runtime_account_id,
+            deleteAccount: false,
+          });
+        } catch {
+          // The committed inactive state already cuts off secret resolution.
+        }
+      }
       return { ok: true };
     });
   });
