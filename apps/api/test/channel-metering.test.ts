@@ -70,6 +70,10 @@ function store(overrides: Partial<ChannelTurnStoreLike> = {}): ChannelTurnStoreL
 describe('ChannelTurnMeteringService economic authorization', () => {
   it('FG-ECON-CHANNEL-01 reserves the frozen worst-case ceiling before returning provider permission', async () => {
     const record = turn('reserving');
+    const runtimeBinding = {
+      agentId: 'runtime-agent-one',
+      bindingId: '33333333-3333-4333-8333-333333333333',
+    };
     const events: string[] = [];
     const persistence = store({
       claimTurn: vi.fn(async (_connection, _input, amount) => {
@@ -86,11 +90,18 @@ describe('ChannelTurnMeteringService economic authorization', () => {
       turnId: record.turnId,
       connectionId: connection.connectionId,
       runtimeAccountId: connection.runtimeAccountId,
+      ...runtimeBinding,
       sessionId: record.sessionId,
       externalMessageId: record.externalMessageId,
     });
 
     expect(events).toEqual(['claim:61', 'authorize:61']);
+    expect(persistence.getBillableConnection).toHaveBeenCalledWith(
+      connection.connectionId,
+      record.sessionId,
+      runtimeBinding,
+    );
+    expect(persistence.authorize).toHaveBeenCalledWith(record, runtimeBinding);
     expect(result).toMatchObject({ balance: 39, replayed: false, turn: { status: 'reserved' } });
   });
 

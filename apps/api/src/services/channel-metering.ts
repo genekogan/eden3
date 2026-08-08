@@ -15,6 +15,7 @@ import { sql } from 'drizzle-orm';
 
 import { meterChatUsage, type ChatTurnMetering } from './turns';
 import { insertTurnAuthorization, markTurnSettled } from './turn-authorization';
+import { channelRuntimeBindingMatches } from './channel-runtime-binding';
 
 export interface ChannelTurnUsage extends GatewayUsage {
   cacheWriteTokens?: number;
@@ -86,6 +87,8 @@ export interface ReserveChannelTurnInput {
   turnId: string;
   connectionId: string;
   runtimeAccountId: string;
+  agentId?: string;
+  bindingId?: string;
   sessionId?: string | null;
   externalMessageId?: string | null;
 }
@@ -106,6 +109,7 @@ export interface ChannelTurnStoreLike {
   getBillableConnection(
     connectionId: string,
     sessionId?: string | null,
+    runtimeBinding?: { agentId?: string; bindingId?: string },
   ): Promise<BillableChannelConnection | null>;
   claimTurn(
     connection: BillableChannelConnection,
@@ -122,7 +126,10 @@ export interface ChannelTurnStoreLike {
   claimStale(cutoff: Date, limit: number): Promise<string[]>;
   markDelivered(turnId: string): Promise<void>;
   markError(turnId: string, errorCode: string): Promise<void>;
-  authorize(turn: ChannelTurnRecord): Promise<ChannelAuthorizationResult>;
+  authorize(
+    turn: ChannelTurnRecord,
+    runtimeBinding?: { agentId?: string; bindingId?: string },
+  ): Promise<ChannelAuthorizationResult>;
   settleAuthorized(
     turn: ChannelTurnRecord,
     usage: ChannelTurnUsage | undefined,
@@ -140,6 +147,8 @@ interface BillableRow {
   agent_id: string;
   channel: 'discord' | 'telegram';
   model: string;
+  agent_openclaw_id: string;
+  metadata: unknown;
 }
 
 interface TurnRow {
@@ -221,29 +230,57 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   async getBillableConnection(
     connectionId: string,
     sessionId?: string | null,
+    runtimeBinding?: { agentId?: string; bindingId?: string },
   ): Promise<BillableChannelConnection | null> {
     const rows = await pg<BillableRow[]>`
       select c.id as connection_id, c.runtime_account_id, c.account_id,
-             c.agent_id, c.channel, a.model
+             c.agent_id, c.channel, a.model, a.openclaw_id as agent_openclaw_id,
+             c.metadata
       from channel_connections c
       join agents a on a.account_id = c.agent_id
+      join accounts owner_account on owner_account.id = c.account_id
+      join accounts agent_account on agent_account.id = c.agent_id
       where c.id = ${connectionId}
         and c.desired_state = 'active'
         and c.runtime_account_id is not null
         and c.agent_id is not null
         and c.channel in ('discord', 'telegram')
+        and a.owner_id = c.account_id
+        and a.openclaw_id is not null
+        and owner_account.type = 'user' and owner_account.deleted = false
+        and agent_account.type = 'agent' and agent_account.deleted = false
         and (
           ${sessionId ?? null}::uuid is null
           or exists (
             select 1 from sessions s
             where s.id = ${sessionId ?? null}::uuid
               and s.channel_connection_id = c.id
+              and s.owner_id = c.account_id
+              and s.session_type = 'channel'
+              and s.deleted = false
+              and s.visible is distinct from false
+              and exists (
+                select 1 from session_agents sa
+                where sa.session_id = s.id and sa.agent_account_id = c.agent_id
+              )
+              and not exists (
+                select 1 from session_agents sa
+                where sa.session_id = s.id and sa.agent_account_id <> c.agent_id
+              )
           )
         )
       limit 1
     `;
     const row = rows[0];
-    if (!row) return null;
+    if (
+      !row ||
+      !channelRuntimeBindingMatches({
+        metadata: row.metadata,
+        storedAgentId: row.agent_openclaw_id,
+        requesterAgentId: runtimeBinding?.agentId,
+        requesterBindingId: runtimeBinding?.bindingId,
+      })
+    ) return null;
     const agentRuntime = await this.runtimeForModel(row.model);
     return {
       connectionId: row.connection_id,
@@ -269,20 +306,39 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     return pg.begin(async (tx) => {
       const currentRows = await tx<BillableRow[]>`
         select c.id as connection_id, c.runtime_account_id, c.account_id,
-               c.agent_id, c.channel, a.model
+               c.agent_id, c.channel, a.model, a.openclaw_id as agent_openclaw_id,
+               c.metadata
         from channel_connections c
         join agents a on a.account_id = c.agent_id
+        join accounts owner_account on owner_account.id = c.account_id
+        join accounts agent_account on agent_account.id = c.agent_id
         where c.id = ${connection.connectionId}
           and c.desired_state = 'active'
           and c.runtime_account_id is not null
           and c.agent_id is not null
           and c.channel in ('discord', 'telegram')
+          and a.owner_id = c.account_id
+          and a.openclaw_id is not null
+          and owner_account.type = 'user' and owner_account.deleted = false
+          and agent_account.type = 'agent' and agent_account.deleted = false
           and (
             ${input.sessionId ?? null}::uuid is null
             or exists (
               select 1 from sessions s
               where s.id = ${input.sessionId ?? null}::uuid
-                and s.channel_connection_id = c.id
+              and s.channel_connection_id = c.id
+              and s.owner_id = c.account_id
+              and s.session_type = 'channel'
+              and s.deleted = false
+              and s.visible is distinct from false
+              and exists (
+                select 1 from session_agents sa
+                where sa.session_id = s.id and sa.agent_account_id = c.agent_id
+              )
+              and not exists (
+                select 1 from session_agents sa
+                where sa.session_id = s.id and sa.agent_account_id <> c.agent_id
+              )
             )
           )
         for update of c
@@ -295,9 +351,37 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
         current.account_id !== connection.accountId ||
         current.agent_id !== connection.agentId ||
         current.channel !== connection.channel ||
-        current.model !== connection.model
+        current.model !== connection.model ||
+        !channelRuntimeBindingMatches({
+          metadata: current.metadata,
+          storedAgentId: current.agent_openclaw_id,
+          requesterAgentId: input.agentId,
+          requesterBindingId: input.bindingId,
+        })
       ) {
         throw new Error('channel connection unavailable');
+      }
+      if (input.sessionId) {
+        const sessionRows = await tx<{ id: string }[]>`
+          select s.id
+          from sessions s
+          where s.id = ${input.sessionId}
+            and s.channel_connection_id = ${connection.connectionId}
+            and s.owner_id = ${connection.accountId}
+            and s.session_type = 'channel'
+            and s.deleted = false
+            and s.visible is distinct from false
+            and exists (
+              select 1 from session_agents sa
+              where sa.session_id = s.id and sa.agent_account_id = ${connection.agentId}
+            )
+            and not exists (
+              select 1 from session_agents sa
+              where sa.session_id = s.id and sa.agent_account_id <> ${connection.agentId}
+            )
+          for update of s
+        `;
+        if (!sessionRows[0]) throw new Error('channel connection unavailable');
       }
       await tx`
         insert into channel_turns (
@@ -439,14 +523,20 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     });
   }
 
-  async authorize(turn: ChannelTurnRecord): Promise<ChannelAuthorizationResult> {
+  async authorize(
+    turn: ChannelTurnRecord,
+    runtimeBinding?: { agentId?: string; bindingId?: string },
+  ): Promise<ChannelAuthorizationResult> {
     const route = modelIdentity(turn.model);
     return db.transaction(async (tx) => {
       const liveRows = (await tx.execute(sql`
         select c.id as connection_id, c.runtime_account_id, c.account_id,
-               c.agent_id, c.channel, a.model
+               c.agent_id, c.channel, a.model, a.openclaw_id as agent_openclaw_id,
+               c.metadata
         from channel_connections c
         join agents a on a.account_id = c.agent_id
+        join accounts owner_account on owner_account.id = c.account_id
+        join accounts agent_account on agent_account.id = c.agent_id
         where c.id = ${turn.connectionId}
           and c.desired_state = 'active'
           and c.runtime_account_id = ${turn.runtimeAccountId}
@@ -454,17 +544,63 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
           and c.agent_id = ${turn.agentId}
           and c.channel = ${turn.channel}
           and a.model = ${turn.model}
+          and a.owner_id = c.account_id
+          and a.openclaw_id is not null
+          and owner_account.type = 'user' and owner_account.deleted = false
+          and agent_account.type = 'agent' and agent_account.deleted = false
           and (
             ${turn.sessionId}::uuid is null
             or exists (
               select 1 from sessions s
               where s.id = ${turn.sessionId}::uuid
-                and s.channel_connection_id = c.id
+              and s.channel_connection_id = c.id
+              and s.owner_id = c.account_id
+              and s.session_type = 'channel'
+              and s.deleted = false
+              and s.visible is distinct from false
+              and exists (
+                select 1 from session_agents sa
+                where sa.session_id = s.id and sa.agent_account_id = c.agent_id
+              )
+              and not exists (
+                select 1 from session_agents sa
+                where sa.session_id = s.id and sa.agent_account_id <> c.agent_id
+              )
             )
           )
         for update of c
       `)) as unknown as BillableRow[];
-      if (!liveRows[0]) throw new Error('channel connection unavailable');
+      if (
+        !liveRows[0] ||
+        !channelRuntimeBindingMatches({
+          metadata: liveRows[0].metadata,
+          storedAgentId: liveRows[0].agent_openclaw_id,
+          requesterAgentId: runtimeBinding?.agentId,
+          requesterBindingId: runtimeBinding?.bindingId,
+        })
+      ) throw new Error('channel connection unavailable');
+      if (turn.sessionId) {
+        const sessionRows = (await tx.execute(sql`
+          select s.id
+          from sessions s
+          where s.id = ${turn.sessionId}
+            and s.channel_connection_id = ${turn.connectionId}
+            and s.owner_id = ${turn.accountId}
+            and s.session_type = 'channel'
+            and s.deleted = false
+            and s.visible is distinct from false
+            and exists (
+              select 1 from session_agents sa
+              where sa.session_id = s.id and sa.agent_account_id = ${turn.agentId}
+            )
+            and not exists (
+              select 1 from session_agents sa
+              where sa.session_id = s.id and sa.agent_account_id <> ${turn.agentId}
+            )
+          for update of s
+        `)) as unknown as Array<{ id: string }>;
+        if (!sessionRows[0]) throw new Error('channel connection unavailable');
+      }
       const debited = await debit({
         accountId: turn.accountId,
         amount: turn.reservedManna,
@@ -926,6 +1062,7 @@ export class ChannelTurnMeteringService {
     const connection = await this.store.getBillableConnection(
       input.connectionId,
       input.sessionId,
+      { agentId: input.agentId, bindingId: input.bindingId },
     );
     if (!connection || connection.runtimeAccountId !== input.runtimeAccountId) {
       throw new Error('channel connection unavailable');
@@ -957,7 +1094,10 @@ export class ChannelTurnMeteringService {
     }
     if (turn.status !== 'reserving') throw new Error('channel turn is not reservable');
     try {
-      const authorized = await this.store.authorize(turn);
+      const authorized = await this.store.authorize(turn, {
+        agentId: input.agentId,
+        bindingId: input.bindingId,
+      });
       turn = { ...turn, status: 'reserved' };
       return {
         turn,

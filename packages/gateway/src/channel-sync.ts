@@ -211,6 +211,8 @@ export interface HostedChannelAccountOptions extends ConfigGenOptions {
   accountId: string;
   label?: string | null;
   bindAgentId: string;
+  /** Opaque generation of this exact published runtime mapping. */
+  bindingId?: string;
   dmPolicy: HostedChannelDmPolicy;
   allowFrom: string[];
   discordGuilds?: HostedChannelGuildSelection[];
@@ -630,6 +632,7 @@ export async function ensureHostedChannelAccount(
         accountId: options.runtimeAccountId,
         connectionId: options.connectionId,
         agentId: options.bindAgentId,
+        ...(options.bindingId ? { bindingId: options.bindingId } : {}),
         ...(groups.length > 0 ? { groups } : {}),
       })
     ) {

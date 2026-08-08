@@ -36,6 +36,10 @@ import {
 import { addConnectionScopedPeer, decidePendingPairing } from '../services/channel-pairing';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
 import {
+  channelRuntimeBindingMatches,
+  storedChannelRuntimeBindingId,
+} from '../services/channel-runtime-binding';
+import {
   ChannelSessionSync,
   PostgresChannelSessionSyncStore,
   channelPeerFingerprint,
@@ -183,6 +187,8 @@ const onboardingParamsSchema = z.object({ intentId: z.string().uuid() });
 const runtimeMessageSchema = z.object({
   connectionId: z.string().uuid(),
   runtimeAccountId: z.string().min(1).max(128),
+  agentId: z.string().min(1).max(200).optional(),
+  bindingId: z.string().uuid().optional(),
   gatewaySessionKey: z.string().min(1).max(1_000),
   conversationId: z.string().trim().min(1).max(500).optional(),
   conversationScope: z.enum(['direct', 'group']).default('direct'),
@@ -198,6 +204,8 @@ const runtimeMessageSchema = z.object({
 const runtimePairingSchema = z.object({
   connectionId: z.string().uuid(),
   runtimeAccountId: z.string().min(1).max(128),
+  agentId: z.string().min(1).max(200).optional(),
+  bindingId: z.string().uuid().optional(),
   peerId: externalIdSchema,
   code: z.string().trim().min(1).max(128),
 });
@@ -220,6 +228,8 @@ const approvePairingBodySchema = z
 const runtimeStatusSchema = z.object({
   connectionId: z.string().uuid(),
   runtimeAccountId: z.string().min(1).max(128),
+  agentId: z.string().min(1).max(200).optional(),
+  bindingId: z.string().uuid().optional(),
   state: z.enum(['live', 'stopped', 'error']),
   errorCode: z
     .enum([
@@ -236,6 +246,8 @@ const reserveTurnSchema = z.object({
   turnId: z.string().uuid(),
   connectionId: z.string().uuid(),
   runtimeAccountId: z.string().min(1).max(128),
+  agentId: z.string().min(1).max(200).optional(),
+  bindingId: z.string().uuid().optional(),
   sessionId: z.string().uuid().optional(),
   externalMessageId: z.string().min(1).max(500).optional(),
 });
@@ -614,7 +626,7 @@ function telegramStartBinding(input: unknown): { nonce: string; ownerId: string 
   return match && ownerId ? { nonce: match[1]!, ownerId } : null;
 }
 
-async function getOwnedConnection(
+async function getOwnedHostedConnection(
   id: string,
   accountId: string,
   isAdmin: boolean,
@@ -622,7 +634,7 @@ async function getOwnedConnection(
   const rows = await pg<ChannelConnectionRow[]>`
     select ${CONNECTION_COLUMNS}
     from channel_connections
-    where id = ${id}
+    where id = ${id} and channel in ('discord', 'telegram')
       ${isAdmin ? pg`` : pg`and account_id = ${accountId}`}
     limit 1
   `;
@@ -713,6 +725,42 @@ async function provisionedAgent(agentId: string): Promise<{ openclawId: string }
     select openclaw_id from agents where account_id = ${agentId} limit 1
   `;
   return rows[0]?.openclaw_id ? { openclawId: rows[0].openclaw_id } : null;
+}
+
+async function assertActiveChannelRuntimeBinding(input: {
+  connectionId: string;
+  runtimeAccountId: string;
+  agentId?: string;
+  bindingId?: string;
+}): Promise<void> {
+  const rows = await pg<Array<{ agent_openclaw_id: string; metadata: unknown }>>`
+    select a.openclaw_id as agent_openclaw_id, c.metadata
+    from channel_connections c
+    join agents a on a.account_id = c.agent_id
+    join accounts owner_account on owner_account.id = c.account_id
+    join accounts agent_account on agent_account.id = c.agent_id
+    where c.id = ${input.connectionId}
+      and c.runtime_account_id = ${input.runtimeAccountId}
+      and c.desired_state = 'active'
+      and c.channel in ('discord', 'telegram')
+      and a.owner_id = c.account_id
+      and a.openclaw_id is not null
+      and owner_account.type = 'user' and owner_account.deleted = false
+      and agent_account.type = 'agent' and agent_account.deleted = false
+    limit 1
+  `;
+  const row = rows[0];
+  if (
+    !row ||
+    !channelRuntimeBindingMatches({
+      metadata: row.metadata,
+      storedAgentId: row.agent_openclaw_id,
+      requesterAgentId: input.agentId,
+      requesterBindingId: input.bindingId,
+    })
+  ) {
+    throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
+  }
 }
 
 function encryptedRecord(row: ChannelConnectionRow) {
@@ -924,14 +972,16 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         update channel_connections
         set last_error_code = ${result.code}, last_error_message = ${result.message},
             status = ${result.code === 'revoked' ? 'revoked' : row.status}, updated_at = now()
-        where id = ${row.id}
+        where id = ${row.id} and account_id = ${account.accountId}
+          and channel = 'x' and desired_state = 'active'
       `;
       return sendError(reply, xFailureStatus(result.code), result.code, result.message);
     }
     await pg`
       update channel_connections
       set last_error_code = null, last_error_message = null, status = 'active', updated_at = now()
-      where id = ${row.id}
+      where id = ${row.id} and account_id = ${account.accountId}
+        and channel = 'x' and desired_state = 'active'
     `;
     return reply.code(201).send({ ok: true, post: result.value });
   });
@@ -1329,7 +1379,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = retryBodySchema.parse(req.body ?? {});
-    const row = await getOwnedConnection(id, account.accountId, false);
+    const row = await getOwnedHostedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
 
     let token: string;
@@ -1415,6 +1465,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       metadata = {
         ...metadataRecord(current.metadata),
         bot: validation.ok ? validation.bot : null,
+        ...(validation.ok && wasActive ? { _runtimeBindingId: randomUUID() } : {}),
         ...(validation.ok && wasActive ? { _runtimeOperation: retryOperation } : {}),
       };
       return tx<ChannelConnectionRow[]>`
@@ -1472,6 +1523,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           accountId: fresh.account_id,
           label: fresh.label,
           bindAgentId: agent.openclawId,
+          bindingId: storedChannelRuntimeBindingId(metadata),
           dmPolicy: config.dmPolicy,
           allowFrom: config.allowFrom,
           discordGuilds: fresh.channel === 'discord' ? config.discordGuilds : [],
@@ -1549,7 +1601,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.get('/connections/:id/destinations', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
-    const row = await getOwnedConnection(id, account.accountId, false);
+    const row = await getOwnedHostedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     await audit({
       actorAccountId: account.accountId,
@@ -1577,7 +1629,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = activationBodySchema.parse(req.body ?? {});
-    const row = await getOwnedConnection(id, account.accountId, false);
+    const row = await getOwnedHostedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     if (row.channel === 'discord' && body.telegramGroups.length > 0) {
       return sendError(reply, 400, 'invalid_channel_group_config', 'Telegram groups cannot be attached to Discord');
@@ -1638,7 +1690,12 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       kind: 'activate',
       nonce: randomUUID(),
     };
-    const metadata = { bot: validation.bot, config: body, _runtimeOperation: runtimeOperation };
+    const metadata = {
+      bot: validation.bot,
+      config: body,
+      _runtimeBindingId: randomUUID(),
+      _runtimeOperation: runtimeOperation,
+    };
     // Make the resolver record eligible immediately before publishing its
     // SecretRef. Otherwise a fast config watcher can ask the sidecar while the
     // row is still inactive and turn a valid activation into a crash loop.
@@ -1714,6 +1771,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         accountId: row.account_id,
         label: row.label,
         bindAgentId: agent.openclawId,
+        bindingId: storedChannelRuntimeBindingId(metadata),
         dmPolicy: body.dmPolicy,
         allowFrom: body.allowFrom,
         discordGuilds: row.channel === 'discord' ? body.discordGuilds : [],
@@ -1806,7 +1864,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.post('/connections/:id/deactivate', { preHandler: app.requireAuth }, lifecycleHandler(async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
-    const row = await getOwnedConnection(id, account.accountId, false);
+    const row = await getOwnedHostedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     // Revoke resolver eligibility first. Even if the config write fails, the
     // retained SecretRef can no longer retrieve plaintext for this account.
@@ -1868,7 +1926,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.delete('/connections/:id', { preHandler: app.requireAuth }, lifecycleHandler(async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
-    const row = await getOwnedConnection(id, account.accountId, false);
+    const row = await getOwnedHostedConnection(id, account.accountId, false);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     // Deletion is fail-closed from the first durable write: any retained
     // SecretRef becomes unresolvable while refunds and exact-account cleanup
@@ -1934,7 +1992,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = mockMessageBodySchema.parse(req.body);
-    const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
+    const row = await getOwnedHostedConnection(id, account.accountId, account.isAdmin);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     return { ok: true, channel: row.channel, routed: true, messageLength: body.message.length };
   });
@@ -1942,7 +2000,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.get('/connections/:id/pairing', { preHandler: app.requireAuth }, async (req, reply) => {
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
-    const row = await getOwnedConnection(id, account.accountId, account.isAdmin);
+    const row = await getOwnedHostedConnection(id, account.accountId, account.isAdmin);
     if (!row) return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
     await pg`
       update channel_pairing_requests
@@ -1985,7 +2043,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       const account = req.account!;
       const { id, requestId } = pairingParamsSchema.parse(req.params);
       const body = approvePairingBodySchema.parse(req.body ?? {});
-      const connection = await getOwnedConnection(id, account.accountId, false);
+      const connection = await getOwnedHostedConnection(id, account.accountId, false);
       if (!connection) {
         return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
       }
@@ -2024,6 +2082,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             accountId: connection.account_id,
             label: connection.label,
             bindAgentId: agent.openclawId,
+            bindingId: storedChannelRuntimeBindingId(connection.metadata),
             dmPolicy: config.dmPolicy,
             allowFrom: config.allowFrom,
             discordGuilds: connection.channel === 'discord' ? config.discordGuilds : [],
@@ -2256,6 +2315,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         const newConnectionMetadata = {
           ...oldConnectionMetadata,
           config: newConfig,
+          _runtimeBindingId: randomUUID(),
           _pairingDecision: marker,
         };
         const oldRequestMetadata = metadataRecord(pairing.metadata);
@@ -2319,6 +2379,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           accountId: prepared.connection.account_id,
           label: prepared.connection.label,
           bindAgentId: agent.openclawId,
+          bindingId: storedChannelRuntimeBindingId(prepared.newConnectionMetadata),
           dmPolicy: prepared.newConfig.dmPolicy,
           allowFrom: prepared.newConfig.allowFrom,
           discordGuilds:
@@ -2340,6 +2401,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             accountId: prepared.connection.account_id,
             label: prepared.connection.label,
             bindAgentId: agent.openclawId,
+            bindingId: storedChannelRuntimeBindingId(prepared.oldConnectionMetadata),
             dmPolicy: prepared.oldConfig.dmPolicy,
             allowFrom: prepared.oldConfig.allowFrom,
             discordGuilds:
@@ -2514,7 +2576,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     async (req, reply) => {
       const account = req.account!;
       const { id, requestId } = pairingParamsSchema.parse(req.params);
-      const connection = await getOwnedConnection(id, account.accountId, false);
+      const connection = await getOwnedHostedConnection(id, account.accountId, false);
       if (!connection) {
         return sendError(reply, 404, 'channel_connection_not_found', 'Connection not found');
       }
@@ -2535,6 +2597,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   // no browser cookie and no database credential is available to OpenClaw.
   app.post('/runtime/messages', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = runtimeMessageSchema.parse(req.body);
+    await assertActiveChannelRuntimeBinding(body);
     const result = await sessionSync.syncMessage({
       ...body,
       createdAt: new Date(body.createdAt),
@@ -2545,16 +2608,41 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   app.post('/runtime/pairing', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = runtimePairingSchema.parse(req.body);
     const connectionRows = await pg<
-      Array<{ id: string; account_id: string; channel: string; runtime_account_id: string }>
+      Array<{
+        id: string;
+        account_id: string;
+        channel: string;
+        runtime_account_id: string;
+        agent_openclaw_id: string;
+        metadata: unknown;
+      }>
     >`
-      select id, account_id, channel, runtime_account_id
-      from channel_connections
-      where id = ${body.connectionId} and runtime_account_id = ${body.runtimeAccountId}
-        and desired_state = 'active' and channel in ('discord', 'telegram')
+      select c.id, c.account_id, c.channel, c.runtime_account_id,
+             a.openclaw_id as agent_openclaw_id, c.metadata
+      from channel_connections c
+      join agents a on a.account_id = c.agent_id
+      join accounts owner_account on owner_account.id = c.account_id
+      join accounts agent_account on agent_account.id = c.agent_id
+      where c.id = ${body.connectionId} and c.runtime_account_id = ${body.runtimeAccountId}
+        and c.desired_state = 'active' and c.channel in ('discord', 'telegram')
+        and a.owner_id = c.account_id
+        and a.openclaw_id is not null
+        and owner_account.type = 'user' and owner_account.deleted = false
+        and agent_account.type = 'agent' and agent_account.deleted = false
       limit 1
     `;
     const connection = connectionRows[0];
-    if (!connection) throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
+    if (
+      !connection ||
+      !channelRuntimeBindingMatches({
+        metadata: connection.metadata,
+        storedAgentId: connection.agent_openclaw_id,
+        requesterAgentId: body.agentId,
+        requesterBindingId: body.bindingId,
+      })
+    ) {
+      throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
+    }
     const fingerprint = channelPeerFingerprint(connection.id, body.peerId);
     const encrypted = vault.encrypt(
       body.peerId,
@@ -2572,20 +2660,41 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         )
       `;
       const currentConnections = await tx<
-        Array<{ id: string; account_id: string; channel: string; runtime_account_id: string }>
+        Array<{
+          id: string;
+          account_id: string;
+          channel: string;
+          runtime_account_id: string;
+          agent_openclaw_id: string;
+          metadata: unknown;
+        }>
       >`
-        select id, account_id, channel, runtime_account_id
-        from channel_connections
-        where id = ${connection.id} and desired_state = 'active'
-          and runtime_account_id = ${connection.runtime_account_id}
-          and channel in ('discord', 'telegram')
-        for update
+        select c.id, c.account_id, c.channel, c.runtime_account_id,
+               a.openclaw_id as agent_openclaw_id, c.metadata
+        from channel_connections c
+        join agents a on a.account_id = c.agent_id
+        join accounts owner_account on owner_account.id = c.account_id
+        join accounts agent_account on agent_account.id = c.agent_id
+        where c.id = ${connection.id} and c.desired_state = 'active'
+          and c.runtime_account_id = ${connection.runtime_account_id}
+          and c.channel in ('discord', 'telegram')
+          and a.owner_id = c.account_id
+          and a.openclaw_id is not null
+          and owner_account.type = 'user' and owner_account.deleted = false
+          and agent_account.type = 'agent' and agent_account.deleted = false
+        for update of c
       `;
       const currentConnection = currentConnections[0];
       if (
         !currentConnection ||
         currentConnection.account_id !== connection.account_id ||
-        currentConnection.channel !== connection.channel
+        currentConnection.channel !== connection.channel ||
+        !channelRuntimeBindingMatches({
+          metadata: currentConnection.metadata,
+          storedAgentId: currentConnection.agent_openclaw_id,
+          requesterAgentId: body.agentId,
+          requesterBindingId: body.bindingId,
+        })
       ) {
         throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
       }
@@ -2650,37 +2759,61 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
 
   app.post('/runtime/status', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = runtimeStatusSchema.parse(req.body);
-    const errorCode = body.state === 'error' ? (body.errorCode ?? 'gateway_disconnected') : null;
-    const errorMessage = errorCode ? (SAFE_RUNTIME_ERRORS[errorCode] ?? 'Channel runtime error') : null;
-    const fatalCredentialError =
-      errorCode === 'invalid_token' || errorCode === 'configuration_error';
-    if (fatalCredentialError) {
+    return withChannelLifecycleLease(body.connectionId, async () => {
+      const errorCode = body.state === 'error' ? (body.errorCode ?? 'gateway_disconnected') : null;
+      const errorMessage = errorCode ? (SAFE_RUNTIME_ERRORS[errorCode] ?? 'Channel runtime error') : null;
+      const fatalCredentialError =
+        errorCode === 'invalid_token' || errorCode === 'configuration_error';
       const connections = await pg<
-        Array<{ channel: SupportedChannelProvider; runtime_account_id: string }>
+        Array<{
+          channel: SupportedChannelProvider;
+          runtime_account_id: string;
+          agent_id: string;
+          agent_openclaw_id: string;
+          metadata: unknown;
+        }>
       >`
-        select channel, runtime_account_id
-        from channel_connections
-        where id = ${body.connectionId} and runtime_account_id = ${body.runtimeAccountId}
-          and desired_state = 'active' and channel in ('discord', 'telegram')
+        select c.channel, c.runtime_account_id, c.agent_id,
+               a.openclaw_id as agent_openclaw_id, c.metadata
+        from channel_connections c
+        join agents a on a.account_id = c.agent_id
+        join accounts owner_account on owner_account.id = c.account_id
+        join accounts agent_account on agent_account.id = c.agent_id
+        where c.id = ${body.connectionId} and c.runtime_account_id = ${body.runtimeAccountId}
+          and (c.desired_state = 'active' or ${body.state} = 'stopped')
+          and c.channel in ('discord', 'telegram')
+          and a.owner_id = c.account_id
+          and a.openclaw_id is not null
+          and owner_account.type = 'user' and owner_account.deleted = false
+          and agent_account.type = 'agent' and agent_account.deleted = false
         limit 1
       `;
       const connection = connections[0];
-      if (!connection) {
+      if (
+        !connection ||
+        !channelRuntimeBindingMatches({
+          metadata: connection.metadata,
+          storedAgentId: connection.agent_openclaw_id,
+          requesterAgentId: body.agentId,
+          requesterBindingId: body.bindingId,
+        })
+      ) {
         throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
       }
-      try {
-        await sync.removeHostedChannelAccount({
-          channel: connection.channel,
-          runtimeAccountId: connection.runtime_account_id,
-          deleteAccount: false,
-        });
-      } catch {
-        // The desired-state revocation below still cuts off secret resolution.
+      if (fatalCredentialError) {
+        try {
+          await sync.removeHostedChannelAccount({
+            channel: connection.channel,
+            runtimeAccountId: connection.runtime_account_id,
+            deleteAccount: false,
+          });
+        } catch {
+          // The desired-state revocation below still cuts off secret resolution.
+        }
       }
-    }
-    const rows = await pg<{ id: string }[]>`
-      update channel_connections
-      set desired_state = case
+      const rows = await pg<{ id: string }[]>`
+        update channel_connections
+        set desired_state = case
             when ${fatalCredentialError} then 'inactive'
             else desired_state
           end,
@@ -2713,16 +2846,20 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             else ${errorMessage}
           end,
           updated_at = now()
-      where id = ${body.connectionId} and runtime_account_id = ${body.runtimeAccountId}
-        and (desired_state = 'active' or ${body.state} = 'stopped')
-      returning id
-    `;
-    if (!rows[0]) throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
-    return { ok: true };
+        where id = ${body.connectionId} and runtime_account_id = ${body.runtimeAccountId}
+          and agent_id = ${connection.agent_id}
+          and (metadata ->> '_runtimeBindingId') is not distinct from ${body.bindingId ?? null}
+          and (desired_state = 'active' or ${body.state} = 'stopped')
+        returning id
+      `;
+      if (!rows[0]) throw new ApiError(404, 'channel_connection_unavailable', 'Connection unavailable');
+      return { ok: true };
+    });
   });
 
   app.post('/runtime/turns/reserve', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const body = reserveTurnSchema.parse(req.body);
+    await assertActiveChannelRuntimeBinding(body);
     try {
       const result = await turnMetering.reserve(body);
       return {

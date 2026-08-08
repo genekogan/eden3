@@ -4,12 +4,17 @@ import { pg } from '@eden3/db';
 
 import { memoryUserRelativePath } from './memory-paths';
 import { channelPeerSecretContext, type SecretVaultLike } from './secret-vault';
+import { channelRuntimeBindingMatches, storedChannelRuntimeBindingId } from './channel-runtime-binding';
 
 export type ChannelMessageRole = 'user' | 'assistant';
 
 export interface ChannelMessageEvent {
   connectionId: string;
   runtimeAccountId: string;
+  /** OpenClaw agent id from the exact published runtime mapping. */
+  agentId?: string;
+  /** Opaque published mapping generation; absent only for legacy mappings. */
+  bindingId?: string;
   gatewaySessionKey: string;
   /** Provider-native DM/channel/thread id. Falls back to peerId for legacy DMs. */
   conversationId?: string | null;
@@ -31,6 +36,8 @@ export interface ChannelSyncConnection {
   agentId: string;
   channel: 'discord' | 'telegram';
   runtimeAccountId: string;
+  runtimeAgentId: string;
+  bindingId?: string;
   allowedGroups: ChannelAllowedGroup[];
 }
 
@@ -88,6 +95,7 @@ interface ConnectionRow {
   channel: string;
   runtime_account_id: string | null;
   metadata: unknown;
+  agent_openclaw_id: string;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -238,11 +246,19 @@ function sessionExternalId(connectionId: string, fingerprint: string): string {
 export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreLike {
   async getLiveConnection(connectionId: string): Promise<ChannelSyncConnection | null> {
     const rows = await pg<ConnectionRow[]>`
-      select id, account_id, agent_id, channel, runtime_account_id, metadata
-      from channel_connections
-      where id = ${connectionId}
-        and desired_state = 'active'
-        and channel in ('discord', 'telegram')
+      select c.id, c.account_id, c.agent_id, c.channel, c.runtime_account_id,
+             c.metadata, a.openclaw_id as agent_openclaw_id
+      from channel_connections c
+      join agents a on a.account_id = c.agent_id
+      join accounts owner_account on owner_account.id = c.account_id
+      join accounts agent_account on agent_account.id = c.agent_id
+      where c.id = ${connectionId}
+        and c.desired_state = 'active'
+        and c.channel in ('discord', 'telegram')
+        and a.owner_id = c.account_id
+        and a.openclaw_id is not null
+        and owner_account.type = 'user' and owner_account.deleted = false
+        and agent_account.type = 'agent' and agent_account.deleted = false
       limit 1
     `;
     const row = rows[0];
@@ -258,6 +274,8 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
       id: row.id,
       accountId: row.account_id,
       agentId: row.agent_id,
+      runtimeAgentId: row.agent_openclaw_id,
+      bindingId: storedChannelRuntimeBindingId(row.metadata),
       channel: row.channel,
       runtimeAccountId: row.runtime_account_id,
       allowedGroups: configuredChannelGroups(row.channel, row.metadata),
@@ -267,11 +285,19 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
   async persistMessage(input: ChannelMessagePersistence): Promise<ChannelMessageSyncResult> {
     return pg.begin(async (tx) => {
       const connectionRows = await tx<ConnectionRow[]>`
-        select id, account_id, agent_id, channel, runtime_account_id, metadata
-        from channel_connections
-        where id = ${input.connection.id} and desired_state = 'active'
-          and channel in ('discord', 'telegram')
-        for update
+        select c.id, c.account_id, c.agent_id, c.channel, c.runtime_account_id,
+               c.metadata, a.openclaw_id as agent_openclaw_id
+        from channel_connections c
+        join agents a on a.account_id = c.agent_id
+        join accounts owner_account on owner_account.id = c.account_id
+        join accounts agent_account on agent_account.id = c.agent_id
+        where c.id = ${input.connection.id} and c.desired_state = 'active'
+          and c.channel in ('discord', 'telegram')
+          and a.owner_id = c.account_id
+          and a.openclaw_id is not null
+          and owner_account.type = 'user' and owner_account.deleted = false
+          and agent_account.type = 'agent' and agent_account.deleted = false
+        for update of c
       `;
       const row = connectionRows[0];
       if (
@@ -282,7 +308,13 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
         row.account_id !== input.connection.accountId ||
         row.agent_id !== input.connection.agentId ||
         row.channel !== input.connection.channel ||
-        row.runtime_account_id !== input.connection.runtimeAccountId
+        row.runtime_account_id !== input.connection.runtimeAccountId ||
+        !channelRuntimeBindingMatches({
+          metadata: row.metadata,
+          storedAgentId: row.agent_openclaw_id,
+          requesterAgentId: input.event.agentId,
+          requesterBindingId: input.event.bindingId,
+        })
       ) {
         throw new Error('channel connection unavailable');
       }
@@ -290,6 +322,8 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
         id: row.id,
         accountId: row.account_id,
         agentId: row.agent_id,
+        runtimeAgentId: row.agent_openclaw_id,
+        bindingId: storedChannelRuntimeBindingId(row.metadata),
         channel: row.channel,
         runtimeAccountId: row.runtime_account_id,
         allowedGroups: configuredChannelGroups(row.channel, row.metadata),
@@ -312,16 +346,21 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
           channel_connection_id: string | null;
           channel_peer_fingerprint: string | null;
           channel_conversation_fingerprint: string | null;
+          owner_id: string | null;
+          session_type: string | null;
+          deleted: boolean;
+          visible: boolean | null;
         }>
       >`
         select id, gateway_session_key, channel_connection_id,
-               channel_peer_fingerprint, channel_conversation_fingerprint
+               channel_peer_fingerprint, channel_conversation_fingerprint,
+               owner_id, session_type, deleted, visible
         from sessions
         where gateway_session_key = ${input.event.gatewaySessionKey}
            or (
              channel_connection_id = ${input.connection.id}
              and channel_conversation_fingerprint = ${input.conversationFingerprint}
-           )
+          )
         for update
       `;
       const session = existingSessions[0];
@@ -331,12 +370,31 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
       if (
         existingSessions.length > 1 ||
         (session &&
-          (session.gateway_session_key !== input.event.gatewaySessionKey ||
+          (session.deleted ||
+            session.visible === false ||
+            session.owner_id !== input.connection.accountId ||
+            session.session_type !== 'channel' ||
+            session.gateway_session_key !== input.event.gatewaySessionKey ||
             session.channel_connection_id !== input.connection.id ||
             (session.channel_conversation_fingerprint !== input.conversationFingerprint &&
               !legacyConversationMatch)))
       ) {
         throw new Error('channel session isolation violation');
+      }
+      if (session) {
+        const sessionAgentRows = await tx<{ agent_account_id: string }[]>`
+          select agent_account_id
+          from session_agents
+          where session_id = ${session.id}
+          order by agent_account_id
+          for update
+        `;
+        if (
+          sessionAgentRows.length !== 1 ||
+          sessionAgentRows[0]?.agent_account_id !== input.connection.agentId
+        ) {
+          throw new Error('channel session isolation violation');
+        }
       }
       if (session && legacyConversationMatch) {
         // 0021 backfills the old peer digest so legacy sessions remain
@@ -487,6 +545,12 @@ export class ChannelSessionSync {
       !connection ||
       connection.id !== event.connectionId ||
       connection.runtimeAccountId !== event.runtimeAccountId
+      || !channelRuntimeBindingMatches({
+        metadata: connection.bindingId ? { _runtimeBindingId: connection.bindingId } : {},
+        storedAgentId: connection.runtimeAgentId,
+        requesterAgentId: event.agentId,
+        requesterBindingId: event.bindingId,
+      })
     ) {
       throw new Error('channel connection unavailable');
     }

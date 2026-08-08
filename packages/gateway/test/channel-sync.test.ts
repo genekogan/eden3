@@ -279,6 +279,7 @@ describe('hosted named channel accounts', () => {
         accountId: accountA,
       label: 'First bot',
       bindAgentId: 'agent-one',
+      bindingId: '33333333-3333-4333-8333-333333333333',
       dmPolicy: 'allowlist',
       allowFrom: ['404322488215142410'],
     });
@@ -377,6 +378,7 @@ describe('hosted named channel accounts', () => {
         accountId: 'agent-one',
         connectionId: connectionA,
         agentId: 'agent-one',
+        bindingId: '33333333-3333-4333-8333-333333333333',
         model: 'anthropic/claude-haiku-4-5',
         agentRuntime: 'openclaw',
       },
