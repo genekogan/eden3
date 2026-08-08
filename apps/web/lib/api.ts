@@ -143,6 +143,13 @@ async function toApiError(res: Response, path: string): Promise<ApiError> {
   const detail =
     body && typeof body === "object" && "message" in body
       ? String((body as { message: unknown }).message)
+      : body &&
+          typeof body === "object" &&
+          "error" in body &&
+          (body as { error?: unknown }).error &&
+          typeof (body as { error: unknown }).error === "object" &&
+          "message" in ((body as { error: object }).error)
+        ? String(((body as { error: { message: unknown } }).error).message)
       : res.statusText;
   return new ApiError(res.status, `${res.status} ${path}: ${detail}`, body);
 }

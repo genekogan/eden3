@@ -4,6 +4,7 @@ import type {
   ChannelCredentialCustodyLike,
   ChannelSecretHandle,
 } from './channel-connector-custody';
+import { assertRequestScopedSecretHandle } from './channel-connector-custody';
 import {
   DISCORD_BOT_PERMISSIONS,
   DiscordByobService,
@@ -19,7 +20,7 @@ const HANDLE: ChannelSecretHandle = {
 
 function custody(): ChannelCredentialCustodyLike {
   return {
-    seal: vi.fn(async () => HANDLE),
+    sealScoped: vi.fn(async () => HANDLE),
     withPlaintext: vi.fn(),
     revoke: vi.fn(),
   };
@@ -43,6 +44,23 @@ describe('discordOauthInviteUrl', () => {
     expect(() => discordOauthInviteUrl('123&permissions=8')).toThrow(
       'invalid Discord application id',
     );
+  });
+});
+
+describe('assertRequestScopedSecretHandle', () => {
+  it('parses and compares the exact connection UUID', () => {
+    expect(() =>
+      assertRequestScopedSecretHandle({
+        connectionId: `${HANDLE.connectionId}.c1`,
+        secretRefId: HANDLE.secretRefId,
+      }),
+    ).toThrow('invalid connection id');
+    expect(() =>
+      assertRequestScopedSecretHandle({
+        connectionId: '30000000-0000-4000-8000-000000000003',
+        secretRefId: HANDLE.secretRefId,
+      }),
+    ).toThrow('cross-connection');
   });
 });
 
@@ -83,7 +101,7 @@ describe('DiscordByobService', () => {
   it('validates before sealing and returns no token material', async () => {
     const order: string[] = [];
     const vault = custody();
-    vi.mocked(vault.seal).mockImplementation(async () => {
+    vi.mocked(vault.sealScoped).mockImplementation(async () => {
       order.push('seal');
       return HANDLE;
     });
@@ -107,7 +125,7 @@ describe('DiscordByobService', () => {
     });
 
     expect(order).toEqual(['validate', 'seal']);
-    expect(vault.seal).toHaveBeenCalledWith(
+    expect(vault.sealScoped).toHaveBeenCalledWith(
       expect.objectContaining({ channel: 'discord', plaintext: 'synthetic.discord.token' }),
     );
     expect(JSON.stringify(result)).not.toContain('synthetic.discord.token');
@@ -133,12 +151,34 @@ describe('DiscordByobService', () => {
     await expect(
       service.connect({ accountId: 'account-1', agentId: null, token: 'synthetic-invalid' }),
     ).resolves.toMatchObject({ ok: false, code: 'invalid_token' });
-    expect(vault.seal).not.toHaveBeenCalled();
+    expect(vault.sealScoped).not.toHaveBeenCalled();
+  });
+
+  it('allowlists adapter failures so an echoed token cannot escape', async () => {
+    const vault = custody();
+    const service = new DiscordByobService(
+      {
+        getCurrentBot: vi.fn(async () => ({
+          ok: false,
+          code: 'invalid_token',
+          message: 'synthetic-secret-token',
+          retryable: true,
+          token: 'synthetic-secret-token',
+        }) as never),
+      },
+      vault,
+    );
+    const result = await service.connect({
+      accountId: 'account-1',
+      agentId: null,
+      token: 'synthetic-secret-token',
+    });
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret-token');
   });
 
   it('fails closed when custody returns a legacy unscoped reference', async () => {
     const vault = custody();
-    vi.mocked(vault.seal).mockResolvedValue({
+    vi.mocked(vault.sealScoped).mockResolvedValue({
       connectionId: HANDLE.connectionId,
       secretRefId: `channel/${HANDLE.connectionId}`,
     });
@@ -154,10 +194,6 @@ describe('DiscordByobService', () => {
     await expect(
       service.connect({ accountId: 'account-1', agentId: null, token: 'synthetic' }),
     ).rejects.toThrow('request-scoped SecretRef');
-    expect(vault.revoke).toHaveBeenCalledWith({
-      connectionId: HANDLE.connectionId,
-      secretRefId: `channel/${HANDLE.connectionId}`,
-    });
   });
 
   it('rejects an invalid provider identity before custody', async () => {
@@ -174,6 +210,29 @@ describe('DiscordByobService', () => {
     await expect(
       service.connect({ accountId: 'account-1', agentId: null, token: 'synthetic' }),
     ).resolves.toMatchObject({ ok: false, code: 'provider_unavailable' });
-    expect(vault.seal).not.toHaveBeenCalled();
+    expect(vault.sealScoped).not.toHaveBeenCalled();
+  });
+
+  it('copies only allowlisted handle and bot fields', async () => {
+    const vault = custody();
+    vi.mocked(vault.sealScoped).mockResolvedValue({
+      ...HANDLE,
+      plaintext: 'synthetic-secret-token',
+    } as never);
+    const result = await new DiscordByobService(
+      {
+        getCurrentBot: vi.fn(async () => ({
+          ok: true,
+          bot: {
+            id: '123456789',
+            username: 'edenbot',
+            displayName: null,
+            token: 'synthetic-secret-token',
+          },
+        }) as never),
+      },
+      vault,
+    ).connect({ accountId: 'account-1', agentId: null, token: 'synthetic-secret-token' });
+    expect(JSON.stringify(result)).not.toContain('synthetic-secret-token');
   });
 });

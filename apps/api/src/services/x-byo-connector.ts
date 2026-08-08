@@ -25,6 +25,49 @@ export type XConnectorFailureCode =
   | 'rate_limited'
   | 'provider_unavailable';
 
+function safeFailure(
+  failure: Extract<XConnectorResult<unknown>, { ok: false }>,
+): Extract<XConnectorResult<never>, { ok: false }> {
+  const retryAfterSeconds =
+    failure.code === 'rate_limited' &&
+    Number.isInteger(failure.retryAfterSeconds) &&
+    failure.retryAfterSeconds! > 0 &&
+    failure.retryAfterSeconds! <= 86_400
+      ? failure.retryAfterSeconds
+      : undefined;
+  switch (failure.code) {
+    case 'invalid_credentials':
+      return {
+        ok: false,
+        code: failure.code,
+        message: 'X rejected these app credentials. Check all four values.',
+        retryable: false,
+      };
+    case 'revoked':
+      return {
+        ok: false,
+        code: failure.code,
+        message: 'X reports that this access token was revoked. Generate a replacement token.',
+        retryable: false,
+      };
+    case 'rate_limited':
+      return {
+        ok: false,
+        code: failure.code,
+        message: 'X rate-limited this request. Wait for the limit to reset.',
+        retryable: true,
+        ...(retryAfterSeconds ? { retryAfterSeconds } : {}),
+      };
+    default:
+      return {
+        ok: false,
+        code: 'provider_unavailable',
+        message: 'X could not complete this request right now.',
+        retryable: true,
+      };
+  }
+}
+
 export type XConnectorResult<T> =
   | { ok: true; value: T }
   | {
@@ -113,7 +156,7 @@ export class XByoConnectorService {
       };
     }
     const validation = await this.client.validate(credentials);
-    if (!validation.ok) return validation;
+    if (!validation.ok) return safeFailure(validation);
     if (!validIdentity(validation.value)) {
       return {
         ok: false,
@@ -122,20 +165,29 @@ export class XByoConnectorService {
         retryable: true,
       };
     }
-    const handle = await this.custody.seal({
+    const returnedHandle = await this.custody.sealScoped({
       accountId: input.accountId,
       agentId: input.agentId,
       channel: 'x',
       label: input.label?.trim() || null,
       plaintext: serializeCredentials(credentials),
     });
-    try {
-      assertRequestScopedSecretHandle(handle);
-    } catch (error) {
-      await Promise.resolve(this.custody.revoke(handle)).catch(() => undefined);
-      throw error;
-    }
-    return { ok: true, value: { handle, user: validation.value } };
+    const handle = {
+      connectionId: returnedHandle.connectionId,
+      secretRefId: returnedHandle.secretRefId,
+    };
+    assertRequestScopedSecretHandle(handle);
+    return {
+      ok: true,
+      value: {
+        handle,
+        user: {
+          id: validation.value.id,
+          username: validation.value.username,
+          name: validation.value.name,
+        },
+      },
+    };
   }
 
   async post(
@@ -143,13 +195,25 @@ export class XByoConnectorService {
     text: string,
   ): Promise<XConnectorResult<{ id: string }>> {
     const trimmed = text.trim();
-    if (!trimmed || [...trimmed].length > 280) {
-      throw new Error('X post must contain between 1 and 280 characters');
+    // X applies URL/CJK/emoji weighted length. The concrete provider adapter
+    // is authoritative; this bound only rejects empty/abusive local payloads.
+    if (!trimmed || [...trimmed].length > 10_000) {
+      throw new Error('X post must contain text within the request-size limit');
     }
     assertRequestScopedSecretHandle(handle);
-    return this.custody.withPlaintext(handle, async (plaintext) =>
+    const result = await this.custody.withPlaintext(handle, async (plaintext) =>
       this.client.post(parseCredentials(plaintext), trimmed),
     );
+    if (!result.ok) return safeFailure(result);
+    if (!/^\d{1,25}$/.test(result.value.id)) {
+      return {
+        ok: false,
+        code: 'provider_unavailable',
+        message: 'X returned an invalid post identity.',
+        retryable: true,
+      };
+    }
+    return { ok: true, value: { id: result.value.id } };
   }
 
   async revoke(handle: ChannelSecretHandle): Promise<void> {

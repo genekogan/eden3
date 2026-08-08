@@ -199,6 +199,11 @@ export function ChannelsClient() {
     [xConnections, selectedAgentId],
   );
 
+  const unassignedXConnections = useMemo(
+    () => xConnections.filter((item) => !agents.some((agent) => agent.id === item.agentId)),
+    [xConnections, agents],
+  );
+
   /** Connections whose bound agent is no longer in the owned list (e.g. deleted agent). */
   const unassignedConnections = useMemo(
     () => connections.filter((item) => !agents.some((agent) => agent.id === item.agentId)),
@@ -297,7 +302,16 @@ export function ChannelsClient() {
       setXLabel("");
       setNote(`X connected as @${connection.user?.username ?? "your account"}.`);
     } catch (error) {
-      if (alive.current) setNote(errorCopy(error));
+      if (alive.current) {
+        const body = error instanceof ApiError ? error.body : null;
+        const code =
+          body && typeof body === "object" && "error" in body &&
+          body.error && typeof body.error === "object" && "code" in body.error
+            ? String(body.error.code)
+            : null;
+        const action = xFailureAction(code);
+        setNote([errorCopy(error), action].filter(Boolean).join(" "));
+      }
     } finally {
       if (alive.current) setBusy(null);
     }
@@ -726,6 +740,12 @@ export function ChannelsClient() {
             </form>
             <div>
               {agentXConnections.length === 0 ? <EmptyState title="No X app connected" hint="Connect a user-owned developer app to publish from this agent." /> : <ul className="space-y-4">{agentXConnections.map(renderXConnection)}</ul>}
+              {unassignedXConnections.length > 0 ? (
+                <div className="mt-8">
+                  <p className="font-mono text-[10px] uppercase tracking-[0.25em] text-faint">X apps not linked to one of your agents</p>
+                  <ul className="mt-3 space-y-4">{unassignedXConnections.map(renderXConnection)}</ul>
+                </div>
+              ) : null}
             </div>
           </div>
         </section>
