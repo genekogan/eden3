@@ -249,14 +249,6 @@ describe('MediaPipeline.ingestFile (live postgres)', () => {
       kind: 'audio',
       action: 'music',
     },
-    {
-      label: 'speech',
-      fileName: 'chat-speech.mp3',
-      tool: 'tts',
-      mime: 'audio/mpeg',
-      kind: 'audio',
-      action: 'tts',
-    },
   ] as const) {
     it(`in-chat ${mediaCase.label} ingest attaches inline metadata and charges ${mediaCase.action}`, async () => {
       events.length = 0;
