@@ -94,6 +94,7 @@ describe('Telegram Managed Bots state', () => {
     expect(telegramManagedStep('attached')).toBe('complete');
     expect(telegramManagedStep('cancelled')).toBe('terminal');
     expect(telegramManagedStep('expired')).toBe('terminal');
+    expect(telegramManagedStep('failed')).toBe('terminal');
   });
 });
 

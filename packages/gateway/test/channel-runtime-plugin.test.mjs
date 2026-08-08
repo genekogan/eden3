@@ -12,6 +12,9 @@ import {
   createEdenChannelRuntimeBridge,
 } from '../../../infra/openclaw/plugins/eden3-channel-runtime/bridge.js';
 import {
+  createDurableDeliverySuccessOutbox,
+} from '../../../infra/openclaw/plugins/eden3-channel-runtime/delivery-outbox.js';
+import {
   ChannelRuntimeClientError,
   createChannelRuntimeClient,
   validateChannelRuntimeBaseUrl,
@@ -140,6 +143,36 @@ function groupHostedConfig() {
   return config;
 }
 
+function telegramGroupHostedConfig() {
+  const config = telegramHostedConfig();
+  config.channels.telegram.accounts['account-a'].groupPolicy = 'allowlist';
+  config.plugins.entries['eden3-channel-runtime'].config.accounts[0].groups = [
+    {
+      conversationId: '-1001234567890',
+      guildId: null,
+      allowFrom: [PEER_A],
+      mentionRequired: true,
+    },
+  ];
+  return config;
+}
+
+function memoryDeliverySuccessOutbox() {
+  const entries = new Map();
+  return {
+    record(marker) {
+      entries.set(`${marker.connectionId}:${marker.turnId}`, structuredClone(marker));
+      return marker;
+    },
+    list() {
+      return [...entries.values()].map((marker) => structuredClone(marker));
+    },
+    remove(marker) {
+      return entries.delete(`${marker.connectionId}:${marker.turnId}`);
+    },
+  };
+}
+
 function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) {
   const calls = [];
   const client = {
@@ -178,6 +211,7 @@ function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) 
       api,
       client,
       now: () => 1_800_000_000_000,
+      deliverySuccessOutbox: memoryDeliverySuccessOutbox(),
       ...bridgeOptions,
     }),
     calls,
@@ -234,6 +268,34 @@ function receiveTelegramA(bridge, overrides = {}) {
       ...overrides.context,
     },
   );
+}
+
+function receiveTelegramGroup(bridge, overrides = {}) {
+  const conversationId = '-1001234567890';
+  const sessionKey = `agent:agent-a:telegram:account-a:group:${conversationId}`;
+  bridge.onMessageReceived(
+    {
+      content: 'hello from a Telegram group',
+      timestamp: 1_800_000_000_000,
+      messageId: '84',
+      senderId: PEER_A,
+      from: `telegram:group:${conversationId}`,
+      metadata: { messageId: '84', senderId: PEER_A, chatType: 'group', isGroup: true },
+      ...overrides.event,
+    },
+    {
+      channelId: 'telegram',
+      accountId: 'account-a',
+      conversationId,
+      sessionKey,
+      messageId: '84',
+      senderId: PEER_A,
+      isGroup: true,
+      wasMentioned: true,
+      ...overrides.context,
+    },
+  );
+  return { conversationId, sessionKey };
 }
 
 describe('hosted channel account mapping', () => {
@@ -1221,6 +1283,142 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(
       calls.some((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivery-failed`),
     ).toBe(false);
+  });
+
+  it('fsyncs native success before POST, survives timeout, and replays once after restart', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'eden3-delivery-outbox-'));
+    const filePath = join(tempDir, 'delivery-success.json');
+    const firstOutbox = createDurableDeliverySuccessOutbox({ filePath });
+    let observedDurableBeforePost = false;
+    const first = mockBridge(
+      telegramHostedConfig(),
+      {
+        [`/channels/runtime/turns/${RUN_A}/delivered`]: async () => {
+          // Model a server commit followed by client timeout. The marker must
+          // already be fsynced before the HTTP attempt begins.
+          observedDurableBeforePost = firstOutbox.list().length === 1;
+          throw new Error('timeout after commit');
+        },
+      },
+      { deliverySuccessOutbox: firstOutbox },
+    );
+    receiveTelegramA(first.bridge);
+    await first.bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey: TELEGRAM_SESSION_A, messageProvider: 'telegram', agentId: 'agent-a' },
+    );
+    await first.bridge.onReplyPayloadSending(
+      {
+        kind: 'final',
+        runId: RUN_A,
+        payload: { text: 'assistant answer' },
+        usageState: {
+          usage: { input: 3, output: 2, total: 5 },
+          provider: 'claude-cli',
+          model: 'claude-sonnet-4-6',
+        },
+      },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        channelId: 'telegram',
+        accountId: 'account-a',
+        messageId: '42',
+      },
+    );
+    await first.bridge.onMessageSent(
+      { to: PEER_A, content: 'assistant answer', runId: RUN_A, success: true, messageId: '9001' },
+      { channelId: 'telegram', accountId: 'account-a', conversationId: PEER_A, runId: RUN_A },
+    );
+    expect(observedDurableBeforePost).toBe(true);
+    expect(firstOutbox.list()).toHaveLength(1);
+
+    const restartedOutbox = createDurableDeliverySuccessOutbox({ filePath });
+    const restarted = mockBridge(telegramHostedConfig(), {}, {
+      deliverySuccessOutbox: restartedOutbox,
+    });
+    await restarted.bridge.onGatewayStart();
+    expect(
+      restarted.calls.filter((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivered`),
+    ).toHaveLength(1);
+    expect(restartedOutbox.list()).toEqual([]);
+    await restarted.bridge.onGatewayStart();
+    expect(
+      restarted.calls.filter((call) => call.path === `/channels/runtime/turns/${RUN_A}/delivered`),
+    ).toHaveLength(1);
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('quarantines a replay marker when terminal compensation already won', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'eden3-delivery-poison-'));
+    const filePath = join(tempDir, 'delivery-success.json');
+    const outbox = createDurableDeliverySuccessOutbox({ filePath });
+    const marker = {
+      connectionId: CONNECTION_A,
+      runtimeAccountId: 'account-a',
+      channel: 'telegram',
+      turnId: RUN_A,
+      messageId: '9002',
+    };
+    outbox.record(marker);
+    outbox.record(marker);
+    expect(outbox.list()).toHaveLength(1);
+    expect(() => outbox.record({ ...marker, messageId: 'different' })).toThrow('marker conflict');
+    const replay = mockBridge(
+      telegramHostedConfig(),
+      {
+        [`/channels/runtime/turns/${RUN_A}/delivered`]: async () => {
+          throw new ChannelRuntimeClientError('channel_turn_terminal_compensated', 409);
+        },
+      },
+      { deliverySuccessOutbox: outbox },
+    );
+    await replay.bridge.onGatewayStart();
+    expect(outbox.list()).toEqual([]);
+    expect(outbox.listQuarantined()).toEqual([
+      expect.objectContaining({ turnId: RUN_A, reason: 'terminal_compensated_before_ack' }),
+    ]);
+    expect(
+      replay.calls.some(
+        (call) =>
+          call.path === '/channels/runtime/status' &&
+          call.body.state === 'error' &&
+          call.body.errorCode === 'delivery_ack_lost',
+      ),
+    ).toBe(true);
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('correlates Telegram group delivery against the group chat, never the sender id', async () => {
+    for (const success of [true, false]) {
+      const current = mockBridge(telegramGroupHostedConfig());
+      const { conversationId, sessionKey } = receiveTelegramGroup(current.bridge);
+      await current.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'hello group', messages: [] },
+        { runId: RUN_A, sessionKey, messageProvider: 'telegram', agentId: 'agent-a' },
+      );
+      await current.bridge.onReplyPayloadSending(
+        {
+          kind: 'final',
+          runId: RUN_A,
+          payload: { text: 'group answer' },
+          usageState: {
+            usage: { input: 3, output: 2, total: 5 },
+            provider: 'claude-cli',
+            model: 'claude-sonnet-4-6',
+          },
+        },
+        { runId: RUN_A, sessionKey, channelId: 'telegram', accountId: 'account-a', messageId: '84' },
+      );
+      await current.bridge.onMessageSent(
+        { to: conversationId, content: 'group answer', runId: RUN_A, success },
+        { channelId: 'telegram', accountId: 'account-a', conversationId, runId: RUN_A },
+      );
+      const terminalPath = success
+        ? `/channels/runtime/turns/${RUN_A}/delivered`
+        : `/channels/runtime/turns/${RUN_A}/delivery-failed`;
+      expect(current.calls.some((call) => call.path === terminalPath)).toBe(true);
+    }
   });
 
   it('normalizes Discord user delivery targets before acknowledging the exact run', async () => {

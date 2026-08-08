@@ -3,6 +3,7 @@ import {
   getEnv,
   mannaFromUsd,
   numericToNumber,
+  refundIdempotencyKey,
   reverseReservation,
   settleReservation,
   turnAuthorizedMax,
@@ -482,19 +483,56 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   }
 
   async markDelivered(turnId: string): Promise<void> {
-    const rows = await pg<{ turn_id: string }[]>`
-      update channel_turns
-      set status = 'delivered', error_code = null,
-          updated_at = now(), completed_at = now()
-      where turn_id = ${turnId} and status = 'delivery_pending'
-      returning turn_id
-    `;
-    if (rows[0]) return;
-    const existing = await pg<{ status: ChannelTurnStatus }[]>`
-      select status from channel_turns where turn_id = ${turnId} limit 1
-    `;
-    if (existing[0]?.status === 'delivered') return;
-    throw new Error('channel turn delivery state changed');
+    await db.transaction(async (tx) => {
+      const rows = (await tx.execute(sql`
+        select status, error_code
+        from channel_turns
+        where turn_id = ${turnId}
+        for update
+      `)) as unknown as Array<{ status: ChannelTurnStatus; error_code: string | null }>;
+      const turn = rows[0];
+      if (turn?.status === 'delivered') return;
+      let deliverable = turn?.status === 'delivery_pending';
+      if (
+        turn?.status === 'refunding' &&
+        turn.error_code === 'channel_delivery_compensation_pending'
+      ) {
+        const reversalRows = (await tx.execute(sql`
+          select 1 from manna_transactions
+          where idempotency_key = ${refundIdempotencyKey(channelTurnLedgerKey(turnId))}
+          limit 1
+        `)) as unknown as unknown[];
+        // A replayed native-success outbox may beat a claimed stale reversal.
+        // The channel row lock serializes this rescue against reverseAuthorized:
+        // success wins before the ledger leg, otherwise compensation is final.
+        deliverable = reversalRows.length === 0;
+      }
+      if (!deliverable) {
+        if (
+          turn?.status === 'refunded' ||
+          (turn?.status === 'refunding' &&
+            turn.error_code === 'channel_delivery_compensation_pending')
+        ) {
+          throw new ChannelDeliveryTerminalCompensatedError();
+        }
+        throw new Error('channel turn delivery state changed');
+      }
+      const updated = (await tx.execute(sql`
+        update channel_turns
+        set status = 'delivered', error_code = null,
+            updated_at = now(), completed_at = now()
+        where turn_id = ${turnId}
+          and (
+            status = 'delivery_pending'
+            or (
+              status = 'refunding'
+              and error_code = 'channel_delivery_compensation_pending'
+            )
+          )
+        returning turn_id
+      `)) as unknown as Array<{ turn_id: string }>;
+      if (!updated[0]) throw new Error('channel turn delivery state changed');
+    });
   }
 
   async markError(turnId: string, errorCode: string): Promise<void> {
@@ -724,6 +762,15 @@ export class ChannelExecutionMismatchError extends Error {
   constructor(message = 'Provider execution did not match the reserved channel model') {
     super(message);
     this.name = 'ChannelExecutionMismatchError';
+  }
+}
+
+export class ChannelDeliveryTerminalCompensatedError extends Error {
+  readonly code = 'channel_turn_terminal_compensated';
+
+  constructor() {
+    super('channel turn was already terminal-compensated');
+    this.name = 'ChannelDeliveryTerminalCompensatedError';
   }
 }
 
