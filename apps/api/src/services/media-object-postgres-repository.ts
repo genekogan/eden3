@@ -63,7 +63,7 @@ export class PostgresMediaObjectRepository implements MediaObjectRepository {
                      and jsonb_path_exists(
                        sl.snapshot_payload,
                        '$.messages[*].attachments[*] ? (@.url == $url)',
-                       jsonb_build_object('url', ${durableUrl})
+                       jsonb_build_object('url', ${durableUrl}::text)
                      )
                    )
                    or (
