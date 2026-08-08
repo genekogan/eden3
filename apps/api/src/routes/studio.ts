@@ -407,6 +407,8 @@ export interface StudioDeps {
   /** OpenClaw agent the tools are invoked through (default "main"). */
   agentId?: string;
   timeoutsMs?: Partial<Record<StudioToolName, number>>;
+  /** TEST SEAM: exact-pot reversal; production uses the core ledger primitive. */
+  reverseDebit?: typeof reverseReservation;
   /**
    * OpenClaw 2026.6.10 exposes TTS as a chat/control command, not as a direct
    * `/tools/invoke` media tool. Studio keeps the OpenClaw path first, then
@@ -483,6 +485,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
   const bus = (app.eventsBus as typeof app.eventsBus | undefined) ?? null;
   const pipeline = deps.pipeline ?? new MediaPipeline({ bus, logger: app.log });
   const agentId = deps.agentId ?? 'main';
+  const reverseDebit = deps.reverseDebit ?? reverseReservation;
   const ttsFallback = deps.ttsFallback === undefined ? elevenLabsTtsFallback : deps.ttsFallback;
 
   // The process should run exactly ONE watcher. Until the chat pipeline
@@ -600,18 +603,6 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       throw err;
     }
 
-    const refundQuietly = async (): Promise<void> => {
-      try {
-        await reverseReservation({
-          reservationKey: idempotencyKey,
-          reservedSubscriptionManna,
-          type: `refund:${action}`,
-        });
-      } catch (refundErr) {
-        req.log.error(`studio: refund of ${idempotencyKey} failed: ${String(refundErr)}`);
-      }
-    };
-
     const settleReserve = async (): Promise<{
       status: 'settled' | 'failed';
       reservedManna: number;
@@ -728,6 +719,38 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       }
     };
 
+    type RefundOutcome = { status: 'refunded' } | { status: 'refund_pending' };
+    const reverseFailedGeneration = async (): Promise<RefundOutcome> => {
+      try {
+        await reverseDebit({
+          reservationKey: idempotencyKey,
+          reservedSubscriptionManna,
+          type: `refund:${action}`,
+        });
+        return { status: 'refunded' };
+      } catch (refundErr) {
+        req.log.error(`studio: refund of ${idempotencyKey} failed: ${String(refundErr)}`);
+        return { status: 'refund_pending' };
+      }
+    };
+
+    const requireReversal = async (): Promise<void> => {
+      const outcome = await reverseFailedGeneration();
+      if (outcome.status === 'refunded') return;
+      await recordUsageEvent({
+        status: 'error',
+        chargedManna: quote.manna,
+        costUsd: quote.costUsd,
+        errorCode: 'refund_pending',
+        errorMessage: 'Studio generation failed and its manna reversal requires retry',
+      });
+      throw new ApiError(
+        503,
+        'refund_pending',
+        'Generation failed and your manna refund is pending. Please retry later or contact support.',
+      );
+    };
+
     // 2. Claim BEFORE invoking (the claim is the dir snapshot: only files
     //    landing after this point can match), then kick off the tool.
     //    claimSource.start() can throw (watcher/chokidar startup) — that is
@@ -738,7 +761,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
       await claimSource.start();
       claim = claimSource.claimNext({ kinds: TOOL_CLAIM_KINDS[body.tool], timeoutMs });
     } catch (err) {
-      await refundQuietly();
+      await requireReversal();
       await recordUsageEvent({
         status: 'error',
         chargedManna: 0,
@@ -797,7 +820,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
         try {
           file = await ttsFallback({ args: body.args, requestId, timeoutMs });
         } catch (fallbackErr) {
-          await refundQuietly();
+          await requireReversal();
           const detail =
             fallbackErr instanceof ApiError
               ? fallbackErr.message
@@ -818,7 +841,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           return sendError(reply, 502, 'provider_error', `tts failed: ${detail}`);
         }
       } else {
-      await refundQuietly();
+      await requireReversal();
       if (timedOut || err instanceof MediaClaimTimeoutError) {
         await recordUsageEvent({
           status: 'error',
@@ -879,7 +902,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
         settlement,
       };
     } catch (err) {
-      await refundQuietly();
+      await requireReversal();
       await recordUsageEvent({
         status: 'error',
         chargedManna: 0,

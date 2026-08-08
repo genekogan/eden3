@@ -3,7 +3,14 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { DEV_USER_COOKIE, DevAuthProvider, LocalMediaStore, credit, getBalance } from '@eden3/core';
+import {
+  DEV_USER_COOKIE,
+  DevAuthProvider,
+  LocalMediaStore,
+  credit,
+  getBalance,
+  reverseReservation,
+} from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import { GatewayHttpError, GatewayToolError } from '@eden3/gateway';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -83,6 +90,7 @@ let invokeCalls: Array<{
 }> = [];
 let invokeError: Error | null = null;
 let invokeHang = false;
+let reversalError: Error | null = null;
 let nextTtsFallback: TtsFallbackGenerator | null = null;
 const fakeToolsClient = {
   async invokeTool(params: {
@@ -177,6 +185,10 @@ beforeAll(async () => {
       getToolsClient: () => fakeToolsClient,
       agentId: 'main',
       timeoutsMs: { image_generate: 50 },
+      reverseDebit: async (params) => {
+        if (reversalError) throw reversalError;
+        return await reverseReservation(params);
+      },
       ttsFallback: (params) => {
         if (nextTtsFallback === null) throw new Error('unexpected tts fallback');
         return nextTtsFallback(params);
@@ -634,6 +646,44 @@ describe('POST /studio/generate', () => {
     });
     expect(usage!.latencyMs).toBeGreaterThanOrEqual(0);
     invokeError = null;
+  });
+
+  it('fails loudly and records the outstanding charge when reversal fails', async () => {
+    invokeError = new GatewayToolError('provider exploded', 'image_generate');
+    reversalError = new Error('ledger unavailable');
+    nextClaim = claimUnused;
+    const before = await getBalance(richUserId);
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/studio/generate',
+        headers: asUser(richUserId),
+        payload: { tool: 'image_generate', args: { prompt: 'x' } },
+      });
+
+      expect(res.statusCode).toBe(503);
+      const error = (res.json() as { error: { code: string; message: string } }).error;
+      expect(error.code).toBe('refund_pending');
+      expect(error.message).toContain('refund is pending');
+      expect(error.message).not.toContain('ledger unavailable');
+      expect((await getBalance(richUserId)).total).toBe(before.total - imageQuote.manna);
+
+      const [usage] = await pg<Array<{ status: string; manna: number; errorCode: string }>>`
+        select status, manna, error_code as "errorCode"
+        from usage_events
+        where user_id = ${richUserId}
+          and event_type = 'studio_generation'
+          and error_code = 'refund_pending'
+        order by created_at desc limit 1`;
+      expect(usage).toEqual({
+        status: 'error',
+        manna: imageQuote.manna,
+        errorCode: 'refund_pending',
+      });
+    } finally {
+      invokeError = null;
+      reversalError = null;
+    }
   });
 
   it('504s and refunds when the gateway invocation hangs past the generation timeout', async () => {

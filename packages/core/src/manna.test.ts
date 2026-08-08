@@ -682,6 +682,55 @@ describe('reservation settle/reverse kernel (T08-U02, MVP gap 42)', () => {
     expect(balance.balance).toBe(50);
   });
 
+  it('reverseReservation replays and races a completed reversal without double credit', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 50, type: 'credit:test' });
+    await credit({ accountId, amount: 40, type: 'credit:subscription', toSubscriptionBalance: true });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 61, type: 'spend:chat', idempotencyKey: key });
+
+    const results = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        reverseReservation({
+          reservationKey: key,
+          reservedSubscriptionManna: 40,
+          type: 'refund:chat',
+        }),
+      ),
+    );
+
+    expect(results.filter((result) => !result.alreadyApplied)).toHaveLength(1);
+    expect(results.filter((result) => result.alreadyApplied)).toHaveLength(4);
+    expect(new Set(results.map((result) => result.transaction?.id)).size).toBe(1);
+    expect(await getBalance(accountId)).toEqual({
+      subscriptionBalance: 40,
+      balance: 50,
+      total: 90,
+    });
+  });
+
+  it('reverseReservation rejects a foreign transaction occupying its refund key', async () => {
+    const accountId = await makeAccount();
+    await credit({ accountId, amount: 100, type: 'credit:test' });
+    const key = `resv-${randomUUID()}`;
+    await debit({ accountId, amount: 20, type: 'spend:chat', idempotencyKey: key });
+    await debit({
+      accountId,
+      amount: 1,
+      type: 'spend:foreign',
+      idempotencyKey: refundIdempotencyKey(key),
+    });
+
+    await expect(
+      reverseReservation({
+        reservationKey: key,
+        reservedSubscriptionManna: 0,
+        type: 'refund:chat',
+      }),
+    ).rejects.toThrow(/already reverses transaction/);
+    expect((await getBalance(accountId)).total).toBe(79);
+  });
+
   it('settle + reverse compose split-exactly: charge draws subscription-first', async () => {
     const accountId = await makeAccount();
     await credit({ accountId, amount: 50, type: 'credit:test' });
