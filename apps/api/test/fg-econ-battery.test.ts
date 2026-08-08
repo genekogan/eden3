@@ -452,18 +452,11 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
     },
   );
 
-  // FG-ECON-CHAT-10: same-turnId replay — the MONEY invariant survives (the
-  // user is charged exactly once even under an abusive duplicated turnId), and
-  // this case is DEBT-004 EVIDENCE: without a kernel-level `provider_started`
-  // lease the reserved authorization is a reusable provider ticket, so the
-  // provider can be handed the same reservation more than once (the platform
-  // eats the duplicate provider cost; the user does not). This double-call is
-  // NOT reachable through production dispatch (web turns get fresh uuids;
-  // scheduled turns use the scheduler's atomic occurrence claim + generation
-  // fence) — it is a latent kernel gap deferred to DEBT-004 / T04-U01, which
-  // this battery now measures. The unit does NOT fix it (frozen interface;
-  // production change out of scope).
-  it('FG-ECON-CHAT-10: duplicated turnId charges exactly once (money-safe); provider double-handoff recorded as DEBT-004 evidence', async () => {
+  // FG-ECON-CHAT-10: same-turnId replay — both the MONEY invariant and the
+  // provider-spend invariant are exact. A durable kernel lease makes one
+  // reservation a one-shot provider ticket: concurrent replay may observe the
+  // winning turn, but it can never hand the provider the same turn twice.
+  it('FG-ECON-CHAT-10: duplicated turnId charges once and hands the provider exactly once', async () => {
     const model = 'anthropic/claude-haiku-4-5';
     const reservation = oracleReservation(model);
     const startBalance = 5000;
@@ -506,17 +499,7 @@ describe('FG-ECON battery — chat route tiers (T08-U03)', () => {
     // The user's balance dropped by exactly one charge — never doubled.
     expect((await getBalance(fixture.user.accountId)).total).toBe(startBalance - expected.charged);
 
-    // DEBT-004 evidence: with no provider-start lease the same reservation can
-    // be handed to the provider more than once. This assertion documents the
-    // measured reality; when T04-U01 adds the lease it will drop to 1 and this
-    // line must be tightened (a deliberate DEBT-004 tripwire).
-    expect(calls(), 'DEBT-004: provider handoffs observed for one reservation').toBeGreaterThanOrEqual(1);
-    if (calls() > 1) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `FG-ECON-CHAT-10 DEBT-004 evidence: ${calls()} provider handoffs for one reservation ${turnId}`,
-      );
-    }
+    expect(calls(), 'one durable authorization must be a one-shot provider ticket').toBe(1);
   });
 });
 
