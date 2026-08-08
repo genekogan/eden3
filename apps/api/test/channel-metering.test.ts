@@ -121,7 +121,6 @@ describe('ChannelTurnMeteringService economic authorization', () => {
     const persistence = store({
       getBillableConnection: vi.fn(async () => unsupported),
     });
-
     await expect(
       new ChannelTurnMeteringService(persistence).reserve({
         turnId: randomUUID(),

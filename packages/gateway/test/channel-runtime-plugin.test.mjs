@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -12,11 +16,16 @@ import {
   createChannelRuntimeClient,
   validateChannelRuntimeBaseUrl,
 } from '../../../infra/openclaw/plugins/eden3-channel-runtime/runtime-client.js';
+import {
+  BOT_LOOP_TTL_MS,
+  createDurableBotLoopBreaker,
+} from '../../../infra/openclaw/plugins/eden3-channel-runtime/loop-breaker.js';
 
 const CONNECTION_A = '11111111-1111-4111-8111-111111111111';
 const CONNECTION_B = '22222222-2222-4222-8222-222222222222';
 const RUN_A = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const RUN_B = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const RUN_C = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const EDEN_SESSION_A = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const EDEN_SESSION_B = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const PEER_A = '963544662646354001';
@@ -25,6 +34,7 @@ const SESSION_A = 'agent:agent-a:discord:account-a:direct:963544662646354001';
 const SESSION_B = 'agent:agent-b:discord:account-b:direct:1532630091471786166';
 const TELEGRAM_SESSION_A = 'agent:agent-a:telegram:account-a:direct:963544662646354001';
 const MEMORY_A = 'memory/users/alice-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.md';
+const MEMORY_GROUP = `memory/users/channel-group-${'a'.repeat(64)}.md`;
 
 function hostedConfig(overrides = {}) {
   return {
@@ -116,7 +126,21 @@ function telegramHostedConfig() {
   return config;
 }
 
-function mockBridge(config = hostedConfig(), handlers = {}) {
+function groupHostedConfig() {
+  const config = hostedConfig();
+  config.channels.discord.accounts['account-a'].groupPolicy = 'allowlist';
+  config.plugins.entries['eden3-channel-runtime'].config.accounts[0].groups = [
+    {
+      conversationId: '758719600895590444',
+      guildId: '758719600895590441',
+      allowFrom: [PEER_A],
+      mentionRequired: true,
+    },
+  ];
+  return config;
+}
+
+function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) {
   const calls = [];
   const client = {
     post: vi.fn(async (path, body, options) => {
@@ -126,7 +150,10 @@ function mockBridge(config = hostedConfig(), handlers = {}) {
         return {
           ok: true,
           sessionId: body.runtimeAccountId === 'account-a' ? EDEN_SESSION_A : EDEN_SESSION_B,
-          memoryContext: { linkState: 'linked', relativePath: MEMORY_A },
+          memoryContext:
+            body.conversationScope === 'group'
+              ? { linkState: 'group', relativePath: MEMORY_GROUP }
+              : { linkState: 'linked', relativePath: MEMORY_A },
         };
       }
       if (path === '/channels/runtime/turns/reserve') {
@@ -146,7 +173,15 @@ function mockBridge(config = hostedConfig(), handlers = {}) {
     pluginConfig: hostedPluginConfig(config),
     runtime: { config: { current: () => config } },
   };
-  return { bridge: createEdenChannelRuntimeBridge({ api, client, now: () => 1_800_000_000_000 }), calls };
+  return {
+    bridge: createEdenChannelRuntimeBridge({
+      api,
+      client,
+      now: () => 1_800_000_000_000,
+      ...bridgeOptions,
+    }),
+    calls,
+  };
 }
 
 function receiveA(bridge, overrides = {}) {
@@ -426,7 +461,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     ]);
   });
 
-  it('accepts the 7.1 runless message_received shape and claims concurrent session turns FIFO', async () => {
+  it('FG-CHANNEL-RUNTIME-QUEUE accepts runless inbound state but executes one session turn at a time', async () => {
     const { bridge, calls } = mockBridge();
     receiveA(bridge);
     receiveA(bridge, {
@@ -442,10 +477,17 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       { accountId: 'account-a', senderId: PEER_A, prompt: 'first', messages: [] },
       { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
     );
-    await bridge.onBeforeAgentRun(
+    const secondRun = bridge.onBeforeAgentRun(
       { accountId: 'account-a', senderId: PEER_A, prompt: 'second', messages: [] },
       { runId: RUN_B, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
     );
+    await Promise.resolve();
+    expect(calls.filter((call) => call.path === '/channels/runtime/turns/reserve')).toHaveLength(1);
+    await bridge.onAgentEnd(
+      { runId: RUN_A, success: false, messages: [] },
+      { runId: RUN_A, sessionKey: SESSION_A },
+    );
+    await secondRun;
 
     expect(
       calls
@@ -476,10 +518,19 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
         { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
       );
       await vi.advanceTimersByTimeAsync(30 * 60 * 1_000 + 30_000);
-      await bridge.onBeforeAgentRun(
+      const secondRun = bridge.onBeforeAgentRun(
         { accountId: 'account-a', senderId: PEER_A, prompt: 'second', messages: [] },
         { runId: RUN_B, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
       );
+      await Promise.resolve();
+      expect(
+        calls.some((call) => call.path === '/channels/runtime/turns/reserve' && call.body.turnId === RUN_B),
+      ).toBe(false);
+      await bridge.onAgentEnd(
+        { runId: RUN_A, success: false, messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A },
+      );
+      await secondRun;
 
       // The original inbound timer would expire five minutes into this run.
       // Advance through an entire valid provider ceiling from B's actual
@@ -641,6 +692,127 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(calls.some((call) => call.path.includes('/turns/'))).toBe(false);
   });
 
+  it('FG-CHANNEL-RUNTIME-MIME rejects an unallowlisted attachment before sync, reserve, or provider execution', async () => {
+    const { bridge, calls } = mockBridge();
+    receiveA(bridge, {
+      event: {
+        attachments: [{ contentType: 'application/x-sh', name: 'payload.sh' }],
+      },
+    });
+    await expect(
+      bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'open it', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block', category: 'policy' });
+    expect(calls.some((call) => call.path === '/channels/runtime/messages')).toBe(false);
+    expect(calls.some((call) => call.path.endsWith('/reserve'))).toBe(false);
+
+    const allowed = mockBridge();
+    receiveA(allowed.bridge, {
+      event: { attachments: [{ contentType: 'image/png', name: 'safe.png' }] },
+    });
+    await expect(
+      allowed.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'describe it', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toEqual({ outcome: 'pass' });
+  });
+
+  it('FG-F7 gives one allowlisted mentioned bot message a reply, then suppresses across restart and releases after TTL', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'eden3-loop-'));
+    const filePath = join(tempDir, 'loop-state.json');
+    let clock = 1_800_000_000_000;
+    const groupSession = 'agent:agent-a:discord:channel:758719600895590444';
+    const receiveGroup = (bridge, messageId) =>
+      bridge.onMessageReceived(
+        {
+          content: 'bot-authored group message',
+          messageId,
+          senderId: PEER_A,
+          senderIsBot: true,
+          from: 'discord:channel:758719600895590444',
+          metadata: {
+            messageId,
+            chatType: 'channel',
+            guildId: '758719600895590441',
+            senderId: PEER_A,
+            senderIsBot: true,
+            wasMentioned: true,
+          },
+        },
+        {
+          channelId: 'discord',
+          accountId: 'account-a',
+          conversationId: '758719600895590444',
+          guildId: '758719600895590441',
+          sessionKey: groupSession,
+          messageId,
+          senderId: PEER_A,
+          senderIsBot: true,
+          wasMentioned: true,
+        },
+      );
+    try {
+      const first = mockBridge(groupHostedConfig(), {}, {
+        now: () => clock,
+        loopBreaker: createDurableBotLoopBreaker({ filePath, now: () => clock }),
+      });
+      receiveGroup(first.bridge, '1532630091471786201');
+      await expect(
+        first.bridge.onBeforePromptBuild(
+          { prompt: 'group message', messages: [] },
+          { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord' },
+        ),
+      ).resolves.toEqual({
+        prependSystemContext: expect.stringContaining('Never read or write any participant private-memory file'),
+      });
+      await expect(
+        first.bridge.onBeforeAgentRun(
+          { accountId: 'account-a', senderId: PEER_A, prompt: 'group message', messages: [] },
+          { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord', agentId: 'agent-a' },
+        ),
+      ).resolves.toEqual({ outcome: 'pass' });
+      expect(first.calls.find((call) => call.path === '/channels/runtime/messages').body).toMatchObject({
+        conversationId: '758719600895590444',
+        conversationScope: 'group',
+      });
+      await first.bridge.onAgentEnd(
+        { runId: RUN_A, success: false, messages: [] },
+        { runId: RUN_A, sessionKey: groupSession },
+      );
+
+      const restarted = mockBridge(groupHostedConfig(), {}, {
+        now: () => clock,
+        loopBreaker: createDurableBotLoopBreaker({ filePath, now: () => clock }),
+      });
+      receiveGroup(restarted.bridge, '1532630091471786202');
+      await expect(
+        restarted.bridge.onBeforeAgentRun(
+          { accountId: 'account-a', senderId: PEER_A, prompt: 'loop', messages: [] },
+          { runId: RUN_B, sessionKey: groupSession, messageProvider: 'discord', agentId: 'agent-a' },
+        ),
+      ).resolves.toMatchObject({ outcome: 'block' });
+      expect(restarted.calls.some((call) => call.path.endsWith('/reserve'))).toBe(false);
+
+      clock += BOT_LOOP_TTL_MS + 1;
+      const expired = mockBridge(groupHostedConfig(), {}, {
+        now: () => clock,
+        loopBreaker: createDurableBotLoopBreaker({ filePath, now: () => clock }),
+      });
+      receiveGroup(expired.bridge, '1532630091471786203');
+      await expect(
+        expired.bridge.onBeforeAgentRun(
+          { accountId: 'account-a', senderId: PEER_A, prompt: 'new window', messages: [] },
+          { runId: RUN_C, sessionKey: groupSession, messageProvider: 'discord', agentId: 'agent-a' },
+        ),
+      ).resolves.toEqual({ outcome: 'pass' });
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it('blocks malformed hosted mappings or missing inbound sync before provider work', async () => {
     const duplicate = hostedConfig();
     duplicate.plugins.entries['eden3-channel-runtime'].config.accounts[1].connectionId =
@@ -653,6 +825,38 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     );
     expect(result).toMatchObject({ outcome: 'block', category: 'policy' });
     expect(calls.some((call) => call.path.includes('/turns/reserve'))).toBe(false);
+  });
+
+  it('FG-CHANNEL-RUNTIME-AUTHZ refuses an unsupported channel model before agent/provider execution', async () => {
+    const config = hostedConfig();
+    config.agents.list[0].model = 'openrouter/unsupported-model';
+    config.agents.defaults.models['openrouter/unsupported-model'] = {
+      agentRuntime: { id: 'openclaw' },
+    };
+    Object.assign(config.plugins.entries['eden3-channel-runtime'].config.accounts[0], {
+      model: 'openrouter/unsupported-model',
+      agentRuntime: 'openclaw',
+    });
+    const { bridge, calls } = mockBridge(config, {
+      '/channels/runtime/turns/reserve': async () => {
+        throw new ChannelRuntimeClientError('unsupported_channel_model', 422);
+      },
+    });
+    receiveA(bridge);
+    expect(
+      bridge.onBeforeModelResolve(
+        { prompt: 'try unsupported route' },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord' },
+      ),
+    ).toEqual({ providerOverride: 'openrouter', modelOverride: 'unsupported-model' });
+    await expect(
+      bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'try it', messages: [] },
+        { runId: RUN_A, sessionKey: SESSION_A, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toMatchObject({ outcome: 'block', category: 'policy' });
+    expect(calls.filter((call) => call.path.endsWith('/reserve'))).toHaveLength(1);
+    expect(calls.some((call) => call.path.includes('/settle'))).toBe(false);
   });
 
   it('rejects invalid session identity or reserve provenance and refunds a claimed turn', async () => {
@@ -1075,24 +1279,6 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       event: { content: 'second message', messageId: '43' },
       context: { messageId: '43' },
     });
-    await bridge.onBeforeAgentRun(
-      { accountId: 'account-a', senderId: PEER_A, prompt: 'first', messages: [] },
-      {
-        runId: RUN_A,
-        sessionKey: TELEGRAM_SESSION_A,
-        messageProvider: 'telegram',
-        agentId: 'agent-a',
-      },
-    );
-    await bridge.onBeforeAgentRun(
-      { accountId: 'account-a', senderId: PEER_A, prompt: 'second', messages: [] },
-      {
-        runId: RUN_B,
-        sessionKey: TELEGRAM_SESSION_A,
-        messageProvider: 'telegram',
-        agentId: 'agent-a',
-      },
-    );
     const approve = (runId, messageId, text) =>
       bridge.onReplyPayloadSending(
         {
@@ -1113,8 +1299,26 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
           messageId,
         },
       );
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'first', messages: [] },
+      {
+        runId: RUN_A,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
     await approve(RUN_A, '42', 'first answer');
     await approve(RUN_A, '42', 'first answer');
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'second', messages: [] },
+      {
+        runId: RUN_B,
+        sessionKey: TELEGRAM_SESSION_A,
+        messageProvider: 'telegram',
+        agentId: 'agent-a',
+      },
+    );
     await approve(RUN_B, '43', 'second answer');
 
     bridge.onMessageSent(
