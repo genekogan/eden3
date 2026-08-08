@@ -15,6 +15,8 @@ export interface ChannelMessageEvent {
   conversationId?: string | null;
   /** Trusted provider conversation scope; group memory never resolves to a sender file. */
   conversationScope?: 'direct' | 'group';
+  /** Discord guild coordinate. Null/absent for Telegram groups and DMs. */
+  guildId?: string | null;
   peerId: string;
   externalMessageId: string;
   role: ChannelMessageRole;
@@ -29,6 +31,13 @@ export interface ChannelSyncConnection {
   agentId: string;
   channel: 'discord' | 'telegram';
   runtimeAccountId: string;
+  allowedGroups: ChannelAllowedGroup[];
+}
+
+export interface ChannelAllowedGroup {
+  conversationId: string;
+  guildId: string | null;
+  allowFrom: string[];
 }
 
 export interface EncryptedChannelPeer {
@@ -73,6 +82,85 @@ interface ConnectionRow {
   agent_id: string | null;
   channel: string;
   runtime_account_id: string | null;
+  metadata: unknown;
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function canonicalIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  const ids = value.filter((item): item is string => typeof item === 'string' && /^-?\d{3,25}$/.test(item));
+  return ids.length === value.length && new Set(ids).size === ids.length ? ids : [];
+}
+
+/** Compile only the persisted activation shape; malformed config fails closed. */
+export function configuredChannelGroups(channel: 'discord' | 'telegram', metadata: unknown): ChannelAllowedGroup[] {
+  const config = record(record(metadata).config);
+  if (channel === 'discord') {
+    if (config.discordGuilds === undefined) return [];
+    if (!Array.isArray(config.discordGuilds)) throw new Error('invalid channel group configuration');
+    if (config.discordGuilds.length === 0) return [];
+    const allowFrom = canonicalIds(config.allowFrom);
+    if (allowFrom.length === 0) throw new Error('invalid channel group configuration');
+    const groups: ChannelAllowedGroup[] = [];
+    for (const raw of config.discordGuilds) {
+      const guild = record(raw);
+      if (typeof guild.guildId !== 'string' || !/^\d{3,25}$/.test(guild.guildId)) {
+        throw new Error('invalid channel group configuration');
+      }
+      const channelIds = canonicalIds(guild.channelIds);
+      if (!Array.isArray(guild.channelIds) || channelIds.length !== guild.channelIds.length) {
+        throw new Error('invalid channel group configuration');
+      }
+      for (const conversationId of channelIds) {
+        if (conversationId.startsWith('-')) throw new Error('invalid channel group configuration');
+        groups.push({ conversationId, guildId: guild.guildId, allowFrom: [...allowFrom] });
+      }
+    }
+    return groups;
+  }
+  if (config.telegramGroups === undefined) return [];
+  if (!Array.isArray(config.telegramGroups)) throw new Error('invalid channel group configuration');
+  if (config.telegramGroups.length === 0) return [];
+  const allowFrom = canonicalIds(config.allowFrom);
+  if (allowFrom.length === 0) throw new Error('invalid channel group configuration');
+  const groups: ChannelAllowedGroup[] = [];
+  for (const raw of config.telegramGroups) {
+    const group = record(raw);
+    if (typeof group.groupId !== 'string' || !/^-\d{3,25}$/.test(group.groupId)) {
+      throw new Error('invalid channel group configuration');
+    }
+    groups.push({ conversationId: group.groupId, guildId: null, allowFrom: [...allowFrom] });
+  }
+  return groups;
+}
+
+export function assertChannelConversationAuthorized(
+  connection: ChannelSyncConnection,
+  event: Pick<ChannelMessageEvent, 'conversationId' | 'conversationScope' | 'guildId' | 'peerId'>,
+): void {
+  const conversationId = event.conversationId ?? event.peerId;
+  const configuredConversation = connection.allowedGroups.some(
+    (group) => group.conversationId === conversationId,
+  );
+  if ((event.conversationScope ?? 'direct') === 'direct') {
+    if (event.guildId != null || configuredConversation) {
+      throw new Error('channel conversation scope is not authorized');
+    }
+    return;
+  }
+  const guildId = event.guildId ?? null;
+  const allowed = connection.allowedGroups.some(
+    (group) =>
+      group.conversationId === conversationId &&
+      group.guildId === guildId &&
+      group.allowFrom.includes(event.peerId),
+  );
+  if (!allowed) throw new Error('channel conversation scope is not authorized');
 }
 
 /** Digest never crosses connection boundaries, even for the same provider id. */
@@ -145,7 +233,7 @@ function sessionExternalId(connectionId: string, fingerprint: string): string {
 export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreLike {
   async getLiveConnection(connectionId: string): Promise<ChannelSyncConnection | null> {
     const rows = await pg<ConnectionRow[]>`
-      select id, account_id, agent_id, channel, runtime_account_id
+      select id, account_id, agent_id, channel, runtime_account_id, metadata
       from channel_connections
       where id = ${connectionId}
         and desired_state = 'active'
@@ -167,6 +255,7 @@ export class PostgresChannelSessionSyncStore implements ChannelSessionSyncStoreL
       agentId: row.agent_id,
       channel: row.channel,
       runtimeAccountId: row.runtime_account_id,
+      allowedGroups: configuredChannelGroups(row.channel, row.metadata),
     };
   }
 
@@ -355,9 +444,14 @@ export class ChannelSessionSync {
 
   async syncMessage(event: ChannelMessageEvent): Promise<ChannelMessageSyncResult> {
     const connection = await this.store.getLiveConnection(event.connectionId);
-    if (!connection || connection.runtimeAccountId !== event.runtimeAccountId) {
+    if (
+      !connection ||
+      connection.id !== event.connectionId ||
+      connection.runtimeAccountId !== event.runtimeAccountId
+    ) {
       throw new Error('channel connection unavailable');
     }
+    assertChannelConversationAuthorized(connection, event);
     const peerFingerprint = channelPeerFingerprint(connection.id, event.peerId);
     const encrypted = this.vault.encrypt(
       event.peerId,
@@ -367,7 +461,7 @@ export class ChannelSessionSync {
       connection.id,
       event.conversationId ?? event.peerId,
     );
-    const { peerId: _peerId, conversationId: _conversationId, ...persistedEvent } = event;
+    const { peerId: _peerId, conversationId: _conversationId, guildId: _guildId, ...persistedEvent } = event;
     return this.store.persistMessage({
       connection,
       event: persistedEvent,
@@ -387,6 +481,7 @@ export class ChannelSessionSync {
         runtimeAccountId: connection.runtimeAccountId,
         conversationFingerprint,
         conversationScope: event.conversationScope ?? 'direct',
+        ...(event.guildId ? { guildId: event.guildId } : {}),
         readOnly: true,
       },
     });

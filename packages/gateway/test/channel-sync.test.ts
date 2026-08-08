@@ -526,21 +526,6 @@ describe('hosted named channel accounts', () => {
     await expect(
       ensureHostedChannelAccount({
         dataDir,
-        channel: 'discord',
-        runtimeAccountId: 'agent',
-        connectionId: connectionA,
-        accountId: accountA,
-        bindAgentId: 'agent',
-        dmPolicy: 'pairing',
-        allowFrom: [],
-        discordGuilds: [
-          { guildId: '111111111111111111', channelIds: ['222222222222222222'] },
-        ],
-      }),
-    ).rejects.toThrow(/guild delivery is disabled.*private user memory/);
-    await expect(
-      ensureHostedChannelAccount({
-        dataDir,
         channel: 'telegram',
         runtimeAccountId: 'agent',
         connectionId: connectionA,
@@ -551,5 +536,84 @@ describe('hosted named channel accounts', () => {
       }),
     ).rejects.toThrow(ConfigGenError);
     expect(await readOpenClawConfig(dataDir)).toEqual({ marker: 'unchanged' });
+  });
+
+  it('projects mention-gated allowlisted Discord and Telegram groups into native and runtime config', async () => {
+    await seedConfig(hostedAgents(['discord-agent', 'telegram-agent']));
+    const allowFrom = ['404322488215142410'];
+    await ensureHostedChannelAccount({
+      dataDir,
+      channel: 'discord',
+      runtimeAccountId: 'discord-agent',
+      connectionId: connectionA,
+      accountId: accountA,
+      bindAgentId: 'discord-agent',
+      dmPolicy: 'allowlist',
+      allowFrom,
+      discordGuilds: [
+        { guildId: '111111111111111111', channelIds: ['222222222222222222'] },
+      ],
+    });
+    const { config } = await ensureHostedChannelAccount({
+      dataDir,
+      channel: 'telegram',
+      runtimeAccountId: 'telegram-agent',
+      connectionId: connectionB,
+      accountId: accountB,
+      bindAgentId: 'telegram-agent',
+      dmPolicy: 'allowlist',
+      allowFrom,
+      telegramGroups: [{ groupId: '-1001234567890' }],
+    });
+
+    const channels = config.channels as Record<string, { accounts: Record<string, Record<string, unknown>> }>;
+    expect(channels.discord!.accounts['discord-agent']).toMatchObject({
+      groupPolicy: 'allowlist',
+      guilds: {
+        '111111111111111111': {
+          users: allowFrom,
+          requireMention: true,
+          channels: {
+            '222222222222222222': {
+              enabled: true,
+              requireMention: true,
+              users: allowFrom,
+            },
+          },
+        },
+      },
+    });
+    expect(channels.telegram!.accounts['telegram-agent']).toMatchObject({
+      groupPolicy: 'allowlist',
+      groupAllowFrom: allowFrom,
+      groups: { '-1001234567890': { enabled: true, requireMention: true } },
+    });
+    const mappings = (
+      config.plugins as { entries: Record<string, { config: { accounts: unknown[] } }> }
+    ).entries[EDEN_CHANNEL_RUNTIME_PLUGIN_ID]!.config.accounts;
+    expect(mappings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          channel: 'discord',
+          accountId: 'discord-agent',
+          groups: [{
+            conversationId: '222222222222222222',
+            guildId: '111111111111111111',
+            allowFrom,
+            mentionRequired: true,
+          }],
+        }),
+        expect.objectContaining({
+          channel: 'telegram',
+          accountId: 'telegram-agent',
+          groups: [{
+            conversationId: '-1001234567890',
+            guildId: null,
+            allowFrom,
+            mentionRequired: true,
+          }],
+        }),
+      ]),
+    );
   });
 });

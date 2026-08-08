@@ -19,6 +19,7 @@ const connection: ChannelSyncConnection = {
   agentId: randomUUID(),
   channel: 'discord',
   runtimeAccountId: 'eden-connection-one',
+  allowedGroups: [],
 };
 
 function vault(): SecretVaultLike {
@@ -107,9 +108,13 @@ describe('ChannelSessionSync', () => {
   });
 
   it('projects an allowlisted group as one conversation-scoped memory boundary', async () => {
+    const groupConnection: ChannelSyncConnection = {
+      ...connection,
+      allowedGroups: [{ conversationId: '758719600895590444', guildId: '758719600895590441', allowFrom: ['1234567890'] }],
+    };
     let persisted: Parameters<ChannelSessionSyncStoreLike['persistMessage']>[0] | undefined;
     const store: ChannelSessionSyncStoreLike = {
-      getLiveConnection: vi.fn(async () => connection),
+      getLiveConnection: vi.fn(async () => groupConnection),
       persistMessage: vi.fn(async (input) => {
         persisted = input;
         return {
@@ -127,8 +132,9 @@ describe('ChannelSessionSync', () => {
       connectionId: connection.id,
       runtimeAccountId: connection.runtimeAccountId,
       gatewaySessionKey: 'agent:one:discord:account:channel:group-42',
-      conversationId: 'group-42',
+      conversationId: '758719600895590444',
       conversationScope: 'group',
+      guildId: '758719600895590441',
       peerId: '1234567890',
       externalMessageId: 'discord:group-message:1',
       role: 'user',
@@ -138,12 +144,58 @@ describe('ChannelSessionSync', () => {
     expect(result.memoryContext).toEqual({
       linkState: 'group',
       relativePath: channelGroupMemoryPath(
-        channelConversationFingerprint(connection.id, 'group-42'),
+        channelConversationFingerprint(connection.id, '758719600895590444'),
       ),
     });
     expect(persisted?.event.conversationScope).toBe('group');
     expect(persisted?.safeChannelMetadata).toMatchObject({ conversationScope: 'group' });
     expect(result.memoryContext.relativePath).not.toContain('1234567890');
+  });
+
+  it('fails closed on cross-guild, cross-connection, spoofed-scope, and unconfigured groups', async () => {
+    const persistMessage = vi.fn();
+    const allowed: ChannelSyncConnection = {
+      ...connection,
+      allowedGroups: [{ conversationId: '758719600895590444', guildId: '758719600895590441', allowFrom: ['1234567890'] }],
+    };
+    const service = new ChannelSessionSync(
+      { getLiveConnection: vi.fn(async () => allowed), persistMessage },
+      vault(),
+    );
+    const base = {
+      connectionId: allowed.id,
+      runtimeAccountId: allowed.runtimeAccountId,
+      gatewaySessionKey: 'group-session',
+      conversationId: '758719600895590444',
+      conversationScope: 'group' as const,
+      guildId: '758719600895590441',
+      peerId: '1234567890',
+      externalMessageId: 'message-1',
+      role: 'user' as const,
+      content: 'hello',
+      createdAt: new Date(),
+    };
+    for (const event of [
+      { ...base, guildId: '758719600895590442' },
+      { ...base, conversationId: '758719600895590445' },
+      { ...base, peerId: '1234567891' },
+      { ...base, conversationScope: 'direct' as const },
+    ]) {
+      await expect(service.syncMessage(event)).rejects.toThrow('scope is not authorized');
+    }
+    const noGroups = new ChannelSessionSync(
+      { getLiveConnection: vi.fn(async () => connection), persistMessage },
+      vault(),
+    );
+    await expect(noGroups.syncMessage(base)).rejects.toThrow('scope is not authorized');
+    const crossConnection = new ChannelSessionSync(
+      { getLiveConnection: vi.fn(async () => allowed), persistMessage },
+      vault(),
+    );
+    await expect(
+      crossConnection.syncMessage({ ...base, connectionId: randomUUID() }),
+    ).rejects.toThrow('connection unavailable');
+    expect(persistMessage).not.toHaveBeenCalled();
   });
 
   it('never selects linked private memory for a group, and isolates distinct groups', () => {

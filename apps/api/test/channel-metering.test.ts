@@ -10,6 +10,7 @@ import {
   ChannelTurnMeteringService,
   assertChannelReservationReplay,
   assertChannelExecutionMatches,
+  channelAuthorizationReversalKind,
   isBillableChannelTurnProvenance,
   meterChannelUsage,
   type BillableChannelConnection,
@@ -267,6 +268,89 @@ describe('ChannelTurnMeteringService economic authorization', () => {
     await new ChannelTurnMeteringService(persistence).refundDeliveryFailure(record.turnId);
     expect(persistence.claimRefund).toHaveBeenCalledWith(record.turnId, false, true);
     expect(persistence.reverseAuthorized).toHaveBeenCalledWith(record.turnId, 'channel_delivery_failed');
+  });
+
+  it('accepts only an exact compensation replay and rejects a different prior reversal', async () => {
+    const turnId = randomUUID();
+    const exactReplay = store({
+      claimRefund: vi.fn(async () => ({
+        turnId,
+        status: 'refunded' as const,
+        claimed: false,
+        errorCode: 'channel_delivery_failed',
+      })),
+    });
+    await expect(new ChannelTurnMeteringService(exactReplay).refundDeliveryFailure(turnId)).resolves.toBeUndefined();
+    expect(exactReplay.reverseAuthorized).not.toHaveBeenCalled();
+
+    const different = store({
+      claimRefund: vi.fn(async () => ({
+        turnId,
+        status: 'refunded' as const,
+        claimed: false,
+        errorCode: 'runtime_refund',
+      })),
+    });
+    await expect(new ChannelTurnMeteringService(different).refundDeliveryFailure(turnId)).rejects.toThrow(
+      'not refundable',
+    );
+    expect(different.reverseAuthorized).not.toHaveBeenCalled();
+  });
+
+  it('keeps settled authorization terminal and permits only the delivery-pending compensation marker', () => {
+    expect(
+      channelAuthorizationReversalKind({
+        authorizationState: 'reserved',
+        channelStatus: 'refunding',
+        channelErrorCode: 'runtime_refund',
+      }),
+    ).toBe('pre_settlement');
+    expect(
+      channelAuthorizationReversalKind({
+        authorizationState: 'settled',
+        channelStatus: 'refunding',
+        channelErrorCode: 'channel_delivery_compensation_pending',
+      }),
+    ).toBe('delivery_compensation');
+    for (const invalid of [
+      { authorizationState: 'settled', channelStatus: 'delivery_pending', channelErrorCode: null },
+      { authorizationState: 'settled', channelStatus: 'refunding', channelErrorCode: 'runtime_refund' },
+      { authorizationState: 'settled', channelStatus: 'delivered', channelErrorCode: 'channel_delivery_compensation_pending' },
+    ]) {
+      expect(() => channelAuthorizationReversalKind(invalid)).toThrow('not reversible');
+    }
+  });
+
+  it('pins every channel crash boundary to reversal, compensation, or delivered finality', () => {
+    const crashPoints = [
+      { point: 'before provider completion', authorization: 'reserved', channel: 'reserved', reapable: true },
+      { point: 'after provider completion before settlement', authorization: 'reserved', channel: 'settling', reapable: true },
+      { point: 'after settlement before transcript write', authorization: 'settled', channel: 'delivery_pending', reapable: true },
+      { point: 'after transcript write before native delivery', authorization: 'settled', channel: 'delivery_pending', reapable: true },
+      { point: 'after native delivery', authorization: 'settled', channel: 'delivered', reapable: false },
+      { point: 'during compensation', authorization: 'settled', channel: 'refunding', reapable: true },
+    ] as const;
+    for (const crash of crashPoints) {
+      expect(REAPABLE_CHANNEL_TURN_STATUSES.includes(crash.channel)).toBe(crash.reapable);
+      if (crash.point === 'during compensation') {
+        expect(
+          channelAuthorizationReversalKind({
+            authorizationState: crash.authorization,
+            channelStatus: crash.channel,
+            channelErrorCode: 'channel_delivery_compensation_pending',
+          }),
+        ).toBe('delivery_compensation');
+      }
+      if (crash.point === 'after native delivery') {
+        expect(() =>
+          channelAuthorizationReversalKind({
+            authorizationState: crash.authorization,
+            channelStatus: crash.channel,
+            channelErrorCode: null,
+          }),
+        ).toThrow('not reversible');
+      }
+    }
   });
 
   it('rejects cross-bot replay attribution before authorization', async () => {

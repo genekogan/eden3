@@ -812,6 +812,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       expect(first.calls.find((call) => call.path === '/channels/runtime/messages').body).toMatchObject({
         conversationId: '758719600895590444',
         conversationScope: 'group',
+        guildId: '758719600895590441',
       });
       await first.bridge.onAgentEnd(
         { runId: RUN_A, success: false, messages: [] },

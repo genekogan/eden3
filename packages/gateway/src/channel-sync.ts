@@ -8,6 +8,7 @@ import {
   resolveDataDir,
   upsertHostedChannelRuntimeMapping,
   type ConfigGenOptions,
+  type HostedChannelRuntimeGroup,
   type OpenClawConfig,
 } from './config-gen';
 import {
@@ -196,6 +197,10 @@ export interface HostedChannelGuildSelection {
   channelIds: string[];
 }
 
+export interface HostedTelegramGroupSelection {
+  groupId: string;
+}
+
 export interface HostedChannelAccountOptions extends ConfigGenOptions {
   channel: HostedChannelKind;
   /** Stable OpenClaw account id, normally the attached agent's openclaw id. */
@@ -209,6 +214,7 @@ export interface HostedChannelAccountOptions extends ConfigGenOptions {
   dmPolicy: HostedChannelDmPolicy;
   allowFrom: string[];
   discordGuilds?: HostedChannelGuildSelection[];
+  telegramGroups?: HostedTelegramGroupSelection[];
 }
 
 export interface RemoveHostedChannelAccountOptions extends ConfigGenOptions {
@@ -422,14 +428,53 @@ function ensureHostedPluginAllowed(config: OpenClawConfig, channel: HostedChanne
   return changed;
 }
 
-function validateDiscordGuildSelections(
-  selections: HostedChannelGuildSelection[] | undefined,
-): void {
-  if ((selections?.length ?? 0) > 0) {
-    throw new ConfigGenError(
-      'hosted Discord guild delivery is disabled: shared group transcripts cannot access private user memory',
-    );
+function hostedGroups(options: HostedChannelAccountOptions, allowFrom: string[]): HostedChannelRuntimeGroup[] {
+  const groups: HostedChannelRuntimeGroup[] = [];
+  if ((options.discordGuilds?.length ?? 0) > 100 || (options.telegramGroups?.length ?? 0) > 100) {
+    throw new ConfigGenError('hosted channel groups cannot exceed 100 entries');
   }
+  if (options.channel === 'discord') {
+    if ((options.telegramGroups?.length ?? 0) > 0) {
+      throw new ConfigGenError('Telegram groups cannot be projected into a Discord account');
+    }
+    for (const selection of options.discordGuilds ?? []) {
+      if (!/^\d{3,25}$/.test(selection.guildId) || selection.channelIds.length > 100) {
+        throw new ConfigGenError('invalid hosted Discord guild selection');
+      }
+      for (const channelId of selection.channelIds) {
+        if (!/^\d{3,25}$/.test(channelId)) {
+          throw new ConfigGenError('invalid hosted Discord channel id');
+        }
+        groups.push({
+          conversationId: channelId,
+          guildId: selection.guildId,
+          allowFrom: [...allowFrom],
+          mentionRequired: true,
+        });
+      }
+    }
+  } else {
+    if ((options.discordGuilds?.length ?? 0) > 0) {
+      throw new ConfigGenError('Discord guilds cannot be projected into a Telegram account');
+    }
+    for (const selection of options.telegramGroups ?? []) {
+      if (!/^-\d{3,25}$/.test(selection.groupId)) {
+        throw new ConfigGenError('invalid hosted Telegram group id');
+      }
+      groups.push({
+        conversationId: selection.groupId,
+        guildId: null,
+        allowFrom: [...allowFrom],
+        mentionRequired: true,
+      });
+    }
+  }
+  const keys = groups.map((group) => `${group.guildId ?? ''}\0${group.conversationId}`);
+  if (new Set(keys).size !== keys.length) throw new ConfigGenError('hosted channel groups must be unique');
+  if (groups.length > 0 && allowFrom.length === 0) {
+    throw new ConfigGenError('hosted group delivery requires at least one allowFrom id');
+  }
+  return groups;
 }
 
 function isHostedAccountBinding(
@@ -457,7 +502,7 @@ export async function ensureHostedChannelAccount(
   if (options.dmPolicy === 'allowlist' && allowFrom.length === 0) {
     throw new ConfigGenError('allowlist channel accounts require at least one allowFrom id');
   }
-  if (options.channel === 'discord') validateDiscordGuildSelections(options.discordGuilds);
+  const groups = hostedGroups(options, allowFrom);
 
   const capKey = hostedCapabilityKey();
   const dataDir = options.dataDir ?? resolveDataDir();
@@ -504,11 +549,43 @@ export async function ensureHostedChannelAccount(
         : { botToken: hostedChannelSecretRef(scopeOf(options), capKey) }),
       dmPolicy: options.dmPolicy,
       allowFrom,
-      // Shared group/guild transcripts cannot safely receive one DM sender's
-      // private memory context or private-memory tools. Keep hosted delivery
-      // DM-only until OpenClaw exposes a securely isolated per-participant
-      // group memory/tool scope.
-      groupPolicy: 'disabled',
+      groupPolicy: groups.length > 0 ? 'allowlist' : 'disabled',
+      ...(options.channel === 'discord' && groups.length > 0
+        ? {
+            guilds: Object.fromEntries(
+              [...new Set(groups.map((group) => group.guildId!))].map((guildId) => [
+                guildId,
+                {
+                  users: [...allowFrom],
+                  requireMention: true,
+                  channels: Object.fromEntries(
+                    groups
+                      .filter((group) => group.guildId === guildId)
+                      .map((group) => [
+                        group.conversationId,
+                        {
+                          enabled: true,
+                          requireMention: true,
+                          users: [...allowFrom],
+                        },
+                      ]),
+                  ),
+                },
+              ]),
+            ),
+          }
+        : {}),
+      ...(options.channel === 'telegram' && groups.length > 0
+        ? {
+            groupAllowFrom: [...allowFrom],
+            groups: Object.fromEntries(
+              groups.map((group) => [
+                group.conversationId,
+                { enabled: true, requireMention: true },
+              ]),
+            ),
+          }
+        : {}),
     };
     if (setHostedValue(accounts, options.runtimeAccountId, account)) changed = true;
 
@@ -541,6 +618,7 @@ export async function ensureHostedChannelAccount(
         accountId: options.runtimeAccountId,
         connectionId: options.connectionId,
         agentId: options.bindAgentId,
+        ...(groups.length > 0 ? { groups } : {}),
       })
     ) {
       changed = true;

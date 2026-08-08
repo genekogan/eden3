@@ -1,3 +1,5 @@
+import { createHmac, randomBytes } from 'node:crypto';
+
 import {
   assertRequestScopedSecretHandle,
   type ChannelCredentialCustodyLike,
@@ -38,6 +40,167 @@ export type XConnectorResult<T> =
 export interface XUserClientLike {
   validate(credentials: XByoCredentials): Promise<XConnectorResult<XUserIdentity>>;
   post(credentials: XByoCredentials, text: string): Promise<XConnectorResult<{ id: string }>>;
+}
+
+type FetchLike = typeof fetch;
+
+function oauthEncode(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (character) =>
+    `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+}
+
+function oauthAuthorization(
+  method: 'GET' | 'POST',
+  url: string,
+  credentials: XByoCredentials,
+  nonce: string,
+  timestamp: number,
+): string {
+  const parameters: Record<string, string> = {
+    oauth_consumer_key: credentials.apiKey,
+    oauth_nonce: nonce,
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: String(timestamp),
+    oauth_token: credentials.accessToken,
+    oauth_version: '1.0',
+  };
+  const normalized = Object.entries(parameters)
+    .map(([key, value]) => [oauthEncode(key), oauthEncode(value)] as const)
+    .sort(([leftKey, leftValue], [rightKey, rightValue]) =>
+      leftKey === rightKey ? leftValue.localeCompare(rightValue) : leftKey.localeCompare(rightKey),
+    )
+    .map(([key, value]) => `${key}=${value}`)
+    .join('&');
+  const signatureBase = [method, oauthEncode(url), oauthEncode(normalized)].join('&');
+  const signingKey = `${oauthEncode(credentials.apiSecret)}&${oauthEncode(credentials.accessTokenSecret)}`;
+  parameters.oauth_signature = createHmac('sha1', signingKey)
+    .update(signatureBase, 'utf8')
+    .digest('base64');
+  return `OAuth ${Object.entries(parameters)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => `${oauthEncode(key)}="${oauthEncode(value)}"`)
+    .join(', ')}`;
+}
+
+function retryAfterSeconds(response: Response): number | undefined {
+  const raw = response.headers.get('retry-after');
+  if (!raw) return undefined;
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds) : undefined;
+}
+
+/** Production X adapter using the four BYO-app OAuth 1.0a credentials. */
+export class FetchXUserClient implements XUserClientLike {
+  constructor(
+    private readonly fetchImpl: FetchLike = fetch,
+    private readonly options: {
+      timeoutMs?: number;
+      nonce?: () => string;
+      nowSeconds?: () => number;
+    } = {},
+  ) {}
+
+  private async request(
+    method: 'GET' | 'POST',
+    url: string,
+    credentials: XByoCredentials,
+    body?: Record<string, unknown>,
+  ): Promise<Response | null> {
+    try {
+      return await this.fetchImpl(url, {
+        method,
+        headers: {
+          authorization: oauthAuthorization(
+            method,
+            url,
+            credentials,
+            this.options.nonce?.() ?? randomBytes(16).toString('hex'),
+            this.options.nowSeconds?.() ?? Math.floor(Date.now() / 1_000),
+          ),
+          ...(body ? { 'content-type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(this.options.timeoutMs ?? 7_500),
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  async validate(credentials: XByoCredentials): Promise<XConnectorResult<XUserIdentity>> {
+    const response = await this.request('GET', 'https://api.x.com/2/users/me', credentials);
+    if (!response) {
+      return { ok: false, code: 'provider_unavailable', message: 'X could not be reached.', retryable: true };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, code: 'invalid_credentials', message: 'X rejected these app credentials.', retryable: false };
+    }
+    if (response.status === 429) {
+      return {
+        ok: false,
+        code: 'rate_limited',
+        message: 'X rate-limited credential validation. Wait for the limit to reset.',
+        retryable: true,
+        ...(retryAfterSeconds(response) !== undefined
+          ? { retryAfterSeconds: retryAfterSeconds(response) }
+          : {}),
+      };
+    }
+    if (!response.ok) {
+      return { ok: false, code: 'provider_unavailable', message: 'X could not validate these credentials.', retryable: true };
+    }
+    try {
+      const payload = (await response.json()) as { data?: Record<string, unknown> };
+      const data = payload.data;
+      if (!data || typeof data.id !== 'string' || typeof data.username !== 'string') throw new Error();
+      return {
+        ok: true,
+        value: {
+          id: data.id,
+          username: data.username,
+          name: typeof data.name === 'string' ? data.name : null,
+        },
+      };
+    } catch {
+      return { ok: false, code: 'provider_unavailable', message: 'X returned an incomplete account identity.', retryable: true };
+    }
+  }
+
+  async post(
+    credentials: XByoCredentials,
+    text: string,
+  ): Promise<XConnectorResult<{ id: string }>> {
+    const response = await this.request('POST', 'https://api.x.com/2/tweets', credentials, { text });
+    if (!response) {
+      return { ok: false, code: 'provider_unavailable', message: 'X could not be reached.', retryable: true };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, code: 'revoked', message: 'X rejected the saved access token. Replace or revoke it.', retryable: false };
+    }
+    if (response.status === 429) {
+      return {
+        ok: false,
+        code: 'rate_limited',
+        message: 'X rate-limited this account. Wait for the limit to reset.',
+        retryable: true,
+        ...(retryAfterSeconds(response) !== undefined
+          ? { retryAfterSeconds: retryAfterSeconds(response) }
+          : {}),
+      };
+    }
+    if (response.status !== 201) {
+      return { ok: false, code: 'provider_unavailable', message: 'X could not publish this post.', retryable: true };
+    }
+    try {
+      const payload = (await response.json()) as { data?: Record<string, unknown> };
+      const id = payload.data?.id;
+      if (typeof id !== 'string' || !/^\d{1,25}$/.test(id)) throw new Error();
+      return { ok: true, value: { id } };
+    } catch {
+      return { ok: false, code: 'provider_unavailable', message: 'X returned an incomplete post result.', retryable: true };
+    }
+  }
 }
 
 export interface XByoConnection {

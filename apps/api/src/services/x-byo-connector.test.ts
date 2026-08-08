@@ -5,6 +5,7 @@ import type {
   ChannelSecretHandle,
 } from './channel-connector-custody';
 import {
+  FetchXUserClient,
   XByoConnectorService,
   type XByoCredentials,
   type XUserClientLike,
@@ -130,5 +131,72 @@ describe('XByoConnectorService', () => {
     });
     expect(result).toMatchObject({ ok: false, code: 'provider_unavailable' });
     expect(custody.seal).not.toHaveBeenCalled();
+  });
+});
+
+describe('FetchXUserClient', () => {
+  const clientWith = (fetchImpl: typeof fetch) =>
+    new FetchXUserClient(fetchImpl, {
+      nonce: () => 'fixed-nonce',
+      nowSeconds: () => 1_700_000_000,
+    });
+
+  it('validates the authenticated X user with an OAuth 1.0a signed GET', async () => {
+    const fetchImpl = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+      new Response(
+        JSON.stringify({ data: { id: '2244994945', username: 'XDevelopers', name: 'X Dev' } }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    const result = await clientWith(fetchImpl as typeof fetch).validate(CREDENTIALS);
+    expect(result).toEqual({
+      ok: true,
+      value: { id: '2244994945', username: 'XDevelopers', name: 'X Dev' },
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://api.x.com/2/users/me',
+      expect.objectContaining({ method: 'GET' }),
+    );
+    const headers = fetchImpl.mock.calls[0]![1]!.headers as Record<string, string>;
+    expect(headers.authorization).toContain('oauth_signature_method="HMAC-SHA1"');
+    expect(headers.authorization).toContain('oauth_nonce="fixed-nonce"');
+    expect(headers.authorization).not.toContain(CREDENTIALS.apiSecret);
+    expect(headers.authorization).not.toContain(CREDENTIALS.accessTokenSecret);
+  });
+
+  it('publishes text through the signed POST /2/tweets contract', async () => {
+    const fetchImpl = vi.fn(async (_input: Parameters<typeof fetch>[0], _init?: RequestInit) =>
+      new Response(JSON.stringify({ data: { id: '1900000000000000000', text: 'hello' } }), {
+        status: 201,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    await expect(clientWith(fetchImpl as typeof fetch).post(CREDENTIALS, 'hello')).resolves.toEqual({
+      ok: true,
+      value: { id: '1900000000000000000' },
+    });
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://api.x.com/2/tweets',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ text: 'hello' }) }),
+    );
+  });
+
+  it('returns actionable revoked and rate-limit outcomes without response-body leakage', async () => {
+    const revoked = vi.fn(async () => new Response('provider detail must not escape', { status: 401 }));
+    await expect(clientWith(revoked as typeof fetch).post(CREDENTIALS, 'hello')).resolves.toMatchObject({
+      ok: false,
+      code: 'revoked',
+      retryable: false,
+    });
+
+    const limited = vi.fn(async () =>
+      new Response('provider detail must not escape', { status: 429, headers: { 'retry-after': '17' } }),
+    );
+    await expect(clientWith(limited as typeof fetch).validate(CREDENTIALS)).resolves.toMatchObject({
+      ok: false,
+      code: 'rate_limited',
+      retryable: true,
+      retryAfterSeconds: 17,
+    });
   });
 });

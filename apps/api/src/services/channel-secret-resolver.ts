@@ -82,7 +82,7 @@ export class PostgresChannelSecretStore implements ChannelSecretStoreLike {
       from channel_connections
       where id = ${connectionId}
         and desired_state = 'active'
-        and channel in ('discord', 'telegram')
+        and channel in ('discord', 'telegram', 'x')
       limit 1
     `;
     const row = rows[0];
