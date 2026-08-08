@@ -541,7 +541,13 @@ function makeRunner(
       completedAt: string | null;
       summary: string | null;
     }>;
-    refund?: (params: { originalIdempotencyKey: string; type?: string }) => Promise<null>;
+    reverse?: (params: {
+      turnId: string;
+      refundType: string;
+      fence?: (dbc: never) => Promise<void>;
+    }) => Promise<{ reversed: boolean; balanceTotal?: number }>;
+    claimFence?: (claim: MemoryDreamRunClaim) => Promise<void>;
+    recordRecoveryUsage?: (claim: MemoryDreamRunClaim) => Promise<void>;
     providerCalled?: () => void;
     assistantContent?: (messageId: string, sessionId: string) => Promise<string | null>;
   } = {},
@@ -564,7 +570,11 @@ function makeRunner(
     durability,
     ...(overrides.distill ? { distillMemory: overrides.distill as never } : {}),
     ...(overrides.status ? { memoryStatus: overrides.status as never } : {}),
-    ...(overrides.refund ? { refundDebit: overrides.refund as never } : {}),
+    reverseAuthorization:
+      (overrides.reverse as never) ??
+      (async () => ({ reversed: true, balanceTotal: 100 })),
+    claimFence: overrides.claimFence ?? (async () => {}),
+    recordRecoveryUsage: overrides.recordRecoveryUsage ?? (async () => {}),
     ...(overrides.assistantContent
       ? { loadAssistantContent: overrides.assistantContent }
       : {}),
@@ -887,7 +897,8 @@ describe('memory dream crash safety', () => {
         usage: null,
         debitKeys: [runId],
       });
-      const refunds: string[] = [];
+      const reversals: string[] = [];
+      const fencedClaims: string[] = [];
       let providerCalls = 0;
       const deprovisionedCandidate = {
         ...activeCandidate(workspace),
@@ -898,9 +909,13 @@ describe('memory dream crash safety', () => {
         recoveryPending: true,
       };
       const runner = makeRunner(durability, {
-        refund: async ({ originalIdempotencyKey }) => {
-          refunds.push(originalIdempotencyKey);
-          return null;
+        reverse: async ({ turnId, fence }) => {
+          reversals.push(turnId);
+          await fence?.(undefined as never);
+          return { reversed: true, balanceTotal: 100 };
+        },
+        claimFence: async (claim) => {
+          fencedClaims.push(claim.claimToken);
         },
         providerCalled: () => {
           providerCalls += 1;
@@ -914,12 +929,14 @@ describe('memory dream crash safety', () => {
           lastActivityAt: new Date('2026-07-31T05:00:00.000Z'),
           isRecovery: true,
         }),
-      ).rejects.toThrow('terminal recovery is pending');
-      expect(refunds).toEqual([`${runId}:settle`, runId]);
+      ).rejects.toThrow('authorization was reversed idempotently');
+      expect(reversals).toEqual([runId]);
+      expect(fencedClaims).toEqual([expect.any(String)]);
       expect(providerCalls).toBe(0);
       expect(durability.saves.at(-1)?.providerStatus).toBe('indeterminate');
 
-      // The same-day recovery-pending retry re-runs only idempotent refunds,
+      // The same-day recovery-pending retry re-runs only the idempotent
+      // canonical authorization reversal,
       // then fails terminally without ever replaying the provider.
       await expect(
         runner.run(deprovisionedCandidate, 'sweep-1', {
@@ -929,20 +946,16 @@ describe('memory dream crash safety', () => {
           lastActivityAt: new Date('2026-07-31T05:00:00.000Z'),
           isRecovery: true,
         }),
-      ).rejects.toThrow('were reversed idempotently');
-      expect(refunds).toEqual([
-        `${runId}:settle`,
-        runId,
-        `${runId}:settle`,
-        runId,
-      ]);
+      ).rejects.toThrow('authorization was reversed idempotently');
+      expect(reversals).toEqual([runId, runId]);
+      expect(fencedClaims).toHaveLength(2);
       expect(providerCalls).toBe(0);
     } finally {
       await rm(workspace, { recursive: true, force: true });
     }
   });
 
-  it('retries refunds for terminal error usage without replaying the provider', async () => {
+  it('retries canonical reversal for terminal error usage without replaying the provider', async () => {
     const workspace = await mkdtemp(path.join(tmpdir(), 'eden3-memory-error-refund-'));
     const runId = randomUUID();
     try {
@@ -967,17 +980,17 @@ describe('memory dream crash safety', () => {
         },
         debitKeys: [runId],
       });
-      const refunds: string[] = [];
-      let failFirstRefund = true;
+      const reversals: string[] = [];
+      let failFirstReversal = true;
       let providerCalls = 0;
       const runner = makeRunner(durability, {
-        refund: async ({ originalIdempotencyKey }) => {
-          refunds.push(originalIdempotencyKey);
-          if (failFirstRefund) {
-            failFirstRefund = false;
+        reverse: async ({ turnId }) => {
+          reversals.push(turnId);
+          if (failFirstReversal) {
+            failFirstReversal = false;
             throw new Error('transient ledger failure');
           }
-          return null;
+          return { reversed: true, balanceTotal: 100 };
         },
         providerCalled: () => {
           providerCalls += 1;
@@ -993,21 +1006,16 @@ describe('memory dream crash safety', () => {
 
       await expect(
         runner.run(activeCandidate(workspace), 'sweep-1', claim),
-      ).rejects.toThrow('refund remains pending');
+      ).rejects.toThrow('reversal remains pending');
+
+      await expect(
+        runner.run(activeCandidate(workspace), 'sweep-1', claim),
+      ).rejects.toThrow('authorization was reversed idempotently');
+      expect(reversals).toEqual([runId, runId]);
       expect(durability.saves.at(-1)).toMatchObject({
         checkpoint: { phase: 'provider_terminal' },
         providerStatus: 'terminal',
       });
-
-      await expect(
-        runner.run(activeCandidate(workspace), 'sweep-1', claim),
-      ).rejects.toThrow('debits were reversed idempotently');
-      expect(refunds).toEqual([
-        `${runId}:settle`,
-        runId,
-        `${runId}:settle`,
-        runId,
-      ]);
       expect(providerCalls).toBe(0);
     } finally {
       await rm(workspace, { recursive: true, force: true });
