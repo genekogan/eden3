@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { gatewaySessionKey, refund, type AuthSession } from '@eden3/core';
+import { gatewaySessionKey, type AuthSession, type DbHandle } from '@eden3/core';
 import {
   db,
+  memoryDreamRuns,
   messages,
   pg,
   sessionAgents,
@@ -14,7 +15,7 @@ import {
 } from '@eden3/db';
 import { MEMORY_DREAM_MODEL, type MemoryPromotionSummary } from '@eden3/gateway';
 import type { AgentRuntime } from '@eden3/shared';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
 import type { EventsBus } from '../events-bus';
 import type { MemoryRuntimeLike, ModelRuntimeCatalogLike } from '../gateway-glue';
@@ -29,8 +30,13 @@ import type { TurnRegistry } from './turn-registry';
 import {
   runTurn,
   type CompatClientLike,
+  TurnClaimLostError,
   type TurnSink,
 } from './turns';
+import {
+  reverseTurnAuthorization,
+  type ReverseTurnAuthorizationResult,
+} from './turn-authorization';
 import { MAX_PROVIDER_TURN_MS } from './subscription-turn-claims';
 
 export type MemoryDreamSkipReason =
@@ -834,7 +840,9 @@ interface EdenMemoryDreamAgentRunnerOptions {
   durability?: MemoryDreamDurability;
   distillMemory?: typeof distillAgentMemory;
   memoryStatus?: typeof agentMemoryStatus;
-  refundDebit?: typeof refund;
+  reverseAuthorization?: typeof reverseTurnAuthorization;
+  claimFence?: (claim: MemoryDreamRunClaim, dbc?: DbHandle) => Promise<void>;
+  recordRecoveryUsage?: (claim: MemoryDreamRunClaim, dbc?: DbHandle) => Promise<void>;
   loadAssistantContent?: (messageId: string, sessionId: string) => Promise<string | null>;
   now?: () => Date;
   onError?: (err: unknown, context: string) => void;
@@ -1074,6 +1082,96 @@ function parseMemoryDreamCheckpoint(value: unknown): MemoryDreamCheckpoint | nul
   return checkpoint;
 }
 
+/**
+ * Renew and fence the exact dream-run generation. When supplied a transaction
+ * handle this update serializes with a recovery claimant and becomes part of
+ * the caller's money transaction.
+ */
+export async function renewMemoryDreamRunClaim(
+  claim: MemoryDreamRunClaim,
+  dbc: DbHandle = db,
+): Promise<void> {
+  const renewed = await dbc
+    .update(memoryDreamRuns)
+    .set({
+      leaseExpiresAt: sql`now() + (${MEMORY_DREAM_CLAIM_STALE_MS} * interval '1 millisecond')`,
+    })
+    .where(
+      and(
+        eq(memoryDreamRuns.id, claim.id),
+        eq(memoryDreamRuns.claimToken, claim.claimToken),
+        eq(memoryDreamRuns.status, 'running'),
+        sql`${memoryDreamRuns.leaseExpiresAt} > now()`,
+      ),
+    )
+    .returning({ id: memoryDreamRuns.id });
+  if (renewed.length === 0) {
+    throw new TurnClaimLostError(
+      `Memory dream run ${claim.id} claim was superseded before funding or settlement`,
+    );
+  }
+}
+
+/**
+ * Persist the terminal economic truth after provider-free recovery. The row
+ * is inserted (or an existing error row is corrected) only for this run's
+ * exact reversed authorization and while this claim generation still owns
+ * the run. Retrying is idempotent via usage_events_turn_unique.
+ */
+export async function recordMemoryDreamRecoveryUsage(
+  claim: MemoryDreamRunClaim,
+  dbc: DbHandle = db,
+): Promise<void> {
+  await dbc.transaction(async (tx) => {
+    await renewMemoryDreamRunClaim(claim, tx);
+    const rows = (await tx.execute(sql`
+      insert into usage_events (
+        event_type, status, user_id, agent_id, session_id, message_id, turn_id,
+        provider, model, pricing_basis, table_version, manna,
+        error_code, error_message, metadata
+      )
+      select
+        'memory_dream', 'error', ta.account_id, ta.agent_account_id, ta.session_id,
+        null, ta.turn_id, ta.provider, ta.model, ta.pricing_basis,
+        ta.ceiling_table_version, 0,
+        'memory_dream_recovered_reversal',
+        'A crashed memory dream reservation was reversed before provider replay',
+        jsonb_build_object(
+          'recovery', jsonb_build_object(
+            'kind', 'crash_reversal',
+            'authorizationState', ta.state,
+            'authorizedMaxManna', ta.authorized_max_manna
+          )
+        )
+      from turn_authorizations ta
+      join memory_dream_runs run
+        on run.id = ${claim.id}
+       and run.agent_account_id = ta.agent_account_id
+      where ta.turn_id = ${claim.id}
+        and ta.session_id = run.id
+        and ta.state in ('reversed', 'reaped')
+      on conflict (event_type, turn_id) where turn_id is not null do update set
+        manna = 0,
+        error_code = coalesce(usage_events.error_code, excluded.error_code),
+        error_message = coalesce(usage_events.error_message, excluded.error_message),
+        metadata = coalesce(usage_events.metadata, '{}'::jsonb) || excluded.metadata
+      where usage_events.status = 'error'
+        and usage_events.user_id = excluded.user_id
+        and usage_events.agent_id = excluded.agent_id
+        and usage_events.session_id = excluded.session_id
+        and usage_events.provider = excluded.provider
+        and usage_events.model = excluded.model
+        and usage_events.pricing_basis = excluded.pricing_basis
+      returning id
+    `)) as unknown as { id: string }[];
+    if (rows.length === 0) {
+      throw new Error(
+        `memory dream run ${claim.id} has no matching reversed authorization or has conflicting telemetry`,
+      );
+    }
+  });
+}
+
 export class PostgresMemoryDreamDurability implements MemoryDreamDurability {
   async inspect(runId: string): Promise<MemoryDreamDurableEvidence> {
     const [run] = await pg<{
@@ -1151,7 +1249,15 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
   private readonly durability: MemoryDreamDurability;
   private readonly distillMemory: typeof distillAgentMemory;
   private readonly memoryStatus: typeof agentMemoryStatus;
-  private readonly refundDebit: typeof refund;
+  private readonly reverseAuthorization: typeof reverseTurnAuthorization;
+  private readonly claimFence: (
+    claim: MemoryDreamRunClaim,
+    dbc?: DbHandle,
+  ) => Promise<void>;
+  private readonly recordRecoveryUsage: (
+    claim: MemoryDreamRunClaim,
+    dbc?: DbHandle,
+  ) => Promise<void>;
   private readonly loadAssistantContent: (
     messageId: string,
     sessionId: string,
@@ -1162,7 +1268,9 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
     this.durability = options.durability ?? new PostgresMemoryDreamDurability();
     this.distillMemory = options.distillMemory ?? distillAgentMemory;
     this.memoryStatus = options.memoryStatus ?? agentMemoryStatus;
-    this.refundDebit = options.refundDebit ?? refund;
+    this.reverseAuthorization = options.reverseAuthorization ?? reverseTurnAuthorization;
+    this.claimFence = options.claimFence ?? renewMemoryDreamRunClaim;
+    this.recordRecoveryUsage = options.recordRecoveryUsage ?? recordMemoryDreamRecoveryUsage;
     this.loadAssistantContent = options.loadAssistantContent ?? loadMemoryDreamAssistantContent;
   }
 
@@ -1368,6 +1476,9 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
           source: { kind: 'memory_dream', sweepId, runId },
           beginStream: () => remSink,
           turnId: runId,
+          fundingFence: (dbc) => this.claimFence(run, dbc),
+          beforeProvider: () => this.claimFence(run),
+          beforeTerminal: () => this.claimFence(run),
         },
       );
       turnErrorCode = outcome.errorCode;
@@ -1420,20 +1531,17 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
       date: this.now().toISOString().slice(0, 10),
       previousSha256: null,
     };
-    const failures = await this.refundRunDebits(run.id);
-    await this.durability.saveCheckpoint(run, checkpoint, 'indeterminate');
-    if (failures.length > 0) {
+    try {
+      await this.reverseRunAuthorization(run);
+      await this.recordRecoveryUsage(run);
+      await this.durability.saveCheckpoint(run, checkpoint, 'indeterminate');
+    } catch (err) {
       throw new MemoryDreamRecoveryPendingError(
-        `memory dream run ${run.id} has a debit without terminal usage; reversal remains pending (${failures.join('; ')})`,
-      );
-    }
-    if (!alreadyIndeterminate) {
-      throw new MemoryDreamRecoveryPendingError(
-        `memory dream run ${run.id} has a debit without terminal usage; reversals landed and terminal recovery is pending`,
+        `memory dream run ${run.id} has a debit without terminal usage; reversal remains pending (${err instanceof Error ? err.message : String(err)})`,
       );
     }
     throw new MemoryDreamRecoveryResolvedError(
-      `memory dream run ${run.id} had a debit without terminal usage; settlement and reservation were reversed idempotently and the provider call will not be replayed`,
+      `memory dream run ${run.id} had a debit without terminal usage; its authorization was reversed idempotently and the provider call will not be replayed${alreadyIndeterminate ? '' : ' after crash recovery'}`,
     );
   }
 
@@ -1442,37 +1550,34 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
     checkpoint: MemoryDreamCheckpoint | null,
     usageStatus: string,
   ): Promise<never> {
-    const failures = await this.refundRunDebits(run.id);
-    if (checkpoint) {
-      await this.durability.saveCheckpoint(
-        run,
-        { ...checkpoint, phase: 'provider_terminal' },
-        'terminal',
-      );
-    }
-    if (failures.length > 0) {
+    try {
+      await this.reverseRunAuthorization(run);
+      await this.recordRecoveryUsage(run);
+      if (checkpoint) {
+        await this.durability.saveCheckpoint(
+          run,
+          { ...checkpoint, phase: 'provider_terminal' },
+          'terminal',
+        );
+      }
+    } catch (err) {
       throw new MemoryDreamRecoveryPendingError(
-        `memory dream run ${run.id} terminal ${usageStatus} refund remains pending (${failures.join('; ')})`,
+        `memory dream run ${run.id} terminal ${usageStatus} reversal remains pending (${err instanceof Error ? err.message : String(err)})`,
       );
     }
     throw new MemoryDreamRecoveryResolvedError(
-      `memory dream run ${run.id} terminal usage status is ${usageStatus}; debits were reversed idempotently`,
+      `memory dream run ${run.id} terminal usage status is ${usageStatus}; its authorization was reversed idempotently`,
     );
   }
 
-  private async refundRunDebits(runId: string): Promise<string[]> {
-    const failures: string[] = [];
-    for (const [key, type] of [
-      [`${runId}:settle`, 'refund:memory-dream:settle'],
-      [runId, 'refund:memory-dream'],
-    ] as const) {
-      try {
-        await this.refundDebit({ originalIdempotencyKey: key, type });
-      } catch (err) {
-        failures.push(err instanceof Error ? err.message : String(err));
-      }
-    }
-    return failures;
+  private async reverseRunAuthorization(
+    run: MemoryDreamRunClaim,
+  ): Promise<ReverseTurnAuthorizationResult> {
+    return await this.reverseAuthorization({
+      turnId: run.id,
+      refundType: 'refund:memory-dream',
+      fence: (dbc) => this.claimFence(run, dbc),
+    });
   }
 
   private async recoverTerminalUsage(

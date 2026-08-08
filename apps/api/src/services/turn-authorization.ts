@@ -127,9 +127,12 @@ export async function reverseTurnAuthorization(options: {
   refundType: string;
   terminalState?: 'reversed' | 'reaped';
   db?: DbHandle;
+  /** Caller-owned generation fence, checked in the reversal transaction. */
+  fence?: (tx: DbHandle) => Promise<void>;
 }): Promise<ReverseTurnAuthorizationResult> {
   const dbc = options.db ?? db;
   return await dbc.transaction(async (tx) => {
+    await options.fence?.(tx);
     // Lock the authorization row so a racing settle/reverse serializes here.
     const rows = (await tx.execute(sql`
       select turn_id, state, reserved_subscription_manna, reservation_tx_id

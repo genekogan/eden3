@@ -924,7 +924,11 @@ async function runClaimedTurn(
    */
   const reverseTurn = async (): Promise<boolean> => {
     try {
-      const result = await reverseTurnAuthorization({ turnId, refundType });
+      const result = await reverseTurnAuthorization({
+        turnId,
+        refundType,
+        ...(params.fundingFence ? { fence: params.fundingFence } : {}),
+      });
       if (result.reversed && result.balanceTotal !== undefined) {
         publish({
           type: 'manna.updated',
