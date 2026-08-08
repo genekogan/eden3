@@ -58,6 +58,32 @@ export function parseE2EScratchDatabaseUrl(raw: string): {
   return { databaseName, url };
 }
 
+export function parseE2EScratchApiUrl(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('invalid isolated E2E API URL');
+  }
+  const port = Number(url.port);
+  if (
+    url.protocol !== 'http:' ||
+    !LOOPBACK_HOSTS.has(url.hostname) ||
+    !Number.isSafeInteger(port) ||
+    port < 1024 ||
+    port > 65535 ||
+    port === 4301 ||
+    url.pathname !== '/' ||
+    url.search !== '' ||
+    url.hash !== '' ||
+    url.username !== '' ||
+    url.password !== ''
+  ) {
+    throw new Error('invalid isolated E2E API URL');
+  }
+  return url;
+}
+
 export function e2eScratchUser(databaseName: string): E2EScratchUser {
   if (!SCRATCH_DATABASE.test(databaseName)) {
     throw new Error('invalid E2E scratch database name');

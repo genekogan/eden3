@@ -5,6 +5,7 @@ import {
   assertNoE2EScratchSideEffects,
   cleanupE2EScratchUser,
   e2eScratchUser,
+  parseE2EScratchApiUrl,
   parseE2EScratchDatabaseUrl,
   preflightE2EScratchUser,
   seedE2EScratchUser,
@@ -83,8 +84,33 @@ describe('isolated E2E scratch user fixture', () => {
       'postgres://eden3:eden3@example.com:5433/eden3_runtime_e2e_x',
       'postgres://eden3:eden3@127.0.0.1:5432/eden3_runtime_e2e_x',
       'postgres://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_x?sslmode=disable',
+      'http://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_x',
+      'postgres://other:eden3@127.0.0.1:5433/eden3_runtime_e2e_x',
+      'postgres://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_%78',
+      'postgres://eden3:eden3@127.0.0.1:5433/eden3_runtime_e2e_x#fragment',
     ]) {
       expect(() => parseE2EScratchDatabaseUrl(candidate)).toThrow(/scratch database URL/);
+    }
+  });
+
+  it('accepts only an uncredentialed alternate loopback API root', () => {
+    for (const candidate of [
+      'http://127.0.0.1:4381/',
+      'http://localhost:4381/',
+      'http://[::1]:4381/',
+    ]) {
+      expect(parseE2EScratchApiUrl(candidate).port).toBe('4381');
+    }
+    for (const candidate of [
+      'https://127.0.0.1:4381/',
+      'http://example.com:4381/',
+      'http://user@127.0.0.1:4381/',
+      'http://127.0.0.1:4381/dev/users',
+      'http://127.0.0.1:4381/?q=gene',
+      'http://127.0.0.1:4381/#fragment',
+      'http://127.0.0.1:4301/',
+    ]) {
+      expect(() => parseE2EScratchApiUrl(candidate)).toThrow(/isolated E2E API URL/);
     }
   });
 
@@ -112,6 +138,9 @@ describe('isolated E2E scratch user fixture', () => {
       [{ ...fixture, type: 'agent' }],
       [{ ...fixture, clerkUserId: 'clerk_subject' }],
       [{ ...fixture, externalId: 'legacy_id' }],
+      [{ ...fixture, id: e2eScratchUser(`${databaseName}_other`).id }],
+      [{ ...fixture, userImage: 'https://example.invalid/image.png' }],
+      [{ ...fixture, deleted: true }],
       [fixture, { ...fixture, id: e2eScratchUser(`${databaseName}_other`).id }],
     ]) {
       expect(() => assertE2EScratchAccountInventory(rows, fixture)).toThrow(

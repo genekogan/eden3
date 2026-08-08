@@ -3,6 +3,7 @@ import { pathToFileURL } from 'node:url';
 
 import {
   cleanupE2EScratchUser,
+  parseE2EScratchApiUrl,
   parseE2EScratchDatabaseUrl,
   preflightE2EScratchUser,
   seedE2EScratchUser,
@@ -29,32 +30,6 @@ interface QuerySql {
 
 function queryOnly(sql: unknown): QuerySql {
   return sql as QuerySql;
-}
-
-export function safeApiUrl(raw: string): URL {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error('invalid isolated E2E API URL');
-  }
-  const port = Number(url.port);
-  if (
-    url.protocol !== 'http:' ||
-    !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) ||
-    !Number.isSafeInteger(port) ||
-    port < 1024 ||
-    port > 65535 ||
-    port === 4301 ||
-    url.pathname !== '/' ||
-    url.search !== '' ||
-    url.hash !== '' ||
-    url.username !== '' ||
-    url.password !== ''
-  ) {
-    throw new Error('invalid isolated E2E API URL');
-  }
-  return url;
 }
 
 export function postgresRepository(
@@ -153,7 +128,7 @@ async function seed(databaseName: string) {
 }
 
 async function preflight(databaseName: string, rawApiUrl: string) {
-  const apiUrl = safeApiUrl(rawApiUrl);
+  const apiUrl = parseE2EScratchApiUrl(rawApiUrl);
   const fixture = await preflightE2EScratchUser({
     repository: e2eScratchPostgresRepository,
     databaseName,
