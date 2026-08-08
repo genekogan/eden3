@@ -25,15 +25,37 @@ describe('netspend refunds-correlation index migration (T08-U01, RUNBOOK §12)',
   it('is a single catalog-guarded DO statement creating exactly the live-box index', async () => {
     const sql = await readFile(MIGRATION, 'utf8');
 
-    // One statement only — no breakpoints, no DDL outside the DO block.
+    // One statement only — no breakpoints, and (comments stripped) exactly one
+    // mutating statement anywhere in the file: the guarded CREATE INDEX inside
+    // the DO body. Nothing outside the block, nothing extra inside it.
     expect(sql).not.toContain('--> statement-breakpoint');
-    const outsideDo = sql.replace(/DO \$\$[\s\S]*?\$\$;/, '');
-    expect(outsideDo).not.toMatch(/^\s*(create|alter|drop|truncate|delete|update|insert)\b/im);
+    const executableSql = sql
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('--'))
+      .join('\n');
+    // Outside SQL string literals no mutating verb may appear at all (the only
+    // DDL is the EXECUTE'd literal); and every literal that does contain a
+    // mutating verb may speak only of our index, only via CREATE.
+    const literals = executableSql.match(/'(?:[^']|'')*'/g) ?? [];
+    const outsideLiterals = executableSql.replace(/'(?:[^']|'')*'/g, "''");
+    expect(outsideLiterals).not.toMatch(/\b(create|alter|drop|truncate|delete|update|insert)\b/i);
+    const mutatingLiterals = literals.filter((literal) =>
+      /\b(create|alter|drop|truncate|delete|update|insert)\b/i.test(literal),
+    );
+    expect(mutatingLiterals.length).toBeGreaterThan(0);
+    for (const literal of mutatingLiterals) {
+      expect(literal).toMatch(/create index/i);
+      expect(literal).toContain('idx_manna_tx_refunds_tx');
+      expect(literal).not.toMatch(/\b(alter|drop|truncate|delete|update|insert)\b/i);
+    }
+    // Exactly one of them is executed.
+    expect(executableSql.match(/EXECUTE '/g)).toHaveLength(1);
 
     // The guarded create matches the live-box definition verbatim (name, column,
-    // btree, partial predicate).
+    // btree, partial predicate) — schema-qualified so search_path can never aim
+    // it at a shadow table while the guard inspects public.
     expect(sql).toContain(
-      'CREATE INDEX "idx_manna_tx_refunds_tx" ON "manna_transactions" USING btree ("refunds_transaction_id") WHERE "refunds_transaction_id" IS NOT NULL',
+      'CREATE INDEX "idx_manna_tx_refunds_tx" ON public."manna_transactions" USING btree ("refunds_transaction_id") WHERE "refunds_transaction_id" IS NOT NULL',
     );
 
     // The exists-and-correct path returns without executing CREATE (no table
@@ -45,11 +67,7 @@ describe('netspend refunds-correlation index migration (T08-U01, RUNBOOK §12)',
     // Drizzle runs migrations transactionally; a concurrent build here would be
     // broken. The concurrent path lives outside the migration (ops runbook).
     // Comments are stripped first — the file may (should) explain this rule.
-    const executable = sql
-      .split('\n')
-      .filter((line) => !line.trimStart().startsWith('--'))
-      .join('\n');
-    expect(executable).not.toMatch(/concurrently/i);
+    expect(executableSql).not.toMatch(/concurrently/i);
   });
 
   it('changes the snapshot by exactly one index and is journaled as idx 27', async () => {
@@ -85,6 +103,13 @@ describe('netspend refunds-correlation index migration (T08-U01, RUNBOOK §12)',
       idx: 27,
       tag: '0027_netspend_refunds_index',
     });
+    // Ordering coverage (replaces the tail assertion this unit re-anchored):
+    // journal indices are unique, contiguous, and ascending from 0, and the
+    // snapshot chain links 0026 -> 0027.
+    expect(journal.entries.map((entry) => entry.idx)).toEqual(
+      journal.entries.map((_, position) => position),
+    );
+    expect(next.prevId).toBe(prev.id);
   });
 
   it('is declared in the drizzle schema with the verbatim live-box name', () => {

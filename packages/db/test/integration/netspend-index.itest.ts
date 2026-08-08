@@ -1,6 +1,5 @@
-import { randomBytes } from 'node:crypto';
-import { createHash } from 'node:crypto';
-import { readFile, readdir } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -16,7 +15,8 @@ import { loadRootEnv } from '../../src/env';
  * (RUNBOOK §12 "Missing ledger index" codification).
  *
  * All DDL-exercising cases run on scratch databases this file creates and
- * drops itself. The shared operator databases are verified READ-ONLY.
+ * drops itself; every scratch connection is verified with current_database()
+ * before use. The shared operator databases are verified READ-ONLY.
  */
 
 loadRootEnv();
@@ -31,16 +31,28 @@ const BOX_DDL =
 
 const PROTECTED_DBS = new Set(['eden3', 'eden3_stg']);
 
-function serverUrl(): URL {
+/**
+ * Build a clean connection URL carrying ONLY user/password/host/port and the
+ * given database as the pathname. Query parameters from DATABASE_URL are
+ * deliberately dropped: postgres.js lets `?database=` override the pathname,
+ * which would let a connection approved for a scratch name actually target a
+ * protected shared DB.
+ */
+function urlForDb(dbName: string): string {
   const raw = process.env.DATABASE_URL;
   if (!raw) throw new Error('DATABASE_URL is not set');
-  return new URL(raw);
-}
-
-function urlForDb(dbName: string): string {
-  const url = serverUrl();
+  const src = new URL(raw);
+  const url = new URL(`${src.protocol}//${src.host}`);
+  url.username = src.username;
+  url.password = src.password;
   url.pathname = `/${dbName}`;
   return url.toString();
+}
+
+function targetDbName(): string {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) throw new Error('DATABASE_URL is not set');
+  return new URL(raw).pathname.replace(/^\//, '');
 }
 
 /** Admin connection to the maintenance DB for CREATE/DROP DATABASE. */
@@ -63,14 +75,23 @@ async function createScratchDb(): Promise<string> {
   return name;
 }
 
-/** Guarded client factory: scratch DBs only — never the shared databases. */
-function scratchClient(dbName: string) {
+/**
+ * Guarded client factory: scratch DBs only — never the shared databases. The
+ * connection's actual current_database() is asserted before it is handed out.
+ */
+async function scratchClient(dbName: string) {
   if (PROTECTED_DBS.has(dbName) || !dbName.startsWith('t08u01_mig_')) {
     throw new Error(`refusing DDL connection to non-scratch database "${dbName}"`);
   }
   // max:1 so session-level statements (BEGIN/LOCK, SET lock_timeout) share the
   // exact connection that runs the migration statement under test.
-  return postgres(urlForDb(dbName), { max: 1, onnotice: () => {} });
+  const client = postgres(urlForDb(dbName), { max: 1, onnotice: () => {} });
+  const [row] = await client`select current_database() as db`;
+  if (row?.db !== dbName) {
+    await client.end();
+    throw new Error(`connected to "${row?.db}", expected scratch "${dbName}"`);
+  }
+  return client;
 }
 
 afterAll(async () => {
@@ -86,7 +107,7 @@ afterAll(async () => {
 });
 
 async function indexRow(client: postgres.Sql) {
-  const rows = await client`
+  return client`
     select pg_get_indexdef(ix.indexrelid) as indexdef,
            ix.indisvalid as indisvalid,
            ix.indexrelid as oid
@@ -97,31 +118,33 @@ async function indexRow(client: postgres.Sql) {
      where i.relname = ${INDEX_NAME}
        and t.relname = 'manna_transactions'
        and n.nspname = 'public'`;
-  return rows;
 }
 
 async function migrationSql(): Promise<string> {
   return readFile(MIGRATION_FILE, 'utf8');
 }
 
-/** Apply migrations 0000..0026 (everything before ours) without the journal. */
-async function applyChainThrough0026(client: postgres.Sql) {
-  const files = (await readdir(MIGRATIONS_DIR))
-    .filter((f) => f.endsWith('.sql') && f < '0027')
-    .sort();
-  expect(files[files.length - 1]).toMatch(/^0026_/);
-  for (const file of files) {
-    const body = await readFile(path.join(MIGRATIONS_DIR, file), 'utf8');
-    for (const statement of body.split('--> statement-breakpoint')) {
-      if (statement.trim()) await client.unsafe(statement);
-    }
-  }
+function migrationHash(sql: string): string {
+  return createHash('sha256').update(sql).digest('hex');
 }
 
-describe('scratch-DB migration paths (DDL confined to self-created databases)', () => {
+async function journalHasMigration(client: postgres.Sql): Promise<boolean> {
+  const hash = migrationHash(await migrationSql());
+  const rows = await client`
+    select 1 as one from drizzle.__drizzle_migrations where hash = ${hash}`;
+  return rows.length === 1;
+}
+
+/** Remove 0027's journal row so the real migrator will attempt it again. */
+async function unjournalMigration(client: postgres.Sql) {
+  const hash = migrationHash(await migrationSql());
+  await client`delete from drizzle.__drizzle_migrations where hash = ${hash}`;
+}
+
+describe('scratch-DB migration paths (DDL confined to self-created, verified databases)', () => {
   it('fresh database: full drizzle chain creates the index; rerun and replay are no-ops', async () => {
     const name = await createScratchDb();
-    const client = scratchClient(name);
+    const client = await scratchClient(name);
     try {
       const db = drizzle(client);
       await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
@@ -131,17 +154,13 @@ describe('scratch-DB migration paths (DDL confined to self-created databases)', 
       expect(rows[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
       expect(rows[0]?.indisvalid).toBe(true);
       const oid = rows[0]?.oid;
-
-      // Journal recorded exactly the 28-migration chain, newest hash = our file.
-      const journal = await client`
-        select hash from drizzle.__drizzle_migrations order by created_at`;
-      const expectedHash = createHash('sha256').update(await migrationSql()).digest('hex');
-      expect(journal.map((r) => r.hash)).toContain(expectedHash);
+      expect(await journalHasMigration(client)).toBe(true);
 
       // Re-running the migrator is a journal-level no-op.
+      const before = await client`select count(*)::int as n from drizzle.__drizzle_migrations`;
       await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
-      const journalAfter = await client`select count(*)::int as n from drizzle.__drizzle_migrations`;
-      expect(journalAfter[0]?.n).toBe(journal.length);
+      const after = await client`select count(*)::int as n from drizzle.__drizzle_migrations`;
+      expect(after[0]?.n).toBe(before[0]?.n);
 
       // Replaying the migration statement itself is harmless (exists-path).
       await client.unsafe(await migrationSql());
@@ -154,48 +173,70 @@ describe('scratch-DB migration paths (DDL confined to self-created databases)', 
     }
   });
 
-  it('box path: pre-existing correct index → migration no-ops without CREATE and without a table lock', async () => {
+  it('box path through the real migrator: pre-existing correct index → journaled success, index untouched, no table lock', async () => {
     const name = await createScratchDb();
-    const client = scratchClient(name);
-    const writer = scratchClient(name);
+    const client = await scratchClient(name);
+    const observer = await scratchClient(name);
     try {
-      await applyChainThrough0026(client);
-      // Recreate the live box state: the index already exists (made with
-      // CREATE INDEX CONCURRENTLY there; lock semantics of the result are
-      // identical).
-      await client.unsafe(BOX_DDL);
+      const db = drizzle(client);
+      await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
       const before = await indexRow(client);
       expect(before).toHaveLength(1);
 
-      // Demo-safety contention proof: a concurrent writer holds ROW EXCLUSIVE
-      // (the lock class every INSERT/UPDATE takes). The exists-path migration
-      // must complete under a short lock_timeout — i.e. it takes no table lock.
-      await writer.unsafe('begin; lock table manna_transactions in row exclusive mode');
+      // Rewind the journal so the migrator will run 0027 again against a DB
+      // where the correct index already exists — exactly the prod-box state
+      // (its index was made with CREATE INDEX CONCURRENTLY; the resulting
+      // relation is identical).
+      await unjournalMigration(client);
+      expect(await journalHasMigration(client)).toBe(false);
+      await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+      expect(await journalHasMigration(client)).toBe(true); // journaled success
+      const after = await indexRow(client);
+      expect(after[0]?.oid).toBe(before[0]?.oid); // untouched, not rebuilt
+
+      // Lock proof: run the exists-path inside an open transaction and inspect
+      // pg_locks from a second connection before commit — the migration
+      // backend must hold NO lock of any mode on manna_transactions.
+      const tableOid = (await client`select 'public.manna_transactions'::regclass::oid as oid`)[0]
+        ?.oid;
+      await client.begin(async (tx) => {
+        const pid = (await tx`select pg_backend_pid() as pid`)[0]?.pid;
+        await tx.unsafe(await migrationSql());
+        const pidLocks = await observer`
+          select l.relation::int as relation from pg_locks l where l.pid = ${pid}`;
+        expect(pidLocks.length).toBeGreaterThan(0); // right backend, mid-transaction
+        const tableLocks = pidLocks.filter((l) => l.relation === Number(tableOid));
+        expect(tableLocks).toEqual([]);
+      });
+
+      // Same exists-path under a session with quote_all_identifiers=on — the
+      // deparser pin keeps the definition comparison stable.
+      await client.unsafe(`set quote_all_identifiers = on`);
+      await client.unsafe(await migrationSql());
+      await client.unsafe(`set quote_all_identifiers = off`);
+
+      // And under a concurrent writer holding ROW EXCLUSIVE (the lock class
+      // every INSERT/UPDATE takes), with a short lock_timeout: completes.
+      await observer.unsafe('begin; lock table manna_transactions in row exclusive mode');
       try {
         await client.unsafe(`set lock_timeout = '1s'`);
         await client.unsafe(await migrationSql());
       } finally {
         await client.unsafe(`set lock_timeout = 0`).catch(() => {});
-        await writer.unsafe('rollback').catch(() => {});
+        await observer.unsafe('rollback').catch(() => {});
       }
-
-      const after = await indexRow(client);
-      expect(after).toHaveLength(1);
-      expect(after[0]?.oid).toBe(before[0]?.oid); // untouched, not rebuilt
-      expect(after[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
     } finally {
-      await writer.end().catch(() => {});
+      await observer.end().catch(() => {});
       await client.end();
     }
   });
 
   it('negative control: a plain CREATE INDEX IF NOT EXISTS would block behind a writer (why the DO guard exists)', async () => {
     const name = await createScratchDb();
-    const client = scratchClient(name);
-    const writer = scratchClient(name);
+    const client = await scratchClient(name);
+    const writer = await scratchClient(name);
     try {
-      await applyChainThrough0026(client);
-      await client.unsafe(BOX_DDL);
+      await migrate(drizzle(client), { migrationsFolder: MIGRATIONS_DIR });
       await writer.unsafe('begin; lock table manna_transactions in row exclusive mode');
       try {
         await client.unsafe(`set lock_timeout = '1s'`);
@@ -214,17 +255,34 @@ describe('scratch-DB migration paths (DDL confined to self-created databases)', 
     }
   });
 
-  it('anomaly path: same-named wrong index → migration raises instead of journaling success', async () => {
+  it('anomaly paths through the real migrator: wrong or invalid index → migration raises and is NOT journaled', async () => {
     const name = await createScratchDb();
-    const client = scratchClient(name);
+    const client = await scratchClient(name);
     try {
-      await applyChainThrough0026(client);
+      const db = drizzle(client);
+      await migrate(db, { migrationsFolder: MIGRATIONS_DIR });
+
+      // Wrong definition: same name, missing partial predicate.
+      await unjournalMigration(client);
+      await client.unsafe(`drop index "${INDEX_NAME}"`);
       await client.unsafe(
-        'create index idx_manna_tx_refunds_tx on manna_transactions (refunds_transaction_id)', // missing partial predicate
+        'create index idx_manna_tx_refunds_tx on manna_transactions (refunds_transaction_id)',
       );
-      await expect(client.unsafe(await migrationSql())).rejects.toThrow(
+      await expect(migrate(db, { migrationsFolder: MIGRATIONS_DIR })).rejects.toThrow(
         /does not match the expected definition/,
       );
+      expect(await journalHasMigration(client)).toBe(false); // failure not journaled
+
+      // Invalid index: correct definition, indisvalid flipped (the state a
+      // failed CONCURRENTLY build leaves behind).
+      await client.unsafe(`drop index "${INDEX_NAME}"`);
+      await client.unsafe(BOX_DDL);
+      const oid = (await indexRow(client))[0]?.oid;
+      await client`update pg_index set indisvalid = false where indexrelid = ${oid}`;
+      await expect(migrate(db, { migrationsFolder: MIGRATIONS_DIR })).rejects.toThrow(
+        /does not match the expected definition/,
+      );
+      expect(await journalHasMigration(client)).toBe(false);
     } finally {
       await client.end();
     }
@@ -233,18 +291,16 @@ describe('scratch-DB migration paths (DDL confined to self-created databases)', 
 
 describe('shared-DB read-only verification (target = DATABASE_URL)', () => {
   it('the migrated target database carries the valid index and the journaled migration', async () => {
-    const target = serverUrl().pathname.replace(/^\//, '');
+    const target = targetDbName();
     const client = postgres(urlForDb(target), { max: 1, onnotice: () => {} });
     try {
       const rows = await indexRow(client);
       expect(rows, `index missing on ${target}`).toHaveLength(1);
       expect(rows[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
       expect(rows[0]?.indisvalid).toBe(true);
-
-      const expectedHash = createHash('sha256').update(await migrationSql()).digest('hex');
-      const journal = await client`
-        select hash from drizzle.__drizzle_migrations where hash = ${expectedHash}`;
-      expect(journal, `migration 0027 not journaled on ${target}`).toHaveLength(1);
+      expect(await journalHasMigration(client), `migration 0027 not journaled on ${target}`).toBe(
+        true,
+      );
     } finally {
       await client.end();
     }

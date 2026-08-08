@@ -5,13 +5,14 @@
 --
 -- Catalog-guarded on purpose:
 --   * exists + correct + valid  -> return via catalog reads only. No CREATE INDEX
---     is issued, so no SHARE lock is taken — safe against a live-serving database
---     (the prod box; local canonical eden3 after its concurrent pre-create).
---     Plain CREATE INDEX IF NOT EXISTS would still take the SHARE lock before
---     resolving the name, and never verifies the existing definition.
+--     is issued, so no lock of any mode is taken on manna_transactions — safe
+--     against a live-serving database (the prod box; local canonical eden3 after
+--     its concurrent pre-create). Plain CREATE INDEX IF NOT EXISTS would still
+--     take the SHARE lock before resolving the name, and never verifies the
+--     existing definition.
 --   * absent                    -> plain transactional CREATE INDEX (fresh DBs).
---   * exists but wrong/invalid  -> RAISE so the migration fails loudly instead of
---     journaling success over a broken or mismatched index.
+--   * exists but wrong/invalid  -> RAISE so the migration fails loudly (and is
+--     not journaled) instead of recording success over a broken index.
 -- CONCURRENTLY deliberately does not appear here: drizzle runs migrations inside
 -- a transaction, and concurrent builds are not transaction-safe. Operational
 -- recovery for a failed concurrent pre-create: DROP INDEX CONCURRENTLY, retry.
@@ -20,6 +21,10 @@ DECLARE
   existing_def text;
   existing_valid boolean;
 BEGIN
+  -- Pin the deparser so the definition comparison is deterministic even under
+  -- quote_all_identifiers=on (set_config with is_local=true reverts at commit).
+  PERFORM set_config('quote_all_identifiers', 'off', true);
+
   SELECT pg_get_indexdef(ix.indexrelid), ix.indisvalid
     INTO existing_def, existing_valid
     FROM pg_index ix
@@ -31,7 +36,9 @@ BEGIN
      AND n.nspname = 'public';
 
   IF existing_def IS NULL THEN
-    EXECUTE 'CREATE INDEX "idx_manna_tx_refunds_tx" ON "manna_transactions" USING btree ("refunds_transaction_id") WHERE "refunds_transaction_id" IS NOT NULL';
+    -- Schema-qualified so a foreign search_path can never aim this at a shadow
+    -- table while the guard above inspects public.
+    EXECUTE 'CREATE INDEX "idx_manna_tx_refunds_tx" ON public."manna_transactions" USING btree ("refunds_transaction_id") WHERE "refunds_transaction_id" IS NOT NULL';
     RETURN;
   END IF;
 
