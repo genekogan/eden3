@@ -9,6 +9,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import {
   CHAT_MEDIA_EVENT_TYPE,
+  ChatMediaReservationReaper,
   compensateChatMedia,
   quoteChatMediaTool,
   reserveChatMedia,
@@ -97,6 +98,18 @@ describe('FG-ECON in-chat media authorization', () => {
     expect(providerCalls).toBe(0);
     const rows = await pg`select 1 from usage_events where user_id = ${f.userId} and event_type = ${CHAT_MEDIA_EVENT_TYPE}`;
     expect(rows).toHaveLength(0);
+
+    const capped = await fixture(quote.manna + 10);
+    await expect(
+      reserveChatMedia({
+        request: request(capped, 'video_generate', { prompt: 'expensive', duration: 5 }),
+        dailyCap: quote.manna - 1,
+      }),
+    ).rejects.toThrow();
+    const cappedRows = await pg`
+      select 1 from usage_events
+      where user_id = ${capped.userId} and event_type = ${CHAT_MEDIA_EVENT_TYPE}`;
+    expect(cappedRows).toHaveLength(0);
   });
 
   it('FG-ECON-MEDIA-02: funded media reserves before provider and settles quote with attributable usage', async () => {
@@ -167,7 +180,19 @@ describe('FG-ECON in-chat media authorization', () => {
 
   it('FG-ECON-MEDIA-04: provider/tool failure restores the exact reservation and terminalizes usage', async () => {
     const quote = quoteChatMediaTool('music_generate', { prompt: 'quiet synth' });
-    const f = await fixture(quote.manna + 10);
+    const f = await fixture(0);
+    const subscription = Number((quote.manna / 2).toFixed(4));
+    await credit({
+      accountId: f.userId,
+      amount: subscription,
+      type: 'credit:subscription',
+      toSubscriptionBalance: true,
+    });
+    await credit({
+      accountId: f.userId,
+      amount: Number((quote.manna - subscription + 10).toFixed(4)),
+      type: 'credit:test',
+    });
     const before = await getBalance(f.userId);
     const auth = await reserveChatMedia({
       request: request(f, 'music_generate', { prompt: 'quiet synth' }),
@@ -178,9 +203,32 @@ describe('FG-ECON in-chat media authorization', () => {
       errorCode: 'media_tool_failed',
       errorMessage: 'provider failed',
     })).toBe('refunded');
-    expect((await getBalance(f.userId)).total).toBe(before.total);
+    expect(await getBalance(f.userId)).toEqual(before);
     const [usage] = await pg<{ status: string; manna: number; error_code: string }[]>`
       select status, manna, error_code from usage_events where turn_id = ${auth.authorizationId}`;
     expect(usage).toMatchObject({ status: 'error', manna: 0, error_code: 'media_tool_failed' });
+  });
+
+  it('stale chat-media reservations are reaped split-exactly without a provider', async () => {
+    const quote = quoteChatMediaTool('image_generate', { prompt: 'lost result' });
+    const f = await fixture(quote.manna + 10);
+    const before = await getBalance(f.userId);
+    const auth = await reserveChatMedia({
+      request: request(f, 'image_generate', { prompt: 'lost result' }),
+      dailyCap: 100_000,
+    });
+    await pg`
+      update usage_events set created_at = now() - interval '2 hours'
+      where turn_id = ${auth.authorizationId}`;
+    const reaper = new ChatMediaReservationReaper({ ttlMs: 60 * 60 * 1_000 });
+    expect(await reaper.runOnce()).toMatchObject({ scanned: 1, reaped: 1, pending: 0 });
+    expect(await getBalance(f.userId)).toEqual(before);
+    const [usage] = await pg<{ status: string; manna: number; error_code: string }[]>`
+      select status, manna, error_code from usage_events where turn_id = ${auth.authorizationId}`;
+    expect(usage).toMatchObject({
+      status: 'error',
+      manna: 0,
+      error_code: 'media_generation_timeout',
+    });
   });
 });

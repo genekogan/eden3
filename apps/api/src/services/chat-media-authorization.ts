@@ -252,7 +252,7 @@ export async function reserveChatMedia(options: {
       join session_agents sa on sa.session_id = s.id
       join agents a on a.account_id = sa.agent_account_id
       where s.gateway_session_key = ${sessionKey}
-        and s.session_type <> 'channel' and s.channel_connection_id is null
+        and s.session_type is distinct from 'channel' and s.channel_connection_id is null
         and a.openclaw_id = ${agentId}
       order by a.account_id
       limit 2

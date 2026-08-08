@@ -263,20 +263,13 @@ export class MediaPipeline {
       }
     }
     const action = pricedActionForTool(opts.tool, kind);
-    if (
-      sessionId &&
-      (!action ||
-        action === 'chatTurn' ||
-        !(await hasPendingChatMediaAuthorization({ sessionId, action, db: this.db })))
-    ) {
-      this.log.warn(
-        `media-pipeline: no pending authorization for ${action ?? 'unknown'} in session ${sessionId} — parking ${hostPath}`,
-      );
-      sessionId = null;
-      sessionOwnerId = null;
-    }
-    const creationUserId = sessionId ? sessionOwnerId : (opts.userId ?? null);
-    const correlated = sessionId !== null || (opts.userId ?? null) !== null;
+    const hasChatAuthorization =
+      sessionId !== null &&
+      action !== null &&
+      action !== 'chatTurn' &&
+      (await hasPendingChatMediaAuthorization({ sessionId, action, db: this.db }));
+    let creationUserId = sessionId ? sessionOwnerId : (opts.userId ?? null);
+    let correlated = sessionId !== null || (opts.userId ?? null) !== null;
 
     // --- resolve the attach-target message (history-sync sighting flow) --
     let attachTo: Message | null = null;
@@ -389,6 +382,20 @@ export class MediaPipeline {
         }
         return result;
       }
+    }
+
+    // An already-correlated identical artifact can be returned/re-homed above
+    // without a second charge. Any new correlation, however, requires the
+    // exact still-pending pre-provider authorization.
+    if (sessionId && !hasChatAuthorization) {
+      this.log.warn(
+        `media-pipeline: no pending authorization for ${action ?? 'unknown'} in session ${sessionId} — parking ${hostPath}`,
+      );
+      sessionId = null;
+      sessionOwnerId = null;
+      attachTo = null;
+      creationUserId = opts.userId ?? null;
+      correlated = creationUserId !== null;
     }
 
     // --- rows (creation + message + asset) in one transaction -----------
