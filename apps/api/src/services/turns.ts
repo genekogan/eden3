@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type { AuthSession, CostProvider, DbHandle } from '@eden3/core';
 import {
@@ -46,6 +46,10 @@ import {
 import { HistorySync, PRIMER_HEADER } from './history-sync';
 import { memoryUserRelativePath } from './memory-paths';
 import {
+  isPlatformEveTurnIdentity,
+  type PlatformEveTurnIdentity,
+} from './platform-eve';
+import {
   AUTOMATION_BUDGET_SCOPE,
   AUTOMATION_HOURLY_BUDGET_ERROR,
   automationLedgerKey,
@@ -63,6 +67,31 @@ import {
 } from './turn-authorization';
 
 export { renderPeerContext };
+
+/**
+ * Keep platform Eve's persisted OpenClaw history private to one authenticated
+ * peer. Eve's trusted envelope contains that peer's private note, and the
+ * compat gateway persists every user message under its session key; using the
+ * conversation-wide key would therefore disclose an earlier participant's
+ * envelope to the next participant in the same Eden session.
+ *
+ * The derived key is deterministic so a process/gateway restart recovers the
+ * same peer's useful history. The opaque digest also avoids putting an Eden
+ * account id into gateway filenames or routine session-key diagnostics.
+ */
+export function gatewaySessionKeyForTurn(
+  sessionKey: string,
+  agent: PlatformEveTurnIdentity,
+  peer: Pick<AuthSession, 'accountId'>,
+  includePrivatePeerContext = true,
+): string {
+  if (!includePrivatePeerContext || !isPlatformEveTurnIdentity(agent)) return sessionKey;
+  const peerDigest = createHash('sha256')
+    .update('eden3:platform-eve-peer-session:v1\0')
+    .update(peer.accountId.toLowerCase())
+    .digest('hex');
+  return `${sessionKey}:eve-peer:${peerDigest}`;
+}
 
 /**
  * Chat turn pipeline (POST /sessions/:idOrNew/messages body → SSE stream).
@@ -640,6 +669,12 @@ async function runClaimedTurn(
   const isMemoryDream = params.source?.kind === 'memory_dream';
   const isAutomation =
     params.source?.kind === 'scheduled_task' || params.source?.kind === 'heartbeat';
+  const gatewaySessionKey = gatewaySessionKeyForTurn(
+    sessionKey,
+    agent,
+    user,
+    params.source === undefined,
+  );
   const usageEventType = isMemoryDream ? 'memory_dream' : 'chat_turn';
   const spendType = isMemoryDream ? 'spend:memory-dream' : 'spend:chat';
   const refundType = isMemoryDream ? 'refund:memory-dream' : 'refund:chat';
@@ -844,7 +879,7 @@ async function runClaimedTurn(
       });
 
       // 4. Media/trailing-sync correlation window.
-      deps.registry.register(sessionKey, {
+      deps.registry.register(gatewaySessionKey, {
         sessionId: session.id,
         agentAccountId: agent.accountId,
         agentOpenclawId: agent.openclawId,
@@ -1019,7 +1054,7 @@ async function runClaimedTurn(
     await params.beforeProvider?.();
     for await (const event of deps.compat.chatTurn({
       agentId: agent.openclawId,
-      sessionKey,
+      sessionKey: gatewaySessionKey,
       userMessage: gatewayMessage,
       // Eden's DB configuration is authoritative on every request. OpenClaw
       // persists `/model` session overrides; omitting this header could execute
@@ -1083,7 +1118,7 @@ async function runClaimedTurn(
                 new ClaudeTranscriptUsageCapture({ dataDir: defaultOpenclawDataDir() });
               usageCapture = await capture.capture({
                 agentId: agent.openclawId,
-                sessionKey,
+                sessionKey: gatewaySessionKey,
                 startedAtMs: usageWindowStartedAtMs,
               });
               if (usageCapture) {
@@ -1472,9 +1507,9 @@ async function runClaimedTurn(
   // 8. Trailing sync — async media completions & anything else that posts
   //    into the gateway session after the HTTP turn ended.
   if (outcome.errorCode === null) {
-    deps.registry.touch(sessionKey);
+    deps.registry.touch(gatewaySessionKey);
     deps.historySync.scheduleTrailingSync({
-      session,
+      session: { ...session, gatewaySessionKey },
       agentOpenclawId: agent.openclawId,
       agentAccountId: agent.accountId,
     });

@@ -16,6 +16,7 @@ import {
   isPlatformEveTurnIdentity,
   PLATFORM_EVE_TOOL_ALLOWLIST,
 } from '../src/services/platform-eve';
+import { gatewaySessionKeyForTurn } from '../src/services/turns';
 
 const EVE = {
   accountId: '00000000-0000-4000-8000-000000000001',
@@ -64,6 +65,52 @@ afterEach(async () => {
 });
 
 describe('Eve per-user disclosure memory', () => {
+  it('keeps alternating peers isolated in persistent gateway history across restart', async () => {
+    const reader = new FileEvePeerMemoryReader(dataDir);
+    const baseSessionKey = 'eden3:s:33333333-3333-4333-8333-333333333333';
+    const persistedGatewayHistory = new Map<string, string[]>();
+    const turn = async (peer: typeof ALICE, content: string) => {
+      const sessionKey = gatewaySessionKeyForTurn(baseSessionKey, EVE, peer);
+      const userMessage = await composePeerGatewayMessage(EVE, peer, content, reader);
+      const history = persistedGatewayHistory.get(sessionKey) ?? [];
+      history.push(userMessage);
+      persistedGatewayHistory.set(sessionKey, history);
+      return { sessionKey, visibleHistory: history.join('\n') };
+    };
+
+    const aliceFirst = await turn(ALICE, 'Alice turn one');
+    const bobFirst = await turn(BOB, 'Bob turn one');
+    expect(aliceFirst.sessionKey).not.toBe(bobFirst.sessionKey);
+    expect(aliceFirst.visibleHistory).toContain(ALICE_CANARY);
+    expect(aliceFirst.visibleHistory).not.toContain(BOB_CANARY);
+    expect(bobFirst.visibleHistory).toContain(BOB_CANARY);
+    expect(bobFirst.visibleHistory).not.toContain(ALICE_CANARY);
+
+    // A restarted API derives the same peer keys and therefore recovers only
+    // that peer's useful OpenClaw history, never the other participant's.
+    const aliceAfterRestart = await turn(ALICE, 'Alice turn two after restart');
+    const bobAfterRestart = await turn(BOB, 'Bob turn two after restart');
+    expect(aliceAfterRestart.sessionKey).toBe(aliceFirst.sessionKey);
+    expect(bobAfterRestart.sessionKey).toBe(bobFirst.sessionKey);
+    expect(aliceAfterRestart.visibleHistory).toContain('Alice turn one');
+    expect(aliceAfterRestart.visibleHistory).not.toContain('Bob turn one');
+    expect(aliceAfterRestart.visibleHistory).not.toContain(BOB_CANARY);
+    expect(bobAfterRestart.visibleHistory).toContain('Bob turn one');
+    expect(bobAfterRestart.visibleHistory).not.toContain('Alice turn one');
+    expect(bobAfterRestart.visibleHistory).not.toContain(ALICE_CANARY);
+  });
+
+  it('does not change private-agent or non-memory gateway session behavior', () => {
+    const baseSessionKey = 'eden3:s:44444444-4444-4444-8444-444444444444';
+    expect(
+      gatewaySessionKeyForTurn(baseSessionKey, { ...EVE, ownerId: ALICE.accountId }, ALICE),
+    ).toBe(baseSessionKey);
+    expect(
+      gatewaySessionKeyForTurn(baseSessionKey, { ...EVE, username: 'steve' }, ALICE),
+    ).toBe(baseSessionKey);
+    expect(gatewaySessionKeyForTurn(baseSessionKey, EVE, ALICE, false)).toBe(baseSessionKey);
+  });
+
   it('makes each canary available only in that authenticated peer context', async () => {
     const reader = new FileEvePeerMemoryReader(dataDir);
     const alice = await composePeerGatewayMessage(EVE, ALICE, 'What do you remember?', reader);
