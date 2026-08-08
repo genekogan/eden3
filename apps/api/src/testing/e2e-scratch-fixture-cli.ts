@@ -1,12 +1,14 @@
 import { pg } from '@eden3/db';
+import { pathToFileURL } from 'node:url';
 
 import {
-  assertE2EScratchAccountInventory,
-  assertNoE2EScratchSideEffects,
-  e2eScratchUser,
+  cleanupE2EScratchUser,
   parseE2EScratchDatabaseUrl,
-  verifyE2EScratchPreflight,
+  preflightE2EScratchUser,
+  seedE2EScratchUser,
+  type E2EScratchFixtureRepository,
   type E2EScratchSideEffects,
+  type E2EScratchUser,
 } from './e2e-scratch-fixture';
 
 /**
@@ -22,13 +24,14 @@ interface QuerySql {
     strings: TemplateStringsArray,
     ...parameters: unknown[]
   ): PromiseLike<T>;
+  unsafe<T extends readonly object[] = Record<string, unknown>[]>(query: string): PromiseLike<T>;
 }
 
 function queryOnly(sql: unknown): QuerySql {
   return sql as QuerySql;
 }
 
-function safeApiUrl(raw: string): URL {
+export function safeApiUrl(raw: string): URL {
   let url: URL;
   try {
     url = new URL(raw);
@@ -54,84 +57,106 @@ function safeApiUrl(raw: string): URL {
   return url;
 }
 
-async function accountRows(sql: QuerySql = queryOnly(pg)) {
-  return sql<
-    {
-      id: string;
-      type: string;
-      username: string;
-      externalId: string | null;
-      clerkUserId: string | null;
-      userImage: string | null;
-      deleted: boolean;
-    }[]
-  >`
-    select id::text,
-           type,
-           username::text,
-           external_id as "externalId",
-           clerk_user_id as "clerkUserId",
-           user_image as "userImage",
-           deleted
-    from accounts
-    order by id
-  `;
-}
-
-async function sideEffectCounts(
-  sql: QuerySql = queryOnly(pg),
-): Promise<E2EScratchSideEffects> {
-  const [counts] = await sql<E2EScratchSideEffects[]>`
-    select (select count(*)::int from accounts) as "accountCount",
-           (select count(*)::int from agents) as "agentCount",
-           (select count(*)::int from sessions) as "sessionCount",
-           (select count(*)::int from usage_events) as "usageCount",
-           (select count(*)::int from turn_provider_runs) as "providerRunCount",
-           (select count(*)::int from manna_accounts) as "mannaAccountCount",
-           (select count(*)::int from manna_transactions) as "mannaTransactionCount"
-  `;
-  if (!counts) throw new Error('scratch fixture side-effect inventory was empty');
-  return counts;
-}
-
-async function assertCurrentDatabase(sql: QuerySql, expected: string): Promise<void> {
-  const [row] = await sql<{ databaseName: string }[]>`
-    select current_database()::text as "databaseName"
-  `;
-  if (row?.databaseName !== expected) {
-    throw new Error('scratch fixture connected to an unexpected database');
-  }
-}
-
-async function seed(databaseName: string) {
-  const fixture = e2eScratchUser(databaseName);
-  let action: 'insert' | 'existing' = 'existing';
-  await pg.begin(async (sql) => {
-    const query = queryOnly(sql);
-    await assertCurrentDatabase(query, databaseName);
-    action = assertE2EScratchAccountInventory(await accountRows(query), fixture);
-    if (action === 'insert') {
+export function postgresRepository(
+  sql: QuerySql,
+  begin?: <T>(operation: (transaction: QuerySql) => Promise<T>) => Promise<T>,
+): E2EScratchFixtureRepository {
+  const repository: E2EScratchFixtureRepository = {
+    transaction: (operation) =>
+      begin
+        ? begin((transaction) => operation(postgresRepository(transaction)))
+        : operation(repository),
+    async currentDatabase() {
+      const [row] = await sql<{ databaseName: string }[]>`
+        select current_database()::text as "databaseName"
+      `;
+      if (!row) throw new Error('scratch fixture database identity was empty');
+      return row.databaseName;
+    },
+    async accountRows(options = {}) {
+      const select = `
+        select id::text,
+               type,
+               username::text,
+               external_id as "externalId",
+               clerk_user_id as "clerkUserId",
+               user_image as "userImage",
+               deleted
+        from accounts
+        order by id`;
+      return options.forUpdate
+        ? await sql`
+            select id::text,
+                   type,
+                   username::text,
+                   external_id as "externalId",
+                   clerk_user_id as "clerkUserId",
+                   user_image as "userImage",
+                   deleted
+            from accounts
+            order by id
+            for update
+          `
+        : await sql.unsafe(select);
+    },
+    async insertUser(fixture) {
       await sql`
         insert into accounts
           (id, type, username, external_id, clerk_user_id, user_image, deleted)
         values
-          (${fixture.id}, 'user', 'gene', null, null, null, false)
+          (${fixture.id}, ${fixture.type}, ${fixture.username}, null, null, null, false)
       `;
-    }
-    if (assertE2EScratchAccountInventory(await accountRows(query), fixture) !== 'existing') {
-      throw new Error('scratch fixture insert did not converge');
-    }
-    assertNoE2EScratchSideEffects(await sideEffectCounts(query));
+    },
+    async sideEffectCounts() {
+      const [counts] = await sql<E2EScratchSideEffects[]>`
+        select (select count(*)::int from accounts) as "accountCount",
+               (select count(*)::int from agents) as "agentCount",
+               (select count(*)::int from sessions) as "sessionCount",
+               (select count(*)::int from usage_events) as "usageCount",
+               (select count(*)::int from turn_provider_runs) as "providerRunCount",
+               (select count(*)::int from manna_accounts) as "mannaAccountCount",
+               (select count(*)::int from manna_transactions) as "mannaTransactionCount"
+      `;
+      if (!counts) throw new Error('scratch fixture side-effect inventory was empty');
+      return counts;
+    },
+    async deleteExactUser(fixture: E2EScratchUser) {
+      const rows = await sql<{ id: string }[]>`
+        delete from accounts
+        where id = ${fixture.id}
+          and type = ${fixture.type}
+          and username = ${fixture.username}
+          and external_id is null
+          and clerk_user_id is null
+          and user_image is null
+          and deleted = false
+        returning id::text
+      `;
+      return rows.map((row) => row.id);
+    },
+  };
+  return repository;
+}
+
+export const e2eScratchPostgresRepository = postgresRepository(
+  queryOnly(pg),
+  async (operation) =>
+  (await pg.begin((sql) => operation(queryOnly(sql)))) as Awaited<ReturnType<typeof operation>>,
+);
+
+async function seed(databaseName: string) {
+  const result = await seedE2EScratchUser({
+    repository: e2eScratchPostgresRepository,
+    databaseName,
   });
-  return { ok: true, action, databaseName, userId: fixture.id };
+  return { ok: true, action: result.action, databaseName, userId: result.fixture.id };
 }
 
 async function preflight(databaseName: string, rawApiUrl: string) {
-  const fixture = e2eScratchUser(databaseName);
   const apiUrl = safeApiUrl(rawApiUrl);
-  await assertCurrentDatabase(queryOnly(pg), databaseName);
-  await verifyE2EScratchPreflight({
-    fixture,
+  const fixture = await preflightE2EScratchUser({
+    repository: e2eScratchPostgresRepository,
+    databaseName,
     fetchUsers: async () => {
       const response = await fetch(new URL('/dev/users?q=gene', apiUrl), {
         signal: AbortSignal.timeout(10_000),
@@ -139,39 +164,16 @@ async function preflight(databaseName: string, rawApiUrl: string) {
       if (!response.ok) throw new Error('isolated E2E API user preflight failed');
       return response.json();
     },
-    readSideEffects: () => sideEffectCounts(queryOnly(pg)),
   });
   return { ok: true, databaseName, userId: fixture.id, sideEffects: 'none' };
 }
 
 async function cleanup(databaseName: string) {
-  const fixture = e2eScratchUser(databaseName);
-  let removed = false;
-  await pg.begin(async (sql) => {
-    const query = queryOnly(sql);
-    await assertCurrentDatabase(query, databaseName);
-    const rows = await accountRows(query);
-    if (rows.length === 0) return;
-    if (assertE2EScratchAccountInventory(rows, fixture) !== 'existing') return;
-    assertNoE2EScratchSideEffects(await sideEffectCounts(query));
-    const deleted = await sql<{ id: string }[]>`
-      delete from accounts
-      where id = ${fixture.id}
-        and type = 'user'
-        and username = 'gene'
-        and external_id is null
-        and clerk_user_id is null
-      returning id::text
-    `;
-    if (deleted.length !== 1 || deleted[0]?.id !== fixture.id) {
-      throw new Error('scratch fixture cleanup did not delete the exact user');
-    }
-    if ((await accountRows(query)).length !== 0) {
-      throw new Error('scratch fixture cleanup left an account behind');
-    }
-    removed = true;
+  const result = await cleanupE2EScratchUser({
+    repository: e2eScratchPostgresRepository,
+    databaseName,
   });
-  return { ok: true, databaseName, userId: fixture.id, removed };
+  return { ok: true, databaseName, userId: result.fixture.id, removed: result.removed };
 }
 
 async function main() {
@@ -189,10 +191,12 @@ async function main() {
   throw new Error('usage: e2e-scratch-fixture-cli.ts seed|preflight|cleanup');
 }
 
-main()
-  .then((result) => console.log(JSON.stringify(result)))
-  .catch((error) => {
-    console.error(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
-    process.exitCode = 1;
-  })
-  .finally(() => pg.end({ timeout: 5 }));
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main()
+    .then((result) => console.log(JSON.stringify(result)))
+    .catch((error) => {
+      console.error(JSON.stringify({ ok: false, error: String(error?.message ?? error) }));
+      process.exitCode = 1;
+    })
+    .finally(() => pg.end({ timeout: 5 }));
+}
