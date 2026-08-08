@@ -140,6 +140,8 @@ export const envSchema = z.object({
   API_RATE_LIMIT_MAX: nonnegativeIntSchema.default(600),
   /** Stripe secret key; optional until billing routes are exercised. */
   STRIPE_SECRET_KEY: z.string().min(1).optional(),
+  /** Closed-door billing mode. Live mode is introduced only by the later switch ceremony. */
+  STRIPE_MODE: z.literal('test').default('test'),
   /** Stripe webhook signing secret for /billing/webhook. */
   STRIPE_WEBHOOK_SECRET: z.string().min(1).optional(),
   /** Stripe Checkout Price id for one-time manna top-ups. */
@@ -171,6 +173,26 @@ export const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ['EDEN3_DATABASE_NAME'],
       message: `must match DATABASE_URL database "${fromUrl}"`,
+    });
+  }
+  if (env.STRIPE_SECRET_KEY !== undefined && !env.STRIPE_SECRET_KEY.startsWith('sk_test_')) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STRIPE_SECRET_KEY'],
+      message: 'must be an sk_test_ test-mode secret while Eden3 doors are closed',
+    });
+  }
+  const stripePrices = [
+    env.STRIPE_MANNA_TOPUP_PRICE_ID,
+    env.STRIPE_SUBSCRIPTION_BASIC_PRICE_ID,
+    env.STRIPE_SUBSCRIPTION_PRO_PRICE_ID,
+    env.STRIPE_SUBSCRIPTION_BELIEVER_PRICE_ID,
+  ].filter((value): value is string => value !== undefined);
+  if (new Set(stripePrices).size !== stripePrices.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['STRIPE_MANNA_TOPUP_PRICE_ID'],
+      message: 'Stripe *_PRICE_ID values must be unique',
     });
   }
   return {

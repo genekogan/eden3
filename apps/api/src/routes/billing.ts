@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-import { credit, getBalance, getEnv } from '@eden3/core';
+import { credit, getBalance, getEnv, type DbHandle } from '@eden3/core';
 import {
   accounts,
   billingSubscriptions,
@@ -43,13 +43,7 @@ const defaultStripeClient: StripeCheckoutClient = {
     const body = (await res.json().catch(() => ({}))) as Partial<StripeCheckoutSession> & {
       error?: { message?: string };
     };
-    if (!res.ok) {
-      throw new ApiError(
-        502,
-        'stripe_checkout_failed',
-        body.error?.message ?? `Stripe checkout failed with HTTP ${res.status}`,
-      );
-    }
+    if (!res.ok) throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout is unavailable');
     if (!body.id) throw new ApiError(502, 'stripe_checkout_failed', 'Stripe response missing session id');
     return { id: body.id, url: body.url ?? null };
   },
@@ -67,10 +61,12 @@ const redeemVoucherBodySchema = z.object({
 type StripeEvent = {
   id: string;
   type: string;
-  livemode?: boolean;
-  created?: number;
+  livemode: false;
+  created: number;
   data: { object: Record<string, unknown> };
 };
+
+type SubscriptionTier = 'basic' | 'pro' | 'believer';
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -163,11 +159,30 @@ function metadataValue(object: Record<string, unknown>, key: string): string | n
   return null;
 }
 
-function accountIdFromStripeObject(object: Record<string, unknown>): string | null {
-  return metadataValue(object, 'accountId') ?? asString(object.client_reference_id);
+function consistentStripeValue(label: string, values: readonly (string | null)[]): string | null {
+  const unique = [...new Set(values.filter((value): value is string => value !== null))];
+  if (unique.length > 1) {
+    throw new ApiError(409, 'stripe_binding_mismatch', `Stripe ${label} binding is inconsistent`);
+  }
+  return unique[0] ?? null;
 }
 
-function tierAmount(tier: string | null): number | null {
+function accountIdFromStripeObject(object: Record<string, unknown>): string | null {
+  return consistentStripeValue('account', [
+    ...metadataCandidates(object).map((metadata) => asString(metadata.accountId)),
+    asString(object.client_reference_id),
+  ]);
+}
+
+function metadataTier(object: Record<string, unknown>): SubscriptionTier | null {
+  const value = consistentStripeValue(
+    'tier',
+    metadataCandidates(object).map((metadata) => asString(metadata.tier)),
+  );
+  return value === 'basic' || value === 'pro' || value === 'believer' ? value : null;
+}
+
+function tierAmount(tier: SubscriptionTier | null): number | null {
   const env = getEnv();
   switch (tier) {
     case 'basic':
@@ -181,7 +196,7 @@ function tierAmount(tier: string | null): number | null {
   }
 }
 
-function subscriptionPrice(tier: 'basic' | 'pro' | 'believer'): { priceId: string | undefined; manna: number } {
+function subscriptionPrice(tier: SubscriptionTier): { priceId: string | undefined; manna: number } {
   const env = getEnv();
   switch (tier) {
     case 'basic':
@@ -194,6 +209,43 @@ function subscriptionPrice(tier: 'basic' | 'pro' | 'believer'): { priceId: strin
         manna: env.STRIPE_SUBSCRIPTION_BELIEVER_MONTHLY_MANNA,
       };
   }
+}
+
+function configuredTierForPrice(priceId: string): SubscriptionTier | null {
+  const env = getEnv();
+  if (priceId === env.STRIPE_SUBSCRIPTION_BASIC_PRICE_ID) return 'basic';
+  if (priceId === env.STRIPE_SUBSCRIPTION_PRO_PRICE_ID) return 'pro';
+  if (priceId === env.STRIPE_SUBSCRIPTION_BELIEVER_PRICE_ID) return 'believer';
+  return null;
+}
+
+function stripePriceIds(object: Record<string, unknown>): string[] {
+  const lines = asRecord(object.lines) ?? asRecord(object.items);
+  const data = Array.isArray(lines?.data) ? lines.data : [];
+  return data.flatMap((item) => {
+    const line = asRecord(item);
+    const legacy = asString(asRecord(line?.price)?.id);
+    const modern = asString(asRecord(asRecord(line?.pricing)?.price_details)?.price);
+    return [legacy, modern].filter((value): value is string => value !== null);
+  });
+}
+
+function configuredTierFromStripeObject(object: Record<string, unknown>): SubscriptionTier {
+  const tiers = [
+    ...new Set(
+      stripePriceIds(object)
+        .map(configuredTierForPrice)
+        .filter((tier): tier is SubscriptionTier => tier !== null),
+    ),
+  ];
+  if (tiers.length !== 1) {
+    throw new ApiError(400, 'bad_event', 'Stripe event does not identify one configured tier');
+  }
+  const claimed = metadataTier(object);
+  if (claimed !== null && claimed !== tiers[0]) {
+    throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe tier does not match its configured price');
+  }
+  return tiers[0]!;
 }
 
 function subscriptionIdFromInvoice(object: Record<string, unknown>): string | null {
@@ -246,12 +298,68 @@ export function verifyStripeWebhookSignature(
   }
 }
 
-async function assertAccountExists(accountId: string): Promise<void> {
-  const [row] = await db.select({ id: accounts.id }).from(accounts).where(eq(accounts.id, accountId)).limit(1);
+async function assertAccountExists(accountId: string, dbc: DbHandle = db): Promise<void> {
+  const [row] = await dbc.select({ id: accounts.id }).from(accounts).where(eq(accounts.id, accountId)).limit(1);
   if (!row) throw new ApiError(400, 'unknown_account', 'Stripe event does not map to an Eden3 account');
 }
 
+async function lockStripeScopes(dbc: DbHandle, scopes: readonly string[]): Promise<void> {
+  for (const scope of [...new Set(scopes)].sort()) {
+    await dbc.execute(sql`select pg_advisory_xact_lock(hashtextextended(${scope}, 29))`);
+  }
+}
+
+async function assertStripeBindings(
+  dbc: DbHandle,
+  params: { accountId: string; stripeCustomerId: string | null; stripeSubscriptionId: string | null },
+): Promise<void> {
+  await assertAccountExists(params.accountId, dbc);
+  const conditions = [
+    params.stripeSubscriptionId
+      ? eq(billingSubscriptions.stripeSubscriptionId, params.stripeSubscriptionId)
+      : undefined,
+    params.stripeCustomerId
+      ? eq(billingSubscriptions.stripeCustomerId, params.stripeCustomerId)
+      : undefined,
+  ].filter((condition): condition is NonNullable<typeof condition> => condition !== undefined);
+  if (conditions.length === 0) return;
+  const rows = await dbc
+    .select({
+      accountId: billingSubscriptions.accountId,
+      stripeCustomerId: billingSubscriptions.stripeCustomerId,
+      stripeSubscriptionId: billingSubscriptions.stripeSubscriptionId,
+    })
+    .from(billingSubscriptions)
+    .where(conditions.length === 1 ? conditions[0] : or(...conditions));
+  for (const row of rows) {
+    if (row.accountId !== params.accountId) {
+      throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe billing identity belongs to another account');
+    }
+    if (
+      params.stripeSubscriptionId === row.stripeSubscriptionId &&
+      params.stripeCustomerId !== null &&
+      row.stripeCustomerId !== null &&
+      row.stripeCustomerId !== params.stripeCustomerId
+    ) {
+      throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe customer binding cannot change');
+    }
+  }
+}
+
+async function assertCreditBinding(dbc: DbHandle, idempotencyKey: string, accountId: string): Promise<void> {
+  const [existing] = await dbc
+    .select({ accountId: mannaAccounts.accountId })
+    .from(mannaTransactions)
+    .innerJoin(mannaAccounts, eq(mannaAccounts.id, mannaTransactions.mannaAccountId))
+    .where(eq(mannaTransactions.idempotencyKey, idempotencyKey))
+    .limit(1);
+  if (existing && existing.accountId !== accountId) {
+    throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe credit object belongs to another account');
+  }
+}
+
 async function upsertSubscription(params: {
+  db: DbHandle;
   accountId: string;
   stripeCustomerId: string | null;
   stripeSubscriptionId: string;
@@ -264,7 +372,7 @@ async function upsertSubscription(params: {
   eventCreatedAt: Date | null;
 }): Promise<void> {
   const eventAt = params.eventCreatedAt;
-  await db
+  await params.db
     .insert(billingSubscriptions)
     .values({
       accountId: params.accountId,
@@ -281,8 +389,7 @@ async function upsertSubscription(params: {
     .onConflictDoUpdate({
       target: billingSubscriptions.stripeSubscriptionId,
       set: {
-        accountId: params.accountId,
-        stripeCustomerId: params.stripeCustomerId,
+        stripeCustomerId: sql`coalesce(${billingSubscriptions.stripeCustomerId}, excluded.stripe_customer_id)`,
         status: params.status,
         tier: params.tier,
         monthlyManna: params.monthlyManna,
@@ -296,80 +403,138 @@ async function upsertSubscription(params: {
       // canceled row. Apply only when this event is not older than the last
       // one recorded (rows/events without timestamps keep old behavior).
       setWhere:
-        eventAt === null
-          ? undefined
-          : // ISO text + cast: raw sql`` params bypass the column's Date
-            // mapping, and postgres.js rejects a bare Date here.
-            sql`${billingSubscriptions.lastStripeEventAt} is null or ${billingSubscriptions.lastStripeEventAt} <= ${eventAt.toISOString()}::timestamptz`,
+        and(
+          eq(billingSubscriptions.accountId, params.accountId),
+          params.stripeCustomerId === null
+            ? undefined
+            : or(
+                isNull(billingSubscriptions.stripeCustomerId),
+                eq(billingSubscriptions.stripeCustomerId, params.stripeCustomerId),
+              ),
+          eventAt === null
+            ? undefined
+            : sql`${billingSubscriptions.lastStripeEventAt} is null
+              or ${billingSubscriptions.lastStripeEventAt} < ${eventAt.toISOString()}::timestamptz
+              or (
+                ${billingSubscriptions.lastStripeEventAt} = ${eventAt.toISOString()}::timestamptz
+                and (${params.status} = 'canceled' or ${billingSubscriptions.status} <> 'canceled')
+              )`,
+        ),
     });
 }
 
 /** Stripe `event.created` (unix seconds) as a Date, when present. */
 function eventCreatedAtOf(event: StripeEvent): Date | null {
-  return typeof event.created === 'number' && Number.isFinite(event.created)
-    ? new Date(event.created * 1000)
-    : null;
+  return new Date(event.created * 1000);
 }
 
 async function handleCheckoutCompleted(event: StripeEvent): Promise<{ action: string; alreadyApplied?: boolean }> {
   const session = event.data.object;
   const accountId = accountIdFromStripeObject(session);
   if (!accountId) throw new ApiError(400, 'missing_account', 'Checkout session missing account metadata');
-  await assertAccountExists(accountId);
-
+  const sessionId = asString(session.id);
+  if (!sessionId) throw new ApiError(400, 'bad_event', 'Checkout session is missing its id');
   const mode = asString(session.mode);
   if (mode === 'subscription') {
     const subscriptionId = asString(session.subscription);
-    if (subscriptionId) {
-      const tier = metadataValue(session, 'tier');
-      await upsertSubscription({
+    const customerId = asString(session.customer);
+    const tier = metadataTier(session);
+    if (!subscriptionId || !customerId || !tier || !subscriptionPrice(tier).priceId) {
+      throw new ApiError(400, 'bad_event', 'Subscription checkout is missing configured billing identity');
+    }
+    await db.transaction(async (tx) => {
+      await lockStripeScopes(tx, [
+        `stripe-customer:${customerId}`,
+        `stripe-subscription:${subscriptionId}`,
+      ]);
+      await assertStripeBindings(tx, {
         accountId,
-        stripeCustomerId: asString(session.customer),
+        stripeCustomerId: customerId,
+        stripeSubscriptionId: subscriptionId,
+      });
+      await upsertSubscription({
+        db: tx,
+        accountId,
+        stripeCustomerId: customerId,
         stripeSubscriptionId: subscriptionId,
         status: 'checkout_completed',
         tier,
-        monthlyManna: asNumber(metadataValue(session, 'monthlyManna')) ?? tierAmount(tier) ?? 0,
+        monthlyManna: tierAmount(tier) ?? 0,
         currentPeriodEnd: null,
         cancelAtPeriodEnd: false,
         eventCreatedAt: eventCreatedAtOf(event),
       });
-    }
+    });
     return { action: 'subscription_recorded' };
   }
 
+  if (mode !== 'payment' || metadataValue(session, 'kind') !== 'manna_topup') {
+    throw new ApiError(400, 'bad_event', 'Checkout session is not an Eden manna purchase');
+  }
   if (asString(session.payment_status) !== 'paid') return { action: 'payment_not_paid' };
-  const amount = asNumber(metadataValue(session, 'mannaAmount')) ?? getEnv().STRIPE_MANNA_TOPUP_AMOUNT;
-  const result = await credit({
-    accountId,
-    amount,
-    type: 'credit:stripe',
-    idempotencyKey: `stripe:${event.id}`,
-    stripeEventId: event.id,
-    stripeEventType: event.type,
-    stripeEventData: session,
+  const customerId = asString(session.customer);
+  const idempotencyKey = `stripe:checkout:${sessionId}`;
+  return await db.transaction(async (tx) => {
+    await lockStripeScopes(tx, [
+      `stripe-credit:${idempotencyKey}`,
+      ...(customerId ? [`stripe-customer:${customerId}`] : []),
+    ]);
+    await assertStripeBindings(tx, {
+      accountId,
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: null,
+    });
+    await assertCreditBinding(tx, idempotencyKey, accountId);
+    const result = await credit({
+      accountId,
+      amount: getEnv().STRIPE_MANNA_TOPUP_AMOUNT,
+      type: 'credit:stripe',
+      idempotencyKey,
+      stripeEventId: event.id,
+      stripeEventType: event.type,
+      stripeEventData: { objectId: sessionId, livemode: false },
+      db: tx,
+    });
+    return { action: 'manna_credited', alreadyApplied: result.alreadyApplied };
   });
-  return { action: 'manna_credited', alreadyApplied: result.alreadyApplied };
 }
 
 async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ action: string; alreadyApplied?: boolean }> {
   const invoice = event.data.object;
+  const invoiceId = asString(invoice.id);
+  if (!invoiceId) throw new ApiError(400, 'bad_event', 'Invoice is missing its id');
+  const billingReason = asString(invoice.billing_reason);
+  if (billingReason === 'subscription_update') return { action: 'subscription_proration_ignored' };
+  if (billingReason !== 'subscription_create' && billingReason !== 'subscription_cycle') {
+    return { action: 'subscription_invoice_ignored' };
+  }
   const accountId = accountIdFromStripeObject(invoice);
   if (!accountId) throw new ApiError(400, 'missing_account', 'Invoice missing account metadata');
-  await assertAccountExists(accountId);
-
-  const tier = metadataValue(invoice, 'tier');
-  const monthlyManna =
-    asNumber(metadataValue(invoice, 'monthlyManna')) ??
-    asNumber(metadataValue(invoice, 'prorationManna')) ??
-    tierAmount(tier) ??
-    0;
-  if (monthlyManna <= 0) return { action: 'no_subscription_manna' };
-
+  const tier = configuredTierFromStripeObject(invoice);
+  const monthlyManna = tierAmount(tier);
+  if (!monthlyManna || monthlyManna <= 0) return { action: 'no_subscription_manna' };
   const subscriptionId = subscriptionIdFromInvoice(invoice);
-  if (subscriptionId) {
-    await upsertSubscription({
+  const customerId = asString(invoice.customer);
+  if (!subscriptionId || !customerId) {
+    throw new ApiError(400, 'bad_event', 'Invoice is missing subscription billing identity');
+  }
+  const idempotencyKey = `stripe:invoice:${invoiceId}`;
+  return await db.transaction(async (tx) => {
+    await lockStripeScopes(tx, [
+      `stripe-credit:${idempotencyKey}`,
+      `stripe-customer:${customerId}`,
+      `stripe-subscription:${subscriptionId}`,
+    ]);
+    await assertStripeBindings(tx, {
       accountId,
-      stripeCustomerId: asString(invoice.customer),
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+    });
+    await assertCreditBinding(tx, idempotencyKey, accountId);
+    await upsertSubscription({
+      db: tx,
+      accountId,
+      stripeCustomerId: customerId,
       stripeSubscriptionId: subscriptionId,
       status: 'active',
       tier,
@@ -378,38 +543,57 @@ async function handleInvoicePaymentSucceeded(event: StripeEvent): Promise<{ acti
       cancelAtPeriodEnd: false,
       eventCreatedAt: eventCreatedAtOf(event),
     });
-  }
-
-  const result = await credit({
-    accountId,
-    amount: monthlyManna,
-    type: 'credit:subscription',
-    idempotencyKey: `stripe:${event.id}`,
-    stripeEventId: event.id,
-    stripeEventType: event.type,
-    stripeEventData: invoice,
-    toSubscriptionBalance: true,
+    const result = await credit({
+      accountId,
+      amount: monthlyManna,
+      type: 'credit:subscription',
+      idempotencyKey,
+      stripeEventId: event.id,
+      stripeEventType: event.type,
+      stripeEventData: {
+        objectId: invoiceId,
+        customerId,
+        subscriptionId,
+        tier,
+        billingReason,
+        livemode: false,
+      },
+      toSubscriptionBalance: true,
+      db: tx,
+    });
+    return { action: 'subscription_manna_credited', alreadyApplied: result.alreadyApplied };
   });
-  return { action: 'subscription_manna_credited', alreadyApplied: result.alreadyApplied };
 }
 
 async function handleSubscriptionChanged(event: StripeEvent): Promise<{ action: string }> {
   const subscription = event.data.object;
   const accountId = accountIdFromStripeObject(subscription);
   const subscriptionId = asString(subscription.id);
-  if (!accountId || !subscriptionId) return { action: 'subscription_ignored' };
-  await assertAccountExists(accountId);
-  const tier = metadataValue(subscription, 'tier');
-  await upsertSubscription({
-    accountId,
-    stripeCustomerId: asString(subscription.customer),
-    stripeSubscriptionId: subscriptionId,
-    status: event.type === 'customer.subscription.deleted' ? 'canceled' : (asString(subscription.status) ?? 'unknown'),
-    tier,
-    monthlyManna: asNumber(metadataValue(subscription, 'monthlyManna')) ?? tierAmount(tier) ?? 0,
-    currentPeriodEnd: currentPeriodEndFrom(subscription.current_period_end),
-    cancelAtPeriodEnd: asBoolean(subscription.cancel_at_period_end),
-    eventCreatedAt: eventCreatedAtOf(event),
+  const customerId = asString(subscription.customer);
+  if (!accountId || !subscriptionId || !customerId) return { action: 'subscription_ignored' };
+  const tier = configuredTierFromStripeObject(subscription);
+  await db.transaction(async (tx) => {
+    await lockStripeScopes(tx, [
+      `stripe-customer:${customerId}`,
+      `stripe-subscription:${subscriptionId}`,
+    ]);
+    await assertStripeBindings(tx, {
+      accountId,
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+    });
+    await upsertSubscription({
+      db: tx,
+      accountId,
+      stripeCustomerId: customerId,
+      stripeSubscriptionId: subscriptionId,
+      status: event.type === 'customer.subscription.deleted' ? 'canceled' : (asString(subscription.status) ?? 'unknown'),
+      tier,
+      monthlyManna: tierAmount(tier) ?? 0,
+      currentPeriodEnd: currentPeriodEndFrom(subscription.current_period_end),
+      cancelAtPeriodEnd: asBoolean(subscription.cancel_at_period_end),
+      eventCreatedAt: eventCreatedAtOf(event),
+    });
   });
   return { action: 'subscription_updated' };
 }
@@ -535,10 +719,35 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
         typeof req.headers['stripe-signature'] === 'string' ? req.headers['stripe-signature'] : undefined,
         env.STRIPE_WEBHOOK_SECRET,
       );
-      const event = JSON.parse(rawBody.toString('utf8')) as StripeEvent;
-      if (!event.id || !event.type || !event.data?.object) {
+      let decoded: unknown;
+      try {
+        decoded = JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        throw new ApiError(400, 'bad_event', 'Stripe webhook payload is invalid');
+      }
+      const record = asRecord(decoded);
+      if (record?.livemode !== false) {
+        throw new ApiError(400, 'stripe_mode_mismatch', 'Stripe webhook is not a test-mode event');
+      }
+      const data = asRecord(record.data);
+      const object = asRecord(data?.object);
+      if (
+        !asString(record.id) ||
+        !asString(record.type) ||
+        typeof record.created !== 'number' ||
+        !Number.isFinite(record.created) ||
+        record.created < 0 ||
+        !object
+      ) {
         throw new ApiError(400, 'bad_event', 'Stripe webhook payload is not a supported event object');
       }
+      const event = {
+        id: record.id,
+        type: record.type,
+        livemode: false,
+        created: record.created,
+        data: { object },
+      } as StripeEvent;
       const result = await handleStripeEvent(event);
       return { received: true, ...result };
     });

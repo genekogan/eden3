@@ -22,6 +22,7 @@ const webhookSecret = 'whsec_test_secret';
 let userId = '';
 let otherUserId = '';
 let app: FastifyInstance;
+let testStripeCreated = 10_000;
 const checkoutCalls: Array<{ params: URLSearchParams; secretKey: string }> = [];
 
 const fakeStripeClient: StripeCheckoutClient = {
@@ -32,6 +33,7 @@ const fakeStripeClient: StripeCheckoutClient = {
 };
 
 const envKeys = [
+  'STRIPE_MODE',
   'STRIPE_SECRET_KEY',
   'STRIPE_WEBHOOK_SECRET',
   'STRIPE_MANNA_TOPUP_PRICE_ID',
@@ -51,7 +53,11 @@ function signPayload(payload: string, timestamp = Math.floor(Date.now() / 1000))
 }
 
 async function postWebhook(event: unknown) {
-  const payload = JSON.stringify(event);
+  const payload = JSON.stringify(
+    event !== null && typeof event === 'object' && !Array.isArray(event)
+      ? { livemode: false, created: testStripeCreated++, ...event }
+      : event,
+  );
   return await app.inject({
     method: 'POST',
     url: '/billing/webhook',
@@ -75,6 +81,7 @@ async function ledgerRows(accountId: string) {
 
 beforeAll(async () => {
   for (const key of envKeys) originalEnv.set(key, process.env[key]);
+  process.env.STRIPE_MODE = 'test';
   process.env.STRIPE_SECRET_KEY = 'sk_test_billing';
   process.env.STRIPE_WEBHOOK_SECRET = webhookSecret;
   process.env.STRIPE_MANNA_TOPUP_PRICE_ID = 'price_topup';
@@ -223,7 +230,7 @@ describe('POST /billing/webhook', () => {
           mode: 'payment',
           payment_status: 'paid',
           client_reference_id: userId,
-          metadata: { accountId: userId, mannaAmount: '1234' },
+          metadata: { accountId: userId, kind: 'manna_topup', mannaAmount: '1234' },
         },
       },
     };
@@ -241,6 +248,51 @@ describe('POST /billing/webhook', () => {
     expect(stripeRows[0]).toMatchObject({ type: 'credit:stripe', amount: '1234.0000' });
   });
 
+  it('credits one checkout object once across concurrent distinct event ids and ignores amount metadata', async () => {
+    const before = await getBalance(userId);
+    const object = {
+      id: `${marker}_cs_semantic`,
+      mode: 'payment',
+      payment_status: 'paid',
+      client_reference_id: userId,
+      metadata: { accountId: userId, kind: 'manna_topup', mannaAmount: '999999' },
+    };
+    const responses = await Promise.all([
+      postWebhook({ id: `${marker}_evt_semantic_a`, type: 'checkout.session.completed', data: { object } }),
+      postWebhook({ id: `${marker}_evt_semantic_b`, type: 'checkout.session.completed', data: { object } }),
+    ]);
+
+    for (const response of responses) expect(response.statusCode).toBe(200);
+    expect(responses.filter((response) => response.json().alreadyApplied === false)).toHaveLength(1);
+    expect((await getBalance(userId)).balance - before.balance).toBe(1234);
+    const semanticRows = (await ledgerRows(userId)).filter((row) =>
+      [`${marker}_evt_semantic_a`, `${marker}_evt_semantic_b`].includes(row.stripe_event_id ?? ''),
+    );
+    expect(semanticRows).toHaveLength(1);
+    expect(semanticRows[0]?.amount).toBe('1234.0000');
+  });
+
+  it('rejects conflicting checkout account claims before credit', async () => {
+    const before = await getBalance(userId);
+    const res = await postWebhook({
+      id: `${marker}_evt_checkout_conflict`,
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: `${marker}_cs_conflict`,
+          mode: 'payment',
+          payment_status: 'paid',
+          client_reference_id: otherUserId,
+          metadata: { accountId: userId, kind: 'manna_topup' },
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('stripe_binding_mismatch');
+    expect(await getBalance(userId)).toEqual(before);
+  });
+
   it('grants subscription manna to the subscription pot and records subscription state', async () => {
     const event = {
       id: `${marker}_evt_invoice`,
@@ -250,7 +302,9 @@ describe('POST /billing/webhook', () => {
           id: `${marker}_in`,
           customer: `${marker}_cus`,
           subscription: `${marker}_sub`,
-          metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
+          billing_reason: 'subscription_cycle',
+          lines: { data: [{ price: { id: 'price_basic' } }] },
+          metadata: { accountId: userId, tier: 'basic', monthlyManna: '999999' },
         },
       },
     };
@@ -274,7 +328,97 @@ describe('POST /billing/webhook', () => {
     expect(sub).toMatchObject({ status: 'active', tier: 'basic', monthly_manna: 4321 });
   });
 
-  it('credits subscription upgrade proration from invoice metadata', async () => {
+  it('credits one paid invoice once across concurrent distinct event ids', async () => {
+    const before = await getBalance(userId);
+    const object = {
+      id: `${marker}_in_semantic`,
+      customer: `${marker}_cus_semantic`,
+      subscription: `${marker}_sub_semantic`,
+      billing_reason: 'subscription_cycle',
+      lines: { data: [{ price: { id: 'price_basic' } }] },
+      metadata: { accountId: userId, tier: 'basic', monthlyManna: '999999' },
+    };
+    const responses = await Promise.all([
+      postWebhook({ id: `${marker}_evt_invoice_semantic_a`, type: 'invoice.payment_succeeded', data: { object } }),
+      postWebhook({ id: `${marker}_evt_invoice_semantic_b`, type: 'invoice.payment_succeeded', data: { object } }),
+    ]);
+
+    for (const response of responses) expect(response.statusCode).toBe(200);
+    expect(responses.filter((response) => response.json().alreadyApplied === false)).toHaveLength(1);
+    expect((await getBalance(userId)).subscriptionBalance - before.subscriptionBalance).toBe(4321);
+  });
+
+  it('rejects subscription and customer rebinding across tenants', async () => {
+    const baseBalance = await getBalance(otherUserId);
+    const sameSubscription = await postWebhook({
+      id: `${marker}_evt_rebind_subscription`,
+      type: 'customer.subscription.updated',
+      created: 4_000,
+      data: {
+        object: {
+          id: `${marker}_sub`,
+          customer: `${marker}_cus`,
+          status: 'active',
+          items: { data: [{ price: { id: 'price_basic' } }] },
+          metadata: { accountId: otherUserId, tier: 'basic' },
+        },
+      },
+    });
+    expect(sameSubscription.statusCode).toBe(409);
+    expect((sameSubscription.json() as { error: { code: string } }).error.code).toBe(
+      'stripe_binding_mismatch',
+    );
+
+    const sameCustomer = await postWebhook({
+      id: `${marker}_evt_rebind_customer`,
+      type: 'customer.subscription.created',
+      created: 4_001,
+      data: {
+        object: {
+          id: `${marker}_sub_other`,
+          customer: `${marker}_cus`,
+          status: 'active',
+          items: { data: [{ price: { id: 'price_basic' } }] },
+          metadata: { accountId: otherUserId, tier: 'basic' },
+        },
+      },
+    });
+    expect(sameCustomer.statusCode).toBe(409);
+    expect((sameCustomer.json() as { error: { code: string } }).error.code).toBe(
+      'stripe_binding_mismatch',
+    );
+    expect(await getBalance(otherUserId)).toEqual(baseBalance);
+    const [bound] = await pg<Array<{ account_id: string; stripe_customer_id: string | null }>>`
+      select account_id, stripe_customer_id
+      from billing_subscriptions
+      where stripe_subscription_id = ${`${marker}_sub`}
+    `;
+    expect(bound).toMatchObject({ account_id: userId, stripe_customer_id: `${marker}_cus` });
+  });
+
+  it('rejects a metadata tier that disagrees with the configured Stripe price', async () => {
+    const before = await getBalance(userId);
+    const res = await postWebhook({
+      id: `${marker}_evt_tier_mismatch`,
+      type: 'invoice.payment_succeeded',
+      data: {
+        object: {
+          id: `${marker}_in_tier_mismatch`,
+          customer: `${marker}_cus_tier_mismatch`,
+          subscription: `${marker}_sub_tier_mismatch`,
+          billing_reason: 'subscription_cycle',
+          lines: { data: [{ price: { id: 'price_basic' } }] },
+          metadata: { accountId: userId, tier: 'pro' },
+        },
+      },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('stripe_binding_mismatch');
+    expect(await getBalance(userId)).toEqual(before);
+  });
+
+  it('does not trust webhook metadata to mint subscription upgrade proration', async () => {
     const event = {
       id: `${marker}_evt_proration`,
       type: 'invoice.payment_succeeded',
@@ -283,6 +427,8 @@ describe('POST /billing/webhook', () => {
           id: `${marker}_in_proration`,
           customer: `${marker}_cus`,
           subscription: `${marker}_sub_proration`,
+          billing_reason: 'subscription_update',
+          lines: { data: [{ price: { id: 'price_basic' } }] },
           metadata: { accountId: userId, tier: 'pro', prorationManna: '321' },
         },
       },
@@ -294,15 +440,11 @@ describe('POST /billing/webhook', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({
       received: true,
-      action: 'subscription_manna_credited',
-      alreadyApplied: false,
+      action: 'subscription_proration_ignored',
     });
-    expect(await getBalance(userId)).toMatchObject({
-      subscriptionBalance: before.subscriptionBalance + 321,
-    });
+    expect(await getBalance(userId)).toEqual(before);
     const stripeRows = (await ledgerRows(userId)).filter((row) => row.stripe_event_id === event.id);
-    expect(stripeRows).toHaveLength(1);
-    expect(stripeRows[0]).toMatchObject({ type: 'credit:subscription', amount: '321.0000' });
+    expect(stripeRows).toHaveLength(0);
   });
 
   it('updates subscription tier/monthly manna on downgrade without crediting manna', async () => {
@@ -316,6 +458,7 @@ describe('POST /billing/webhook', () => {
           status: 'active',
           cancel_at_period_end: true,
           current_period_end: 1_800_000_000,
+          items: { data: [{ price: { id: 'price_basic' } }] },
           metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
         },
       },
@@ -352,6 +495,7 @@ describe('POST /billing/webhook', () => {
           id: `${marker}_sub`,
           customer: `${marker}_cus`,
           status: 'canceled',
+          items: { data: [{ price: { id: 'price_basic' } }] },
           metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
         },
       },
@@ -374,6 +518,7 @@ describe('POST /billing/webhook', () => {
     const subId = `${marker}_sub_order`;
     const base = {
       customer: `${marker}_cus`,
+      items: { data: [{ price: { id: 'price_basic' } }] },
       metadata: { accountId: userId, tier: 'basic', monthlyManna: '4321' },
     };
 
@@ -424,6 +569,44 @@ describe('POST /billing/webhook', () => {
     });
     expect(res.statusCode).toBe(400);
     expect((res.json() as { error: { code: string } }).error.code).toBe('bad_signature');
+  });
+
+  it.each([true, undefined])('rejects a signed non-test-mode event livemode=%s', async (livemode) => {
+    const payload = JSON.stringify({
+      id: `${marker}_mode_${String(livemode)}`,
+      type: 'checkout.session.completed',
+      ...(livemode === undefined ? {} : { livemode }),
+      data: { object: { id: `${marker}_mode_object` } },
+    });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/billing/webhook',
+      headers: {
+        'content-type': 'application/json',
+        'stripe-signature': signPayload(payload),
+      },
+      payload,
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string } }).error.code).toBe('stripe_mode_mismatch');
+  });
+
+  it('returns a safe bad-event response for signed malformed JSON', async () => {
+    const payload = '{not-json';
+    const res = await app.inject({
+      method: 'POST',
+      url: '/billing/webhook',
+      headers: {
+        'content-type': 'application/json',
+        'stripe-signature': signPayload(payload),
+      },
+      payload,
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: { code: string; message: string } }).error).toMatchObject({
+      code: 'bad_event',
+      message: 'Stripe webhook payload is invalid',
+    });
   });
 });
 
