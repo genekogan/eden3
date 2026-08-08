@@ -2,7 +2,7 @@ import type { ChannelConnectionDto, XConnectionDto } from '@/lib/types';
 
 export const DISCORD_DEVELOPER_PORTAL = 'https://discord.com/developers/applications';
 export const X_DEVELOPER_PORTAL = 'https://developer.x.com/en/portal/dashboard';
-export const DISCORD_BOT_PERMISSIONS = 68_608;
+export const DISCORD_BOT_PERMISSIONS = 0;
 
 export function discordInviteUrl(clientId: string): string | null {
   if (!/^\d{3,25}$/.test(clientId)) return null;

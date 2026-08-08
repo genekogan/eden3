@@ -5,7 +5,8 @@ import {
 } from './channel-connector-custody';
 
 export const DISCORD_PORTAL_URL = 'https://discord.com/developers/applications';
-export const DISCORD_BOT_PERMISSIONS = 68_608;
+/** Guild permissions stay zero: the retained runtime is direct-message only. */
+export const DISCORD_BOT_PERMISSIONS = 0;
 
 export interface DiscordBotIdentity {
   id: string;
@@ -36,6 +37,34 @@ export interface DiscordByobConnection {
 export type DiscordConnectResult =
   | { ok: true; value: DiscordByobConnection }
   | Extract<DiscordTokenValidation, { ok: false }>;
+
+function safeFailure(
+  code: Extract<DiscordTokenValidation, { ok: false }>['code'],
+): Extract<DiscordTokenValidation, { ok: false }> {
+  switch (code) {
+    case 'invalid_token':
+      return {
+        ok: false,
+        code,
+        message: 'Discord rejected this bot token. Copy a bot token, not a user token.',
+        retryable: false,
+      };
+    case 'rate_limited':
+      return {
+        ok: false,
+        code,
+        message: 'Discord rate-limited validation. Wait briefly, then retry.',
+        retryable: true,
+      };
+    default:
+      return {
+        ok: false,
+        code: 'provider_unavailable',
+        message: 'Discord could not validate this token right now.',
+        retryable: true,
+      };
+  }
+}
 
 type FetchLike = typeof fetch;
 
@@ -141,7 +170,7 @@ export class DiscordByobService {
       };
     }
     const validation = await this.client.getCurrentBot(token);
-    if (!validation.ok) return validation;
+    if (!validation.ok) return safeFailure(validation.code);
     if (!/^\d{3,25}$/.test(validation.bot.id)) {
       return {
         ok: false,
@@ -150,26 +179,27 @@ export class DiscordByobService {
         retryable: true,
       };
     }
-    const handle = await this.custody.seal({
+    const returnedHandle = await this.custody.sealScoped({
       accountId: input.accountId,
       agentId: input.agentId,
       channel: 'discord',
       label: input.label?.trim() || null,
       plaintext: token,
     });
-    try {
-      assertRequestScopedSecretHandle(handle);
-    } catch (error) {
-      // Compensate a malformed custody response by revoking the row by its
-      // opaque handle. A valid SecretRef is never published to a caller.
-      await Promise.resolve(this.custody.revoke(handle)).catch(() => undefined);
-      throw error;
-    }
+    const handle = {
+      connectionId: returnedHandle.connectionId,
+      secretRefId: returnedHandle.secretRefId,
+    };
+    assertRequestScopedSecretHandle(handle);
     return {
       ok: true,
       value: {
         handle,
-        bot: validation.bot,
+        bot: {
+          id: validation.bot.id,
+          username: validation.bot.username,
+          displayName: validation.bot.displayName,
+        },
         oauthInviteUrl: discordOauthInviteUrl(validation.bot.id),
       },
     };
