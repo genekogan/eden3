@@ -7,6 +7,7 @@ import {
   channelGroupMemoryPath,
   channelConversationFingerprint,
   channelPeerFingerprint,
+  configuredChannelGroups,
   resolveChannelMemoryContext,
   type ChannelSessionSyncStoreLike,
   type ChannelSyncConnection,
@@ -37,6 +38,42 @@ function vault(): SecretVaultLike {
 }
 
 describe('ChannelSessionSync', () => {
+  it('compiles only the canonical persisted provider group allowlist', () => {
+    expect(
+      configuredChannelGroups('discord', {
+        config: {
+          allowFrom: ['1234567890'],
+          discordGuilds: [
+            { guildId: '758719600895590441', channelIds: ['758719600895590444'] },
+          ],
+        },
+      }),
+    ).toEqual([
+      {
+        conversationId: '758719600895590444',
+        guildId: '758719600895590441',
+        allowFrom: ['1234567890'],
+      },
+    ]);
+    expect(
+      configuredChannelGroups('telegram', {
+        config: { allowFrom: ['1234567890'], telegramGroups: [{ groupId: '-1001234567890' }] },
+      }),
+    ).toEqual([
+      { conversationId: '-1001234567890', guildId: null, allowFrom: ['1234567890'] },
+    ]);
+    expect(() =>
+      configuredChannelGroups('discord', {
+        config: {
+          allowFrom: [],
+          discordGuilds: [
+            { guildId: '758719600895590441', channelIds: ['758719600895590444'] },
+          ],
+        },
+      }),
+    ).toThrow('invalid channel group configuration');
+  });
+
   it('projects safe, read-only session metadata with exact attribution', async () => {
     let persisted: Parameters<ChannelSessionSyncStoreLike['persistMessage']>[0] | undefined;
     const persistMessage: ChannelSessionSyncStoreLike['persistMessage'] = vi.fn(async (input) => {
