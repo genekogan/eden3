@@ -218,6 +218,13 @@
       "when": 1786200980865,
       "tag": "0030_storage_object_service",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1786201208971,
+      "tag": "0031_channel_onboarding_intents",
+      "breakpoints": true
     }
   ]
 }
