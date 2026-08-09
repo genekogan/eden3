@@ -5,6 +5,9 @@ import type { AuthSession } from '@eden3/core';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
+  AUTHORIZATION_CHECK_TIMEOUT_MS,
+  KEEPALIVE_INTERVAL_MS,
+  SESSION_EVENT_AUTHORIZATION_LEASE_MS,
   SessionEventAuthorizationLease,
   sessionEventAccessStillValid,
 } from '../src/events-bus';
@@ -114,6 +117,53 @@ describe('session event stream reauthorization', () => {
     expect(check).toHaveBeenCalledTimes(1);
   });
 
+  it('releases a pending reauthorization when the socket-side lease stops', async () => {
+    const check = vi.fn(() => new Promise<boolean>(() => {}));
+    const ping = vi.fn();
+    const close = vi.fn();
+    const lease = new SessionEventAuthorizationLease(check, ping, close);
+
+    const pending = lease.reauthorize();
+    await Promise.resolve();
+    lease.stop();
+    await expect(pending).resolves.toBeUndefined();
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(ping).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it('denies a never-settling verifier at the absolute deadline without revival', async () => {
+    vi.useFakeTimers();
+    try {
+      let rejectLate!: (error: Error) => void;
+      const check = vi.fn(
+        () => new Promise<boolean>((_resolve, reject) => {
+          rejectLate = reject;
+        }),
+      );
+      const ping = vi.fn();
+      const close = vi.fn();
+      const lease = new SessionEventAuthorizationLease(check, ping, close, 100);
+
+      const pending = lease.reauthorize();
+      await vi.advanceTimersByTimeAsync(99);
+      expect(close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(ping).not.toHaveBeenCalled();
+
+      rejectLate(new Error('late verifier failure'));
+      await Promise.resolve();
+      await lease.reauthorize();
+      expect(check).toHaveBeenCalledTimes(1);
+      expect(close).toHaveBeenCalledTimes(1);
+      expect(ping).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('wires the route lease to current auth, account, session, and access authority', () => {
     const source = readFileSync(new URL('../src/events-bus.ts', import.meta.url), 'utf8');
     expect(source).toMatch(/setInterval\(\(\) => \{\s*void authorizationLease\.reauthorize\(\)/);
@@ -122,7 +172,12 @@ describe('session event stream reauthorization', () => {
     expect(source).toContain('expectedSessionId: sessionId');
     expect(source).toContain('resolveSession: () => resolveSession(sessionId)');
     expect(source).toContain('canAccess: canAccessSession');
-    expect(source).toMatch(/const terminate = \(\) => \{\s*cleanup\(\);[\s\S]*reply\.raw\.end\(\)/);
+    expect(source).toMatch(/const terminate = \(\) => \{\s*authorizationLease\?\.stop\(\);\s*cleanup\(\)/);
     expect(source).toContain('keepaliveIntervalMs > KEEPALIVE_INTERVAL_MS');
+    expect(source).toContain("reply.raw.on('error', terminate)");
+    expect(AUTHORIZATION_CHECK_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(KEEPALIVE_INTERVAL_MS + AUTHORIZATION_CHECK_TIMEOUT_MS).toBeLessThanOrEqual(
+      SESSION_EVENT_AUTHORIZATION_LEASE_MS,
+    );
   });
 });

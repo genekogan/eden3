@@ -76,7 +76,10 @@ declare module 'fastify' {
   }
 }
 
-export const KEEPALIVE_INTERVAL_MS = 15_000;
+export const SESSION_EVENT_AUTHORIZATION_LEASE_MS = 15_000;
+export const KEEPALIVE_INTERVAL_MS = 10_000;
+export const AUTHORIZATION_CHECK_TIMEOUT_MS =
+  SESSION_EVENT_AUTHORIZATION_LEASE_MS - KEEPALIVE_INTERVAL_MS;
 
 interface SessionEventAccessCheck<TSession extends { id: string }> {
   expectedAccountId: string;
@@ -101,18 +104,37 @@ export async function sessionEventAccessStillValid<TSession extends { id: string
 export class SessionEventAuthorizationLease {
   private active = true;
   private checking = false;
+  private deadline: NodeJS.Timeout | null = null;
+  private resolveDeadline: (() => void) | null = null;
 
   constructor(
     private readonly check: () => Promise<boolean>,
     private readonly onAuthorized: () => void,
     private readonly onDenied: () => void,
-  ) {}
+    private readonly checkTimeoutMs = AUTHORIZATION_CHECK_TIMEOUT_MS,
+  ) {
+    if (
+      !Number.isSafeInteger(checkTimeoutMs) ||
+      checkTimeoutMs < 1 ||
+      checkTimeoutMs > AUTHORIZATION_CHECK_TIMEOUT_MS
+    ) {
+      throw new Error('session event authorization timeout must be from 1ms to 5000ms');
+    }
+  }
 
   async reauthorize(): Promise<void> {
     if (!this.active || this.checking) return;
     this.checking = true;
     try {
-      if (!(await this.check())) {
+      // Attach the rejection handler before racing so a late verifier failure
+      // after the deadline is inert instead of becoming an unhandled rejection.
+      const guardedCheck = Promise.resolve().then(this.check).catch(() => false);
+      const deadline = new Promise<boolean>((resolve) => {
+        this.resolveDeadline = () => resolve(false);
+        this.deadline = setTimeout(() => this.expireDeadline(), this.checkTimeoutMs);
+        this.deadline.unref();
+      });
+      if (!(await Promise.race([guardedCheck, deadline]))) {
         this.deny();
         return;
       }
@@ -120,12 +142,14 @@ export class SessionEventAuthorizationLease {
     } catch {
       this.deny();
     } finally {
+      this.clearDeadline();
       this.checking = false;
     }
   }
 
   stop(): void {
     this.active = false;
+    this.expireDeadline();
   }
 
   private deny(): void {
@@ -137,10 +161,22 @@ export class SessionEventAuthorizationLease {
       // Denial is already durable in this lease; never revive a failed stream.
     }
   }
+
+  private clearDeadline(): void {
+    if (this.deadline) clearTimeout(this.deadline);
+    this.deadline = null;
+    this.resolveDeadline = null;
+  }
+
+  private expireDeadline(): void {
+    const resolve = this.resolveDeadline;
+    this.clearDeadline();
+    resolve?.();
+  }
 }
 
 export interface SessionEventsRoutesOptions {
-  /** Test-only cadence override; production retains the fixed 15-second lease. */
+  /** Test-only cadence override; production retains the fixed 15-second lease budget. */
   keepaliveIntervalMs?: number;
 }
 
@@ -157,8 +193,9 @@ export interface SessionEventsRoutesOptions {
  *
  * Once authorized the reply is hijacked (we own the raw socket); headers
  * staged by earlier hooks (CORS) are merged into the raw writeHead so
- * EventSource works cross-origin from the web app. A comment ping goes out
- * every 15s to keep proxies and idle sockets alive.
+ * EventSource works cross-origin from the web app. A reauthorized comment ping
+ * starts every 10s and must finish within 5s, bounding the authority lease to
+ * 15s while also keeping proxies and idle sockets alive.
  */
 export const sessionEventsRoutes: FastifyPluginAsync<SessionEventsRoutesOptions> = async (
   app,
@@ -170,7 +207,7 @@ export const sessionEventsRoutes: FastifyPluginAsync<SessionEventsRoutesOptions>
     keepaliveIntervalMs < 10 ||
     keepaliveIntervalMs > KEEPALIVE_INTERVAL_MS
   ) {
-    throw new Error('session event keepalive interval must be an integer from 10ms to 15000ms');
+    throw new Error('session event keepalive interval must be an integer from 10ms to 10000ms');
   }
   app.get<{ Params: { id: string } }>(
     '/sessions/:id/events',
@@ -191,11 +228,30 @@ export const sessionEventsRoutes: FastifyPluginAsync<SessionEventsRoutesOptions>
       const sessionId = session.id;
 
       reply.hijack();
-      // A client that disconnects mid-stream destroys the socket; subsequent
-      // keepalive writes emit async 'error' events on reply.raw — swallow them
-      // so an abrupt disconnect can't take the process down (mirrors chat.ts).
-      reply.raw.on('error', () => {});
       const writable = (): boolean => !reply.raw.destroyed && !reply.raw.writableEnded;
+
+      let closed = false;
+      let keepalive: NodeJS.Timeout | null = null;
+      let unsubscribe = () => {};
+      let authorizationLease: SessionEventAuthorizationLease | null = null;
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        if (keepalive) clearInterval(keepalive);
+        unsubscribe();
+      };
+      const terminate = () => {
+        authorizationLease?.stop();
+        cleanup();
+        try {
+          if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
+        } catch {
+          // The subscriber and timers are already gone; the stream stays dead.
+        }
+      };
+      // Async response failures take the same one-shot terminal path as auth
+      // denial instead of leaving a detached interval or subscriber behind.
+      reply.raw.on('error', terminate);
 
       // Preserve headers already staged on the Fastify reply (e.g. by
       // @fastify/cors) — raw writeHead bypasses them otherwise.
@@ -212,20 +268,8 @@ export const sessionEventsRoutes: FastifyPluginAsync<SessionEventsRoutesOptions>
       });
       reply.raw.write(encodeSseComment('connected'));
 
-      let closed = false;
-      let keepalive: NodeJS.Timeout | null = null;
-      const unsubscribe = bus.subscribe(sessionId, reply.raw);
-      const cleanup = () => {
-        if (closed) return;
-        closed = true;
-        if (keepalive) clearInterval(keepalive);
-        unsubscribe();
-      };
-      const terminate = () => {
-        cleanup();
-        if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
-      };
-      const authorizationLease = new SessionEventAuthorizationLease(
+      unsubscribe = bus.subscribe(sessionId, reply.raw);
+      authorizationLease = new SessionEventAuthorizationLease(
         async () => {
           if (!writable()) return false;
           return sessionEventAccessStillValid({
@@ -251,7 +295,7 @@ export const sessionEventsRoutes: FastifyPluginAsync<SessionEventsRoutesOptions>
       keepalive.unref();
 
       reply.raw.on('close', () => {
-        authorizationLease.stop();
+        authorizationLease?.stop();
         cleanup();
       });
     },
