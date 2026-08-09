@@ -1080,6 +1080,62 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
     }
   }, 60_000);
 
+  it('admits each terminal outbound-effect state without aggregate masking', async () => {
+    const cases = [
+      { kind: 'stripe' as const, state: 'created' as const },
+      { kind: 'stripe' as const, state: 'failed' as const },
+      { kind: 'x' as const, state: 'succeeded' as const },
+      { kind: 'x' as const, state: 'failed' as const },
+    ];
+    for (const [index, testCase] of cases.entries()) {
+      const accountId = randomUUID();
+      const intentId = randomUUID();
+      const connectionId = randomUUID();
+      const username = `erase_terminal_${testCase.kind}_${testCase.state}_${accountId.slice(0, 8)}`;
+      await pg`insert into accounts(id,type,username) values (${accountId},'user',${username})`;
+      if (testCase.kind === 'stripe') {
+        await pg`insert into stripe_checkout_intents(id,account_id,kind,request_key_sha256)
+          values (${intentId},${accountId},'manna_topup',${sha(`terminal-stripe-${index}`)})`;
+        if (testCase.state === 'created') {
+          await pg`update stripe_checkout_intents set state='provider_started' where id=${intentId}`;
+          await pg`update stripe_checkout_intents set state='created',stripe_session_id=${`cs_terminal_${index}`}
+            where id=${intentId}`;
+        } else {
+          await pg`update stripe_checkout_intents set state='failed',last_error_code='provider_failed'
+            where id=${intentId}`;
+        }
+      } else {
+        await pg`insert into channel_connections
+          (id,account_id,channel,token_ciphertext,token_iv,token_auth_tag,token_sha256)
+          values (${connectionId},${accountId},'x','cipher','iv','tag',${sha(`terminal-x-${index}`)})`;
+        await pg`insert into channel_outbound_post_intents(id,account_id,connection_id)
+          values (${intentId},${accountId},${connectionId})`;
+        if (testCase.state === 'succeeded') {
+          await pg`update channel_outbound_post_intents set state='provider_started' where id=${intentId}`;
+          await pg`update channel_outbound_post_intents set state='succeeded',provider_post_id=${`post_terminal_${index}`}
+            where id=${intentId}`;
+        } else {
+          await pg`update channel_outbound_post_intents set state='failed',last_error_code='provider_failed'
+            where id=${intentId}`;
+        }
+      }
+      const manifest = recoverySink();
+      await expect(requestAccountErasure({
+        actorAccountId: accountId,
+        actorUsername: username,
+        actorIsAdmin: false,
+        confirmUsername: username,
+      }, erasureStore(), ledger(), manifest)).resolves.toEqual({
+        jobId: expect.any(String), status: 'pending',
+      });
+      expect(manifest.encryptWriteAndConfirm).toHaveBeenCalledTimes(1);
+      const [truth] = await pg<{ deleted: boolean; inventoried: boolean }[]>`
+        select a.deleted,(j.inventoried_at is not null) inventoried from accounts a
+        join account_erasure_jobs j on j.account_id=a.id where a.id=${accountId}`;
+      expect(truth).toEqual({ deleted: true, inventoried: true });
+    }
+  }, 30_000);
+
   it('records real provider terminal-no-output after Tx1 freezes reversal, then recovery refunds once', async () => {
     const accountId = randomUUID();
     const agentId = randomUUID();
