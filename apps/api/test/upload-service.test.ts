@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { deflateSync } from 'node:zlib';
 
 import { describe, expect, it } from 'vitest';
 
@@ -53,6 +54,47 @@ function benignPng(): Buffer {
     pngChunk('IHDR', ihdr),
     pngChunk('IDAT', Buffer.from([0])),
     pngChunk('IEND'),
+  ]);
+}
+
+function oversizedCompressedPdf(): Buffer {
+  const catalog = '<< /Type /Catalog /Pages 2 0 R >>';
+  const pages = '<< /Type /Pages /Count 0 /Kids [] >>';
+  const padding = `<< /Padding (${'x'.repeat(2 * 1024 * 1024)}) >>`;
+  const header = `1 0 2 ${catalog.length} 5 ${catalog.length + pages.length} `;
+  const decodedObjects = Buffer.from(`${header}${catalog}${pages}${padding}`, 'latin1');
+  const compressedObjects = deflateSync(decodedObjects);
+  const documentHeader = Buffer.from('%PDF-1.7\n', 'latin1');
+  const objectStreamPrefix = Buffer.from(
+    `3 0 obj\n<< /Type /ObjStm /N 3 /First ${header.length} /Filter /FlateDecode /Length ${compressedObjects.length} >>\nstream\n`,
+    'latin1',
+  );
+  const objectStreamSuffix = Buffer.from('\nendstream\nendobj\n', 'latin1');
+  const xrefOffset = documentHeader.length + objectStreamPrefix.length + compressedObjects.length + objectStreamSuffix.length;
+  const records = Buffer.alloc(7 * 7);
+  const entry = (objectNumber: number, type: number, field: number, third: number) => {
+    records[objectNumber * 7] = type;
+    records.writeUInt32BE(field, objectNumber * 7 + 1);
+    records.writeUInt16BE(third, objectNumber * 7 + 5);
+  };
+  entry(0, 0, 0, 65_535);
+  entry(1, 2, 3, 0);
+  entry(2, 2, 3, 1);
+  entry(3, 1, documentHeader.length, 0);
+  entry(5, 2, 3, 2);
+  entry(6, 1, xrefOffset, 0);
+  const compressedXref = deflateSync(records);
+  return Buffer.concat([
+    documentHeader,
+    objectStreamPrefix,
+    compressedObjects,
+    objectStreamSuffix,
+    Buffer.from(
+      `6 0 obj\n<< /Type /XRef /Size 7 /Root 1 0 R /W [1 4 2] /Filter /FlateDecode /Length ${compressedXref.length} >>\nstream\n`,
+      'latin1',
+    ),
+    compressedXref,
+    Buffer.from(`\nendstream\nendobj\nstartxref\n${xrefOffset}\n%%EOF\n`, 'latin1'),
   ]);
 }
 
@@ -273,6 +315,38 @@ describe('upload.resumable@v1 security boundary', () => {
     expect(status.state).toBe('completed');
     expect(status.objectState).toBe('quarantined');
     expect(status.objectUrl).toBeNull();
+  });
+
+  it('quarantines an oversized compressed PDF before exposing a URL and emits one policy event', async () => {
+    const repository = new InMemoryUploadRepository();
+    const backend = new MemoryMultipartBackend();
+    const events: Array<{ objectId: string; policyCode: string }> = [];
+    const worker = new UploadPolicyEventWorker({
+      store: repository,
+      sink: { deliver: async (event) => { events.push(event); } },
+    });
+    const uploadService = new UploadService({
+      repository,
+      backend,
+      capabilityKey: CAPABILITY_KEY,
+      backingStore: 'local',
+      policyEventWorker: worker,
+      securityMode: 'test',
+    });
+    const bytes = oversizedCompressedPdf();
+    const reservation = await reserveAndPut(uploadService, OWNER_A, bytes, 'application/pdf');
+
+    await expect(uploadService.complete(OWNER_A, reservation.uploadId)).rejects.toMatchObject({
+      code: 'upload_quarantined',
+      message: 'Upload quarantined',
+    });
+    const status = await uploadService.status(OWNER_A, reservation.uploadId);
+    expect(status).toMatchObject({ state: 'completed', objectState: 'quarantined', objectUrl: null });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      objectId: reservation.objectId,
+      policyCode: 'truncated_or_malformed_content',
+    });
   });
 
   it.each([

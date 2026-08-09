@@ -167,6 +167,31 @@ interface PdfIndirectObject {
   stream: Buffer | null;
 }
 
+interface PdfDecodeBudget {
+  remainingBytes: number;
+}
+
+const PDF_MIN_DECODE_BUDGET_BYTES = 1024 * 1024;
+const PDF_MAX_DECODE_BUDGET_BYTES = 64 * 1024 * 1024;
+const PDF_MAX_DECODE_EXPANSION_RATIO = 64;
+
+function createPdfDecodeBudget(compressedBytes: number): PdfDecodeBudget {
+  return {
+    remainingBytes: Math.min(
+      PDF_MAX_DECODE_BUDGET_BYTES,
+      Math.max(PDF_MIN_DECODE_BUDGET_BYTES, compressedBytes * PDF_MAX_DECODE_EXPANSION_RATIO),
+    ),
+  };
+}
+
+function debitPdfDecodeBudget(budget: PdfDecodeBudget, decodedBytes: number): boolean {
+  if (!Number.isSafeInteger(decodedBytes) || decodedBytes < 0 || decodedBytes > budget.remainingBytes) {
+    return false;
+  }
+  budget.remainingBytes -= decodedBytes;
+  return true;
+}
+
 function pdfNumber(dictionary: string, name: string): number | null {
   const match = new RegExp(`/${name}\\s+(\\d+)\\b`).exec(dictionary);
   if (!match) return null;
@@ -179,6 +204,7 @@ function pdfIndirectObject(
   offset: number,
   decodeStream = false,
   hardEnd = bytes.length,
+  decodeBudget?: PdfDecodeBudget,
 ): PdfIndirectObject | null {
   if (hardEnd <= offset || hardEnd > bytes.length) return null;
   const tail = bytes.toString('latin1', offset, Math.min(offset + 128, hardEnd));
@@ -193,6 +219,7 @@ function pdfIndirectObject(
   const dictionary = dictionaryMatch?.[1] ?? null;
   let stream: Buffer | null = null;
   if (decodeStream && dictionary !== null && /\bstream(?:\r\n|\n|\r)/.test(body)) {
+    if (!decodeBudget || decodeBudget.remainingBytes < 1) return null;
     const length = pdfNumber(dictionary, 'Length');
     if (length === null || length < 0 || length > 64 * 1024 * 1024) return null;
     const streamMarker = /\bstream(\r\n|\n|\r)/.exec(body);
@@ -205,11 +232,12 @@ function pdfIndirectObject(
     stream = bytes.subarray(streamStart, streamEnd);
     if (/\/Filter\s*\/FlateDecode\b/.test(dictionary)) {
       try {
-        stream = inflateSync(stream, { maxOutputLength: 64 * 1024 * 1024 });
+        stream = inflateSync(stream, { maxOutputLength: decodeBudget.remainingBytes + 1 });
       } catch {
         return null;
       }
     } else if (/\/Filter\b/.test(dictionary)) return null;
+    if (!debitPdfDecodeBudget(decodeBudget, stream.length)) return null;
   }
   return {
     number: Number(header[1]),
@@ -229,6 +257,7 @@ interface PdfXrefEntry {
 }
 
 function completePdf(bytes: Buffer): boolean {
+  const decodeBudget = createPdfDecodeBudget(bytes.length);
   const text = bytes.toString('latin1');
   if (!/^%PDF-[12]\.[0-9](?:\r?\n|\r)/.test(text)) return false;
   const terminal = /startxref\s+(\d+)\s+%%EOF[\t\r\n ]*$/.exec(text);
@@ -239,7 +268,7 @@ function completePdf(bytes: Buffer): boolean {
   let rootReference: [number, number] | null = null;
   let declaredSize = 0;
   if (text.slice(xrefOffset, xrefOffset + 4) !== 'xref') {
-    const xrefObject = pdfIndirectObject(bytes, xrefOffset, true, terminal.index);
+    const xrefObject = pdfIndirectObject(bytes, xrefOffset, true, terminal.index, decodeBudget);
     if (!xrefObject?.dictionary || !xrefObject.stream || !/\/Type\s*\/XRef\b/.test(xrefObject.dictionary)) {
       return false;
     }
@@ -384,6 +413,7 @@ function completePdf(bytes: Buffer): boolean {
         objectStreamEntry.field,
         true,
         hardEnds.get(objectStreamEntry.field),
+        decodeBudget,
       );
       if (!objectStream?.dictionary || !objectStream.stream || !/\/Type\s*\/ObjStm\b/.test(objectStream.dictionary)) return false;
       const count = pdfNumber(objectStream.dictionary, 'N');
