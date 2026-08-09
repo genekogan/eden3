@@ -25,7 +25,7 @@ import { eq, sql } from 'drizzle-orm';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, sendError } from '../errors';
+import { ApiError, safeServerErrorLog, sendError } from '../errors';
 import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
   agentDtoFromEntities,
@@ -598,7 +598,10 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         runtimeSync: sync.status,
       });
     } catch (err) {
-      req.log.error({ err }, `repair failed for "${account.username}"`);
+      req.log.error(
+        { ...safeServerErrorLog(err), accountId: account.id },
+        `repair failed for "${account.username}"`,
+      );
       return sendError(
         reply,
         502,
