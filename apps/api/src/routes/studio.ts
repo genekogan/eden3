@@ -603,7 +603,7 @@ function isMissingTtsInvoke(err: unknown, tool: StudioToolName): boolean {
   );
 }
 
-async function elevenLabsTtsFallback({
+export async function elevenLabsTtsFallback({
   args,
   timeoutMs,
 }: TtsFallbackParams): Promise<TtsFallbackFile> {
@@ -619,12 +619,12 @@ async function elevenLabsTtsFallback({
     process.env.ELEVEN_VOICE_ID ??
     'JBFqnCBsd6RMkjVDRZzb';
   const modelId = process.env.ELEVENLABS_TTS_MODEL ?? 'eleven_multilingual_v2';
-  const baseUrl = (process.env.ELEVENLABS_BASE_URL ?? 'https://api.elevenlabs.io').replace(/\/+$/, '');
-  const url = `${baseUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`;
+  const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`;
   const signal = AbortSignal.timeout(timeoutMs);
 
   const res = await fetch(url, {
     method: 'POST',
+    redirect: 'error',
     headers: {
       accept: 'audio/mpeg',
       'content-type': 'application/json',
