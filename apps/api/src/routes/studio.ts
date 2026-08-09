@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -505,9 +505,69 @@ export interface TtsFallbackParams {
 
 export interface TtsFallbackFile {
   path: string;
+  /** Removes only storage owned by this fallback. Injected source paths omit it. */
+  cleanup?: () => Promise<void>;
 }
 
 export type TtsFallbackGenerator = (params: TtsFallbackParams) => Promise<TtsFallbackFile>;
+
+interface OwnedTtsTempOptions {
+  tempRoot?: string;
+  write?: (file: string, data: Uint8Array) => Promise<void>;
+  remove?: (target: string, options: { recursive: true; force: true }) => Promise<void>;
+}
+
+/**
+ * Persist one provider response in an exact owned directory. The returned
+ * cleanup is idempotent and cannot reach siblings of that directory.
+ */
+export async function createOwnedTtsTempFile(
+  audio: Uint8Array,
+  options: OwnedTtsTempOptions = {},
+): Promise<TtsFallbackFile> {
+  const remove = options.remove ?? rm;
+  const dir = await mkdtemp(path.join(options.tempRoot ?? tmpdir(), 'eden3-tts-'));
+  const file = path.join(dir, 'output.mp3');
+  try {
+    await (options.write ?? writeFile)(file, audio);
+  } catch (err) {
+    await remove(dir, { recursive: true, force: true }).catch(() => undefined);
+    throw err;
+  }
+
+  let cleanupPromise: Promise<void> | null = null;
+  return {
+    path: file,
+    cleanup: () => {
+      cleanupPromise ??= remove(dir, { recursive: true, force: true });
+      return cleanupPromise;
+    },
+  };
+}
+
+/** Consume an output and always retire storage explicitly owned by it. */
+export async function consumeStudioOutput<T>(
+  file: TtsFallbackFile,
+  consume: (sourcePath: string) => Promise<T>,
+  onCleanupError?: (err: unknown) => void,
+): Promise<T> {
+  try {
+    return await consume(file.path);
+  } finally {
+    if (file.cleanup) {
+      try {
+        await file.cleanup();
+      } catch (err) {
+        try {
+          onCleanupError?.(err);
+        } catch {
+          // Cleanup/reporting is best-effort and must never overwrite an
+          // already committed Studio settlement or the original ingest error.
+        }
+      }
+    }
+  }
+}
 
 export interface StudioDeps {
   pipeline?: MediaPipeline;
@@ -545,7 +605,6 @@ function isMissingTtsInvoke(err: unknown, tool: StudioToolName): boolean {
 
 async function elevenLabsTtsFallback({
   args,
-  requestId,
   timeoutMs,
 }: TtsFallbackParams): Promise<TtsFallbackFile> {
   const text = typeof args.text === 'string' ? args.text.trim() : typeof args.prompt === 'string' ? args.prompt.trim() : '';
@@ -581,10 +640,7 @@ async function elevenLabsTtsFallback({
   const audio = Buffer.from(await res.arrayBuffer());
   if (audio.length === 0) throw new Error('ElevenLabs TTS returned an empty audio file');
 
-  const dir = await mkdtemp(path.join(tmpdir(), 'eden3-tts-'));
-  const file = path.join(dir, `${requestId}.mp3`);
-  await writeFile(file, audio);
-  return { path: file };
+  return createOwnedTtsTempFile(audio);
 }
 
 // ---------------------------------------------------------------------------
@@ -795,7 +851,7 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
     // old queued completions from a reused gateway session can arrive late.
     // The unique sessionKey keeps the gateway context clean; the shared timer
     // keeps the HTTP request/refund bounded even if the gateway call hangs.
-    let file;
+    let file: TtsFallbackFile;
     const controller = new AbortController();
     let timedOut = false;
     let timeout: ReturnType<typeof setTimeout> | null = null;
@@ -899,19 +955,31 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
 
     // 4. Ingest with NO session: the creation belongs to the caller.
     try {
-      const result = await pipeline.ingestFile(file.path, {
-        userId: account.accountId,
-        tool: body.tool,
-        args: body.args,
-        finalizeTransaction: async (tx, ingested) => {
-          if (!ingested.creation) throw new Error('studio: ingest produced no creation row');
-          await completeStudioGeneration(tx, {
-            reservation,
-            creationId: ingested.creation.id,
-            latencyMs: Date.now() - startedAtMs,
-          });
+      const result = await consumeStudioOutput(
+        file,
+        async (sourcePath) =>
+          pipeline.ingestFile(sourcePath, {
+            userId: account.accountId,
+            tool: body.tool,
+            args: body.args,
+            finalizeTransaction: async (tx, ingested) => {
+              if (!ingested.creation) throw new Error('studio: ingest produced no creation row');
+              await completeStudioGeneration(tx, {
+                reservation,
+                creationId: ingested.creation.id,
+                latencyMs: Date.now() - startedAtMs,
+              });
+            },
+          }),
+        (cleanupErr) => {
+          logSafeRequestError(
+            req.log,
+            cleanupErr,
+            { tool: body.tool },
+            'studio: temporary output cleanup failed',
+          );
         },
-      });
+      );
       if (!result.creation) {
         throw new Error('studio: ingest produced no creation row');
       }

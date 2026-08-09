@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { access, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -22,6 +23,12 @@ afterEach(async () => {
 });
 
 describe('owned Studio TTS output cleanup', () => {
+  it('wires owned creation and consumption into the production fallback route', () => {
+    const source = readFileSync(new URL('../src/routes/studio.ts', import.meta.url), 'utf8');
+    expect(source).toContain('return createOwnedTtsTempFile(audio);');
+    expect(source).toMatch(/const result = await consumeStudioOutput\(\s*file,/);
+  });
+
   it('removes only the owned temporary directory and is idempotent', async () => {
     const root = await tempRoot();
     const sibling = path.join(root, 'keep.txt');

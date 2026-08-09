@@ -533,9 +533,15 @@ describe('POST /studio/generate', () => {
     invokeCalls = [];
     invokeError = new GatewayHttpError(404, 'gateway responded 404 to /tools/invoke (tts)');
     nextClaim = claimUnused;
+    let cleanupCalls = 0;
     nextTtsFallback = async ({ args }) => {
       expect(args).toEqual({ text: 'Fallback speech.' });
-      return fakeMediaFile('studio-fallback-voice.mp3', 'audio/mpeg', 'audio');
+      return {
+        ...fakeMediaFile('studio-fallback-voice.mp3', 'audio/mpeg', 'audio'),
+        cleanup: async () => {
+          cleanupCalls += 1;
+        },
+      };
     };
     const quote = quoteStudioGeneration('tts', { text: 'Fallback speech.' });
     const before = await getBalance(richUserId);
@@ -556,6 +562,7 @@ describe('POST /studio/generate', () => {
     expect(body.mime).toBe('audio/mpeg');
     expect(body.metering).toMatchObject({ provider: 'elevenlabs', model: 'tts', manna: quote.manna });
     expect(invokeCalls).toHaveLength(0);
+    expect(cleanupCalls).toBe(1);
 
     const [creation] = await pg<
       { userId: string; tool: string; url: string; args: unknown; public: boolean }[]
