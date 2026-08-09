@@ -11,10 +11,14 @@ const HOSTILE_OR_AMBIGUOUS_ORIGINS = [
   'http://127.0.0.1.attacker.invalid:18789',
   'http://169.254.169.254:18789',
   'http://localhost:18789',
+  'http://[::1]:18789',
   'http://user:pass@127.0.0.1:18789',
   'http://127.0.0.1',
   'http://127.0.0.1:0',
+  'http://127.0.0.1:65536',
   'http://127.0.0.1:18789/v1',
+  'http://127.0.0.1:18789/../',
+  'http://127.0.0.1:028789',
   'http://127.0.0.1:18789/?next=evil',
   'http://127.0.0.1:18789/#fragment',
   '//127.0.0.1:18789',
@@ -44,7 +48,7 @@ describe('OpenClaw gateway credential authority', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it.each(['', ' ', '\ttoken', 'token\n'])('refuses an empty or noncanonical bearer token', (token) => {
+  it.each(['', ' ', '\ttoken', 'token\n', 'token '])('refuses an empty or noncanonical bearer token', (token) => {
     const fetchImpl = vi.fn<typeof fetch>();
     const options = { baseUrl: 'http://127.0.0.1:18789', token, fetchImpl };
     expect(() => normalizeOpenClawGatewayAuthority(options)).toThrow(/token/i);

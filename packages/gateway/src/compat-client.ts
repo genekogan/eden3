@@ -1,5 +1,6 @@
 import { createParser } from 'eventsource-parser';
 
+import { normalizeOpenClawGatewayAuthority } from './gateway-origin';
 import {
   NO_RESPONSE_SENTINEL,
   compatChunkSchema,
@@ -45,8 +46,9 @@ export class OpenClawCompatClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: GatewayClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
-    this.token = options.token;
+    const authority = normalizeOpenClawGatewayAuthority(options);
+    this.baseUrl = authority.origin;
+    this.token = authority.token;
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
@@ -83,6 +85,7 @@ export class OpenClawCompatClient {
           ...(maxOutputTokens !== undefined ? { max_tokens: maxOutputTokens } : {}),
           messages: [{ role: 'user', content: userMessage }],
         }),
+        redirect: 'error',
         ...(signal ? { signal } : {}),
       });
     } catch (err) {

@@ -22,6 +22,10 @@ import {
   prepareAgentMemoryIndexTarget,
   type OpenClawCliLike,
 } from './docker';
+import {
+  normalizeOpenClawGatewayAuthority,
+  type OpenClawGatewayAuthority,
+} from './gateway-origin';
 import type { GatewayClientOptions } from './types';
 
 /**
@@ -386,7 +390,7 @@ export interface ProvisionerOptions {
 
 const DEFAULT_TEMPLATES_DIR = fileURLToPath(new URL('../workspace-templates/', import.meta.url));
 export class AgentProvisioner {
-  private readonly gateway: GatewayClientOptions;
+  private readonly gateway: OpenClawGatewayAuthority;
   private readonly cli: OpenClawCliLike;
   private readonly registrationMode: 'config' | 'cli';
   private readonly dataDir: string;
@@ -400,7 +404,7 @@ export class AgentProvisioner {
   private readonly prepareMemoryIndexTarget: (openclawId: string) => Promise<void>;
 
   constructor(options: ProvisionerOptions) {
-    this.gateway = options.gateway;
+    this.gateway = normalizeOpenClawGatewayAuthority(options.gateway);
     this.cli = options.cli ?? new OpenClawCli();
     this.registrationMode = options.registrationMode ?? 'config';
     this.dataDir = options.dataDir ?? resolveDataDir();
@@ -781,15 +785,15 @@ export class AgentProvisioner {
   private async waitRoutable(openclawId: string): Promise<void> {
     const modelId = `openclaw/${openclawId}`;
     const deadline = Date.now() + this.routableTimeoutMs;
-    const baseUrl = this.gateway.baseUrl.replace(/\/+$/, '');
     let lastFailure = 'no response yet';
     let visibleSince: number | undefined;
     for (;;) {
       try {
         const remainingMs = Math.max(1, deadline - Date.now());
         const { res, json } = await withAbortableTimeout(remainingMs, async (signal) => {
-          const response = await this.fetchImpl(`${baseUrl}/v1/models`, {
+          const response = await this.fetchImpl(`${this.gateway.origin}/v1/models`, {
             headers: { authorization: `Bearer ${this.gateway.token}` },
+            redirect: 'error',
             signal,
           });
           return { res: response, json: response.ok ? await response.json() : null };

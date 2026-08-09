@@ -52,7 +52,11 @@ function makeFetch(factory: (url: string, init: RequestInit) => Response): {
 }
 
 function client(fetchImpl: typeof fetch): OpenClawCompatClient {
-  return new OpenClawCompatClient({ baseUrl: 'http://gw.test/', token: 'tok-secret', fetchImpl });
+  return new OpenClawCompatClient({
+    baseUrl: 'http://127.0.0.1:28789/',
+    token: 'tok-secret',
+    fetchImpl,
+  });
 }
 
 async function collect(iter: AsyncIterable<GatewayTurnEvent>): Promise<GatewayTurnEvent[]> {
@@ -132,7 +136,8 @@ describe('OpenClawCompatClient.chatTurn', () => {
 
     expect(calls).toHaveLength(1);
     const call = calls[0]!;
-    expect(call.url).toBe('http://gw.test/v1/chat/completions');
+    expect(call.url).toBe('http://127.0.0.1:28789/v1/chat/completions');
+    expect(call.init.redirect).toBe('error');
     const headers = call.init.headers as Record<string, string>;
     expect(headers.authorization).toBe('Bearer tok-secret');
     const scoped = `agent:testbot:${turnParams.sessionKey}`;

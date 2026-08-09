@@ -26,7 +26,11 @@ function jsonResponse(payload: unknown, status = 200): Response {
 }
 
 function client(fetchImpl: typeof fetch): OpenClawToolsClient {
-  return new OpenClawToolsClient({ baseUrl: 'http://gw.test', token: 'tok-secret', fetchImpl });
+  return new OpenClawToolsClient({
+    baseUrl: 'http://127.0.0.1:28789',
+    token: 'tok-secret',
+    fetchImpl,
+  });
 }
 
 describe('OpenClawToolsClient.invokeTool', () => {
@@ -50,7 +54,8 @@ describe('OpenClawToolsClient.invokeTool', () => {
     expect(result.details).toMatchObject({ status: 'accepted' });
 
     const call = calls[0]!;
-    expect(call.url).toBe('http://gw.test/tools/invoke');
+    expect(call.url).toBe('http://127.0.0.1:28789/tools/invoke');
+    expect(call.init.redirect).toBe('error');
     const headers = call.init.headers as Record<string, string>;
     expect(headers.authorization).toBe('Bearer tok-secret');
     const body = JSON.parse(String(call.init.body));

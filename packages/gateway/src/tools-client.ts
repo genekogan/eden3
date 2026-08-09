@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks';
 
+import { normalizeOpenClawGatewayAuthority } from './gateway-origin';
 import type { MemorySearchHit, MemorySearchResult } from './memory-cli';
 import {
   GatewayHttpError,
@@ -71,8 +72,9 @@ export class OpenClawToolsClient {
   private readonly fetchImpl: typeof fetch;
 
   constructor(options: GatewayClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/+$/, '');
-    this.token = options.token;
+    const authority = normalizeOpenClawGatewayAuthority(options);
+    this.baseUrl = authority.origin;
+    this.token = authority.token;
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
@@ -97,6 +99,7 @@ export class OpenClawToolsClient {
           'content-type': 'application/json',
         },
         body: JSON.stringify(body),
+        redirect: 'error',
         ...(signal ? { signal } : {}),
       });
     } catch (err) {

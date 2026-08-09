@@ -89,10 +89,13 @@ class FakeCli implements OpenClawCliLike {
 }
 
 /** /v1/models fetch fake — models appear per the ids list. */
-function modelsFetch(idsRef: { ids: string[] }): { fetchImpl: typeof fetch; requests: string[] } {
-  const requests: string[] = [];
-  const fetchImpl = (async (input: unknown) => {
-    requests.push(String(input));
+function modelsFetch(idsRef: { ids: string[] }): {
+  fetchImpl: typeof fetch;
+  requests: { url: string; init: RequestInit }[];
+} {
+  const requests: { url: string; init: RequestInit }[] = [];
+  const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+    requests.push({ url: String(input), init: init ?? {} });
     return new Response(
       JSON.stringify({ object: 'list', data: idsRef.ids.map((id) => ({ id, object: 'model' })) }),
       { status: 200, headers: { 'content-type': 'application/json' } },
@@ -135,7 +138,7 @@ function makeProvisioner(overrides: {
   const { fetchImpl } = modelsFetch(idsRef);
   return new AgentProvisioner({
     gateway: {
-      baseUrl: 'http://gw.test',
+      baseUrl: 'http://127.0.0.1:28789',
       token: 'tok-secret',
       fetchImpl: overrides.fetchImpl ?? fetchImpl,
     },
@@ -384,7 +387,7 @@ describe('AgentProvisioner.provisionAgent', () => {
       }
     }
     const provisioner = new RaceProvisioner({
-      gateway: { baseUrl: 'http://gw.test', token: 'tok', fetchImpl: modelsFetch({
+      gateway: { baseUrl: 'http://127.0.0.1:28789', token: 'tok', fetchImpl: modelsFetch({
         ids: ['openclaw/main', 'openclaw/banny'],
       }).fetchImpl },
       cli: new FakeCli(),
@@ -410,7 +413,7 @@ describe('AgentProvisioner.provisionAgent', () => {
     }
     const provisioner = new BootstrapRaceProvisioner({
       gateway: {
-        baseUrl: 'http://gw.test',
+        baseUrl: 'http://127.0.0.1:28789',
         token: 'tok',
         fetchImpl: modelsFetch({ ids: ['openclaw/main', 'openclaw/banny'] }).fetchImpl,
       },
@@ -579,7 +582,9 @@ describe('AgentProvisioner.provisionAgent', () => {
     // routable on the third poll
     const idsRef = { ids: ['openclaw/main'] };
     let polls = 0;
-    const fetchImpl = (async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fetchImpl = (async (input: unknown, init?: RequestInit) => {
+      calls.push({ url: String(input), init: init ?? {} });
       polls += 1;
       if (polls >= 3) idsRef.ids = ['openclaw/main', 'openclaw/banny'];
       return new Response(
@@ -593,6 +598,11 @@ describe('AgentProvisioner.provisionAgent', () => {
     }).provisionAgent(PARAMS);
     expect(ok.openclawId).toBe('banny');
     expect(polls).toBeGreaterThanOrEqual(5);
+    expect(calls[0]?.url).toBe('http://127.0.0.1:28789/v1/models');
+    expect(calls[0]?.init.redirect).toBe('error');
+    expect((calls[0]?.init.headers as Record<string, string>).authorization).toBe(
+      'Bearer tok-secret',
+    );
 
     // never routable → ProvisionError mentioning the deadline
     const neverFetch = (async () =>
@@ -703,7 +713,7 @@ describe('AgentProvisioner.updateAgentPersona', () => {
     const cli = new FakeCli();
     const provisioner = new CorruptingProvisioner({
       gateway: {
-        baseUrl: 'http://gw.test',
+        baseUrl: 'http://127.0.0.1:28789',
         token: 'tok-secret',
         fetchImpl: modelsFetch({ ids: ['openclaw/main', 'openclaw/banny'] }).fetchImpl,
       },
