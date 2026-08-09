@@ -162,12 +162,17 @@ describe('uploadsRoutes tenant boundary', () => {
       checksumSha256: digest(bytes),
     });
     const capability = signed.requiredHeaders['x-eden-upload-capability']!;
-    const put = (url: string, token?: string) => app.inject({
+    const put = (
+      url: string,
+      token?: string,
+      headers: Record<string, string> = {},
+    ) => app.inject({
       method: 'PUT',
       url,
       headers: {
         'content-type': 'application/octet-stream',
         ...(token ? { 'x-eden-upload-capability': token } : {}),
+        ...headers,
       },
       payload: bytes,
     });
@@ -177,12 +182,30 @@ describe('uploadsRoutes tenant boundary', () => {
       await put(`/uploads/${reservation.uploadId}/parts/1`, 'malformed'),
       await put('/uploads/00000000-0000-4000-8000-000000000001/parts/1', capability),
       await put(`/uploads/${reservation.uploadId}/parts/2`, capability),
+      await put(`/uploads/${reservation.uploadId}/parts/1`, capability, { 'content-type': 'text/plain' }),
+      await put(`/uploads/${reservation.uploadId}/parts/1`, capability, { 'content-length': '8' }),
+      await put(`/uploads/${reservation.uploadId}/parts/1`, capability, { 'content-length': '07' }),
     ];
-    now = new Date('2026-08-09T12:10:00.000Z');
-    responses.push(await put(`/uploads/${reservation.uploadId}/parts/1`, capability));
-
-    expect(responses.every((response) => response.statusCode >= 400)).toBe(true);
+    expect(responses.map((response) => response.statusCode)).toEqual([
+      401,
+      401,
+      401,
+      401,
+      415,
+      400,
+      411,
+    ]);
     expect(parserCalls).toBe(0);
     expect([...backend.parts.values()].every((parts) => parts.size === 0)).toBe(true);
+
+    const valid = await put(`/uploads/${reservation.uploadId}/parts/1`, capability);
+    expect(valid.statusCode).toBe(201);
+    expect(parserCalls).toBe(1);
+    expect([...backend.parts.values()].some((parts) => parts.size === 1)).toBe(true);
+
+    now = new Date('2026-08-09T12:10:00.000Z');
+    const expired = await put(`/uploads/${reservation.uploadId}/parts/1`, capability);
+    expect(expired.statusCode).toBe(401);
+    expect(parserCalls).toBe(1);
   });
 });

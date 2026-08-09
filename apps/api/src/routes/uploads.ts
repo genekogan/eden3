@@ -30,6 +30,25 @@ const partParams = uploadParams.extend({ partNumber: z.coerce.number().int().pos
 const signBody = z.object({ checksumSha256: z.string().regex(/^[a-f0-9]{64}$/) });
 const capabilityHeader = z.string().min(1).max(4_096);
 
+function localPartCapability(value: string | string[] | undefined): string {
+  const parsed = capabilityHeader.safeParse(value);
+  if (!parsed.success) {
+    throw new ApiError(401, 'invalid_upload_capability', 'Invalid upload capability');
+  }
+  return parsed.data;
+}
+
+function canonicalContentLength(value: string | string[] | undefined): number {
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
+    throw new ApiError(411, 'part_content_length_required', 'A canonical Content-Length is required');
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed > UploadService.MAX_OBJECT_BYTES) {
+    throw new ApiError(413, 'upload_too_large', 'Upload part exceeds the size limit');
+  }
+  return parsed;
+}
+
 /**
  * upload.resumable@v1 route module. Shared registration/configuration belongs
  * to Task 1; this plugin has no ambient secret or backend defaults.
@@ -75,10 +94,28 @@ export const uploadsRoutes: FastifyPluginAsync<UploadRoutesOptions> = async (app
   if (options.service.localPartUploadsEnabled) {
     app.put(
       '/uploads/:uploadId/parts/:partNumber',
-      { bodyLimit: UploadService.MAX_OBJECT_BYTES },
+      {
+        bodyLimit: UploadService.MAX_OBJECT_BYTES,
+        preParsing: async (request, _reply, payload) => {
+          const { uploadId, partNumber } = partParams.parse(request.params);
+          const token = localPartCapability(request.headers['x-eden-upload-capability']);
+          if (request.headers['content-type'] !== 'application/octet-stream') {
+            throw new ApiError(415, 'invalid_part_content_type', 'Part body must be application/octet-stream');
+          }
+          const contentLength = canonicalContentLength(request.headers['content-length']);
+          const preflight = await options.service.preflightLocalPart(token, {
+            expectedUploadId: uploadId,
+            expectedPartNumber: partNumber,
+          });
+          if (contentLength !== preflight.expectedSizeBytes) {
+            throw new ApiError(400, 'part_size_mismatch', 'Part Content-Length does not match authorization');
+          }
+          return payload;
+        },
+      },
       async (request, reply) => {
       const { uploadId, partNumber } = partParams.parse(request.params);
-      const token = capabilityHeader.parse(request.headers['x-eden-upload-capability']);
+      const token = localPartCapability(request.headers['x-eden-upload-capability']);
       if (!Buffer.isBuffer(request.body)) {
         throw new ApiError(415, 'invalid_part_content_type', 'Part body must be application/octet-stream');
       }

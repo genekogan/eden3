@@ -9,6 +9,7 @@ import {
 import {
   newUploadIds,
   type StoredUpload,
+  type StoredPartAuthorization,
   type StoredUploadPart,
   type UploadInspection,
   type UploadPurpose,
@@ -20,6 +21,17 @@ export interface UploadedPartResult {
   etag: string;
   checksumSha256: string;
   sizeBytes: number;
+}
+
+export interface LocalPartPreflight {
+  expectedSizeBytes: number;
+}
+
+interface ValidatedLocalPart {
+  claims: UploadCapabilityClaims;
+  upload: StoredUpload;
+  authorization: StoredPartAuthorization;
+  expectedSizeBytes: number;
 }
 
 export interface BackendObservedPart {
@@ -339,6 +351,18 @@ export class UploadService {
     };
   }
 
+  async preflightLocalPart(
+    token: string,
+    options: {
+      authenticatedAccountId?: string;
+      expectedUploadId?: string;
+      expectedPartNumber?: number;
+    } = {},
+  ): Promise<LocalPartPreflight> {
+    const validated = await this.validateLocalPart(token, options);
+    return { expectedSizeBytes: validated.expectedSizeBytes };
+  }
+
   async putLocalPart(
     token: string,
     bytes: Buffer,
@@ -348,7 +372,62 @@ export class UploadService {
       expectedPartNumber?: number;
     } = {},
   ): Promise<UploadedPartResult> {
-    const claims = verifyUploadCapability(this.capabilityKey, token, this.now());
+    const initial = await this.validateLocalPart(token, options);
+    if (bytes.length !== initial.expectedSizeBytes) {
+      throw new ApiError(400, 'part_size_mismatch', `Part must contain exactly ${initial.expectedSizeBytes} bytes`);
+    }
+    if (!equalText(initial.authorization.checksumSha256, sha256Bytes(bytes))) {
+      throw new ApiError(422, 'part_authorization_mismatch', 'Part bytes do not match authorization');
+    }
+    const writeKey = `${initial.upload.id}:${initial.claims.partNumber}`;
+    if (this.partWrites.has(writeKey)) {
+      throw new ApiError(409, 'part_upload_in_progress', 'Part upload is already in progress');
+    }
+    this.partWrites.add(writeKey);
+    try {
+      // Re-run every capability, coordinate, lifecycle, and durable authorization
+      // check after body parsing and after acquiring the process fence. The
+      // pre-parser admission check is only a memory-safety gate, never durable
+      // authority for the backend mutation.
+      const current = await this.validateLocalPart(token, options);
+      if (
+        bytes.length !== current.expectedSizeBytes ||
+        !equalText(current.authorization.checksumSha256, sha256Bytes(bytes))
+      ) {
+        throw new ApiError(422, 'part_authorization_mismatch', 'Part bytes do not match authorization');
+      }
+      const result = await this.backend.putPart({
+        key: current.upload.backingKey,
+        backendUploadId: current.upload.backendUploadId,
+        partNumber: current.claims.partNumber,
+        bytes,
+      });
+      if (result.sizeBytes !== current.expectedSizeBytes) {
+        throw new ApiError(502, 'backend_part_size_mismatch', 'Backend reported an invalid part size');
+      }
+      const added = await this.repository.addPart(current.upload.id, current.upload.ownerAccountId, {
+        partNumber: current.claims.partNumber,
+        etag: result.etag,
+        checksumSha256: result.checksumSha256,
+        sizeBytes: result.sizeBytes,
+      });
+      if (!added) throw new ApiError(409, 'part_already_uploaded', 'Part was already uploaded');
+      return result;
+    } finally {
+      this.partWrites.delete(writeKey);
+    }
+  }
+
+  private async validateLocalPart(
+    token: string,
+    options: {
+      authenticatedAccountId?: string;
+      expectedUploadId?: string;
+      expectedPartNumber?: number;
+    },
+  ): Promise<ValidatedLocalPart> {
+    const now = this.now();
+    const claims = verifyUploadCapability(this.capabilityKey, token, now);
     if (
       (options.expectedUploadId !== undefined && options.expectedUploadId !== claims.uploadId) ||
       (options.expectedPartNumber !== undefined && options.expectedPartNumber !== claims.partNumber)
@@ -371,15 +450,14 @@ export class UploadService {
     if (upload.backingStore !== 'local') {
       throw new ApiError(404, 'local_part_upload_unavailable', 'Local part upload is unavailable');
     }
-    await this.requireLive(upload);
+    if (upload.expiresAt.getTime() <= now.getTime()) {
+      throw new ApiError(410, 'upload_expired', 'Upload session expired');
+    }
     if (!['initiated', 'uploading'].includes(upload.state)) throw new ApiError(409, 'upload_not_active', 'Upload is not active');
     if (upload.parts.some((part) => part.partNumber === claims.partNumber)) {
       throw new ApiError(409, 'part_already_uploaded', 'Part was already uploaded');
     }
     const expectedSize = this.expectedPartSize(upload, claims.partNumber);
-    if (bytes.length !== expectedSize) {
-      throw new ApiError(400, 'part_size_mismatch', `Part must contain exactly ${expectedSize} bytes`);
-    }
     const authorization = await this.repository.findPartAuthorization(
       upload.id,
       upload.ownerAccountId,
@@ -388,42 +466,12 @@ export class UploadService {
     if (
       !authorization ||
       authorization.sizeBytes !== expectedSize ||
-      !equalText(authorization.checksumSha256, sha256Bytes(bytes))
+      authorization.expiresAt.getTime() <= now.getTime() ||
+      Math.floor(authorization.expiresAt.getTime() / 1000) !== claims.expiresUnix
     ) {
-      throw new ApiError(422, 'part_authorization_mismatch', 'Part bytes do not match authorization');
+      throw new ApiError(401, 'invalid_upload_capability', 'Invalid upload capability');
     }
-    const writeKey = `${upload.id}:${claims.partNumber}`;
-    if (this.partWrites.has(writeKey)) {
-      throw new ApiError(409, 'part_upload_in_progress', 'Part upload is already in progress');
-    }
-    this.partWrites.add(writeKey);
-    try {
-      // Re-read after acquiring the process fence; this closes the ordinary
-      // replay race before any backend mutation in the local/test path.
-      const fresh = await this.repository.findOwned(upload.id, upload.ownerAccountId);
-      if (!fresh || fresh.parts.some((part) => part.partNumber === claims.partNumber)) {
-        throw new ApiError(409, 'part_already_uploaded', 'Part was already uploaded');
-      }
-      const result = await this.backend.putPart({
-        key: upload.backingKey,
-        backendUploadId: upload.backendUploadId,
-        partNumber: claims.partNumber,
-        bytes,
-      });
-      if (result.sizeBytes !== expectedSize) {
-        throw new ApiError(502, 'backend_part_size_mismatch', 'Backend reported an invalid part size');
-      }
-      const added = await this.repository.addPart(upload.id, upload.ownerAccountId, {
-        partNumber: claims.partNumber,
-        etag: result.etag,
-        checksumSha256: result.checksumSha256,
-        sizeBytes: result.sizeBytes,
-      });
-      if (!added) throw new ApiError(409, 'part_already_uploaded', 'Part was already uploaded');
-      return result;
-    } finally {
-      this.partWrites.delete(writeKey);
-    }
+    return { claims, upload, authorization, expectedSizeBytes: expectedSize };
   }
 
   /**
