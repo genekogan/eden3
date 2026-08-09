@@ -18,7 +18,51 @@ const PUBLIC_SERVER_ERROR_MESSAGES = new Map<number, string>([
   [502, 'Upstream service unavailable'],
   [504, 'Request timed out'],
 ]);
-const PUBLIC_ERROR_CODE = /^[a-z][a-z0-9_]{0,63}$/;
+const PUBLIC_SERVER_ERROR_CODES = new Set([
+  'account_erasure_unavailable',
+  'agent_provision_failed',
+  'backend_part_size_mismatch',
+  'channel_custody_unavailable',
+  'configuration_error',
+  'erasure_intent_mismatch',
+  'erasure_ledger_mismatch',
+  'erasure_ledger_unavailable',
+  'erasure_recovery_manifest_mismatch',
+  'erasure_recovery_manifest_unavailable',
+  'gateway_error',
+  'gateway_not_configured',
+  'gateway_stream_error',
+  'gateway_unavailable',
+  'gateway_unconfigured',
+  'generation_timeout',
+  'internal_error',
+  'managed_bot_activation_failed',
+  'managed_bot_revocation_failed',
+  'managed_bot_state_unavailable',
+  'media_refund_pending',
+  'memory_scheduler_unavailable',
+  'metering_not_configured',
+  'not_implemented',
+  'provider_error',
+  'provider_unavailable',
+  'refund_pending',
+  'repair_failed',
+  'scheduled_task_checkpointed_failure',
+  'scheduled_task_empty_response',
+  'scheduled_task_error',
+  'scheduled_task_occurrence_indeterminate',
+  'scheduled_task_occurrence_refund_pending',
+  'secret_vault_not_configured',
+  'skill_sync_failed',
+  'stripe_checkout_failed',
+  'stripe_not_configured',
+  'stripe_price_not_configured',
+  'subscription_runtime_unavailable',
+  'telegram_manager_not_configured',
+  'telegram_response_invalid',
+  'telegram_unavailable',
+  'tts_not_configured',
+]);
 
 /**
  * Server failures may contain database, provider, filesystem, or credential
@@ -32,7 +76,7 @@ export function publicErrorMessage(statusCode: number, message: string): string 
 }
 
 export function publicErrorCode(statusCode: number, code: string): string {
-  if (statusCode < 500 || PUBLIC_ERROR_CODE.test(code)) {
+  if (statusCode < 500 || PUBLIC_SERVER_ERROR_CODES.has(code)) {
     return code;
   }
   return 'internal_error';
@@ -61,7 +105,6 @@ const SAFE_ERROR_NAMES = new Set([
   'TypeError',
   'ZodError',
 ]);
-const SAFE_ERROR_CODE = /^(?:E[A-Z0-9_]{1,31}|FST_ERR_[A-Z0-9_]{1,48})$/;
 
 /**
  * Retain useful HTTP-boundary telemetry without serializing an exception's
@@ -70,21 +113,24 @@ const SAFE_ERROR_CODE = /^(?:E[A-Z0-9_]{1,31}|FST_ERR_[A-Z0-9_]{1,48})$/;
  */
 export function safeServerErrorLog(error: unknown): {
   errorName: string;
-  errorCode?: string | number;
 } {
   const candidateName = error instanceof Error ? error.name : typeof error;
   const errorName = SAFE_ERROR_NAMES.has(candidateName) ? candidateName : 'Error';
-  if (!error || typeof error !== 'object' || !('code' in error)) {
-    return { errorName };
-  }
-  const candidateCode = (error as { code?: unknown }).code;
-  if (typeof candidateCode === 'number' && Number.isSafeInteger(candidateCode)) {
-    return { errorName, errorCode: candidateCode };
-  }
-  if (typeof candidateCode === 'string' && SAFE_ERROR_CODE.test(candidateCode)) {
-    return { errorName, errorCode: candidateCode };
-  }
   return { errorName };
+}
+
+interface RequestErrorLogger {
+  error(context: Record<string, unknown>, message: string): unknown;
+}
+
+/** Runtime-capturable request logging seam that never serializes the throwable. */
+export function logSafeRequestError(
+  logger: RequestErrorLogger,
+  error: unknown,
+  context: Record<string, unknown>,
+  message: string,
+): void {
+  logger.error({ ...context, ...safeServerErrorLog(error) }, message);
 }
 
 /** Throwable error carrying its HTTP status + envelope code. */
