@@ -287,10 +287,10 @@ describe('memory dream canonical recovery authorization (DEBT-003)', () => {
       select state from turn_authorizations where turn_id = ${fixture.claim.id}`;
     expect(reserved?.state).toBe('reserved');
     expect((await getBalance(fixture.ownerId)).total).toBe(0);
-    const [usageBeforeRecovery] = await pg<{ count: number }[]>`
-      select count(*)::int as count from usage_events
+    const [usageBeforeRecovery] = await pg<{ count: number; statuses: string[] }[]>`
+      select count(*)::int as count,array_agg(status order by id)::text[] statuses from usage_events
       where event_type = 'memory_dream' and turn_id = ${fixture.claim.id}`;
-    expect(usageBeforeRecovery?.count).toBe(0);
+    expect(usageBeforeRecovery).toEqual({ count: 1, statuses: ['provider_admitted'] });
 
     expect((await reverseWithClaim(replacement)).reversed).toBe(true);
     await recordMemoryDreamRecoveryUsage(replacement);

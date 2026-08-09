@@ -1185,17 +1185,33 @@ export async function recordMemoryDreamRecoveryUsage(
         and ta.session_id = run.id
         and ta.state in ('reversed', 'reaped')
       on conflict (event_type, turn_id) where turn_id is not null do update set
+        status = 'error',
         manna = 0,
         error_code = coalesce(usage_events.error_code, excluded.error_code),
         error_message = coalesce(usage_events.error_message, excluded.error_message),
         metadata = coalesce(usage_events.metadata, '{}'::jsonb) || excluded.metadata
-      where usage_events.status = 'error'
+      where usage_events.status in ('provider_admitted', 'error')
         and usage_events.user_id = excluded.user_id
         and usage_events.agent_id = excluded.agent_id
         and usage_events.session_id = excluded.session_id
         and usage_events.provider = excluded.provider
         and usage_events.model = excluded.model
         and usage_events.pricing_basis = excluded.pricing_basis
+        and usage_events.table_version is not distinct from excluded.table_version
+        and (usage_events.status = 'error' or (
+          usage_events.message_id is null
+          and usage_events.prompt_tokens is null
+          and usage_events.completion_tokens is null
+          and usage_events.cached_tokens is null
+          and usage_events.cache_write_tokens is null
+          and usage_events.total_tokens is null
+          and usage_events.cost_usd is null
+          and usage_events.manna is null
+          and usage_events.latency_ms is null
+          and usage_events.error_code is null
+          and usage_events.error_message is null
+          and usage_events.metadata is null
+        ))
       returning id
     `)) as unknown as { id: string }[];
     if (rows.length === 0) {

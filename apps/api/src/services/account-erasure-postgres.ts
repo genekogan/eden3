@@ -767,6 +767,42 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           select 1 from creations c where c.id=cc.creation_id
             and (c.user_id in (select id from principals) or c.agent_id in (select id from principals))
         )`;
+      const [invalidCollectionContributors] = await tx<{ invalid: boolean }[]>`
+        with principals as (
+          select ${input.accountId}::uuid id union all select account_id from agents where owner_id=${input.accountId}
+        ), deleting_external_ids as materialized (
+          select external_id from accounts
+          where id in (select id from principals) and external_id is not null
+        )
+        select exists (
+          select 1 from collections c
+          where (c.user_id is null or c.user_id not in (select id from principals))
+            and c.contributors is not null
+            and jsonb_typeof(c.contributors)<>'array'
+            and exists (select 1 from deleting_external_ids)
+        ) invalid`;
+      if (invalidCollectionContributors?.invalid) {
+        throw new Error('account_erasure_collection_contributors_invalid');
+      }
+      await tx`
+        with principals as (select ${input.accountId}::uuid id union all select account_id from agents where owner_id=${input.accountId})
+        , deleting_external_ids as materialized (
+          select external_id from accounts
+          where id in (select id from principals) and external_id is not null
+        )
+        update collections c set contributors=(
+          select coalesce(jsonb_agg(item.value order by item.ordinality),'[]'::jsonb)
+          from jsonb_array_elements(c.contributors) with ordinality item(value,ordinality)
+          where not exists (
+            select 1 from deleting_external_ids d where item.value=to_jsonb(d.external_id)
+          )
+        ),updated_at=statement_timestamp()
+        where (c.user_id is null or c.user_id not in (select id from principals))
+          and jsonb_typeof(c.contributors)='array'
+          and exists (
+            select 1 from jsonb_array_elements(c.contributors) item(value)
+            join deleting_external_ids d on item.value=to_jsonb(d.external_id)
+          )`;
       await tx`
         with principals as (select ${input.accountId}::uuid id union all select account_id from agents where owner_id=${input.accountId})
         update collections set external_id=null,name=null,description=null,
@@ -795,7 +831,12 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           and (owner_id is null or owner_id not in (select id from principals))`;
       await tx`
         with principals as (select ${input.accountId}::uuid id union all select account_id from agents where owner_id=${input.accountId})
-        delete from etl_social_edges where user_id in (select id from principals)`;
+        delete from etl_social_edges e where e.user_id in (select id from principals)
+          or (e.edge_kind='agent_like' and e.target_id in (select id from principals))
+          or (e.edge_kind='creation_like' and exists (
+            select 1 from creations c where c.id=e.target_id
+              and (c.user_id in (select id from principals) or c.agent_id in (select id from principals))
+          ))`;
       await tx`
         with principals as (select account_id id from agents where owner_id=${input.accountId})
         delete from agent_skills where agent_id in (select id from principals)`;

@@ -94,6 +94,10 @@ const SHARED_FOREIGN_MESSAGE = '50000000-0000-4000-8000-000000000003';
 const FOREIGN_OWN_MESSAGE = '50000000-0000-4000-8000-000000000004';
 const FOREIGN_FOREIGN_MESSAGE = '50000000-0000-4000-8000-000000000005';
 const COLLECTION = '60000000-0000-4000-8000-000000000001';
+const FOREIGN_COLLECTION = '60000000-0000-4000-8000-000000000002';
+const UNRELATED_COLLECTION = '60000000-0000-4000-8000-000000000003';
+const OWN_CREATION = '60000000-0000-4000-8000-000000000004';
+const FOREIGN_CREATION = '60000000-0000-4000-8000-000000000005';
 const TURN = '70000000-0000-4000-8000-000000000001';
 const CONCEPT = '80000000-0000-4000-8000-000000000001';
 const CONCEPT_IMAGE = '80000000-0000-4000-8000-000000000002';
@@ -214,10 +218,10 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
   });
   it('proves money, privacy, multipart gating, worker concurrency, and route-vs-worker fencing', async () => {
     await pg`
-      insert into accounts (id,type,username,clerk_user_id) values
-        (${HUMAN},'user','erase_runtime_human','clerk-runtime-human'),
-        (${AGENT},'agent','erase_runtime_agent',null),
-        (${FOREIGN},'user','erase_runtime_foreign',null)`;
+      insert into accounts (id,type,username,clerk_user_id,external_id) values
+        (${HUMAN},'user','erase_runtime_human','clerk-runtime-human','legacy-human'),
+        (${AGENT},'agent','erase_runtime_agent',null,'legacy-agent'),
+        (${FOREIGN},'user','erase_runtime_foreign',null,'legacy-foreign')`;
     await pg`
       insert into agents (account_id,owner_id,name,description,persona,public)
       values (${AGENT},${HUMAN},'private agent','private description','private persona',true)`;
@@ -273,8 +277,22 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         values (${sessionId},${HUMAN},${sha(`share:${sessionId}`)},'snapshot','{"secret":"snapshot"}'::jsonb)`;
     }
     await pg`
-      insert into collections (id,user_id,name,description,public)
-      values (${COLLECTION},${HUMAN},'public secret collection','private description',true)`;
+      insert into collections (id,user_id,name,description,contributors,public) values
+        (${COLLECTION},${HUMAN},'public secret collection','private description',null,true),
+        (${FOREIGN_COLLECTION},${FOREIGN},'foreign collection','foreign survives',
+          ${JSON.stringify(['legacy-human', 'legacy-survivor', 'legacy-agent'])}::jsonb,true),
+        (${UNRELATED_COLLECTION},${FOREIGN},'unrelated collection','unrelated survives',
+          ${JSON.stringify(['legacy-foreign'])}::jsonb,true)`;
+    await pg`
+      insert into creations (id,user_id,url,public,deleted) values
+        (${OWN_CREATION},${HUMAN},'/media/owned-social.png',false,false),
+        (${FOREIGN_CREATION},${FOREIGN},'/media/foreign-social.png',false,false)`;
+    await pg`
+      insert into etl_social_edges
+        (source_collection,source_external_id,edge_kind,user_id,target_id,last_seen_run_id) values
+        ('users3','foreign-agent-edge','agent_like',${FOREIGN},${AGENT},${randomUUID()}),
+        ('users3','foreign-creation-edge','creation_like',${FOREIGN},${OWN_CREATION},${randomUUID()}),
+        ('users3','unrelated-edge','creation_like',${FOREIGN},${FOREIGN_CREATION},${randomUUID()})`;
     await pg`
       insert into concepts (id,agent_id,name,slug,description,instructions)
       values (${CONCEPT},${AGENT},'private concept','private-concept','private description','private instructions')`;
@@ -407,7 +425,8 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       concept_name: string; concept_instructions: string | null; concept_filename: string | null;
       skill_name: string; skill_body: string; upload_state: string; cleanup_state: string;
       foreign_skill_reviewer: string | null; foreign_skill_name: string;
-      sweep_skipped: unknown;
+      sweep_skipped: unknown; foreign_contributors: unknown; unrelated_contributors: unknown;
+      deleted_social_edges: number; unrelated_social_edges: number;
     }[]>`
       select
         (select deleted from sessions where id=${PRIVATE_SESSION}) private_deleted,
@@ -429,6 +448,11 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         (select reviewer_id::text from skill_definitions where id=${FOREIGN_SKILL}) foreign_skill_reviewer,
         (select name from skill_definitions where id=${FOREIGN_SKILL}) foreign_skill_name,
         (select skipped_agents from memory_dream_sweeps where id=${PRIVACY_SWEEP}) sweep_skipped,
+        (select contributors from collections where id=${FOREIGN_COLLECTION}) foreign_contributors,
+        (select contributors from collections where id=${UNRELATED_COLLECTION}) unrelated_contributors,
+        (select count(*)::int from etl_social_edges where source_external_id in
+          ('foreign-agent-edge','foreign-creation-edge')) deleted_social_edges,
+        (select count(*)::int from etl_social_edges where source_external_id='unrelated-edge') unrelated_social_edges,
         (select state from storage_uploads where id=${UPLOAD}) upload_state,
         (select cleanup_state from storage_uploads where id=${UPLOAD}) cleanup_state`;
     expect(privacy).toMatchObject({
@@ -450,6 +474,10 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       foreign_skill_reviewer: null,
       foreign_skill_name: 'Foreign Skill',
       sweep_skipped: [{ agentAccountId: FOREIGN, openclawId: 'foreign-openclaw' }],
+      foreign_contributors: ['legacy-survivor'],
+      unrelated_contributors: ['legacy-foreign'],
+      deleted_social_edges: 0,
+      unrelated_social_edges: 1,
       upload_state: 'aborted',
       cleanup_state: 'pending',
     });
@@ -511,6 +539,11 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       actor_account_id: null, owner_account_id: null, metadata: {},
       outbound_rows: 0, connection_rows: 0,
     });
+    await expect(pg`
+      insert into etl_social_edges
+        (source_collection,source_external_id,edge_kind,user_id,target_id,last_seen_run_id)
+      values ('users3','reinsert-deleted-target','agent_like',${FOREIGN},${AGENT},${randomUUID()})`
+    ).rejects.toThrow();
 
     const collectionApp = Fastify();
     collectionApp.decorateRequest('account', null);
@@ -1196,5 +1229,37 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         (select count(*)::int from turn_authorizations where account_id=${LATE_HUMAN} and state='settled') settled
       from account_erasure_jobs j where j.id=${pending.jobId}`;
     expect(truth).toEqual({ state: 'succeeded', balance: '90.0000', reversed: 1, settled: 1 });
+  }, 30_000);
+
+  it('fails closed on malformed foreign collection contributor provenance', async () => {
+    const accountId = randomUUID();
+    const collectionId = randomUUID();
+    const username = `erase_bad_contributors_${accountId.slice(0, 8)}`;
+    await pg`
+      insert into accounts (id,type,username,external_id)
+      values (${accountId},'user',${username},${`legacy-${accountId}`})`;
+    await pg`
+      insert into collections (id,user_id,name,contributors)
+      values (${collectionId},${FOREIGN},'foreign malformed provenance',
+        ${JSON.stringify({ contributor: `legacy-${accountId}` })}::jsonb)`;
+
+    await expect(requestAccountErasure({
+      actorAccountId: accountId,
+      actorUsername: username,
+      actorIsAdmin: false,
+      confirmUsername: username,
+    }, erasureStore(), ledger(), recoverySink())).rejects.toThrow(
+      'account_erasure_collection_contributors_invalid',
+    );
+    const [state] = await pg<{ deleted: boolean; contributors: unknown; inventoried_at: Date | null }[]>`
+      select a.deleted,c.contributors,j.inventoried_at
+      from accounts a join account_erasure_jobs j on j.account_id=a.id
+      join collections c on c.id=${collectionId}
+      where a.id=${accountId}`;
+    expect(state).toEqual({
+      deleted: false,
+      contributors: { contributor: `legacy-${accountId}` },
+      inventoried_at: null,
+    });
   }, 30_000);
 });

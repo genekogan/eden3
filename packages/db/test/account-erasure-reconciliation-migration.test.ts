@@ -113,6 +113,9 @@ describe('0041 account erasure reconciliation', () => {
     }
     expect(sql).toContain('CREATE TRIGGER zz_account_erasure_media_ingest_fence');
     expect(sql).toContain("TG_TABLE_NAME='collections'");
+    expect(sql).toContain("jsonb_typeof(v_old->'contributors')='array'");
+    expect(sql).toContain("TG_TABLE_NAME='etl_social_edges'");
+    expect(sql).toContain("v_row->>'edge_kind'='creation_like'");
     expect(sql).toContain("TG_TABLE_NAME='skill_definitions'");
     expect(sql).toContain("TG_TABLE_NAME='concepts'");
     expect(sql).toContain("(v_new->>'public')::boolean=false AND (v_new->>'deleted')::boolean=true");

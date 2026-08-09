@@ -646,6 +646,24 @@ BEGIN
 		AND v_new->>'external_id' IS NULL AND v_new->>'name' IS NULL AND v_new->>'description' IS NULL
 		AND v_new->>'cover_creation_external_id' IS NULL AND v_new->>'contributors' IS NULL
 		AND (v_new->>'public')::boolean=false AND (v_new->>'deleted')::boolean=true THEN RETURN NEW; END IF;
+	IF v_job IS NOT NULL AND TG_TABLE_NAME='collections' AND TG_OP='UPDATE'
+		AND NOT public.account_erasure_principal_matches(v_job_account,(v_old->>'user_id')::uuid)
+		AND jsonb_typeof(v_old->'contributors')='array'
+		AND (v_new-'contributors'-'updated_at')=(v_old-'contributors'-'updated_at')
+		AND v_new->'contributors'=(
+			SELECT COALESCE(jsonb_agg(item.value ORDER BY item.ordinality),'[]'::jsonb)
+			FROM jsonb_array_elements(v_old->'contributors') WITH ORDINALITY item(value,ordinality)
+			WHERE NOT EXISTS (
+				SELECT 1 FROM public.account_erasure_jobs j
+				JOIN public.accounts a ON a.id=j.account_id OR EXISTS (
+					SELECT 1 FROM public.agents owned
+					WHERE owned.owner_id=j.account_id AND owned.account_id=a.id
+				)
+				WHERE j.id=v_job AND a.external_id IS NOT NULL
+					AND item.value=to_jsonb(a.external_id)
+			)
+		)
+	THEN RETURN NEW; END IF;
 	IF v_job IS NOT NULL AND TG_TABLE_NAME='concepts' AND TG_OP='UPDATE'
 		AND public.account_erasure_principal_matches(v_job_account,(v_old->>'agent_id')::uuid)
 		AND v_new->>'id'=v_old->>'id' AND v_new->>'agent_id'=v_old->>'agent_id'
@@ -672,7 +690,15 @@ BEGIN
 			(v_old-'reviewer_id'-'reviewed_at'-'updated_at')
 	THEN RETURN NEW; END IF;
 	IF v_job IS NOT NULL AND TG_TABLE_NAME='etl_social_edges' AND TG_OP='DELETE'
-		AND public.account_erasure_principal_matches(v_job_account,(v_old->>'user_id')::uuid) THEN RETURN OLD; END IF;
+		AND (public.account_erasure_principal_matches(v_job_account,(v_old->>'user_id')::uuid)
+			OR (v_old->>'edge_kind'='agent_like'
+				AND public.account_erasure_principal_matches(v_job_account,(v_old->>'target_id')::uuid))
+			OR (v_old->>'edge_kind'='creation_like' AND EXISTS (
+				SELECT 1 FROM public.creations c WHERE c.id=(v_old->>'target_id')::uuid
+					AND (public.account_erasure_principal_matches(v_job_account,c.user_id)
+						OR public.account_erasure_principal_matches(v_job_account,c.agent_id))
+			)))
+	THEN RETURN OLD; END IF;
 	IF v_job IS NOT NULL AND TG_TABLE_NAME='distill_state' AND TG_OP='DELETE'
 		AND public.account_erasure_principal_matches(v_job_account,(v_old->>'agent_account_id')::uuid)
 	THEN RETURN OLD; END IF;
@@ -724,6 +750,19 @@ BEGIN
 	FOR v_row IN SELECT value FROM jsonb_array_elements(CASE TG_OP WHEN 'INSERT' THEN jsonb_build_array(to_jsonb(NEW))
 		WHEN 'DELETE' THEN jsonb_build_array(to_jsonb(OLD)) ELSE jsonb_build_array(to_jsonb(OLD),to_jsonb(NEW)) END)
 	LOOP
+		IF TG_TABLE_NAME='etl_social_edges' THEN
+			IF v_row->>'edge_kind'='agent_like' THEN
+				FOR v_owner IN SELECT owner FROM public.account_erasure_resolve_owner(
+					'agent',(v_row->>'target_id')::uuid) owner
+				LOOP v_owners:=array_append(v_owners,v_owner); END LOOP;
+			ELSIF v_row->>'edge_kind'='creation_like' THEN
+				FOR v_owner IN SELECT owner FROM public.account_erasure_resolve_owner(
+					'creation',(v_row->>'target_id')::uuid) owner
+				LOOP v_owners:=array_append(v_owners,v_owner); END LOOP;
+			ELSE
+				RAISE EXCEPTION 'invalid legacy social edge kind';
+			END IF;
+		END IF;
 		IF (TG_TABLE_NAME='accounts' AND public.account_erasure_target_claim_matches((v_row->>'id')::uuid,'clerk_identity',(v_row->>'id')::uuid))
 		OR (TG_TABLE_NAME='billing_subscriptions' AND public.account_erasure_target_claim_matches((v_row->>'account_id')::uuid,'stripe_customer',(v_row->>'account_id')::uuid))
 			OR (TG_TABLE_NAME='stripe_checkout_intents' AND public.account_erasure_target_claim_matches((v_row->>'account_id')::uuid,'stripe_customer',(v_row->>'account_id')::uuid))
