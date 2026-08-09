@@ -10,6 +10,7 @@ import {
   MAX_ENABLED_TASKS_PER_AGENT,
   MAX_RETAINED_SELF_CRON_TASKS_PER_AGENT,
   createBridgeServer,
+  createPostgresTaskStore,
   handleBridgeRequest,
   sessionIdFromContext,
 } from '../../../infra/agent-cron-bridge/server.mjs';
@@ -20,6 +21,42 @@ const SESSION_ID = '123e4567-e89b-42d3-a456-426614174000';
 const TASK_ID = '123e4567-e89b-42d3-a456-426614174001';
 const identity = { ownerId: 'owner-id', agentAccountId: 'agent-account-id' };
 const sockets = [];
+
+function fakeTaskStoreSql(initialOwnerCount = 0) {
+  let ownerCount = initialOwnerCount;
+  let nextId = 1;
+  const queries = [];
+  const tx = async (strings, ...values) => {
+    const text = strings.join('?').replace(/\s+/g, ' ').trim();
+    queries.push({ text, values });
+    if (text.includes('where user_id = ?') && text.includes('count(*)::int')) {
+      return [{ count: ownerCount }];
+    }
+    if (text.includes("status in ('active', 'running')")) return [{ count: 0 }];
+    if (text.includes('external_id like ?') && text.includes('count(*)::int')) {
+      return [{ count: 0 }];
+    }
+    if (text.startsWith('insert into triggers')) {
+      ownerCount += 1;
+      return [
+        {
+          id: `task-${nextId++}`,
+          name: values[3],
+          prompt: values[4],
+          schedule: {},
+          status: 'active',
+          next_scheduled_run: new Date('2026-08-10T12:00:00.000Z'),
+          last_run_time: null,
+          last_error: null,
+        },
+      ];
+    }
+    return [];
+  };
+  tx.json = (value) => value;
+  const sql = { begin: async (callback) => callback(tx) };
+  return { sql, queries, ownerCount: () => ownerCount };
+}
 
 afterEach(async () => {
   await Promise.all(
@@ -135,6 +172,38 @@ describe('agent cron bridge identity and protocol', () => {
         { resolveIdentity: async () => identity },
       ),
     ).rejects.toMatchObject({ code: 'invalid_schedule' });
+  });
+});
+
+describe('agent cron bridge global owner quota', () => {
+  const input = {
+    name: 'Owner bounded task',
+    prompt: 'Stay within the shared owner limit.',
+    schedule: { hour: 12, minute: 0, timezone: 'UTC' },
+    nextScheduledRun: new Date('2026-08-10T12:00:00.000Z'),
+  };
+
+  it('takes the shared owner lock before the agent lock and rejects at the owner limit', async () => {
+    const fake = fakeTaskStoreSql(1);
+    const store = createPostgresTaskStore(fake.sql, { maxScheduledTasksPerUser: 1 });
+    await expect(store.create(identity, input)).rejects.toMatchObject({
+      code: 'task_quota_exceeded',
+    });
+    const lockValues = fake.queries
+      .filter(({ text }) => text.includes('pg_advisory_xact_lock'))
+      .map(({ values }) => values[0]);
+    expect(lockValues).toEqual(['task-owner:owner-id', 'agent-account-id']);
+    expect(fake.ownerCount()).toBe(1);
+  });
+
+  it('allows exactly one cross-agent create at limit minus one', async () => {
+    const fake = fakeTaskStoreSql(1);
+    const store = createPostgresTaskStore(fake.sql, { maxScheduledTasksPerUser: 2 });
+    await expect(store.create(identity, input)).resolves.toMatchObject({ status: 'active' });
+    await expect(
+      store.create({ ...identity, agentAccountId: 'second-agent' }, input),
+    ).rejects.toMatchObject({ code: 'task_quota_exceeded' });
+    expect(fake.ownerCount()).toBe(2);
   });
 });
 

@@ -51,6 +51,7 @@ describe('metered self-cron infrastructure contract', () => {
       'DATABASE_URL: "postgres://eden3:eden3@postgres:5432/${EDEN3_DATABASE_NAME:?',
     );
     expect(bridge).toContain('EDEN3_API_DATABASE_URL: "${EDEN3_COMPOSE_API_DATABASE_URL:?');
+    expect(bridge).toContain('MAX_SCHEDULED_TASKS_PER_USER: "${MAX_SCHEDULED_TASKS_PER_USER:-100}"');
     expect(bridge).not.toContain('EDEN3_DATABASE_NAME:-eden3');
     expect(bridge).not.toContain('AGENT_CRON_DATABASE_URL');
     expect(bridge).toContain('agent_cron_db');
@@ -59,6 +60,10 @@ describe('metered self-cron infrastructure contract', () => {
     expect(openclaw).toContain('agent_cron_socket:/run/eden3-cron:ro');
     expect(openclaw).not.toContain('EDEN3_API_DATABASE_URL');
     expect(openclaw).not.toMatch(/DATABASE_URL:/);
+    expect(openclaw).not.toContain('MAX_SCHEDULED_TASKS_PER_USER');
+
+    const envExample = await read('.env.example');
+    expect(envExample).toContain('MAX_SCHEDULED_TASKS_PER_USER=100');
   });
 
   it('refuses to open its socket against a different logical DB than the API', () => {
