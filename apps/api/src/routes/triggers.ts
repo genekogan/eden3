@@ -11,7 +11,7 @@ import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, safeRequestErrorCallback, sendError } from '../errors';
+import { ApiError, logSafeRequestError, safeRequestErrorCallback, sendError } from '../errors';
 import type { GatewayGlue } from '../gateway-glue';
 import { triggerDtoFromEntity } from '../route-helpers';
 import { concurrentTurnLimit } from '../services/chat-limits';
@@ -170,7 +170,12 @@ async function ensureGatewayJobRemoved(
       .where(eq(triggers.id, row.id));
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    log.error({ err }, `gateway cron removal failed for trigger ${row.id}`);
+    logSafeRequestError(
+      log,
+      err,
+      { triggerId: row.id },
+      'gateway cron removal failed',
+    );
     await db
       .update(triggers)
       .set({
