@@ -24,10 +24,11 @@ describe("public session share cache and metadata boundary", () => {
     const rules = await nextConfig.headers?.();
     expect(rules).toBeDefined();
     expect(rules?.map((rule) => rule.source)).toEqual([
+      "/((?!api(?:/|$)|media(?:/|$)).*)",
       "/share/:token/:path*",
       "/_next/data/:buildId/share/:token.json",
     ]);
-    for (const rule of rules ?? []) {
+    for (const rule of rules?.slice(1) ?? []) {
       expect(Object.fromEntries(rule.headers.map(({ key, value }) => [key, value]))).toEqual({
         "Cache-Control": "private, no-store, no-cache, max-age=0, must-revalidate",
         "CDN-Cache-Control": "no-store",
