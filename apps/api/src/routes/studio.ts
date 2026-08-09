@@ -26,7 +26,7 @@ import {
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, sendError } from '../errors';
+import { ApiError, safeServerErrorLog, sendError } from '../errors';
 import { MediaPipeline, type AttachmentKind } from '../services/media-pipeline';
 import {
   admitStudioGeneration,
@@ -77,6 +77,15 @@ export const STUDIO_TOOL_NAMES = [
   'tts',
 ] as const;
 export type StudioToolName = (typeof STUDIO_TOOL_NAMES)[number];
+
+/** Durable failure text is stable metadata, never raw provider/exception text. */
+export async function recordStudioReversal<T>(
+  errorCode: string,
+  _unsafeDetail: unknown,
+  compensate: (failure: { errorCode: string; errorMessage: string }) => Promise<T>,
+): Promise<T> {
+  return compensate({ errorCode, errorMessage: 'Studio generation failed' });
+}
 
 /** Attachment kinds a tool's output may claim (music/tts both land as audio). */
 const TOOL_CLAIM_KINDS: Record<StudioToolName, AttachmentKind[]> = {
@@ -744,14 +753,14 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
     };
 
     const requireReversal = async (errorCode: string, errorMessage: string): Promise<void> => {
-      const outcome = await compensateStudioGeneration({
-        turnId: requestId,
-        errorCode,
-        errorMessage,
-        latencyMs: Date.now() - startedAtMs,
-        refundType: `refund:${action}`,
-        reverse: reverseDebit,
-      });
+      const outcome = await recordStudioReversal(errorCode, errorMessage, async (safeFailure) =>
+        compensateStudioGeneration({
+          turnId: requestId,
+          ...safeFailure,
+          latencyMs: Date.now() - startedAtMs,
+          refundType: `refund:${action}`,
+          reverse: reverseDebit,
+        }));
       if (outcome !== 'refund_pending') return;
       req.log.error(`studio: refund of ${idempotencyKey} remains pending`);
       throw new ApiError(
@@ -843,7 +852,10 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           if (fallbackErr instanceof ApiError) {
             return sendError(reply, fallbackErr.statusCode, fallbackErr.code, detail);
           }
-          req.log.error(`studio: tts fallback failed: ${String(fallbackErr)}`);
+          req.log.error(
+            { ...safeServerErrorLog(fallbackErr), tool: body.tool },
+            'studio: tts fallback failed',
+          );
           return sendError(reply, 502, 'provider_error', `tts failed: ${detail}`);
         }
       } else {
@@ -867,7 +879,10 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           err instanceof GatewayHttpError || err instanceof GatewayToolError
             ? err.message
             : 'gateway invocation failed';
-        req.log.error(`studio: ${body.tool} invoke failed: ${String(err)}`);
+        req.log.error(
+          { ...safeServerErrorLog(err), tool: body.tool },
+          'studio: tool invocation failed',
+        );
         await requireReversal('gateway_error', detail);
         return sendError(reply, 502, 'gateway_error', `${body.tool} failed: ${detail}`);
       }

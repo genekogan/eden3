@@ -20,7 +20,13 @@ import {
   registerAuth,
   type AuthPluginOptions,
 } from './auth-plugin';
-import { ApiError, errorEnvelope } from './errors';
+import {
+  ApiError,
+  errorEnvelope,
+  publicErrorCode,
+  publicErrorMessage,
+  safeServerErrorLog,
+} from './errors';
 import { EventsBus, sessionEventsRoutes } from './events-bus';
 import { GatewayGlue, defaultOpenclawDataDir, type GatewayGlueOptions } from './gateway-glue';
 import { TurnConcurrencyLimiter } from './services/chat-limits';
@@ -176,6 +182,180 @@ export interface BuildServerOptions {
   accountErasure?: AccountErasureRuntimeBundle;
 }
 
+const SAFE_HEALTH_IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allowedKeys = new Set(allowed);
+  return Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function isCount(value: unknown): boolean {
+  return value === null || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0);
+}
+
+/** A narrowly reviewed operational 503 body, with no free-form failure text. */
+export function isSafeHealthReadinessResponse(requestUrl: string, payload: unknown): boolean {
+  if (requestUrl.split('?', 1)[0] !== '/health' || !isRecord(payload)) {
+    return false;
+  }
+  if (!hasOnlyKeys(payload, ['ok', 'versions', 'database', 'schema'])) {
+    return false;
+  }
+  if (payload.ok !== false || !isRecord(payload.versions) || !isRecord(payload.schema)) {
+    return false;
+  }
+  const versions = payload.versions;
+  const schema = payload.schema;
+  if (!hasOnlyKeys(versions, ['api', 'node', 'fastify'])) {
+    return false;
+  }
+  if (
+    !['api', 'node', 'fastify'].every(
+      (key) => typeof versions[key] === 'string' && SAFE_HEALTH_IDENTIFIER.test(versions[key]),
+    )
+  ) {
+    return false;
+  }
+  if (
+    payload.database !== null &&
+    (typeof payload.database !== 'string' || !SAFE_HEALTH_IDENTIFIER.test(payload.database))
+  ) {
+    return false;
+  }
+  if (
+    !hasOnlyKeys(schema, [
+      'status',
+      'expectedMigration',
+      'expectedCount',
+      'appliedCount',
+      'missingCount',
+      'unexpectedCount',
+    ])
+  ) {
+    return false;
+  }
+  if (
+    typeof schema.status !== 'string' ||
+    ![
+      'missing_migrations',
+      'unexpected_migrations',
+      'database_unavailable',
+      'unchecked',
+    ].includes(schema.status)
+  ) {
+    return false;
+  }
+  if (
+    schema.expectedMigration !== null &&
+    (typeof schema.expectedMigration !== 'string' ||
+      !SAFE_HEALTH_IDENTIFIER.test(schema.expectedMigration))
+  ) {
+    return false;
+  }
+  return [
+    schema.expectedCount,
+    schema.appliedCount,
+    schema.missingCount,
+    schema.unexpectedCount,
+  ].every(isCount);
+}
+
+function isCanonicalServerError(payload: unknown, statusCode: number): boolean {
+  if (!isRecord(payload) || !hasOnlyKeys(payload, ['error']) || !isRecord(payload.error)) {
+    return false;
+  }
+  if (!hasOnlyKeys(payload.error, ['code', 'message', 'statusCode'])) {
+    return false;
+  }
+  return typeof payload.error.code === 'string' &&
+    publicErrorCode(statusCode, payload.error.code) === payload.error.code &&
+    payload.error.statusCode === statusCode &&
+    payload.error.message === publicErrorMessage(statusCode, '');
+}
+
+export function registerApiErrorHandler(
+  app: FastifyInstance,
+  options: { bodyLimitBytes: number },
+): void {
+  app.addHook('onSend', async (request, reply, payload) => {
+    if (reply.statusCode < 500) return payload;
+    let decoded: unknown = payload;
+    if (typeof payload === 'string' || Buffer.isBuffer(payload)) {
+      try {
+        decoded = JSON.parse(payload.toString());
+      } catch {
+        decoded = null;
+      }
+    }
+    if (
+      isSafeHealthReadinessResponse(request.url, decoded) ||
+      isCanonicalServerError(decoded, reply.statusCode)
+    ) {
+      return payload;
+    }
+    const candidate =
+      decoded && typeof decoded === 'object' &&
+      'error' in decoded && decoded.error && typeof decoded.error === 'object' &&
+      'code' in decoded.error
+        ? decoded.error.code
+        : null;
+    const code = publicErrorCode(
+      reply.statusCode,
+      typeof candidate === 'string' ? candidate : 'internal_error',
+    );
+    reply.removeHeader('content-length');
+    reply.header('content-type', 'application/json; charset=utf-8');
+    return JSON.stringify(errorEnvelope(reply.statusCode, code, ''));
+  });
+
+  app.setErrorHandler<FastifyError | ApiError | ZodError>((err, req, reply) => {
+    let statusCode: number;
+    let code: string;
+    let message: string;
+    if (err instanceof ApiError) {
+      ({ statusCode, code, message } = err);
+    } else if (err instanceof ZodError) {
+      statusCode = 400;
+      code = 'bad_request';
+      message = err.issues
+        .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`)
+        .join('; ');
+    } else if (
+      err.code === 'FST_ERR_CTP_BODY_TOO_LARGE' ||
+      (typeof err.statusCode === 'number' && err.statusCode === 413)
+    ) {
+      statusCode = 413;
+      code = 'payload_too_large';
+      message = `Request body exceeds ${options.bodyLimitBytes} bytes`;
+    } else {
+      statusCode =
+        typeof err.statusCode === 'number' && err.statusCode >= 400 ? err.statusCode : 500;
+      code = statusCode >= 500 ? 'internal_error' : (err.code ?? 'bad_request');
+      message = err.message || 'Internal server error';
+    }
+    code = publicErrorCode(statusCode, code);
+    const capabilityRequest = isShareCapabilityRequest(req.url);
+    if (statusCode >= 500) {
+      req.log.error(
+        {
+          requestId: req.id,
+          statusCode,
+          code,
+          ...safeServerErrorLog(err),
+        },
+        capabilityRequest ? 'share capability request failed' : 'request failed',
+      );
+    }
+    void reply
+      .code(statusCode)
+      .send(errorEnvelope(statusCode, code, safeCapabilityErrorMessage(req.url, message)));
+  });
+}
+
 declare module 'fastify' {
   interface FastifyInstance {
     /** Media-correlation registry of recently-active chat turns. */
@@ -263,44 +443,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     });
   }
 
-  // Global error envelope.
-  app.setErrorHandler<FastifyError | ApiError | ZodError>((err, req, reply) => {
-    let statusCode: number;
-    let code: string;
-    let message: string;
-    if (err instanceof ApiError) {
-      ({ statusCode, code, message } = err);
-    } else if (err instanceof ZodError) {
-      statusCode = 400;
-      code = 'bad_request';
-      message = err.issues
-        .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
-        .join('; ');
-    } else if (
-      err.code === 'FST_ERR_CTP_BODY_TOO_LARGE' ||
-      (typeof err.statusCode === 'number' && err.statusCode === 413)
-    ) {
-      statusCode = 413;
-      code = 'payload_too_large';
-      message = `Request body exceeds ${env.API_BODY_LIMIT_BYTES} bytes`;
-    } else {
-      statusCode =
-        typeof err.statusCode === 'number' && err.statusCode >= 400 ? err.statusCode : 500;
-      code = statusCode >= 500 ? 'internal_error' : (err.code ?? 'bad_request');
-      message = err.message || 'Internal server error';
-    }
-    const capabilityRequest = isShareCapabilityRequest(req.url);
-    if (statusCode >= 500) {
-      if (capabilityRequest) {
-        req.log.error({ requestId: req.id, statusCode, code }, 'share capability request failed');
-      } else {
-        req.log.error({ err }, 'request failed');
-      }
-    }
-    void reply
-      .code(statusCode)
-      .send(errorEnvelope(statusCode, code, safeCapabilityErrorMessage(req.url, message)));
-  });
+  // Global error envelope. Every 5xx crosses the fail-closed public-message
+  // boundary before serialization, while the log retains only safe metadata.
+  registerApiErrorHandler(app, { bodyLimitBytes: env.API_BODY_LIMIT_BYTES });
 
   app.setNotFoundHandler((req, reply) => {
     void reply
@@ -387,7 +532,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       versions: { api: pkg.version, node: process.version, fastify: app.version },
       database: databaseName,
       schema,
-      ...(opts.health?.runtimeAttestation
+      ...(ok && opts.health?.runtimeAttestation
         ? { runtimeAttestation: opts.health.runtimeAttestation }
         : {}),
     });
