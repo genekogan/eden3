@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, type ReadStream } from 'node:fs';
+import { constants, createReadStream, type Stats } from 'node:fs';
 import { promises as fs } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 
 import { ApiError } from '../errors';
 
@@ -154,12 +156,16 @@ async function assertRealContained(root: string, abs: string, forWrite: boolean)
   if (rootReal === null) throw notFound();
   const targetReal = await realpathIfExists(abs);
   if (targetReal === null) throw notFound();
+  assertContainedRealPath(rootReal, targetReal, forWrite);
+  return targetReal;
+}
+
+function assertContainedRealPath(rootReal: string, targetReal: string, forWrite: boolean): void {
   if (targetReal !== rootReal && !targetReal.startsWith(rootReal + path.sep)) {
     throw forWrite ? invalidPath() : notFound();
   }
   const rel = path.relative(rootReal, targetReal);
   if (rel !== '' && containsHiddenSegment(rel)) throw hiddenPath(forWrite);
-  return targetReal;
 }
 
 /**
@@ -272,40 +278,105 @@ export async function listWorkspaceTree(
 // File read
 // ---------------------------------------------------------------------------
 
-export async function readWorkspaceFile(root: string, rawPath: unknown): Promise<WorkspaceFileContent> {
+interface PinnedWorkspaceFile {
+  handle: FileHandle;
+  rel: string;
+  stat: Stats;
+}
+
+function isPathRaceError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP';
+}
+
+/**
+ * Resolve, open, and then re-attest a regular workspace file. The returned
+ * descriptor is the authority: callers must read only through it and close it.
+ *
+ * O_NOFOLLOW rejects a final-component swap. Re-resolving after open catches
+ * ancestor swaps, and the device/inode comparison binds the post-open pathname
+ * back to the exact descriptor rather than trusting two independent checks.
+ */
+async function openPinnedWorkspaceFile(
+  root: string,
+  rawPath: unknown,
+): Promise<PinnedWorkspaceFile> {
   const { abs, rel } = resolveWorkspacePath(root, rawPath);
-  const real = await assertRealContained(root, abs, false);
-  const stat = await fs.stat(real);
-  if (!stat.isFile()) throw notFound();
-  const mtime = stat.mtime.toISOString();
-  if (stat.size > WORKSPACE_TEXT_MAX_BYTES) {
-    return { path: rel, kind: 'binary', sizeBytes: stat.size, mtime };
+  const rootReal = await realpathIfExists(path.resolve(root));
+  if (rootReal === null) throw notFound();
+  const targetReal = await realpathIfExists(abs);
+  if (targetReal === null) throw notFound();
+  assertContainedRealPath(rootReal, targetReal, false);
+
+  let handle: FileHandle | null = null;
+  try {
+    handle = await fs.open(targetReal, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const descriptorStat = await handle.stat();
+    const descriptorIdentity = await handle.stat({ bigint: true });
+    if (!descriptorStat.isFile()) throw notFound();
+
+    const reboundReal = await realpathIfExists(targetReal);
+    if (reboundReal === null) throw notFound();
+    assertContainedRealPath(rootReal, reboundReal, false);
+    const reboundStat = await fs.stat(reboundReal, { bigint: true });
+    if (
+      !reboundStat.isFile()
+      || reboundStat.dev !== descriptorIdentity.dev
+      || reboundStat.ino !== descriptorIdentity.ino
+    ) {
+      throw notFound();
+    }
+
+    return { handle, rel, stat: descriptorStat };
+  } catch (error) {
+    if (handle !== null) await handle.close();
+    if (isPathRaceError(error)) throw notFound();
+    throw error;
   }
-  const buf = await fs.readFile(real);
-  const text = decodeText(buf);
-  if (text === null) {
-    return { path: rel, kind: 'binary', sizeBytes: stat.size, mtime };
+}
+
+/** A descriptor-backed stream that closes its handle on EOF, error, or destroy. */
+function retainedHandleStream(handle: PinnedWorkspaceFile['handle']): Readable {
+  return handle.createReadStream({ autoClose: true });
+}
+
+export async function readWorkspaceFile(root: string, rawPath: unknown): Promise<WorkspaceFileContent> {
+  const { handle, rel, stat } = await openPinnedWorkspaceFile(root, rawPath);
+  try {
+    const mtime = stat.mtime.toISOString();
+    if (stat.size > WORKSPACE_TEXT_MAX_BYTES) {
+      return { path: rel, kind: 'binary', sizeBytes: stat.size, mtime };
+    }
+    const buf = await handle.readFile();
+    if (buf.byteLength > WORKSPACE_TEXT_MAX_BYTES) {
+      return { path: rel, kind: 'binary', sizeBytes: buf.byteLength, mtime };
+    }
+    const text = decodeText(buf);
+    if (text === null) {
+      return { path: rel, kind: 'binary', sizeBytes: buf.byteLength, mtime };
+    }
+    return {
+      path: rel,
+      kind: 'text',
+      content: text,
+      sizeBytes: buf.byteLength,
+      mtime,
+      sha256: sha256Hex(buf),
+    };
+  } finally {
+    await handle.close();
   }
-  return {
-    path: rel,
-    kind: 'text',
-    content: text,
-    sizeBytes: stat.size,
-    mtime,
-    sha256: sha256Hex(buf),
-  };
 }
 
 /** Jail-checked stat + read stream for the raw download route. */
 export async function openWorkspaceDownload(
   root: string,
   rawPath: unknown,
-): Promise<{ rel: string; sizeBytes: number; mtime: string; stream: ReadStream }> {
-  const { abs, rel } = resolveWorkspacePath(root, rawPath);
-  const real = await assertRealContained(root, abs, false);
-  const stat = await fs.stat(real);
-  if (!stat.isFile()) throw notFound();
+): Promise<{ rel: string; sizeBytes: number; mtime: string; stream: Readable }> {
+  const pinned = await openPinnedWorkspaceFile(root, rawPath);
+  const { handle, rel, stat } = pinned;
   if (stat.size > WORKSPACE_DOWNLOAD_MAX_BYTES) {
+    await handle.close();
     throw new ApiError(
       413,
       'workspace_file_too_large',
@@ -316,8 +387,16 @@ export async function openWorkspaceDownload(
     rel,
     sizeBytes: stat.size,
     mtime: stat.mtime.toISOString(),
-    stream: createReadStream(real),
+    stream: retainedHandleStream(handle),
   };
+}
+
+/** Lazy descriptor-pinned stream for each entry in a workspace ZIP export. */
+export function openWorkspaceExportStream(root: string, rawPath: unknown): Readable {
+  return Readable.from((async function* () {
+    const { handle } = await openPinnedWorkspaceFile(root, rawPath);
+    for await (const chunk of retainedHandleStream(handle)) yield chunk;
+  })());
 }
 
 // ---------------------------------------------------------------------------

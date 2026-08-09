@@ -12,6 +12,7 @@ import {
   WORKSPACE_TEXT_MAX_BYTES,
   listWorkspaceTree,
   openWorkspaceDownload,
+  openWorkspaceExportStream,
   readWorkspaceFile,
   resolveWorkspacePath,
   sha256Hex,
@@ -178,9 +179,10 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
     });
     for (const entry of entries) {
       if (entry.kind === 'dir') continue;
-      // entry.path came from the jailed tree walk (symlinks skipped), so it is
-      // safe to join back onto the root.
-      archive.file(path.join(root, entry.path), { name: entry.path });
+      // The tree is only discovery. Each lazy stream independently reopens and
+      // re-attests the file through a retained descriptor when archiver reads
+      // it, so a runtime path swap cannot redirect an export after listing.
+      archive.append(openWorkspaceExportStream(root, entry.path), { name: entry.path });
     }
     void archive.finalize();
     return reply
