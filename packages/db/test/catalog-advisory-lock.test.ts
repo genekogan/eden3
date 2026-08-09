@@ -16,6 +16,7 @@ import { assertMigrationDatabaseBoundary } from '../src/migrate';
 
 const PACKAGE_JSON = fileURLToPath(new URL('../package.json', import.meta.url));
 const MIGRATION_RUNNER = fileURLToPath(new URL('../src/migrate.ts', import.meta.url));
+const DRIZZLE_CONFIG = fileURLToPath(new URL('../drizzle.config.ts', import.meta.url));
 
 describe('shared PostgreSQL catalog advisory-lock convention', () => {
   it('pins one explicit two-int lock identity without database-side hashing', () => {
@@ -54,6 +55,15 @@ describe('shared PostgreSQL catalog advisory-lock convention', () => {
     expect(source).not.toContain('drizzle-kit migrate');
     expect(source.indexOf('assertMigrationDatabaseBoundary(options.databaseUrl'))
       .toBeLessThan(source.indexOf('await withCatalogAdvisoryLock'));
+
+    const drizzleConfig = await readFile(DRIZZLE_CONFIG, 'utf8');
+    expect(drizzleConfig).toContain(
+      'assertMigrationDatabaseBoundary(databaseUrl, process.env.EDEN3_DATABASE_NAME)',
+    );
+    expect(drizzleConfig).toContain(
+      "throw new Error('DATABASE_URL is required for Drizzle tooling')",
+    );
+    expect(drizzleConfig).not.toMatch(/postgres:\/\/eden3:eden3@localhost:5433\/eden3/);
   });
 
   it('refuses implicit-login and ambiguous migration database targets before connection', () => {
