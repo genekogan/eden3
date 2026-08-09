@@ -7,7 +7,7 @@ import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import path from 'node:path';
 import { z } from 'zod';
 
-import { ApiError, errorEnvelope } from '../errors';
+import { ApiError, errorEnvelope, logSafeRequestError } from '../errors';
 import {
   WORKSPACE_TEXT_MAX_BYTES,
   listWorkspaceTree,
@@ -168,7 +168,12 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
 
     const archive = new ZipArchive({ zlib: { level: 6 } });
     archive.on('error', (err) => {
-      req.log.error({ err }, `workspace export failed for "${account.username}"`);
+      logSafeRequestError(
+        req.log,
+        err,
+        { accountId: account.id },
+        'workspace export failed',
+      );
       archive.destroy();
     });
     for (const entry of entries) {

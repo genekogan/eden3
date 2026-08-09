@@ -1,14 +1,18 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 import Fastify, { type FastifyInstance } from 'fastify';
+import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   ApiError,
   errorEnvelope,
   logSafeRequestError,
+  logSafeRequestWarning,
+  safeRequestErrorCallback,
   safeServerErrorLog,
   sendError,
 } from '../src/errors';
@@ -19,6 +23,71 @@ const SENSITIVE = 'SENSITIVE_5XX_SENTINEL_do_not_expose';
 const SECRET_CODE = 'secret_token_value';
 const SECRET_ERRNO = 'ESECRET_TOKEN_VALUE';
 const SECRET_ERROR_NAME = 'SecretTokenError';
+
+const REVIEWED_BACKGROUND_THROWABLE_LOGS = new Set([
+  'server.ts:history-sync failed',
+  'server.ts:scheduled task side-error',
+  'server.ts:scheduled task recovery side-error',
+  'server.ts:turn-reservation reaper side-error',
+  'server.ts:studio-reservation reaper side-error',
+  'server.ts:chat-media reaper side-error',
+  'server.ts:memory dream side-error',
+  'server.ts:memory dream scheduler tick failed',
+  'server.ts:upload policy event tick failed',
+  'server.ts:multipart cleanup tick failed',
+  'routes/channels.ts:channel turn stale-refund sweep failed',
+]);
+
+async function typescriptFiles(root: string): Promise<string[]> {
+  const entries = await readdir(root, { withFileTypes: true });
+  const nested = await Promise.all(entries.map(async (entry) => {
+    const fullPath = path.join(root, entry.name);
+    if (entry.isDirectory()) return typescriptFiles(fullPath);
+    return entry.isFile() && entry.name.endsWith('.ts') ? [fullPath] : [];
+  }));
+  return nested.flat();
+}
+
+function rawThrowableLoggerFindings(filePath: string, sourceText: string): string[] {
+  const source = ts.createSourceFile(filePath, sourceText, ts.ScriptTarget.Latest, true);
+  const findings: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
+      const method = node.expression.name.text;
+      const logger = node.expression.expression;
+      if (
+        (method === 'error' || method === 'warn') &&
+        ts.isPropertyAccessExpression(logger) &&
+        logger.name.text === 'log' &&
+        ts.isIdentifier(logger.expression) &&
+        ['app', 'req', 'request'].includes(logger.expression.text)
+      ) {
+        const messageArg = node.arguments.at(-1);
+        const message = messageArg && ts.isStringLiteral(messageArg) ? messageArg.text : '(dynamic)';
+        let unsafe = false;
+        for (const argument of node.arguments) {
+          const inspect = (candidate: ts.Node): void => {
+            if (
+              ts.isIdentifier(candidate) &&
+              ['err', 'error'].includes(candidate.text)
+            ) {
+              unsafe = true;
+            }
+            ts.forEachChild(candidate, inspect);
+          };
+          inspect(argument);
+        }
+        if (unsafe) {
+          const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+          findings.push(`${filePath}:${line}:${message}`);
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(source);
+  return findings;
+}
 
 describe('HTTP 5xx disclosure boundary', () => {
   const apps: FastifyInstance[] = [];
@@ -254,7 +323,10 @@ describe('HTTP 5xx disclosure boundary', () => {
 
   it('captures request error logs without serializing the throwable', () => {
     const calls: unknown[][] = [];
-    const logger = { error: (...args: unknown[]) => calls.push(args) };
+    const logger = {
+      error: (...args: unknown[]) => calls.push(['error', ...args]),
+      warn: (...args: unknown[]) => calls.push(['warn', ...args]),
+    };
     const error = Object.assign(new Error(SENSITIVE), {
       code: SECRET_ERRNO,
       cause: new Error(SENSITIVE),
@@ -263,11 +335,65 @@ describe('HTTP 5xx disclosure boundary', () => {
     logSafeRequestError(logger, error, { accountId: 'safe-account-id' }, 'request failed');
 
     expect(calls).toEqual([[
+      'error',
       { accountId: 'safe-account-id', errorName: 'Error' },
       'request failed',
     ]]);
     expect(JSON.stringify(calls)).not.toContain(SENSITIVE);
     expect(JSON.stringify(calls)).not.toContain(SECRET_ERRNO);
+  });
+
+  it('redacts synchronous, stream-event, and deferred request log callbacks', async () => {
+    const calls: unknown[][] = [];
+    const logger = {
+      error: (...args: unknown[]) => calls.push(['error', ...args]),
+      warn: (...args: unknown[]) => calls.push(['warn', ...args]),
+    };
+    const unsafe = Object.assign(new Error(SENSITIVE), { code: SECRET_ERRNO });
+
+    logSafeRequestWarning(logger, unsafe, { phase: 'sync' }, 'sync failure');
+    const stream = new EventEmitter();
+    stream.on('error', safeRequestErrorCallback(
+      logger,
+      { phase: 'stream' },
+      'stream failure',
+    ));
+    stream.emit('error', unsafe);
+    await Promise.reject(unsafe).catch(safeRequestErrorCallback(
+      logger,
+      { phase: 'deferred' },
+      'deferred failure',
+      'warn',
+    ));
+
+    expect(calls).toEqual([
+      ['warn', { phase: 'sync', errorName: 'Error' }, 'sync failure'],
+      ['error', { phase: 'stream', errorName: 'Error' }, 'stream failure'],
+      ['warn', { phase: 'deferred', errorName: 'Error' }, 'deferred failure'],
+    ]);
+    expect(JSON.stringify(calls)).not.toContain(SENSITIVE);
+    expect(JSON.stringify(calls)).not.toContain(SECRET_ERRNO);
+  });
+
+  it('recursively inventories raw throwable logs and allows only reviewed background sites', async () => {
+    const apiSrc = path.resolve(import.meta.dirname, '../src');
+    const files = [
+      path.join(apiSrc, 'server.ts'),
+      ...await typescriptFiles(path.join(apiSrc, 'routes')),
+    ];
+    const unsafe: string[] = [];
+    for (const file of files) {
+      const relative = path.relative(apiSrc, file);
+      const findings = rawThrowableLoggerFindings(relative, await readFile(file, 'utf8'));
+      for (const finding of findings) {
+        const [sourceFile, _line, message] = finding.split(':');
+        if (!REVIEWED_BACKGROUND_THROWABLE_LOGS.has(`${sourceFile}:${message}`)) {
+          unsafe.push(finding);
+        }
+      }
+    }
+
+    expect(unsafe).toEqual([]);
   });
 
   it('stores a stable Studio reversal reason instead of provider detail', async () => {

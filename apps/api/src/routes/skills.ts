@@ -3,7 +3,7 @@ import { pg, type Account, type Agent } from '@eden3/db';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, sendError } from '../errors';
+import { ApiError, logSafeRequestWarning, sendError } from '../errors';
 import { isUniqueViolation, pgToIso } from '../route-helpers';
 import {
   attachedSkillRows,
@@ -208,8 +208,10 @@ export const skillsRoutes: FastifyPluginAsync = async (app) => {
       try {
         await reconcileSkillRuntime(agentId, req.log);
       } catch (err) {
-        req.log.warn(
-          { err, accountId: agentId },
+        logSafeRequestWarning(
+          req.log,
+          err,
+          { accountId: agentId },
           'skill rejection saved; agent runtime convergence deferred',
         );
       }

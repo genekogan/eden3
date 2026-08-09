@@ -19,7 +19,7 @@ import { eq } from 'drizzle-orm';
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError } from '../errors';
+import { ApiError, safeRequestErrorCallback } from '../errors';
 import { DEFAULT_AGENT_MODEL, type GatewayGlue } from '../gateway-glue';
 import { concurrentTurnLimit } from '../services/chat-limits';
 import { installDefaultAgentSkills } from '../services/agent-skills';
@@ -418,7 +418,7 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
             registry: app.turnRegistry,
             historySync: app.historySync,
             ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
-            onError: (err, context) => req.log.error({ err, context }, 'chat turn side-error'),
+            onError: safeRequestErrorCallback(req.log, {}, 'chat turn side-error'),
           },
           {
             session: target.session,
@@ -428,11 +428,21 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
             beginStream: () => openSseSink(reply, target.session.id),
           },
         );
-        void enqueueAutomaticMemoryRetryForAgent(target.agent.accountId, (err) =>
-          req.log.warn({ err }, `memory distillation retry failed for "${target.agent.username}"`),
-        ).catch((err) =>
-          req.log.warn({ err }, `memory distillation retry lookup failed for "${target.agent.username}"`),
-        );
+        const memoryLogContext = { accountId: target.agent.accountId };
+        void enqueueAutomaticMemoryRetryForAgent(
+          target.agent.accountId,
+          safeRequestErrorCallback(
+            req.log,
+            memoryLogContext,
+            'memory distillation retry failed',
+            'warn',
+          ),
+        ).catch(safeRequestErrorCallback(
+          req.log,
+          memoryLogContext,
+          'memory distillation retry lookup failed',
+          'warn',
+        ));
       } catch (err) {
         // runTurn only throws BEFORE the reply is hijacked (see its contract).
         if (err instanceof InsufficientMannaError) {

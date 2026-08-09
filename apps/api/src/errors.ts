@@ -121,16 +121,45 @@ export function safeServerErrorLog(error: unknown): {
 
 interface RequestErrorLogger {
   error(context: Record<string, unknown>, message: string): unknown;
+  warn(context: Record<string, unknown>, message: string): unknown;
 }
 
-/** Runtime-capturable request logging seam that never serializes the throwable. */
+function logSafeRequestFailure(
+  logger: RequestErrorLogger,
+  level: 'error' | 'warn',
+  error: unknown,
+  context: Record<string, unknown>,
+  message: string,
+): void {
+  logger[level]({ ...context, ...safeServerErrorLog(error) }, message);
+}
+
+/** Runtime-capturable request logging seams that never serialize throwables. */
 export function logSafeRequestError(
   logger: RequestErrorLogger,
   error: unknown,
   context: Record<string, unknown>,
   message: string,
 ): void {
-  logger.error({ ...context, ...safeServerErrorLog(error) }, message);
+  logSafeRequestFailure(logger, 'error', error, context, message);
+}
+
+export function logSafeRequestWarning(
+  logger: RequestErrorLogger,
+  error: unknown,
+  context: Record<string, unknown>,
+  message: string,
+): void {
+  logSafeRequestFailure(logger, 'warn', error, context, message);
+}
+
+export function safeRequestErrorCallback(
+  logger: RequestErrorLogger,
+  context: Record<string, unknown>,
+  message: string,
+  level: 'error' | 'warn' = 'error',
+): (error: unknown) => void {
+  return (error) => logSafeRequestFailure(logger, level, error, context, message);
 }
 
 /** Throwable error carrying its HTTP status + envelope code. */

@@ -11,7 +11,7 @@ import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyBaseLogger, FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, sendError } from '../errors';
+import { ApiError, safeRequestErrorCallback, sendError } from '../errors';
 import type { GatewayGlue } from '../gateway-glue';
 import { triggerDtoFromEntity } from '../route-helpers';
 import { concurrentTurnLimit } from '../services/chat-limits';
@@ -420,7 +420,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
           bus: app.eventsBus,
           registry: app.turnRegistry,
           historySync: app.historySync,
-          onError: (err, context) => req.log.error({ err, context }, 'scheduled task side-error'),
+          onError: safeRequestErrorCallback(req.log, {}, 'scheduled task side-error'),
         },
         existing,
         manualTaskOccurrence(existing.id, requestId),
