@@ -101,7 +101,7 @@ export const envSchema = z.object({
   CHANNEL_TOKEN_ENCRYPTION_KEY: z.string().min(1).optional(),
   /** Eden3-native agents a non-admin user may create; migrated agents are grandfathered. */
   MAX_NATIVE_AGENTS_PER_USER: nonnegativeIntSchema.default(25),
-  /** Scheduled tasks a non-admin user may keep active/non-deleted. */
+  /** Non-deleted scheduled tasks retained across all agents owned by one user. */
   MAX_SCHEDULED_TASKS_PER_USER: nonnegativeIntSchema.default(100),
   /** External channel connections a non-admin user may keep connected. */
   MAX_CHANNEL_CONNECTIONS_PER_USER: nonnegativeIntSchema.default(20),

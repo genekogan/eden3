@@ -214,28 +214,6 @@ async function lastRunSessionIds(
   return new Map(rows.map((row) => [row.trigger_id, row.session_id]));
 }
 
-async function scheduledTaskQuotaError(account: { accountId: string }): Promise<{
-  statusCode: 429;
-  code: 'task_quota_exceeded';
-  message: string;
-} | null> {
-  const limit = getEnv().MAX_SCHEDULED_TASKS_PER_USER;
-  const [quota] = await pg<{ count: number }[]>`
-    select count(*)::int as count
-    from triggers
-    where user_id = ${account.accountId}
-      and deleted = false
-  `;
-  if ((quota?.count ?? 0) >= limit) {
-    return {
-      statusCode: 429,
-      code: 'task_quota_exceeded',
-      message: `Scheduled task limit reached (${limit} tasks)`,
-    };
-  }
-  return null;
-}
-
 const listTasksQuerySchema = z.object({
   /** Filter to one agent's tasks (username). */
   agent: z.string().trim().min(1).max(200).optional(),
@@ -295,15 +273,29 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
       return sendError(reply, 404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
     }
 
-    const quotaError = await scheduledTaskQuotaError(viewer);
-    if (quotaError) {
-      return sendError(reply, quotaError.statusCode, quotaError.code, quotaError.message);
-    }
+    const ownerTaskLimit = getEnv().MAX_SCHEDULED_TASKS_PER_USER;
 
-    // Serialize enabled-task creates for this agent. The hard per-agent cap
-    // applies to owner-created and self-created jobs alike, including admins;
-    // otherwise two racing creates could both observe slot ten as free.
+    // Every task creator takes the owner lock before the agent lock. The
+    // owner-wide retained-row quota therefore composes with self-cron creates
+    // across different agents, while the existing enabled-task cap remains
+    // exact for this agent.
     const rowId = await pg.begin(async (tx) => {
+      await tx`select pg_advisory_xact_lock(hashtextextended(${
+        `task-owner:${viewer.accountId}`
+      }::text, 84))`;
+      const [quota] = await tx<{ count: number }[]>`
+        select count(*)::int as count
+        from triggers
+        where user_id = ${viewer.accountId}
+          and deleted = false
+      `;
+      if ((quota?.count ?? 0) >= ownerTaskLimit) {
+        throw new ApiError(
+          429,
+          'task_quota_exceeded',
+          `Scheduled task limit reached (${ownerTaskLimit} tasks)`,
+        );
+      }
       await tx`select pg_advisory_xact_lock(hashtextextended(${agentAccount.id}::text, 84))`;
       const [enabled] = await tx<{ count: number }[]>`
         select count(*)::int as count

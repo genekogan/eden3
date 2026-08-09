@@ -379,6 +379,63 @@ describe('POST /tasks', () => {
     }
   });
 
+  it('admits exactly one concurrent create at the shared owner quota boundary', async () => {
+    const [before] = await pg<{ count: number }[]>`
+      select count(*)::int as count
+      from triggers
+      where user_id = ${userId}
+        and deleted = false
+    `;
+    const limit = (before?.count ?? 0) + 1;
+    const restore = withEnv('MAX_SCHEDULED_TASKS_PER_USER', String(limit));
+    const ownerLockKey = `task-owner:${userId}`;
+    const lock = await pg.reserve();
+    await lock`select pg_advisory_lock(hashtextextended(${ownerLockKey}::text, 84))`;
+    const beforeCalls = fakeCron.removals.length;
+    let settled = 0;
+    try {
+      const attempts = ['first', 'second'].map((suffix) =>
+        app
+          .inject({
+            method: 'POST',
+            url: '/tasks',
+            headers: { cookie: devCookie(userId) },
+            payload: {
+              agentUsername,
+              name: `${marker} owner quota ${suffix}`,
+              prompt: 'exactly one request may insert',
+              schedule,
+            },
+          })
+          .finally(() => {
+            settled += 1;
+          }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(0);
+      await lock`select pg_advisory_unlock(hashtextextended(${ownerLockKey}::text, 84))`;
+
+      const responses = await Promise.all(attempts);
+      expect(responses.map((response) => response.statusCode).sort()).toEqual([201, 429]);
+      const rejected = responses.find((response) => response.statusCode === 429)!;
+      expect((rejected.json() as { error: { code: string } }).error.code).toBe(
+        'task_quota_exceeded',
+      );
+      const [after] = await pg<{ count: number }[]>`
+        select count(*)::int as count
+        from triggers
+        where user_id = ${userId}
+          and deleted = false
+      `;
+      expect(after?.count).toBe(limit);
+      expect(fakeCron.removals).toHaveLength(beforeCalls + 1);
+    } finally {
+      await lock`select pg_advisory_unlock(hashtextextended(${ownerLockKey}::text, 84))`;
+      lock.release();
+      restore();
+    }
+  });
+
   it('enforces the hard ten-enabled-task limit per agent', async () => {
     for (let index = 0; index < 10; index += 1) {
       await pg`

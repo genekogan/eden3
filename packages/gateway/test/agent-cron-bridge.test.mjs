@@ -12,6 +12,7 @@ import {
   createBridgeServer,
   createPostgresTaskStore,
   handleBridgeRequest,
+  parseScheduledTaskLimit,
   sessionIdFromContext,
 } from '../../../infra/agent-cron-bridge/server.mjs';
 import { nextOccurrence as bridgeNextOccurrence } from '../../../infra/agent-cron-bridge/schedule.mjs';
@@ -183,7 +184,7 @@ describe('agent cron bridge global owner quota', () => {
     nextScheduledRun: new Date('2026-08-10T12:00:00.000Z'),
   };
 
-  it('takes the shared owner lock before the agent lock and rejects at the owner limit', async () => {
+  it('takes the shared owner lock and rejects before the agent lock at the owner limit', async () => {
     const fake = fakeTaskStoreSql(1);
     const store = createPostgresTaskStore(fake.sql, { maxScheduledTasksPerUser: 1 });
     await expect(store.create(identity, input)).rejects.toMatchObject({
@@ -192,8 +193,16 @@ describe('agent cron bridge global owner quota', () => {
     const lockValues = fake.queries
       .filter(({ text }) => text.includes('pg_advisory_xact_lock'))
       .map(({ values }) => values[0]);
-    expect(lockValues).toEqual(['task-owner:owner-id', 'agent-account-id']);
+    expect(lockValues).toEqual(['task-owner:owner-id']);
     expect(fake.ownerCount()).toBe(1);
+  });
+
+  it('accepts only the exact nonnegative integer configuration', () => {
+    expect(parseScheduledTaskLimit('0')).toBe(0);
+    expect(parseScheduledTaskLimit('100')).toBe(100);
+    for (const raw of [undefined, '', '-1', '+1', '01', '1.0', '1e2', ' 1 ', '9007199254740992']) {
+      expect(() => parseScheduledTaskLimit(raw)).toThrow(/nonnegative integer/);
+    }
   });
 
   it('allows exactly one cross-agent create at limit minus one', async () => {
@@ -203,6 +212,14 @@ describe('agent cron bridge global owner quota', () => {
     await expect(
       store.create({ ...identity, agentAccountId: 'second-agent' }, input),
     ).rejects.toMatchObject({ code: 'task_quota_exceeded' });
+    const lockValues = fake.queries
+      .filter(({ text }) => text.includes('pg_advisory_xact_lock'))
+      .map(({ values }) => values[0]);
+    expect(lockValues).toEqual([
+      'task-owner:owner-id',
+      'agent-account-id',
+      'task-owner:owner-id',
+    ]);
     expect(fake.ownerCount()).toBe(2);
   });
 });
