@@ -19,6 +19,7 @@ export interface ChannelCredentialCustodyLike {
     channel: string;
     label: string | null;
     plaintext: string;
+    bypassAccountQuota?: boolean;
   }): Promise<ChannelSecretHandle>;
   withPlaintext<T>(
     handle: ChannelSecretHandle,

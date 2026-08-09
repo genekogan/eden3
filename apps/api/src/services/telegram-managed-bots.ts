@@ -1,5 +1,7 @@
 import { parseSecretId } from '@eden3/gateway';
 
+import { ChannelConnectionQuotaExceededError } from './channel-connection-quota';
+
 const TELEGRAM_USERNAME = /^[A-Za-z0-9_]{5,32}$/;
 const TELEGRAM_BOT_TOKEN = /^\d{5,20}:[A-Za-z0-9_-]{20,200}$/;
 const TELEGRAM_USER_ID = /^\d{1,20}$/;
@@ -17,6 +19,7 @@ export type TelegramManagedBotErrorCode =
   | 'telegram_rate_limited'
   | 'telegram_unavailable'
   | 'telegram_response_invalid'
+  | 'channel_quota_exceeded'
   | 'channel_custody_unavailable'
   | 'channel_secret_scope_invalid'
   | 'managed_bot_connection_not_found'
@@ -382,7 +385,10 @@ export class TelegramManagedBotsService {
         owner: metadata.owner,
         bot: metadata.bot,
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ChannelConnectionQuotaExceededError) {
+        fail('channel_quota_exceeded', error.message);
+      }
       fail(
         'channel_custody_unavailable',
         'Eden could not secure this bot token. Retry; the bot is not connected yet.',

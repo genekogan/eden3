@@ -13,6 +13,7 @@ import {
   type ChannelCredentialCustodyLike,
   type ChannelSecretHandle,
 } from './channel-connector-custody';
+import { lockAndAssertChannelConnectionQuota } from './channel-connection-quota';
 import {
   channelTokenSecretContext,
   defaultSecretVault,
@@ -93,6 +94,7 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
     channel: string;
     label: string | null;
     plaintext: string;
+    bypassAccountQuota?: boolean;
   }): Promise<ChannelSecretHandle> {
     if (input.channel !== 'x') throw new Error('unsupported outbound connector custody channel');
     const id = randomUUID();
@@ -102,6 +104,11 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
       channelTokenSecretContext({ connectionId: id, accountId: input.accountId, channel: 'x' }),
     );
     return pg.begin(async (tx) => {
+      await lockAndAssertChannelConnectionQuota(tx, {
+        accountId: input.accountId,
+        limit: getEnv().MAX_CHANNEL_CONNECTIONS_PER_USER,
+        bypassAccountQuota: input.bypassAccountQuota === true,
+      });
       await tx`select pg_advisory_xact_lock(hashtextextended(${`channel-credential-token:x:${encrypted.tokenSha256}`}, 0))`;
       const conflict = await tx<{ id: string }[]>`
         select id from channel_connections

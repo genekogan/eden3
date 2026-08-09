@@ -33,7 +33,11 @@ describe('channel connection owner quota', () => {
     }).catch((caught) => caught);
 
     expect(error).toBeInstanceOf(ChannelConnectionQuotaExceededError);
-    expect(error).toMatchObject({ code: 'channel_quota_exceeded', limit: 2 });
+    expect(error).toMatchObject({
+      code: 'channel_quota_exceeded',
+      statusCode: 429,
+      limit: 2,
+    });
     expect(calls).toHaveLength(2);
     expect(calls[0]).toMatchObject({
       values: [`${CHANNEL_ACCOUNT_LOCK_PREFIX}${accountId}`, CHANNEL_ACCOUNT_LOCK_SEED],
@@ -80,8 +84,15 @@ describe('channel connection owner quota', () => {
       hostedInsert.indexOf('channelCredentialLockKeys'),
     );
 
-    for (const source of [xCustody, telegramCustody]) {
-      const transaction = source.slice(source.indexOf('return pg.begin(async (tx)'), source.indexOf('\n  }\n}'));
+    for (const [source, startMarker, endMarker] of [
+      [xCustody, 'async sealScoped', 'async withPlaintext'],
+      [telegramCustody, 'async storeManagedBotToken', '\n  }\n}'],
+    ] as const) {
+      const start = source.indexOf(startMarker);
+      const transaction = source.slice(
+        start,
+        source.indexOf(endMarker, start + startMarker.length),
+      );
       expect(transaction.indexOf('lockAndAssertChannelConnectionQuota')).toBeGreaterThanOrEqual(0);
       expect(transaction.indexOf('lockAndAssertChannelConnectionQuota')).toBeLessThan(
         transaction.indexOf('channel-credential-'),

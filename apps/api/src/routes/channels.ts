@@ -39,6 +39,10 @@ import {
 import { addConnectionScopedPeer, decidePendingPairing } from '../services/channel-pairing';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
 import {
+  ChannelConnectionQuotaExceededError,
+  lockAndAssertChannelConnectionQuota,
+} from '../services/channel-connection-quota';
+import {
   channelRuntimeBindingMatches,
   storedChannelRuntimeBindingId,
 } from '../services/channel-runtime-binding';
@@ -570,7 +574,7 @@ function telegramManagedErrorStatus(code: TelegramManagedBotError['code']): numb
   if (code === 'managed_bot_owner_mismatch') return 403;
   if (code === 'managed_bot_not_found' || code === 'managed_bot_connection_not_found') return 404;
   if (code === 'managed_bot_state_conflict') return 409;
-  if (code === 'telegram_rate_limited') return 429;
+  if (code === 'telegram_rate_limited' || code === 'channel_quota_exceeded') return 429;
   if (
     code === 'telegram_unavailable' ||
     code === 'telegram_response_invalid' ||
@@ -928,9 +932,13 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         accountId: account.accountId,
         agentId,
         label: body.label,
+        ...(account.isAdmin ? { bypassAccountQuota: true } : {}),
         credentials: body.credentials,
       });
     } catch (error) {
+      if (error instanceof ChannelConnectionQuotaExceededError) {
+        return sendError(reply, 429, error.code, error.message);
+      }
       if (error instanceof ChannelCredentialConflictError) {
         return sendError(reply, 409, 'channel_credential_in_use', error.message);
       }
@@ -1372,30 +1380,18 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     };
     const botId = validation.ok ? validation.bot.id : null;
     const rows = await pg.begin(async (tx) => {
-      const lockKeys = [
-        `channel-account:${account.accountId}`,
-        ...channelCredentialLockKeys({
-          channel: body.channel,
-          tokenSha256: encrypted.tokenSha256,
-          botId,
-        }),
-      ].sort();
+      await lockAndAssertChannelConnectionQuota(tx, {
+        accountId: account.accountId,
+        limit: getEnv().MAX_CHANNEL_CONNECTIONS_PER_USER,
+        bypassAccountQuota: account.isAdmin,
+      });
+      const lockKeys = channelCredentialLockKeys({
+        channel: body.channel,
+        tokenSha256: encrypted.tokenSha256,
+        botId,
+      }).sort();
       for (const lockKey of lockKeys) {
         await tx`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`;
-      }
-      if (!account.isAdmin) {
-        const counts = await tx<{ count: number }[]>`
-          select count(*)::int as count
-          from channel_connections
-          where account_id = ${account.accountId}
-        `;
-        if ((counts[0]?.count ?? 0) >= getEnv().MAX_CHANNEL_CONNECTIONS_PER_USER) {
-          throw new ApiError(
-            429,
-            'channel_quota_exceeded',
-            `Channel connection limit reached (${getEnv().MAX_CHANNEL_CONNECTIONS_PER_USER} connections)`,
-          );
-        }
       }
       const conflicts = await tx<{ id: string }[]>`
         select id

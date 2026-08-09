@@ -14,6 +14,7 @@ import type {
   TelegramManagedBotCustodyLike,
   TelegramManagedBotCustodyResult,
 } from './telegram-managed-bots';
+import { lockAndAssertChannelConnectionQuota } from './channel-connection-quota';
 import {
   channelTokenSecretContext,
   defaultSecretVault,
@@ -56,6 +57,11 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
       }),
     );
     return pg.begin(async (tx) => {
+      await lockAndAssertChannelConnectionQuota(tx, {
+        accountId: input.ownerAccountId,
+        limit: getEnv().MAX_CHANNEL_CONNECTIONS_PER_USER,
+        bypassAccountQuota: false,
+      });
       for (const lockKey of [
         `channel-credential-token:telegram:${encrypted.tokenSha256}`,
         `channel-credential-bot:telegram:${input.bot.id}`,

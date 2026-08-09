@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { buildServer } from '../src/server';
 import type { ReserveChannelTurnInput } from '../src/services/channel-metering';
+import { ChannelConnectionQuotaExceededError } from '../src/services/channel-connection-quota';
 import {
   ChannelDeliveryTerminalCompensatedError,
   ChannelTurnMeteringService,
@@ -291,6 +292,17 @@ async function resolvesWithin(promise: Promise<unknown>, timeoutMs = 2_000): Pro
   }
 }
 
+function withChannelLimit(value: number): () => void {
+  const original = process.env.MAX_CHANNEL_CONNECTIONS_PER_USER;
+  process.env.MAX_CHANNEL_CONNECTIONS_PER_USER = String(value);
+  resetEnvCache();
+  return () => {
+    if (original === undefined) delete process.env.MAX_CHANNEL_CONNECTIONS_PER_USER;
+    else process.env.MAX_CHANNEL_CONNECTIONS_PER_USER = original;
+    resetEnvCache();
+  };
+}
+
 beforeAll(async () => {
   process.env.MAX_CHANNEL_CONNECTIONS_PER_USER = '1000';
   resetEnvCache();
@@ -358,6 +370,99 @@ afterAll(async () => {
 });
 
 describe('channel custody and validation', () => {
+  it('serializes X and managed-Telegram inserts under one owner quota lock', async () => {
+    const [before] = await pg<{ count: number }[]>`
+      select count(*)::int as count from channel_connections where account_id = ${ownerId}
+    `;
+    const [beforeAudits] = await pg<{ count: number }[]>`
+      select count(*)::int as count
+      from secret_access_audit_events
+      where owner_account_id = ${ownerId} and action = 'store'
+    `;
+    const limit = (before?.count ?? 0) + 1;
+    const restoreLimit = withChannelLimit(limit);
+    const ownerLockKey = `channel-account:${ownerId}`;
+    const lock = await pg.reserve();
+    const intentId = randomUUID();
+    await pg`
+      insert into channel_onboarding_intents (
+        id, account_id, channel, intent_secret_hash, provider_owner_id_hash,
+        state, expires_at
+      ) values (
+        ${intentId}, ${ownerId}, 'telegram',
+        ${createHash('sha256').update(`intent-${intentId}`).digest('hex')},
+        ${createHash('sha256').update(`owner-${intentId}`).digest('hex')},
+        'exchanging', now() + interval '15 minutes'
+      )
+    `;
+    await lock`select pg_advisory_lock(hashtextextended(${ownerLockKey}, 0))`;
+    let settled = 0;
+    let attempts: Array<Promise<unknown>> = [];
+    try {
+      const xAttempt = new PostgresChannelCredentialCustody(vault)
+        .sealScoped({
+          accountId: ownerId,
+          agentId: firstAgentId,
+          channel: 'x',
+          label: `${marker} quota X`,
+          plaintext: JSON.stringify({ marker, kind: 'x-quota-fixture' }),
+        })
+        .finally(() => {
+          settled += 1;
+        });
+      const telegramAttempt = new PostgresTelegramManagedBotCustody(
+        { id: intentId, accountId: ownerId },
+        vault,
+      )
+        .storeManagedBotToken({
+          ownerAccountId: ownerId,
+          agentId: secondAgentId,
+          channel: 'telegram',
+          label: `${marker} quota Telegram`,
+          plaintextToken: `765432109:${randomBytes(24).toString('base64url')}`,
+          owner: { id: '42424249', username: 'quota_owner', displayName: 'Quota Owner' },
+          bot: { id: '52525259', username: 'quotafixturebot', displayName: 'Quota Fixture' },
+        })
+        .finally(() => {
+          settled += 1;
+        });
+      attempts = [xAttempt, telegramAttempt];
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(0);
+      await lock`select pg_advisory_unlock(hashtextextended(${ownerLockKey}, 0))`;
+
+      const results = await Promise.allSettled([xAttempt, telegramAttempt]);
+      expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+      const rejected = results.find((result) => result.status === 'rejected');
+      expect(rejected?.status === 'rejected' ? rejected.reason : null).toBeInstanceOf(
+        ChannelConnectionQuotaExceededError,
+      );
+      expect(rejected?.status === 'rejected' ? rejected.reason : null).toMatchObject({
+        code: 'channel_quota_exceeded',
+      });
+      const [after] = await pg<{ count: number }[]>`
+        select count(*)::int as count from channel_connections where account_id = ${ownerId}
+      `;
+      expect(after?.count).toBe(limit);
+      const [audits] = await pg<{ count: number }[]>`
+        select count(*)::int as count
+        from secret_access_audit_events
+        where owner_account_id = ${ownerId} and action = 'store'
+      `;
+      expect(audits?.count).toBe((beforeAudits?.count ?? 0) + 1);
+      const [intent] = await pg<{ state: string }[]>`
+        select state from channel_onboarding_intents where id = ${intentId}
+      `;
+      expect(intent?.state).toBe(results[1]?.status === 'fulfilled' ? 'stored' : 'exchanging');
+    } finally {
+      await lock`select pg_advisory_unlock(hashtextextended(${ownerLockKey}, 0))`;
+      await Promise.allSettled(attempts);
+      lock.release();
+      restoreLimit();
+    }
+  });
+
   it('stores only AES ciphertext, exposes no token-derived preview, and audits storage', async () => {
     const token = `valid_${marker}_secret_zxqv`;
     const connection = await createConnection({

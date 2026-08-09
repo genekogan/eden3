@@ -73,6 +73,19 @@ describe('XByoConnectorService', () => {
     }
   });
 
+  it('forwards only an explicit administrator quota bypass into custody', async () => {
+    const { custody, client } = fixtures();
+    await new XByoConnectorService(client, custody).connect({
+      accountId: 'account-1',
+      agentId: null,
+      bypassAccountQuota: true,
+      credentials: CREDENTIALS,
+    });
+    expect(custody.sealScoped).toHaveBeenCalledWith(
+      expect.objectContaining({ bypassAccountQuota: true }),
+    );
+  });
+
   it.each([
     ['invalid_credentials', false],
     ['revoked', false],

@@ -5,6 +5,7 @@ import {
   type ChannelCredentialCustodyLike,
   type ChannelSecretHandle,
 } from './channel-connector-custody';
+import { ChannelConnectionQuotaExceededError } from './channel-connection-quota';
 
 export const X_DEVELOPER_PORTAL_URL = 'https://developer.x.com/en/portal/dashboard';
 
@@ -307,6 +308,7 @@ export class XByoConnectorService {
     accountId: string;
     agentId: string | null;
     label?: string;
+    bypassAccountQuota?: boolean;
     credentials: XByoCredentials;
   }): Promise<XConnectorResult<XByoConnection>> {
     const credentials = normalizeCredentials(input.credentials);
@@ -346,8 +348,10 @@ export class XByoConnectorService {
         channel: 'x',
         label: input.label?.trim() || null,
         plaintext: serializeCredentials(credentials),
+        ...(input.bypassAccountQuota ? { bypassAccountQuota: true } : {}),
       });
-    } catch {
+    } catch (error) {
+      if (error instanceof ChannelConnectionQuotaExceededError) throw error;
       throw new Error('channel credential custody failed');
     }
     const handle = {
