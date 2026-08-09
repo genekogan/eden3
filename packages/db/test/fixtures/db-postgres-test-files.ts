@@ -1,3 +1,4 @@
+import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -19,6 +20,24 @@ export const DB_ALL_POSTGRES_TEST_FILES = [
   ...DB_SCRATCH_INTEGRATION_FILES,
   ...DB_PROTECTED_READONLY_FILES,
 ].sort();
+
+export function discoverDbIntegrationTestFiles(root: string): string[] {
+  const discovered: string[] = [];
+  function visit(relativeDirectory: string): void {
+    const directory = path.join(root, relativeDirectory);
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relative = path.join(relativeDirectory, entry.name);
+      if (entry.isDirectory()) {
+        visit(relative);
+      } else if (entry.isFile() && entry.name.endsWith('.itest.ts')) {
+        const portable = relative.split(path.sep).join('/');
+        discovered.push(`test/integration/${portable}`);
+      }
+    }
+  }
+  visit('');
+  return discovered.sort();
+}
 
 const COMMAND_WORDS = new Set(['run', 'watch', 'related', 'vitest']);
 const DB_PACKAGE_ROOT = fileURLToPath(new URL('../../', import.meta.url));

@@ -31,8 +31,10 @@ function exactProtectedDatabaseUrl(): { databaseName: string; url: string } {
 describe('explicit protected-DB read-only index verification', () => {
   it('uses a read-only transaction and verifies the exact index and migration hash', async () => {
     const target = exactProtectedDatabaseUrl();
-    const client = postgres(target.url, { max: 1, onnotice: () => {} });
+    const pool = postgres(target.url, { max: 1, onnotice: () => {} });
+    let client: Awaited<ReturnType<typeof pool.reserve>> | undefined;
     try {
+      client = await pool.reserve();
       await client.unsafe('begin transaction read only');
       const [identity] = await client<{
         database: string;
@@ -61,8 +63,11 @@ describe('explicit protected-DB read-only index verification', () => {
         select 1 as one from drizzle.__drizzle_migrations where hash = ${hash}`;
       expect(journal, `migration 0027 not journaled on ${target.databaseName}`).toHaveLength(1);
     } finally {
-      await client.unsafe('rollback').catch(() => {});
-      await client.end();
+      if (client) {
+        await client.unsafe('rollback').catch(() => {});
+        await client.release();
+      }
+      await pool.end();
     }
   });
 });

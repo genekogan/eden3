@@ -1,4 +1,13 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import { describe, expect, it } from 'vitest';
 
@@ -10,6 +19,7 @@ import {
   assertDbUnitTestSelectors,
   dbPostgresFileMatchingUnitSelector,
   dbPostgresFilesMatchingUnitSelector,
+  discoverDbIntegrationTestFiles,
   unitSelectorMatchesDbPostgresFile,
 } from './fixtures/db-postgres-test-files';
 
@@ -18,14 +28,29 @@ describe('DB PostgreSQL test manifest', () => {
     expect(DB_SCRATCH_INTEGRATION_FILES).toEqual([...DB_SCRATCH_INTEGRATION_FILES].sort());
     expect(DB_PROTECTED_READONLY_FILES).toEqual([...DB_PROTECTED_READONLY_FILES].sort());
     expect(new Set(DB_ALL_POSTGRES_TEST_FILES).size).toBe(DB_ALL_POSTGRES_TEST_FILES.length);
-    const discovered = readdirSync(new URL('./integration', import.meta.url))
-      .filter((file) => file.endsWith('.itest.ts'))
-      .map((file) => `test/integration/${file}`)
-      .sort();
+    const discovered = discoverDbIntegrationTestFiles(
+      new URL('./integration', import.meta.url).pathname,
+    );
     expect(DB_ALL_POSTGRES_TEST_FILES).toEqual(discovered);
     for (const file of DB_ALL_POSTGRES_TEST_FILES) {
-      expect(file).toMatch(/^test\/integration\/[a-z0-9-]+\.itest\.ts$/);
+      expect(file).toMatch(/^test\/integration\/(?:[a-z0-9-]+\/)*[a-z0-9-]+\.itest\.ts$/);
       expect(existsSync(new URL(`../${file}`, import.meta.url)), file).toBe(true);
+    }
+  });
+
+  it('recursively discovers nested integration files', () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'eden3-db-integration-manifest-'));
+    try {
+      mkdirSync(path.join(root, 'money', 'races'), { recursive: true });
+      writeFileSync(path.join(root, 'flat.itest.ts'), '');
+      writeFileSync(path.join(root, 'money', 'races', 'nested.itest.ts'), '');
+      writeFileSync(path.join(root, 'money', 'ignored.test.ts'), '');
+      expect(discoverDbIntegrationTestFiles(root)).toEqual([
+        'test/integration/flat.itest.ts',
+        'test/integration/money/races/nested.itest.ts',
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -130,19 +155,23 @@ describe('DB PostgreSQL test manifest', () => {
     expect(readonlySource).toContain("current_setting('transaction_read_only')");
     expect(readonlySource).not.toContain('loadRootEnv');
     const tryOffset = readonlySource.indexOf('try {');
+    const reserveOffset = readonlySource.indexOf('await pool.reserve()');
     const beginOffset = readonlySource.indexOf("await client.unsafe('begin transaction read only')");
     const identityOffset = readonlySource.indexOf('select current_database() as database');
     const catalogOffset = readonlySource.indexOf('select pg_get_indexdef');
     const finallyOffset = readonlySource.indexOf('} finally {');
     const rollbackOffset = readonlySource.indexOf("await client.unsafe('rollback')");
-    const closeOffset = readonlySource.indexOf('await client.end()');
+    const releaseOffset = readonlySource.indexOf('await client.release()');
+    const closeOffset = readonlySource.indexOf('await pool.end()');
     expect(tryOffset).toBeGreaterThanOrEqual(0);
-    expect(beginOffset).toBeGreaterThan(tryOffset);
+    expect(reserveOffset).toBeGreaterThan(tryOffset);
+    expect(beginOffset).toBeGreaterThan(reserveOffset);
     expect(identityOffset).toBeGreaterThan(beginOffset);
     expect(catalogOffset).toBeGreaterThan(identityOffset);
     expect(finallyOffset).toBeGreaterThan(catalogOffset);
     expect(rollbackOffset).toBeGreaterThan(finallyOffset);
-    expect(closeOffset).toBeGreaterThan(rollbackOffset);
+    expect(releaseOffset).toBeGreaterThan(rollbackOffset);
+    expect(closeOffset).toBeGreaterThan(releaseOffset);
   });
 
   it('never discloses database credentials in a boundary refusal', () => {
