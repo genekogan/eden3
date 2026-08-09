@@ -11,6 +11,7 @@
     "dev": "concurrently -k -n api,web -c blue,magenta \"pnpm --filter @eden3/api dev\" \"pnpm --filter @eden3/web dev\"",
     "build": "pnpm -r build",
     "test": "pnpm -r test",
+    "test:api-full": "pnpm --filter @eden3/api test:full",
     "typecheck": "pnpm -r typecheck",
     "etl": "pnpm --filter @eden3/etl etl",
     "etl:verify": "pnpm --filter @eden3/etl etl:verify",
