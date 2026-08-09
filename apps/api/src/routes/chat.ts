@@ -271,12 +271,23 @@ export async function ensureChattableAgent(
   }
 }
 
-async function createSession(
+type ChatAgentResolver = (
+  username: string,
+) => ReturnType<typeof resolveAgentByUsername>;
+
+export async function createSession(
   viewer: ChatViewer,
-  resolved: NonNullable<Awaited<ReturnType<typeof resolveAgentByUsername>>>,
+  agentUsername: string,
   content: string,
   gatewayGlue: GatewayGlue,
+  resolver: ChatAgentResolver = resolveAgentByUsername,
 ): Promise<ResolvedTarget> {
+  // The friendly route precheck precedes a potentially blocking funding read.
+  // Resolve again here so a concurrent public -> private change is authoritative
+  // before provisioning, session persistence, model lookup, or provider work.
+  const resolved = await resolver(agentUsername);
+  if (!resolved) throw new ApiError(404, 'agent_not_found', `No agent named "${agentUsername}"`);
+  assertChatAgentVisible(viewer, resolved.account, resolved.agent);
   const chattable = await ensureChattableAgent(viewer, resolved, gatewayGlue);
   const sessionId = randomUUID();
   const key = gatewaySessionKey(sessionId);
@@ -455,7 +466,7 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
         }
         assertChatAgentVisible(account, preResolved.account, preResolved.agent);
         await assertTurnAdmissible(account.accountId, preResolved.agent.model ?? undefined);
-        target = await createSession(account, preResolved, body.content, app.gatewayGlue);
+        target = await createSession(account, body.agentUsername, body.content, app.gatewayGlue);
       } else {
         target = await resolveExisting(req.params.idOrNew, account, app.gatewayGlue);
         await assertTurnAdmissible(
