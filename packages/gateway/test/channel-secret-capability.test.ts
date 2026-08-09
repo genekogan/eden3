@@ -7,6 +7,7 @@ import {
   CAPABILITY_MAC_BYTES,
   CAPABILITY_SECRET_ID,
   LEGACY_SECRET_ID,
+  capabilityEpochId,
   capabilityMac,
   deriveCapabilityKey,
   mintCapabilityId,
@@ -16,6 +17,16 @@ import {
 } from '../src/channel-secret-capability';
 
 const VAULT_KEY = randomBytes(32);
+
+describe('capabilityEpochId', () => {
+  it('maps only the dedicated bounded durable generation to the wire epoch', () => {
+    expect(capabilityEpochId(1)).toBe('c1');
+    expect(capabilityEpochId(999_999)).toBe('c999999');
+    for (const value of [0, -1, 1.1, Number.NaN, Number.POSITIVE_INFINITY, 1_000_000]) {
+      expect(() => capabilityEpochId(value)).toThrow('invalid channel capability epoch');
+    }
+  });
+});
 
 function scope(overrides: Partial<CapabilityScope> = {}): CapabilityScope {
   return {

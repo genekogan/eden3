@@ -64,6 +64,7 @@ function connectionRow(overrides = {}) {
     token_iv: iv.toString('base64'),
     token_auth_tag: cipher.getAuthTag().toString('base64'),
     key_version: 'v2',
+    capability_epoch: overrides.capability_epoch ?? 1,
   };
 }
 
@@ -483,12 +484,12 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     expect(replay.values[id]).toBe(tokensById.get(row.id));
   });
 
-  it('KNOWN RESIDUAL (DEBT-012): a c1 capability follows token rotation until remint/epoch lands', async () => {
+  it('revokes the old capability before decrypt and releases the replacement only to the next epoch', async () => {
     const row = connectionRow();
     rows = [row];
     await start();
-    const id = capIdFor(row);
-    const before = await callBridge([id]);
+    const oldId = capIdFor(row);
+    const before = await callBridge([oldId]);
     const replacement = `rotated-${randomUUID()}`;
     Object.assign(
       row,
@@ -498,10 +499,21 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
         channel: row.channel,
         runtime_account_id: row.runtime_account_id,
         token: replacement,
+        capability_epoch: 2,
       }),
     );
-    const after = await callBridge([id]);
-    expect(before.values[id]).not.toBe(replacement);
-    expect(after.values[id]).toBe(replacement);
+    const decryptsBeforeStale = decryptCount;
+    const stale = await callBridge([oldId]);
+    expect(decryptCount).toBe(decryptsBeforeStale);
+    const nextId = capIdFor(row, 'c2');
+    const after = await callBridge([nextId]);
+    expect(before.values[oldId]).not.toBe(replacement);
+    expect(stale.values).toEqual({});
+    expect(stale.errors[oldId]).toBe('secret unavailable');
+    expect(decryptCount).toBe(decryptsBeforeStale + 1);
+    expect(after.values[nextId]).toBe(replacement);
+    expect(aggregateDenied()).toContainEqual(
+      expect.objectContaining({ deniedReasons: { capability_epoch_revoked: 1 } }),
+    );
   });
 });
