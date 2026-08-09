@@ -48,7 +48,7 @@ describe('0041 account erasure reconciliation', () => {
     const journal = JSON.parse(await readFile(JOURNAL, 'utf8')) as {
       entries: Array<{ idx: number; tag: string }>;
     };
-    expect(journal.entries.at(-1)).toEqual({
+    expect(journal.entries.find((entry) => entry.idx === 41)).toEqual({
       idx: 41,
       version: '7',
       when: expect.any(Number),

@@ -2,7 +2,12 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { getEnv } from '@eden3/core';
 import { pg } from '@eden3/db';
-import { deriveCapabilityKey, hostedChannelSecretRef, parseSecretId } from '@eden3/gateway';
+import {
+  capabilityEpochId,
+  deriveCapabilityKey,
+  hostedChannelSecretRef,
+  parseSecretId,
+} from '@eden3/gateway';
 
 import type {
   TelegramManagedBotCustodyInput,
@@ -68,7 +73,7 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
       `;
       if (conflict[0]) throw new Error('managed bot is already connected');
 
-      await tx`
+      const inserted = await tx<{ capability_epoch: number }[]>`
         insert into channel_connections (
           id, account_id, agent_id, channel, label, runtime_account_id,
           desired_state, observed_state, status, token_ciphertext, token_iv,
@@ -90,7 +95,9 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
             config: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
           }))}
         )
+        returning capability_epoch
       `;
+      const capabilityEpoch = capabilityEpochId(inserted[0]?.capability_epoch ?? Number.NaN);
       const transitioned = await tx<{ id: string }[]>`
         update channel_onboarding_intents
         set state = 'stored', connection_id = ${connectionId},
@@ -120,6 +127,7 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
           accountId: input.ownerAccountId,
           channel: 'telegram',
           runtimeAccountId,
+          epoch: capabilityEpoch,
         },
         this.capKey,
       );
@@ -129,6 +137,7 @@ export class PostgresTelegramManagedBotCustody implements TelegramManagedBotCust
           accountId: input.ownerAccountId,
           channel: 'telegram',
           runtimeAccountId,
+          epoch: capabilityEpoch,
         },
         this.capKey,
       );

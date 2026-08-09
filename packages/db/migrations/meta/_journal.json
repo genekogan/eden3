@@ -295,6 +295,13 @@
       "when": 1786229616327,
       "tag": "0041_account_erasure_reconciliation",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1786260975144,
+      "tag": "0042_channel_secret_capability_epoch",
+      "breakpoints": true
     }
   ]
 }

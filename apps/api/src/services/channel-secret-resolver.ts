@@ -1,7 +1,7 @@
 import { getEnv } from '@eden3/core';
 import { pg, secretAccessAuditEvents, db } from '@eden3/db';
 import {
-  CAPABILITY_EPOCH_DEFAULT,
+  capabilityEpochId,
   deriveCapabilityKey,
   parseSecretId,
   verifySecretId,
@@ -68,6 +68,7 @@ interface ChannelSecretDbRow {
   token_iv: string;
   token_auth_tag: string;
   key_version: string;
+  capability_epoch: number;
 }
 
 /**
@@ -78,7 +79,7 @@ export class PostgresChannelSecretStore implements ChannelSecretStoreLike {
   async getActive(connectionId: string): Promise<ResolvableChannelSecret | null> {
     const rows = await pg<ChannelSecretDbRow[]>`
       select id, account_id, channel, runtime_account_id,
-             token_ciphertext, token_iv, token_auth_tag, key_version
+             token_ciphertext, token_iv, token_auth_tag, key_version, capability_epoch
       from channel_connections
       where id = ${connectionId}
         and desired_state = 'active'
@@ -92,9 +93,7 @@ export class PostgresChannelSecretStore implements ChannelSecretStoreLike {
       accountId: row.account_id,
       channel: row.channel,
       runtimeAccountId: row.runtime_account_id,
-      // Constant epoch in T12-U01 (rotation column is T12-U02); never from
-      // mutable metadata (a wholesale rewrite could resurrect old capabilities).
-      capabilityEpoch: CAPABILITY_EPOCH_DEFAULT,
+      capabilityEpoch: capabilityEpochId(row.capability_epoch),
       tokenCiphertext: row.token_ciphertext,
       tokenIv: row.token_iv,
       tokenAuthTag: row.token_auth_tag,
