@@ -13,5 +13,8 @@ describe('collection public-list moderation wiring', () => {
     expect(source).toMatch(
       /and c\.public = true\s*\$\{options\.includeModerated \? pg`` : publicCreationModeration\(\)\}/,
     );
+    expect(source).toMatch(
+      /where ranked\.rn <= \$\{COVER_LIMIT\}\s*order by ranked\.collection_id, ranked\.rn/,
+    );
   });
 });

@@ -314,6 +314,7 @@ async function coverCreationsFor(
         ${options.includeModerated ? pg`` : publicCreationModeration()}
     ) ranked
     where ranked.rn <= ${COVER_LIMIT}
+    order by ranked.collection_id, ranked.rn
   `;
   for (const row of rows) {
     const list = out.get(row.collection_id) ?? [];
