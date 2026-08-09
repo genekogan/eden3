@@ -9,9 +9,12 @@ import {
   WORKSPACE_DOWNLOAD_MAX_BYTES,
   WORKSPACE_EXPORT_MAX_BYTES,
   WORKSPACE_TEXT_MAX_BYTES,
+  listWorkspaceTree,
   openWorkspaceDownload,
   openWorkspaceExportFile,
   readWorkspaceFile,
+  sha256Hex,
+  writeWorkspaceFile,
 } from '../src/services/workspace-files';
 import { appendWorkspaceArchiveFiles } from '../src/routes/workspace';
 
@@ -45,34 +48,31 @@ async function expectSafeOrRejected(streamFactory: () => Promise<NodeJS.Readable
 async function swapFinalComponentAfterFirstResolution(root: string, neighbor: string) {
   const target = path.join(root, 'notes', 'safe.txt');
   const outside = path.join(neighbor, 'notes', 'safe.txt');
-  const originalRealpath = fs.realpath.bind(fs);
+  const originalOpen = fs.open.bind(fs);
   let swapped = false;
-  vi.spyOn(fs, 'realpath').mockImplementation(async (candidate) => {
-    const resolved = await originalRealpath(candidate);
-    if (!swapped && path.resolve(String(candidate)) === path.resolve(target)) {
+  vi.spyOn(fs, 'open').mockImplementation(async (candidate, flags, mode) => {
+    if (!swapped && String(candidate).endsWith('/notes/safe.txt')) {
       swapped = true;
       await fs.unlink(target);
       await fs.symlink(outside, target);
     }
-    return resolved;
+    return originalOpen(candidate, flags, mode);
   });
 }
 
 async function swapAncestorAfterFirstResolution(root: string, neighbor: string) {
-  const target = path.join(root, 'notes', 'safe.txt');
   const ownerNotes = path.join(root, 'notes');
   const parkedNotes = path.join(root, 'notes-before-swap');
   const neighborNotes = path.join(neighbor, 'notes');
-  const originalRealpath = fs.realpath.bind(fs);
+  const originalOpen = fs.open.bind(fs);
   let swapped = false;
-  vi.spyOn(fs, 'realpath').mockImplementation(async (candidate) => {
-    const resolved = await originalRealpath(candidate);
-    if (!swapped && path.resolve(String(candidate)) === path.resolve(target)) {
+  vi.spyOn(fs, 'open').mockImplementation(async (candidate, flags, mode) => {
+    if (!swapped && String(candidate).endsWith('/notes')) {
       swapped = true;
       await fs.rename(ownerNotes, parkedNotes);
       await fs.symlink(neighborNotes, ownerNotes);
     }
-    return resolved;
+    return originalOpen(candidate, flags, mode);
   });
 }
 
@@ -110,6 +110,129 @@ describe('workspace file descriptor pinning', () => {
       await swapAncestorAfterFirstResolution(fixture.root, fixture.neighbor);
       await expectSafeOrRejected(async () =>
         (await openWorkspaceDownload(fixture.root, 'notes/safe.txt')).stream);
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('never writes into an ancestor swapped after the parent descriptor is pinned', async () => {
+    const fixture = await freshFixture();
+    const ownerNotes = path.join(fixture.root, 'notes');
+    const parkedNotes = path.join(fixture.root, 'notes-before-write-swap');
+    const neighborNotes = path.join(fixture.neighbor, 'notes');
+    const originalOpen = fs.open.bind(fs);
+    let swapped = false;
+    vi.spyOn(fs, 'open').mockImplementation(async (candidate, flags, mode) => {
+      if (!swapped && String(candidate).includes('.eden3-write-')) {
+        swapped = true;
+        await fs.rename(ownerNotes, parkedNotes);
+        await fs.symlink(neighborNotes, ownerNotes);
+      }
+      return originalOpen(candidate, flags, mode);
+    });
+    try {
+      await expect(writeWorkspaceFile({
+        root: fixture.root,
+        path: 'notes/new.txt',
+        content: 'OWNER NEW CONTENT',
+        baseSha256: 'new',
+      })).rejects.toBeTruthy();
+      await expect(fs.readFile(path.join(neighborNotes, 'new.txt'))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      expect(await fs.readFile(path.join(neighborNotes, 'safe.txt'), 'utf8')).toBe('NEIGHBOR SECRET');
+      expect((await fs.readdir(neighborNotes)).some((name) => name.startsWith('.eden3-write-'))).toBe(false);
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('retains normal conflict-checked create and update behavior through pinned parents', async () => {
+    const fixture = await freshFixture();
+    try {
+      const created = await writeWorkspaceFile({
+        root: fixture.root,
+        path: 'drafts/new.txt',
+        content: 'first',
+        baseSha256: 'new',
+      });
+      expect(created).toMatchObject({ ok: true, file: { sha256: sha256Hex('first') } });
+      expect(await fs.readFile(path.join(fixture.root, 'drafts', 'new.txt'), 'utf8')).toBe('first');
+
+      const updated = await writeWorkspaceFile({
+        root: fixture.root,
+        path: 'drafts/new.txt',
+        content: 'second',
+        baseSha256: sha256Hex('first'),
+      });
+      expect(updated).toMatchObject({ ok: true, file: { sha256: sha256Hex('second') } });
+      expect(await fs.readFile(path.join(fixture.root, 'drafts', 'new.txt'), 'utf8')).toBe('second');
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds the conflict read when an existing file grows after admission', async () => {
+    const fixture = await freshFixture();
+    const target = path.join(fixture.root, 'notes', 'safe.txt');
+    const originalOpen = fs.open.bind(fs);
+    let instrumented = false;
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      if (!instrumented && String(args[0]).endsWith('/notes/safe.txt')) {
+        instrumented = true;
+        const originalStat = handle.stat.bind(handle);
+        let statCalls = 0;
+        vi.spyOn(handle, 'stat').mockImplementation(async (options) => {
+          const result = await originalStat(options as never);
+          statCalls += 1;
+          if (statCalls === 2) {
+            await fs.appendFile(target, Buffer.alloc(WORKSPACE_TEXT_MAX_BYTES + 1, 0x78));
+          }
+          return result as never;
+        });
+      }
+      return handle;
+    });
+    try {
+      await expect(writeWorkspaceFile({
+        root: fixture.root,
+        path: 'notes/safe.txt',
+        content: 'replacement',
+        baseSha256: sha256Hex('OWNER BYTES'),
+      })).rejects.toMatchObject({ code: 'workspace_not_text' });
+      expect((await fs.stat(target)).size).toBeGreaterThan(WORKSPACE_TEXT_MAX_BYTES);
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('does not list or hash a final component replaced after directory enumeration', async () => {
+    const fixture = await freshFixture();
+    try {
+      await swapFinalComponentAfterFirstResolution(fixture.root, fixture.neighbor);
+      const tree = await listWorkspaceTree(fixture.root);
+      expect(tree.entries.some((entry) => entry.path === 'notes/safe.txt')).toBe(false);
+      expect(JSON.stringify(tree)).not.toContain(sha256Hex('NEIGHBOR SECRET'));
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds directory enumeration even when hidden names cannot enter the result', async () => {
+    const fixture = await freshFixture();
+    try {
+      await Promise.all(Array.from({ length: 1_100 }, (_, index) =>
+        fs.writeFile(path.join(fixture.root, `.hidden-${index}`), 'x')));
+      const tree = await listWorkspaceTree(fixture.root, { maxEntries: 1, withHashes: false });
+      expect(tree.truncated).toBe(true);
+      expect(tree.entries.length).toBeLessThanOrEqual(1);
+      const source = await fs.readFile(
+        path.join(import.meta.dirname, '../src/services/workspace-files.ts'),
+        'utf8',
+      );
+      expect(source).toContain('fs.opendir(');
+      expect(source).not.toContain('fs.readdir(dirAbs');
     } finally {
       await fs.rm(fixture.parent, { recursive: true, force: true });
     }
@@ -225,10 +348,14 @@ describe('workspace file descriptor pinning', () => {
       const replacement = path.join(fixture.root, 'replacement.txt');
       await fs.writeFile(replacement, 'OTHER OWNER BYTES');
       const target = path.join(fixture.root, 'notes', 'safe.txt');
-      vi.mocked(fs.open).mockImplementationOnce(async (...args) => {
+      let replaced = false;
+      vi.mocked(fs.open).mockImplementation(async (...args) => {
         const handle = await originalOpen(...args);
         opened.push(handle);
-        await fs.rename(replacement, target);
+        if (!replaced && String(args[0]).endsWith('/notes/safe.txt')) {
+          replaced = true;
+          await fs.rename(replacement, target);
+        }
         return handle;
       });
       await expect(readWorkspaceFile(fixture.root, 'notes/safe.txt')).rejects.toMatchObject({
@@ -258,9 +385,12 @@ describe('workspace file descriptor pinning', () => {
     });
     try {
       await readWorkspaceFile(fixture.root, 'notes/safe.txt');
-      expect(flags).toHaveLength(1);
-      expect(flags[0]! & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
-      expect(flags[0]! & constants.O_NONBLOCK).toBe(constants.O_NONBLOCK);
+      expect(flags).toHaveLength(3);
+      for (const flag of flags) {
+        expect(flag & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
+        expect(flag & constants.O_NONBLOCK).toBe(constants.O_NONBLOCK);
+      }
+      expect(flags.slice(0, 2).every((flag) => (flag & constants.O_DIRECTORY) !== 0)).toBe(true);
     } finally {
       await fs.rm(fixture.parent, { recursive: true, force: true });
     }
@@ -345,6 +475,34 @@ describe('workspace file descriptor pinning', () => {
       ).rejects.toThrow('append refused');
       await vi.waitFor(() => expect(opened.at(-1)?.fd).toBe(-1));
       archive.destroy();
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('destroys the active export source when the archive is cancelled', async () => {
+    const fixture = await freshFixture();
+    const large = path.join(fixture.root, 'notes', 'large.bin');
+    await fs.writeFile(large, Buffer.alloc(4 * 1024 * 1024, 0x61));
+    const originalOpen = fs.open.bind(fs);
+    const opened: Awaited<ReturnType<typeof fs.open>>[] = [];
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      opened.push(handle);
+      return handle;
+    });
+    try {
+      const archive = new ZipArchive({ zlib: { level: 1 } });
+      let captured: NodeJS.ReadableStream | null = null;
+      vi.spyOn(archive, 'append').mockImplementationOnce((source) => {
+        captured = source as NodeJS.ReadableStream;
+        return archive;
+      });
+      const pending = appendWorkspaceArchiveFiles(archive, fixture.root, ['notes/large.bin']);
+      await vi.waitFor(() => expect(captured).not.toBeNull());
+      archive.destroy();
+      await expect(pending).rejects.toThrow('workspace export closed before entry completion');
+      await vi.waitFor(() => expect(opened.every((handle) => handle.fd === -1)).toBe(true));
     } finally {
       await fs.rm(fixture.parent, { recursive: true, force: true });
     }

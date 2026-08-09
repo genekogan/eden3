@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, createReadStream, type BigIntStats, type Stats } from 'node:fs';
+import { constants, type BigIntStats, type Stats } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
@@ -147,48 +147,17 @@ async function realpathIfExists(target: string): Promise<string | null> {
   }
 }
 
-/**
- * Symlink jail for an EXISTING path: resolve the real location and require it
- * to stay inside the workspace root and outside hidden names (a symlink to
- * `.secret` or to a neighboring agent's workspace must behave like a missing
- * file). Returns the real absolute path.
- */
-async function assertRealContained(root: string, abs: string, forWrite: boolean): Promise<string> {
-  const rootReal = await realpathIfExists(path.resolve(root));
-  if (rootReal === null) throw notFound();
-  const targetReal = await realpathIfExists(abs);
-  if (targetReal === null) throw notFound();
-  assertContainedRealPath(rootReal, targetReal, forWrite);
-  return targetReal;
-}
-
-function assertContainedRealPath(rootReal: string, targetReal: string, forWrite: boolean): void {
+function assertContainedRealPath(
+  rootReal: string,
+  targetReal: string,
+  forWrite: boolean,
+  allowInternal = false,
+): void {
   if (targetReal !== rootReal && !targetReal.startsWith(rootReal + path.sep)) {
     throw forWrite ? invalidPath() : notFound();
   }
   const rel = path.relative(rootReal, targetReal);
-  if (rel !== '' && containsHiddenSegment(rel)) throw hiddenPath(forWrite);
-}
-
-/**
- * Symlink jail for a possibly-missing WRITE target: realpath the deepest
- * existing ancestor directory and require containment (missing path segments
- * cannot be symlinks, so this covers the whole chain).
- */
-async function assertParentContained(root: string, abs: string): Promise<void> {
-  const rootReal = await realpathIfExists(path.resolve(root));
-  if (rootReal === null) throw notFound();
-  let dir = path.dirname(abs);
-  let dirReal = await realpathIfExists(dir);
-  while (dirReal === null) {
-    const parent = path.dirname(dir);
-    if (parent === dir) throw invalidPath();
-    dir = parent;
-    dirReal = await realpathIfExists(dir);
-  }
-  if (dirReal !== rootReal && !dirReal.startsWith(rootReal + path.sep)) throw invalidPath();
-  const rel = path.relative(rootReal, dirReal);
-  if (rel !== '' && containsHiddenSegment(rel)) throw hiddenPath(true);
+  if (!allowInternal && rel !== '' && containsHiddenSegment(rel)) throw hiddenPath(forWrite);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,12 +166,6 @@ async function assertParentContained(root: string, abs: string): Promise<void> {
 
 export function sha256Hex(data: Buffer | string): string {
   return createHash('sha256').update(data).digest('hex');
-}
-
-async function sha256File(abs: string): Promise<string> {
-  const hash = createHash('sha256');
-  for await (const chunk of createReadStream(abs)) hash.update(chunk as Buffer);
-  return hash.digest('hex');
 }
 
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
@@ -227,53 +190,99 @@ export async function listWorkspaceTree(
 ): Promise<{ entries: WorkspaceTreeEntry[]; truncated: boolean }> {
   const maxEntries = opts.maxEntries ?? WORKSPACE_TREE_MAX_ENTRIES;
   const withHashes = opts.withHashes ?? true;
-  const rootReal = await realpathIfExists(path.resolve(root));
-  // A never-provisioned or wiped workspace is just empty, not an error.
-  if (rootReal === null) return { entries: [], truncated: false };
-
   const entries: WorkspaceTreeEntry[] = [];
   let truncated = false;
+  const maxScannedEntries = Math.max(maxEntries * 4, maxEntries + 1_024);
+  let scannedEntries = 0;
 
-  async function walk(dirAbs: string, relPrefix: string): Promise<void> {
-    const dirents = await fs.readdir(dirAbs, { withFileTypes: true });
-    // Folders first, then files, alphabetical — a stable order for the UI.
-    dirents.sort((a, b) => {
-      if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
-      return a.name.localeCompare(b.name);
+  let rootDirectory: PinnedWorkspaceDirectory;
+  try {
+    rootDirectory = await openPinnedWorkspaceRoot(root);
+  } catch (error) {
+    // A never-provisioned or concurrently wiped workspace is just empty.
+    if (isNotFoundError(error)) return { entries: [], truncated: false };
+    throw error;
+  }
+
+  async function walk(directory: PinnedWorkspaceDirectory, relPrefix: string): Promise<void> {
+    const candidates: Array<{ name: string; directoryHint: boolean }> = [];
+    const dir = await fs.opendir(directoryAccessPath(directory));
+    try {
+      for await (const dirent of dir) {
+        scannedEntries += 1;
+        if (scannedEntries > maxScannedEntries) {
+          truncated = true;
+          break;
+        }
+        if (isHiddenName(dirent.name) || dirent.isSymbolicLink()) continue;
+        if (candidates.length >= Math.max(0, maxEntries - entries.length)) {
+          truncated = true;
+          break;
+        }
+        candidates.push({ name: dirent.name, directoryHint: dirent.isDirectory() });
+      }
+    } finally {
+      await dir.close().catch(() => {});
+    }
+
+    candidates.sort((a, b) => {
+      if (a.directoryHint !== b.directoryHint) return a.directoryHint ? -1 : 1;
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
     });
-    for (const dirent of dirents) {
-      if (isHiddenName(dirent.name)) continue;
-      // Symlinks are never listed: reads through them are rejected anyway,
-      // and following them could loop or wander outside the jail.
-      if (dirent.isSymbolicLink()) continue;
+
+    for (const candidate of candidates) {
       if (entries.length >= maxEntries) {
         truncated = true;
         return;
       }
-      const abs = path.join(dirAbs, dirent.name);
-      const rel = relPrefix === '' ? dirent.name : `${relPrefix}/${dirent.name}`;
-      const stat = await fs.stat(abs);
-      if (dirent.isDirectory()) {
-        entries.push({ path: rel, kind: 'dir', sizeBytes: 0, mtime: stat.mtime.toISOString() });
-        await walk(abs, rel);
-        if (truncated) return;
-      } else if (dirent.isFile()) {
+      const rel = relPrefix === '' ? candidate.name : `${relPrefix}/${candidate.name}`;
+      if (candidate.directoryHint) {
+        let child: PinnedWorkspaceDirectory | null = null;
+        try {
+          child = await openPinnedChildDirectory(directory, candidate.name, false);
+          entries.push({
+            path: rel,
+            kind: 'dir',
+            sizeBytes: 0,
+            mtime: child.stat.mtime.toISOString(),
+          });
+          await walk(child, rel);
+          if (truncated) return;
+        } catch (error) {
+          if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
+        } finally {
+          await child?.handle.close().catch(() => {});
+        }
+        continue;
+      }
+
+      let file: PinnedWorkspaceFile | null = null;
+      try {
+        file = await openPinnedRegularAt(directory, candidate.name, rel, false);
         const entry: WorkspaceTreeEntry = {
           path: rel,
           kind: 'file',
-          sizeBytes: stat.size,
-          mtime: stat.mtime.toISOString(),
+          sizeBytes: file.stat.size,
+          mtime: file.stat.mtime.toISOString(),
         };
-        if (withHashes && stat.size <= WORKSPACE_HASH_MAX_BYTES) {
-          entry.sha256 = await sha256File(abs);
+        if (withHashes && file.stat.size <= WORKSPACE_HASH_MAX_BYTES) {
+          entry.sha256 = sha256Hex(await readPinnedSnapshot(file.handle, file.stat.size));
         }
         entries.push(entry);
+      } catch (error) {
+        if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
+      } finally {
+        await file?.handle.close().catch(() => {});
       }
     }
   }
 
-  await walk(rootReal, '');
-  return { entries, truncated };
+  try {
+    await walk(rootDirectory, '');
+    return { entries, truncated };
+  } finally {
+    await rootDirectory.handle.close().catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -286,15 +295,32 @@ interface PinnedWorkspaceFile {
   stat: Stats;
 }
 
+interface PinnedWorkspaceDirectory {
+  handle: FileHandle;
+  rootReal: string;
+  realPath: string;
+  stat: Stats;
+}
+
 function isPathRaceError(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException).code;
   return code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP';
+}
+
+function isPathRaceOrTypeError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return isPathRaceError(error) || code === 'EISDIR' || code === 'EINVAL';
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof ApiError && error.code === 'workspace_file_not_found';
 }
 
 async function descriptorRealpath(
   handle: FileHandle,
   openedPath: string,
   descriptorIdentity: BigIntStats,
+  expectedKind: 'file' | 'directory',
 ): Promise<string> {
   if (process.platform === 'linux') {
     const descriptorPath = await realpathIfExists(`/proc/self/fd/${handle.fd}`);
@@ -308,14 +334,142 @@ async function descriptorRealpath(
   const reboundReal = await realpathIfExists(openedPath);
   if (reboundReal === null) throw notFound();
   const reboundStat = await fs.stat(reboundReal, { bigint: true });
+  const expectedType = expectedKind === 'file' ? reboundStat.isFile() : reboundStat.isDirectory();
   if (
-    !reboundStat.isFile()
+    !expectedType
     || reboundStat.dev !== descriptorIdentity.dev
     || reboundStat.ino !== descriptorIdentity.ino
   ) {
     throw notFound();
   }
   return reboundReal;
+}
+
+function directoryAccessPath(directory: PinnedWorkspaceDirectory): string {
+  return process.platform === 'linux'
+    ? `/proc/self/fd/${directory.handle.fd}`
+    : directory.realPath;
+}
+
+function childAccessPath(directory: PinnedWorkspaceDirectory, name: string): string {
+  return path.join(directoryAccessPath(directory), name);
+}
+
+async function openPinnedWorkspaceRoot(root: string): Promise<PinnedWorkspaceDirectory> {
+  const rootReal = await realpathIfExists(path.resolve(root));
+  if (rootReal === null) throw notFound();
+  let handle: FileHandle | null = null;
+  try {
+    handle = await fs.open(
+      rootReal,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const stat = await handle.stat();
+    const identity = await handle.stat({ bigint: true });
+    if (!stat.isDirectory()) throw notFound();
+    const descriptorReal = await descriptorRealpath(handle, rootReal, identity, 'directory');
+    if (descriptorReal !== rootReal) throw notFound();
+    return { handle, rootReal, realPath: descriptorReal, stat };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (isPathRaceOrTypeError(error)) throw notFound();
+    throw error;
+  }
+}
+
+async function assertPinnedDirectoryStillBound(directory: PinnedWorkspaceDirectory): Promise<void> {
+  const identity = await directory.handle.stat({ bigint: true });
+  const descriptorReal = await descriptorRealpath(
+    directory.handle,
+    directory.realPath,
+    identity,
+    'directory',
+  );
+  assertContainedRealPath(directory.rootReal, descriptorReal, true);
+  directory.realPath = descriptorReal;
+}
+
+async function openPinnedChildDirectory(
+  parent: PinnedWorkspaceDirectory,
+  name: string,
+  create: boolean,
+): Promise<PinnedWorkspaceDirectory> {
+  const openedPath = childAccessPath(parent, name);
+  if (create) {
+    try {
+      await fs.mkdir(openedPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+  let handle: FileHandle | null = null;
+  try {
+    handle = await fs.open(
+      openedPath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const stat = await handle.stat();
+    const identity = await handle.stat({ bigint: true });
+    if (!stat.isDirectory()) throw create ? invalidPath() : notFound();
+    const descriptorReal = await descriptorRealpath(handle, openedPath, identity, 'directory');
+    assertContainedRealPath(parent.rootReal, descriptorReal, create);
+    return { handle, rootReal: parent.rootReal, realPath: descriptorReal, stat };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function openPinnedParent(
+  root: string,
+  rel: string,
+  create: boolean,
+): Promise<{ directory: PinnedWorkspaceDirectory; name: string }> {
+  const segments = rel.split('/');
+  const name = segments.pop();
+  if (!name) throw invalidPath();
+  let directory = await openPinnedWorkspaceRoot(root);
+  try {
+    for (const segment of segments) {
+      const child = await openPinnedChildDirectory(directory, segment, create);
+      await directory.handle.close();
+      directory = child;
+    }
+    return { directory, name };
+  } catch (error) {
+    await directory.handle.close().catch(() => {});
+    throw error;
+  }
+}
+
+async function openPinnedRegularAt(
+  parent: PinnedWorkspaceDirectory,
+  name: string,
+  rel: string,
+  forWrite: boolean,
+): Promise<PinnedWorkspaceFile> {
+  const openedPath = childAccessPath(parent, name);
+  let handle: FileHandle | null = null;
+  try {
+    handle = await fs.open(
+      openedPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const stat = await handle.stat();
+    const identity = await handle.stat({ bigint: true });
+    if (!stat.isFile()) {
+      throw forWrite
+        ? new ApiError(400, 'workspace_path_forbidden', 'This path cannot be edited')
+        : notFound();
+    }
+    const descriptorReal = await descriptorRealpath(handle, openedPath, identity, 'file');
+    assertContainedRealPath(parent.rootReal, descriptorReal, forWrite);
+    return { handle, rel, stat };
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    if (!forWrite && isPathRaceOrTypeError(error)) throw notFound();
+    throw error;
+  }
 }
 
 /**
@@ -331,31 +485,17 @@ async function openPinnedWorkspaceFile(
   root: string,
   rawPath: unknown,
 ): Promise<PinnedWorkspaceFile> {
-  const { abs, rel } = resolveWorkspacePath(root, rawPath);
-  const rootReal = await realpathIfExists(path.resolve(root));
-  if (rootReal === null) throw notFound();
-  const targetReal = await realpathIfExists(abs);
-  if (targetReal === null) throw notFound();
-  assertContainedRealPath(rootReal, targetReal, false);
-
-  let handle: FileHandle | null = null;
+  const { rel } = resolveWorkspacePath(root, rawPath);
+  let parent: PinnedWorkspaceDirectory | null = null;
   try {
-    handle = await fs.open(
-      targetReal,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-    const descriptorStat = await handle.stat();
-    const descriptorIdentity = await handle.stat({ bigint: true });
-    if (!descriptorStat.isFile()) throw notFound();
-
-    const descriptorReal = await descriptorRealpath(handle, targetReal, descriptorIdentity);
-    assertContainedRealPath(rootReal, descriptorReal, false);
-
-    return { handle, rel, stat: descriptorStat };
+    const pinned = await openPinnedParent(root, rel, false);
+    parent = pinned.directory;
+    return await openPinnedRegularAt(parent, pinned.name, rel, false);
   } catch (error) {
-    if (handle !== null) await handle.close();
     if (isPathRaceError(error)) throw notFound();
     throw error;
+  } finally {
+    await parent?.handle.close().catch(() => {});
   }
 }
 
@@ -369,6 +509,17 @@ async function readPinnedAtMost(handle: FileHandle, maxBytes: number): Promise<B
       result.byteLength - offset,
       offset,
     );
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  return result.subarray(0, offset);
+}
+
+async function readPinnedSnapshot(handle: FileHandle, sizeBytes: number): Promise<Buffer> {
+  const result = Buffer.allocUnsafe(sizeBytes);
+  let offset = 0;
+  while (offset < result.byteLength) {
+    const { bytesRead } = await handle.read(result, offset, result.byteLength - offset, offset);
     if (bytesRead === 0) break;
     offset += bytesRead;
   }
@@ -470,68 +621,92 @@ export async function writeWorkspaceFile(params: {
   content: string;
   baseSha256: string;
 }): Promise<WorkspaceWriteResult> {
-  const { abs, rel } = resolveWorkspacePath(params.root, params.path, { forWrite: true });
-
-  let currentSha: string | null = null;
-  let currentMtime: string | null = null;
-  let lstat: Awaited<ReturnType<typeof fs.lstat>> | null = null;
-  try {
-    lstat = await fs.lstat(abs);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  const { rel } = resolveWorkspacePath(params.root, params.path, { forWrite: true });
+  const content = Buffer.from(params.content, 'utf8');
+  if (content.byteLength > WORKSPACE_TEXT_MAX_BYTES) {
+    throw new ApiError(413, 'workspace_file_too_large', 'Workspace text file is too large');
   }
 
-  if (lstat !== null) {
-    // Never write THROUGH a symlink (its target may be outside the jail or a
-    // runtime-internal file) and never replace a directory.
-    if (lstat.isSymbolicLink() || !lstat.isFile()) {
-      throw new ApiError(400, 'workspace_path_forbidden', 'This path cannot be edited');
+  const { directory, name } = await openPinnedParent(params.root, rel, true);
+  let current: PinnedWorkspaceFile | null = null;
+  let temporary: FileHandle | null = null;
+  let temporaryPath: string | null = null;
+  try {
+    try {
+      current = await openPinnedRegularAt(directory, name, rel, true);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP' || code === 'EISDIR') {
+        throw new ApiError(400, 'workspace_path_forbidden', 'This path cannot be edited');
+      }
+      if (code !== 'ENOENT') throw error;
     }
-    await assertRealContained(params.root, abs, true);
-    if (lstat.size > WORKSPACE_TEXT_MAX_BYTES) {
-      throw new ApiError(400, 'workspace_not_text', 'Only text files can be edited');
-    }
-    const buf = await fs.readFile(abs);
-    if (decodeText(buf) === null) {
-      throw new ApiError(400, 'workspace_not_text', 'Only text files can be edited');
-    }
-    currentSha = sha256Hex(buf);
-    currentMtime = lstat.mtime.toISOString();
-    if (params.baseSha256 !== currentSha) {
-      return { ok: false, currentSha256: currentSha, currentMtime };
-    }
-  } else {
-    await assertParentContained(params.root, abs);
-    if (params.baseSha256 !== 'new') {
-      // Caller thinks it is editing an existing file that is gone (or never
-      // existed) — that is a conflict too, not a silent create.
+
+    if (current !== null) {
+      const currentBytes = await readPinnedAtMost(current.handle, WORKSPACE_TEXT_MAX_BYTES);
+      if (currentBytes.byteLength > WORKSPACE_TEXT_MAX_BYTES || decodeText(currentBytes) === null) {
+        throw new ApiError(400, 'workspace_not_text', 'Only text files can be edited');
+      }
+      const currentSha = sha256Hex(currentBytes);
+      if (params.baseSha256 !== currentSha) {
+        return {
+          ok: false,
+          currentSha256: currentSha,
+          currentMtime: current.stat.mtime.toISOString(),
+        };
+      }
+    } else if (params.baseSha256 !== 'new') {
       return { ok: false, currentSha256: null, currentMtime: null };
     }
-  }
 
-  await fs.mkdir(path.dirname(abs), { recursive: true });
-  // Atomic write: the tmp name starts with '.', so a concurrent tree listing
-  // never sees the half-written file.
-  const tmp = path.join(path.dirname(abs), `.eden3-write-${randomUUID()}.tmp`);
-  try {
-    await fs.writeFile(tmp, params.content, 'utf8');
-    await fs.rename(tmp, abs);
-  } catch (err) {
-    await fs.rm(tmp, { force: true });
-    throw err;
-  }
+    await current?.handle.close();
+    current = null;
+    await assertPinnedDirectoryStillBound(directory);
 
-  const stat = await fs.stat(abs);
-  return {
-    ok: true,
-    file: {
-      path: rel,
-      kind: 'text',
-      sizeBytes: stat.size,
-      mtime: stat.mtime.toISOString(),
-      sha256: sha256Hex(Buffer.from(params.content, 'utf8')),
-    },
-  };
+    // Both names are resolved relative to the retained parent descriptor in
+    // Linux production. A concurrent ancestor replacement therefore cannot
+    // redirect either the temporary write or the atomic rename.
+    temporaryPath = childAccessPath(directory, `.eden3-write-${randomUUID()}.tmp`);
+    temporary = await fs.open(
+      temporaryPath,
+      constants.O_WRONLY
+        | constants.O_CREAT
+        | constants.O_EXCL
+        | constants.O_NOFOLLOW
+        | constants.O_NONBLOCK,
+      0o600,
+    );
+    const temporaryIdentity = await temporary.stat({ bigint: true });
+    const temporaryReal = await descriptorRealpath(
+      temporary,
+      temporaryPath,
+      temporaryIdentity,
+      'file',
+    );
+    assertContainedRealPath(directory.rootReal, temporaryReal, true, true);
+    await temporary.writeFile(content);
+    await temporary.sync();
+    const writtenStat = await temporary.stat();
+    await assertPinnedDirectoryStillBound(directory);
+    await fs.rename(temporaryPath, childAccessPath(directory, name));
+    temporaryPath = null;
+
+    return {
+      ok: true,
+      file: {
+        path: rel,
+        kind: 'text',
+        sizeBytes: writtenStat.size,
+        mtime: writtenStat.mtime.toISOString(),
+        sha256: sha256Hex(content),
+      },
+    };
+  } finally {
+    await current?.handle.close().catch(() => {});
+    await temporary?.close().catch(() => {});
+    if (temporaryPath !== null) await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    await directory.handle.close().catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------

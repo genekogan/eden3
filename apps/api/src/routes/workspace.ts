@@ -129,23 +129,35 @@ async function appendOneArchiveEntry(
   name: string,
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
+    let settled = false;
     const cleanup = () => {
       source.removeListener('error', onSourceError);
       archive.removeListener('error', onArchiveError);
+      archive.removeListener('close', onArchiveClosed);
       archive.removeListener('entry', onEntry);
     };
     const settle = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
       cleanup();
       callback();
     };
-    const onSourceError = (error: Error) => settle(() => reject(error));
+    const onSourceError = (error: Error) => settle(() => {
+      archive.destroy();
+      reject(error);
+    });
     const onArchiveError = (error: Error) => {
       source.destroy();
       settle(() => reject(error));
     };
+    const onArchiveClosed = () => {
+      source.destroy();
+      settle(() => reject(new Error('workspace export closed before entry completion')));
+    };
     const onEntry = () => settle(resolve);
     source.once('error', onSourceError);
     archive.once('error', onArchiveError);
+    archive.once('close', onArchiveClosed);
     archive.once('entry', onEntry);
     try {
       archive.append(source, { name });
@@ -230,6 +242,13 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const archive = new ZipArchive({ zlib: { level: 6 } });
+    let archiveCompleted = false;
+    archive.once('end', () => {
+      archiveCompleted = true;
+    });
+    reply.raw.once('close', () => {
+      if (!archiveCompleted) archive.destroy();
+    });
     archive.on('error', (err) => {
       logSafeRequestError(
         req.log,
