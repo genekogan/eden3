@@ -9,9 +9,12 @@ import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import postgres from 'postgres';
 import { afterAll, describe, expect, it } from 'vitest';
 
+import { localDisposableDatabaseUrl } from '../fixtures/disposable-database';
+
 const MIGRATIONS_DIR = fileURLToPath(new URL('../../migrations', import.meta.url));
 const scratchDatabases: string[] = [];
 const scratchRoots: string[] = [];
+const scratchPattern = /^t21b_local_[a-f0-9]{8}$/;
 
 function sha256(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
@@ -24,13 +27,7 @@ function sourceDatabaseUrl(): string {
 }
 
 function urlForDatabase(database: string): string {
-  if (database !== 'postgres' && !/^t21b_local_[a-f0-9]{8}$/.test(database)) {
-    throw new Error(`refusing non-disposable database ${database}`);
-  }
-  const url = new URL(sourceDatabaseUrl());
-  url.search = '';
-  url.pathname = `/${database}`;
-  return url.toString();
+  return localDisposableDatabaseUrl(sourceDatabaseUrl(), database, scratchPattern);
 }
 
 async function createScratchDatabase(): Promise<{ name: string; url: string }> {
@@ -52,7 +49,7 @@ afterAll(async () => {
   const admin = postgres(urlForDatabase('postgres'), { max: 1, onnotice: () => undefined });
   try {
     for (const name of scratchDatabases) {
-      if (!/^t21b_local_[a-f0-9]{8}$/.test(name)) throw new Error(`refusing to drop ${name}`);
+      if (!scratchPattern.test(name)) throw new Error(`refusing to drop ${name}`);
       await admin.unsafe(`drop database if exists "${name}" with (force)`);
     }
   } finally {

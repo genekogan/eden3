@@ -10,15 +10,20 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 import { CATALOG_ADVISORY_LOCK } from '../../src/catalog-lock';
 import { loadRootEnv } from '../../src/env';
+import { localDisposableDatabaseUrl } from '../fixtures/disposable-database';
 
 loadRootEnv();
 
-const sourceDatabaseUrl = process.env.DATABASE_URL;
-if (!sourceDatabaseUrl) {
-  throw new Error('DATABASE_URL is required for disposable catalog-lock proof');
+function requiredSourceDatabaseUrl(): string {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) {
+    throw new Error('DATABASE_URL is required for disposable catalog-lock proof');
+  }
+  return raw;
 }
+const sourceDatabaseUrl = requiredSourceDatabaseUrl();
 
-const PROTECTED_DATABASES = new Set(['eden3', 'eden3_stg']);
+const scratchPattern = /^debt001_catalog_[a-f0-9]{8}$/;
 const PROCESS_FIXTURE = fileURLToPath(
   new URL('../fixtures/catalog-lock-process.ts', import.meta.url),
 );
@@ -26,18 +31,7 @@ const scratchDatabases: string[] = [];
 const tempDirectories: string[] = [];
 
 function urlForDatabase(database: string): string {
-  if (database !== 'postgres' && !/^debt001_catalog_[a-f0-9]{8}$/.test(database)) {
-    throw new Error(`refusing non-disposable database ${database}`);
-  }
-  if (PROTECTED_DATABASES.has(database)) {
-    throw new Error(`refusing protected database ${database}`);
-  }
-  const source = new URL(sourceDatabaseUrl!);
-  const url = new URL(`${source.protocol}//${source.host}`);
-  url.username = source.username;
-  url.password = source.password;
-  url.pathname = `/${database}`;
-  return url.toString();
+  return localDisposableDatabaseUrl(sourceDatabaseUrl, database, scratchPattern);
 }
 
 async function createScratchDatabase(): Promise<{ name: string; url: string }> {

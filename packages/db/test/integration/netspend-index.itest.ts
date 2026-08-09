@@ -9,6 +9,10 @@ import postgres from 'postgres';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { loadRootEnv } from '../../src/env';
+import {
+  localDisposableDatabaseUrl,
+  localSourceDatabaseName,
+} from '../fixtures/disposable-database';
 
 /**
  * T08-U01 integration proofs for the `idx_manna_tx_refunds_tx` migration
@@ -30,6 +34,14 @@ const BOX_DDL =
   'create index idx_manna_tx_refunds_tx on manna_transactions (refunds_transaction_id) where refunds_transaction_id is not null';
 
 const PROTECTED_DBS = new Set(['eden3', 'eden3_stg']);
+const scratchPattern = /^t08u01_mig_[a-f0-9]{8}$/;
+
+function sourceDatabaseUrl(): string {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) throw new Error('DATABASE_URL is not set');
+  localSourceDatabaseName(raw);
+  return raw;
+}
 
 /**
  * Build a clean connection URL carrying ONLY user/password/host/port and the
@@ -39,20 +51,11 @@ const PROTECTED_DBS = new Set(['eden3', 'eden3_stg']);
  * protected shared DB.
  */
 function urlForDb(dbName: string): string {
-  const raw = process.env.DATABASE_URL;
-  if (!raw) throw new Error('DATABASE_URL is not set');
-  const src = new URL(raw);
-  const url = new URL(`${src.protocol}//${src.host}`);
-  url.username = src.username;
-  url.password = src.password;
-  url.pathname = `/${dbName}`;
-  return url.toString();
+  return localDisposableDatabaseUrl(sourceDatabaseUrl(), dbName, scratchPattern);
 }
 
 function targetDbName(): string {
-  const raw = process.env.DATABASE_URL;
-  if (!raw) throw new Error('DATABASE_URL is not set');
-  return new URL(raw).pathname.replace(/^\//, '');
+  return localSourceDatabaseName(sourceDatabaseUrl());
 }
 
 /** Admin connection to the maintenance DB for CREATE/DROP DATABASE. */
@@ -80,7 +83,7 @@ async function createScratchDb(): Promise<string> {
  * connection's actual current_database() is asserted before it is handed out.
  */
 async function scratchClient(dbName: string) {
-  if (PROTECTED_DBS.has(dbName) || !dbName.startsWith('t08u01_mig_')) {
+  if (PROTECTED_DBS.has(dbName) || !scratchPattern.test(dbName)) {
     throw new Error(`refusing DDL connection to non-scratch database "${dbName}"`);
   }
   // max:1 so session-level statements (BEGIN/LOCK, SET lock_timeout) share the
@@ -317,7 +320,7 @@ describe('scratch-DB migration paths (DDL confined to self-created, verified dat
 describe('shared-DB read-only verification (target = DATABASE_URL)', () => {
   it('the migrated target database carries the valid index and the journaled migration', async () => {
     const target = targetDbName();
-    const client = postgres(urlForDb(target), { max: 1, onnotice: () => {} });
+    const client = postgres(sourceDatabaseUrl(), { max: 1, onnotice: () => {} });
     try {
       const rows = await indexRow(client);
       expect(rows, `index missing on ${target}`).toHaveLength(1);

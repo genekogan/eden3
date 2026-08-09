@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import postgres from 'postgres';
 import { afterAll, describe, expect, it } from 'vitest';
 
+import { localDisposableDatabaseUrl } from '../fixtures/disposable-database';
+
 /**
  * T08-U02 checkpoint-2: prove migrations 0028/0029 by EXECUTION, not file
  * inspection — the full drizzle chain on a self-created scratch database,
@@ -17,20 +19,18 @@ import { afterAll, describe, expect, it } from 'vitest';
 
 const MIGRATIONS_DIR = fileURLToPath(new URL('../../migrations', import.meta.url));
 const scratchDbs: string[] = [];
-
-function baseUrl(): URL {
-  const url = new URL(process.env.DATABASE_URL ?? 'postgres://eden3:eden3@localhost:5433/eden3_stg');
-  url.search = '';
-  return url;
+const scratchPattern = /^t08u02_mig_[a-f0-9]{8}$/;
+function requiredSourceDatabaseUrl(): string {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) {
+    throw new Error('DATABASE_URL is required for disposable turn-authorization proof');
+  }
+  return raw;
 }
+const sourceDatabaseUrl = requiredSourceDatabaseUrl();
 
 function urlForDb(dbName: string): string {
-  if (dbName === 'eden3' || dbName === 'eden3_stg') {
-    throw new Error(`refusing to target shared database ${dbName}`);
-  }
-  const url = baseUrl();
-  url.pathname = `/${dbName}`;
-  return url.toString();
+  return localDisposableDatabaseUrl(sourceDatabaseUrl, dbName, scratchPattern);
 }
 
 async function createScratchDb(): Promise<string> {
@@ -46,9 +46,7 @@ async function createScratchDb(): Promise<string> {
 }
 
 function urlForDbAdmin(): string {
-  const url = baseUrl();
-  url.pathname = '/postgres';
-  return url.toString();
+  return localDisposableDatabaseUrl(sourceDatabaseUrl, 'postgres', scratchPattern);
 }
 
 afterAll(async () => {

@@ -7,23 +7,18 @@ import postgres from 'postgres';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { loadRootEnv } from '../../src/env';
+import { localDisposableDatabaseUrl } from '../fixtures/disposable-database';
 
 loadRootEnv();
 
 const MIGRATIONS_DIR = fileURLToPath(new URL('../../migrations', import.meta.url));
-const PROTECTED_DATABASES = new Set(['eden3', 'eden3_stg']);
 const scratchDatabases: string[] = [];
+const scratchPattern = /^t20t21b_m3_[a-f0-9]{8}$/;
 
 function urlForDatabase(database: string): string {
-  if (PROTECTED_DATABASES.has(database) || !/^t20t21b_m3_[a-f0-9]{8}$/.test(database)) {
-    if (database !== 'postgres') throw new Error(`refusing non-disposable database ${database}`);
-  }
   const source = process.env.DATABASE_URL;
   if (!source) throw new Error('DATABASE_URL is required for disposable storage integration proof');
-  const url = new URL(source);
-  url.search = '';
-  url.pathname = `/${database}`;
-  return url.toString();
+  return localDisposableDatabaseUrl(source, database, scratchPattern);
 }
 
 async function createScratchDatabase(): Promise<string> {
@@ -44,7 +39,7 @@ afterAll(async () => {
   const admin = postgres(urlForDatabase('postgres'), { max: 1, onnotice: () => undefined });
   try {
     for (const name of scratchDatabases) {
-      if (!/^t20t21b_m3_[a-f0-9]{8}$/.test(name)) throw new Error(`refusing to drop ${name}`);
+      if (!scratchPattern.test(name)) throw new Error(`refusing to drop ${name}`);
       await admin.unsafe(`drop database if exists "${name}" with (force)`);
     }
   } finally {

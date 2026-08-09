@@ -6,6 +6,11 @@ import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import postgres from 'postgres';
 import { afterAll, describe, expect, it } from 'vitest';
 
+import {
+  localDisposableDatabaseUrl,
+  localSourceDatabaseName,
+} from '../fixtures/disposable-database';
+
 const MIGRATIONS_DIR = fileURLToPath(new URL('../../migrations', import.meta.url));
 const scratchDatabases: string[] = [];
 const scratchPattern = /^t12u03_erase_[a-f0-9]{8}$/;
@@ -13,21 +18,14 @@ const scratchPattern = /^t12u03_erase_[a-f0-9]{8}$/;
 function sourceDatabaseUrl(): string {
   const raw = process.env.DATABASE_URL;
   if (!raw) throw new Error('DATABASE_URL is required for account-erasure scratch proof');
-  const parsed = new URL(raw);
-  if (parsed.pathname !== '/postgres') {
+  if (localSourceDatabaseName(raw) !== 'postgres') {
     throw new Error('account-erasure proof requires the disposable PostgreSQL admin database');
   }
   return raw;
 }
 
 function urlForDatabase(database: string): string {
-  if (database !== 'postgres' && !scratchPattern.test(database)) {
-    throw new Error(`refusing non-disposable database ${database}`);
-  }
-  const url = new URL(sourceDatabaseUrl());
-  url.search = '';
-  url.pathname = `/${database}`;
-  return url.toString();
+  return localDisposableDatabaseUrl(sourceDatabaseUrl(), database, scratchPattern);
 }
 
 async function createScratchDatabase(): Promise<{ name: string; url: string }> {

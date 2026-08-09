@@ -7,29 +7,25 @@ import postgres from 'postgres';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { loadRootEnv } from '../../src/env';
+import { localDisposableDatabaseUrl } from '../fixtures/disposable-database';
 
 loadRootEnv();
 
 const MIGRATIONS_DIR = fileURLToPath(
   new URL('../../migrations', import.meta.url),
 );
-const PROTECTED_DATABASES = new Set(['eden3', 'eden3_stg']);
-const sourceDatabaseUrl = process.env.DATABASE_URL;
-if (!sourceDatabaseUrl) throw new Error('DATABASE_URL is required for disposable policy integration proof');
+function requiredSourceDatabaseUrl(): string {
+  const raw = process.env.DATABASE_URL;
+  if (!raw) throw new Error('DATABASE_URL is required for disposable policy integration proof');
+  return raw;
+}
+const sourceDatabaseUrl = requiredSourceDatabaseUrl();
 const scratchDatabases: string[] = [];
+const scratchPattern = /^debt020_policy_[a-f0-9]{8}$/;
 let closeStoreClient: (() => Promise<void>) | undefined;
 
 function urlForDatabase(database: string): string {
-  if (database !== 'postgres' && !/^debt020_policy_[a-f0-9]{8}$/.test(database)) {
-    throw new Error(`refusing non-disposable database ${database}`);
-  }
-  if (PROTECTED_DATABASES.has(database)) throw new Error(`refusing protected database ${database}`);
-  const source = new URL(sourceDatabaseUrl!);
-  const url = new URL(`${source.protocol}//${source.host}`);
-  url.username = source.username;
-  url.password = source.password;
-  url.pathname = `/${database}`;
-  return url.toString();
+  return localDisposableDatabaseUrl(sourceDatabaseUrl, database, scratchPattern);
 }
 
 async function createScratchDatabase(): Promise<string> {
@@ -52,7 +48,7 @@ afterAll(async () => {
   const admin = postgres(urlForDatabase('postgres'), { max: 1, onnotice: () => undefined });
   try {
     for (const name of scratchDatabases) {
-      if (!/^debt020_policy_[a-f0-9]{8}$/.test(name)) throw new Error(`refusing to drop ${name}`);
+      if (!scratchPattern.test(name)) throw new Error(`refusing to drop ${name}`);
       await admin.unsafe(`drop database if exists "${name}" with (force)`);
       const [remaining] = await admin<{ count: string }[]>`
         select count(*)::text as count from pg_database where datname = ${name}`;
