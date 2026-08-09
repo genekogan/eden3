@@ -475,9 +475,11 @@ describe('PATCH + DELETE /agents/:username/concepts/:slug', () => {
 
 describe('concept images', () => {
   it('admits exactly one concurrent upload at the per-concept image boundary', async () => {
+    const quotaSlug = 'image-quota-race';
     const [concept] = await pg<{ id: string }[]>`
-      select id from concepts
-      where agent_id = ${pendingAgentId} and slug = 'waiting-room' and deleted = false
+      insert into concepts (agent_id, name, slug)
+      values (${pendingAgentId}, 'Image quota race', ${quotaSlug})
+      returning id
     `;
     expect(concept?.id).toBeTruthy();
     for (let i = 0; i < 7; i += 1) {
@@ -501,7 +503,7 @@ describe('concept images', () => {
         app
           .inject({
             method: 'POST',
-            url: `/agents/${pendingAgentName}/concepts/waiting-room/images`,
+            url: `/agents/${pendingAgentName}/concepts/${quotaSlug}/images`,
             headers: { cookie: devCookie(ownerId) },
             payload: uploadBody(
               Buffer.concat([PNG_1PX, Buffer.from([suffix])]),
