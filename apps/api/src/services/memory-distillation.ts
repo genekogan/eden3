@@ -4,6 +4,7 @@ import path from 'node:path';
 
 import { pg } from '@eden3/db';
 
+import { ApiError } from '../errors';
 import { pgToIso } from '../route-helpers';
 import { memoryUserFilename } from './memory-paths';
 
@@ -138,6 +139,64 @@ interface DistillStateRow {
   error: string | null;
   updated_at: string | Date | null;
   completed_at: string | Date | null;
+}
+
+type PgTransaction = Parameters<Parameters<typeof pg.begin>[1]>[0];
+
+export interface AgentMemoryPublicationIdentity {
+  agentAccountId: string;
+  openclawId: string;
+  workspacePath: string;
+}
+
+export class AgentMemoryPublicationRefusedError extends ApiError {
+  constructor(code: 'account_erasure_active' | 'memory_unavailable', message: string) {
+    super(409, code, message);
+    this.name = 'AgentMemoryPublicationRefusedError';
+  }
+}
+
+/**
+ * Serialize every memory filesystem publication against account erasure.
+ * The human owner row is the first lock and remains held through the matching
+ * revision/state commit, so erasure-first refuses before mkdir/write while a
+ * writer-first transaction makes erasure wait before removing the workspace.
+ */
+export async function withAgentMemoryPublicationFence<T>(
+  params: AgentMemoryPublicationIdentity,
+  publish: (tx: PgTransaction) => Promise<T>,
+  client: typeof pg = pg,
+): Promise<T> {
+  return await (client.begin(async (tx) => {
+    const [current] = await tx<{ owner_account_id: string }[]>`
+      select owner_account.id as owner_account_id
+      from agents ag
+      join accounts agent_account on agent_account.id=ag.account_id
+      join accounts owner_account on owner_account.id=coalesce(ag.owner_id,ag.account_id)
+      where ag.account_id=${params.agentAccountId}
+        and ag.openclaw_id=${params.openclawId}
+        and ag.workspace_path=${params.workspacePath}
+        and agent_account.deleted=false
+        and owner_account.deleted=false
+      for key share of owner_account`;
+    if (!current) {
+      throw new AgentMemoryPublicationRefusedError(
+        'memory_unavailable',
+        'current agent memory runtime is unavailable',
+      );
+    }
+    const activeErasure = await tx`
+      select 1 from account_erasure_jobs
+      where account_id=${current.owner_account_id} and state<>'succeeded'
+      limit 1`;
+    if (activeErasure.length > 0) {
+      throw new AgentMemoryPublicationRefusedError(
+        'account_erasure_active',
+        'account erasure is active',
+      );
+    }
+    return await publish(tx);
+  }) as unknown as Promise<T>);
 }
 
 const inFlight = new Set<string>();
@@ -322,8 +381,8 @@ export async function recordMemoryRevision(params: {
   previousContent: string | null;
   content: string;
   metadata?: Record<string, unknown>;
-}): Promise<void> {
-  await pg`
+}, executor: typeof pg | PgTransaction = pg): Promise<void> {
+  await executor`
     insert into memory_revisions (
       agent_account_id, openclaw_id, actor_account_id, operation,
       previous_sha256, sha256, chars, metadata
@@ -476,54 +535,58 @@ export async function distillAgentMemory(
       sample,
       now: new Date(),
     });
-    await fs.mkdir(params.workspacePath, { recursive: true });
-    const memoryPath = path.join(params.workspacePath, 'MEMORY.md');
-    const previousMemory = await readTextIfExists(memoryPath);
-    await fs.writeFile(memoryPath, memory, 'utf8');
-    await writePerUserNotes(params.workspacePath, sample);
+    return await withAgentMemoryPublicationFence(params, async (tx) => {
+      await fs.mkdir(params.workspacePath, { recursive: true });
+      const memoryPath = path.join(params.workspacePath, 'MEMORY.md');
+      const previousMemory = await readTextIfExists(memoryPath);
+      await fs.writeFile(memoryPath, memory, 'utf8');
+      await writePerUserNotes(params.workspacePath, sample);
 
-    await recordMemoryRevision({
-      agentAccountId: params.agentAccountId,
-      openclawId: params.openclawId,
-      actorAccountId: params.actorAccountId,
-      operation: mode,
-      previousContent: previousMemory,
-      content: memory,
-      metadata: {
-        model: MEMORY_DISTILLATION_MODEL,
+      await recordMemoryRevision({
+        agentAccountId: params.agentAccountId,
+        openclawId: params.openclawId,
+        actorAccountId: params.actorAccountId,
+        operation: mode,
+        previousContent: previousMemory,
+        content: memory,
+        metadata: {
+          model: MEMORY_DISTILLATION_MODEL,
+          sessionsSampled: sample.sessions.length,
+          messagesSampled: sample.messagesSampled,
+        },
+      }, tx);
+
+      await tx`
+        update distill_state
+        set status = 'done',
+            sessions_sampled = ${sample.sessions.length},
+            messages_sampled = ${sample.messagesSampled},
+            map_chunks = ${sample.sessions.length},
+            memory_chars = ${memory.length},
+            model = ${MEMORY_DISTILLATION_MODEL},
+            completed_at = now(),
+            updated_at = now()
+        where openclaw_id = ${params.openclawId}
+      `;
+      return {
+        status: 'done' as const,
         sessionsSampled: sample.sessions.length,
         messagesSampled: sample.messagesSampled,
-      },
+        memoryChars: memory.length,
+      };
     });
-
-    await pg`
-      update distill_state
-      set status = 'done',
-          sessions_sampled = ${sample.sessions.length},
-          messages_sampled = ${sample.messagesSampled},
-          map_chunks = ${sample.sessions.length},
-          memory_chars = ${memory.length},
-          model = ${MEMORY_DISTILLATION_MODEL},
-          completed_at = now(),
-          updated_at = now()
-      where openclaw_id = ${params.openclawId}
-    `;
-    return {
-      status: 'done',
-      sessionsSampled: sample.sessions.length,
-      messagesSampled: sample.messagesSampled,
-      memoryChars: memory.length,
-    };
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await pg`
-      update distill_state
-      set status = 'error',
-          error = ${message.slice(0, 500)},
-          completed_at = now(),
-          updated_at = now()
-      where openclaw_id = ${params.openclawId}
-    `;
+    if (!(err instanceof AgentMemoryPublicationRefusedError)) {
+      const message = err instanceof Error ? err.message : String(err);
+      await pg`
+        update distill_state
+        set status = 'error',
+            error = ${message.slice(0, 500)},
+            completed_at = now(),
+            updated_at = now()
+        where openclaw_id = ${params.openclawId}
+      `;
+    }
     throw err;
   }
 }
@@ -700,43 +763,45 @@ export async function saveAgentMemory(params: {
   actorAccountId: string;
 }): Promise<AgentMemorySnapshot> {
   const normalized = `${params.memory.trimEnd()}\n`;
-  await fs.mkdir(params.workspacePath, { recursive: true });
-  const memoryPath = path.join(params.workspacePath, 'MEMORY.md');
-  const previousMemory = await readTextIfExists(memoryPath);
-  await fs.writeFile(memoryPath, normalized, 'utf8');
-  await recordMemoryRevision({
-    agentAccountId: params.agentAccountId,
-    openclawId: params.openclawId,
-    actorAccountId: params.actorAccountId,
-    operation: 'owner-correction',
-    previousContent: previousMemory,
-    content: normalized,
-    metadata: { model: MANUAL_MEMORY_MODEL },
+  await withAgentMemoryPublicationFence(params, async (tx) => {
+    await fs.mkdir(params.workspacePath, { recursive: true });
+    const memoryPath = path.join(params.workspacePath, 'MEMORY.md');
+    const previousMemory = await readTextIfExists(memoryPath);
+    await fs.writeFile(memoryPath, normalized, 'utf8');
+    await recordMemoryRevision({
+      agentAccountId: params.agentAccountId,
+      openclawId: params.openclawId,
+      actorAccountId: params.actorAccountId,
+      operation: 'owner-correction',
+      previousContent: previousMemory,
+      content: normalized,
+      metadata: { model: MANUAL_MEMORY_MODEL },
+    }, tx);
+    await tx`
+      insert into distill_state (
+        openclaw_id, agent_account_id, username, status, sessions_sampled,
+        messages_sampled, map_chunks, memory_chars, model, error,
+        started_at, completed_at, updated_at
+      )
+      values (
+        ${params.openclawId}, ${params.agentAccountId}, ${params.username}, 'done',
+        0, 0, 0, ${normalized.length}, ${MANUAL_MEMORY_MODEL}, null,
+        now(), now(), now()
+      )
+      on conflict (openclaw_id) do update set
+        agent_account_id = excluded.agent_account_id,
+        username = excluded.username,
+        status = 'done',
+        sessions_sampled = excluded.sessions_sampled,
+        messages_sampled = excluded.messages_sampled,
+        map_chunks = excluded.map_chunks,
+        memory_chars = excluded.memory_chars,
+        model = excluded.model,
+        error = null,
+        completed_at = now(),
+        updated_at = now()
+    `;
   });
-  await pg`
-    insert into distill_state (
-      openclaw_id, agent_account_id, username, status, sessions_sampled,
-      messages_sampled, map_chunks, memory_chars, model, error,
-      started_at, completed_at, updated_at
-    )
-    values (
-      ${params.openclawId}, ${params.agentAccountId}, ${params.username}, 'done',
-      0, 0, 0, ${normalized.length}, ${MANUAL_MEMORY_MODEL}, null,
-      now(), now(), now()
-    )
-    on conflict (openclaw_id) do update set
-      agent_account_id = excluded.agent_account_id,
-      username = excluded.username,
-      status = 'done',
-      sessions_sampled = excluded.sessions_sampled,
-      messages_sampled = excluded.messages_sampled,
-      map_chunks = excluded.map_chunks,
-      memory_chars = excluded.memory_chars,
-      model = excluded.model,
-      error = null,
-      completed_at = now(),
-      updated_at = now()
-  `;
   const snapshot = await agentMemorySnapshot(params.openclawId, params.workspacePath);
   if (!snapshot) throw new Error(`memory snapshot unavailable for ${params.openclawId}`);
   return snapshot;

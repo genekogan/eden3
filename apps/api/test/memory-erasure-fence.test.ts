@@ -32,7 +32,9 @@ function fakeClient(options: { current?: boolean; erasing?: boolean } = {}) {
   const client = {
     begin: async <T>(callback: (tx: typeof transaction) => Promise<T>): Promise<T> => {
       events.push('begin');
-      return callback(transaction);
+      const result = await callback(transaction);
+      events.push('commit');
+      return result;
     },
   };
   return { client, events };
@@ -48,16 +50,19 @@ describe('agent memory publication erasure fence', () => {
 
     await expect(withAgentMemoryPublicationFence(identity, publish, client as never))
       .resolves.toBe('published');
-    expect(events).toEqual(['begin', 'owner-lock', 'erasure-check', 'write']);
+    expect(events).toEqual(['begin', 'owner-lock', 'erasure-check', 'write', 'commit']);
     expect(publish).toHaveBeenCalledTimes(1);
   });
 
   it('refuses erasure-first and stale runtime identities before any write callback', async () => {
-    for (const options of [{ erasing: true }, { current: false }]) {
+    for (const [options, code] of [
+      [{ erasing: true }, 'account_erasure_active'],
+      [{ current: false }, 'memory_unavailable'],
+    ] as const) {
       const { client, events } = fakeClient(options);
       const publish = vi.fn();
       await expect(withAgentMemoryPublicationFence(identity, publish, client as never))
-        .rejects.toThrow(/erasure|current agent memory runtime/i);
+        .rejects.toMatchObject({ statusCode: 409, code });
       expect(publish).not.toHaveBeenCalled();
       expect(events).not.toContain('write');
     }
@@ -66,6 +71,9 @@ describe('agent memory publication erasure fence', () => {
   it('routes automatic/manual distillation, per-user notes, and owner correction through one fence', () => {
     expect(source).toContain('for key share of owner_account');
     expect(source).toContain('from account_erasure_jobs');
+    expect(source).toContain('where ag.account_id=${params.agentAccountId}');
+    expect(source).toContain('and ag.openclaw_id=${params.openclawId}');
+    expect(source).toContain('and ag.workspace_path=${params.workspacePath}');
     expect(source).toContain('await withAgentMemoryPublicationFence(params, async (tx) =>');
     expect(source).toContain('await writePerUserNotes(params.workspacePath, sample)');
 
