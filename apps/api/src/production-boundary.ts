@@ -2,7 +2,7 @@ import type { Env } from '@eden3/core';
 
 type ProductionBoundaryEnv = Pick<
   Env,
-  'ACCESS_ALLOWLIST' | 'AUTH_PROVIDER' | 'EDEN3_DEV_ROUTES'
+  'ACCESS_ALLOWLIST' | 'AUTH_PROVIDER' | 'CLERK_JWT_KEY' | 'EDEN3_DEV_ROUTES'
 >;
 
 /**
@@ -20,6 +20,9 @@ export function assertProductionBoundary(
 
   if (env.AUTH_PROVIDER !== 'clerk') {
     throw new Error('Unsafe production configuration: AUTH_PROVIDER=clerk is required');
+  }
+  if (!env.CLERK_JWT_KEY) {
+    throw new Error('Unsafe production configuration: CLERK_JWT_KEY is required');
   }
   if (env.EDEN3_DEV_ROUTES) {
     throw new Error('Unsafe production configuration: EDEN3_DEV_ROUTES=0 is required');

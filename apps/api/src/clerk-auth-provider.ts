@@ -14,7 +14,6 @@ import { sql } from 'drizzle-orm';
 interface ClerkJwtPayload {
   sub?: unknown;
   azp?: unknown;
-  iss?: unknown;
   exp?: unknown;
   nbf?: unknown;
 }
@@ -23,20 +22,6 @@ interface ClerkJwtHeader {
   alg?: unknown;
   kid?: unknown;
   typ?: unknown;
-}
-
-interface Jwk {
-  kid?: string;
-  kty?: string;
-  alg?: string;
-  use?: string;
-  n?: string;
-  e?: string;
-  [key: string]: unknown;
-}
-
-interface JwksResponse {
-  keys?: Jwk[];
 }
 
 export type ClerkTokenVerifier = (token: string) => Promise<ClerkJwtPayload>;
@@ -76,8 +61,6 @@ interface AccountRow {
 
 const SESSION_COOKIE = '__session';
 const CLOCK_SKEW_SECONDS = 5;
-const JWKS_TTL_MS = 5 * 60 * 1000;
-const jwksCache = new Map<string, { expiresAt: number; keys: Jwk[] }>();
 
 function firstHeader(req: AuthRequestLike, name: string): string | null {
   const value = req.headers[name] ?? req.headers[name.toLowerCase()];
@@ -115,19 +98,6 @@ function splitJwt(token: string): { header: ClerkJwtHeader; payload: ClerkJwtPay
   };
 }
 
-async function getJwks(issuer: string, now: number): Promise<Jwk[]> {
-  const cached = jwksCache.get(issuer);
-  if (cached && cached.expiresAt > now) return cached.keys;
-
-  const url = new URL('/.well-known/jwks.json', issuer);
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`jwks_fetch_failed_${response.status}`);
-  const body = (await response.json()) as JwksResponse;
-  const keys = Array.isArray(body.keys) ? body.keys : [];
-  jwksCache.set(issuer, { expiresAt: now + JWKS_TTL_MS, keys });
-  return keys;
-}
-
 /**
  * Clerk's dashboard hands out the instance public key as a single line
  * (newlines collapsed to spaces), and env files often store it with literal
@@ -151,18 +121,8 @@ export function normalizePemPublicKey(key: string): string {
   return `-----BEGIN PUBLIC KEY-----\n${wrapped}\n-----END PUBLIC KEY-----\n`;
 }
 
-async function publicKeyForJwt(header: ClerkJwtHeader, payload: ClerkJwtPayload, jwtKey?: string): Promise<KeyObject> {
-  if (jwtKey) return createPublicKey(normalizePemPublicKey(jwtKey));
-
-  const issuer = typeof payload.iss === 'string' ? payload.iss : null;
-  const kid = typeof header.kid === 'string' ? header.kid : null;
-  if (!issuer || !kid) throw new Error('missing_issuer_or_kid');
-  if (!issuer.startsWith('https://')) throw new Error('invalid_issuer');
-
-  const keys = await getJwks(issuer, Date.now());
-  const jwk = keys.find((key) => key.kid === kid);
-  if (!jwk) throw new Error('missing_jwk');
-  return createPublicKey({ key: jwk, format: 'jwk' } as Parameters<typeof createPublicKey>[0]);
+function publicKeyForJwt(jwtKey: string): KeyObject {
+  return createPublicKey(normalizePemPublicKey(jwtKey));
 }
 
 function verifySignature(signed: string, signature: Buffer, key: KeyObject): void {
@@ -193,11 +153,16 @@ export function createClerkJwtVerifier(opts: {
   jwtKey?: string;
   now?: () => Date;
 } = {}): ClerkTokenVerifier {
+  // Never derive the verification trust root from the unverified token. In
+  // particular, an unverified issuer claim must not select a JWKS URL: that would let an
+  // attacker host both the issuer and signing key (and would add an SSRF
+  // primitive). Eden3 requires the exact Clerk instance public key at boot.
+  if (!opts.jwtKey) throw new Error('CLERK_JWT_KEY is required for Clerk token verification');
+  const publicKey = publicKeyForJwt(opts.jwtKey);
   return async (token) => {
     const decoded = splitJwt(token);
     if (decoded.header.alg !== 'RS256') throw new Error('unsupported_alg');
-    const key = await publicKeyForJwt(decoded.header, decoded.payload, opts.jwtKey);
-    verifySignature(decoded.signed, decoded.signature, key);
+    verifySignature(decoded.signed, decoded.signature, publicKey);
     validateClaims(decoded.payload, opts.authorizedParties ?? [], opts.now?.() ?? new Date());
     return decoded.payload;
   };

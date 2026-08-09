@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 
+import { createClerkJwtVerifier } from '../src/clerk-auth-provider';
 import { assertProductionBoundary } from '../src/production-boundary';
 
 const closedCohort = {
   AUTH_PROVIDER: 'clerk' as const,
+  CLERK_JWT_KEY: 'configured-clerk-instance-public-key',
   EDEN3_DEV_ROUTES: false,
   ACCESS_ALLOWLIST: ['gene'],
 };
@@ -42,10 +45,30 @@ describe('production service boundary', () => {
     ).toThrow(/ACCESS_ALLOWLIST/);
   });
 
+  it('requires a configured Clerk verification trust root before production work', () => {
+    expect(() =>
+      assertProductionBoundary(
+        { ...closedCohort, CLERK_JWT_KEY: undefined },
+        { nodeEnv: 'production' },
+      ),
+    ).toThrow(/CLERK_JWT_KEY/);
+    expect(() => createClerkJwtVerifier()).toThrow(/CLERK_JWT_KEY/);
+
+    const source = readFileSync(new URL('../src/clerk-auth-provider.ts', import.meta.url), 'utf8');
+    expect(source).not.toContain("new URL('/.well-known/jwks.json'");
+    expect(source).not.toMatch(/\bfetch\s*\(/);
+    expect(source).not.toContain('payload.iss');
+  });
+
   it('preserves explicit local development modes outside production', () => {
     expect(() =>
       assertProductionBoundary(
-        { AUTH_PROVIDER: 'hybrid', EDEN3_DEV_ROUTES: true, ACCESS_ALLOWLIST: [] },
+        {
+          AUTH_PROVIDER: 'hybrid',
+          CLERK_JWT_KEY: undefined,
+          EDEN3_DEV_ROUTES: true,
+          ACCESS_ALLOWLIST: [],
+        },
         { nodeEnv: 'development' },
       ),
     ).not.toThrow();
