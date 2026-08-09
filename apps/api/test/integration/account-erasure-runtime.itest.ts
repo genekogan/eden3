@@ -170,6 +170,7 @@ beforeAll(async () => {
   await pg.unsafe(`grant insert,update,delete on media_assets,concept_images,creations to "${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant select,insert,update on manna_accounts,manna_transactions,turn_authorizations,turn_provider_runs,usage_events,messages,sessions,session_users,session_agents,channel_turns to "${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant select,update on channel_connections to "${ORDINARY_LOGIN}"`);
+  await pg.unsafe(`grant select,update on stripe_checkout_intents,channel_outbound_post_intents to "${ORDINARY_LOGIN}"`);
   const base = new URL(process.env.DATABASE_URL!);
   const operatorUrl = new URL(base); operatorUrl.username = OPERATOR_LOGIN; operatorUrl.password = OPERATOR_PASSWORD;
   const ordinaryUrl = new URL(base); ordinaryUrl.username = ORDINARY_LOGIN; ordinaryUrl.password = ORDINARY_PASSWORD;
@@ -215,6 +216,31 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
     await expect(ordinaryPg`
       select has_table_privilege(session_user,'account_erasure_jobs','select') permitted`
     ).resolves.toEqual([{ permitted: true }]);
+  });
+  it('rejects cross-tenant outbound intents and nonhuman Stripe ownership', async () => {
+    const owner = randomUUID();
+    const foreign = randomUUID();
+    const agent = randomUUID();
+    const connection = randomUUID();
+    await pg`insert into accounts(id,type,username) values
+      (${owner},'user',${`intent_owner_${owner.slice(0, 8)}`}),
+      (${foreign},'user',${`intent_foreign_${foreign.slice(0, 8)}`}),
+      (${agent},'agent',${`intent_agent_${agent.slice(0, 8)}`})`;
+    await pg`insert into agents(account_id,owner_id,name,public)
+      values (${agent},${owner},'intent ownership agent',false)`;
+    await pg`insert into channel_connections
+      (id,account_id,channel,token_ciphertext,token_iv,token_auth_tag,token_sha256)
+      values (${connection},${foreign},'x','cipher','iv','tag',${sha('intent-owner-token')})`;
+    await expect(pg`insert into channel_outbound_post_intents(account_id,connection_id)
+      values (${owner},${connection})`).rejects.toThrow(
+      'outbound intent must match its owned X connection',
+    );
+    await expect(pg`insert into stripe_checkout_intents(account_id,kind,request_key_sha256)
+      values (${agent},'manna_topup',${sha('agent-stripe-intent')})`).rejects.toThrow(
+      'checkout intent owner must be a human account',
+    );
+    await expect(pg`insert into stripe_checkout_intents(account_id,kind,request_key_sha256)
+      values (${owner},'manna_topup',${sha('human-stripe-intent')})`).resolves.toHaveLength(1);
   });
   it('proves money, privacy, multipart gating, worker concurrency, and route-vs-worker fencing', async () => {
     await pg`
@@ -905,7 +931,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
             and state in ('preparing','provider_started')))::int active_effects
       from accounts a join account_erasure_jobs j on j.account_id=a.id where a.id=${activeAccount}`;
     expect(directState).toEqual({
-      deleted: false, state: 'intent_pending', inventoried_at: null, active_effects: 4,
+      deleted: false, state: 'intent_pending', inventoried_at: null, active_effects: 2,
     });
 
     const recoveryManifest = recoverySink();
@@ -925,11 +951,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       deleted: false, state: 'intent_pending', inventoried_at: null, attempt_count: 1,
     });
     await ordinaryPg`select account_erasure_record_stripe_checkout_terminal(
-      ${activeAccount},${activeStripePreparing},'failed',null,'erasure_cancelled_before_provider')`;
-    await ordinaryPg`select account_erasure_record_stripe_checkout_terminal(
       ${activeAccount},${activeStripeStarted},'created','cs_active_effect_reconciled',null)`;
-    await ordinaryPg`select account_erasure_record_outbound_post_terminal(
-      ${activeAccount},${activePostPreparing},'failed',null,'erasure_cancelled_before_provider')`;
     await ordinaryPg`select account_erasure_record_outbound_post_terminal(
       ${activeAccount},${activePostStarted},'succeeded','post_active_effect_reconciled',null)`;
     await new Promise((resolve) => setTimeout(resolve, 2_100));
@@ -1032,6 +1054,67 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         confirmUsername: username,
       }, store, ledger(), manifest);
       expect(accepted).toEqual({ jobId: expect.any(String), status: 'pending' });
+      if (testCase.state === 'preparing') {
+        expect(manifest.encryptWriteAndConfirm).toHaveBeenCalledTimes(1);
+        const table = testCase.kind === 'stripe'
+          ? await pg<{ state: string; last_error_code: string | null }[]>`
+              select state,last_error_code from stripe_checkout_intents where id=${intentId}`
+          : await pg<{ state: string; last_error_code: string | null }[]>`
+              select state,last_error_code from channel_outbound_post_intents where id=${intentId}`;
+        expect(table[0]).toEqual({
+          state: 'failed', last_error_code: 'erasure_cancelled_before_provider',
+        });
+        const [direct] = await pg<{ deleted: boolean; inventoried: boolean }[]>`
+          select a.deleted,(j.inventoried_at is not null) inventoried from accounts a
+          join account_erasure_jobs j on j.account_id=a.id where a.id=${accountId}`;
+        expect(direct).toEqual({ deleted: true, inventoried: true });
+
+        // Crash/restart shape: Tx1 committed but no direct seal call survived.
+        const restartAccount = randomUUID();
+        const restartIntent = randomUUID();
+        const restartConnection = randomUUID();
+        const restartUsername = `erase_restart_${testCase.kind}_${restartAccount.slice(0, 8)}`;
+        await pg`insert into accounts(id,type,username) values
+          (${restartAccount},'user',${restartUsername})`;
+        if (testCase.kind === 'stripe') {
+          await pg`insert into stripe_checkout_intents(id,account_id,kind,request_key_sha256)
+            values (${restartIntent},${restartAccount},'manna_topup',${sha(`restart-stripe-${index}`)})`;
+        } else {
+          await pg`insert into channel_connections
+            (id,account_id,channel,token_ciphertext,token_iv,token_auth_tag,token_sha256)
+            values (${restartConnection},${restartAccount},'x','cipher','iv','tag',
+              ${sha(`restart-x-${index}`)})`;
+          await pg`insert into channel_outbound_post_intents(id,account_id,connection_id)
+            values (${restartIntent},${restartAccount},${restartConnection})`;
+        }
+        await store.acceptIntent({ accountId: restartAccount, confirmUsername: restartUsername });
+        if (testCase.kind === 'stripe') {
+          await expect(ordinaryPg`select account_erasure_record_stripe_checkout_terminal(
+            ${restartAccount},${restartIntent},'created','cs_forged_started',null
+          ) recorded`).resolves.toEqual([{ recorded: false }]);
+          await expect(ordinaryPg`update stripe_checkout_intents set state='provider_started'
+            where id=${restartIntent}`).rejects.toMatchObject({ code: '55000' });
+        } else {
+          await expect(ordinaryPg`select account_erasure_record_outbound_post_terminal(
+            ${restartAccount},${restartIntent},'succeeded','post_forged_started',null
+          ) recorded`).resolves.toEqual([{ recorded: false }]);
+          await expect(ordinaryPg`update channel_outbound_post_intents set state='provider_started'
+            where id=${restartIntent}`).rejects.toMatchObject({ code: '55000' });
+        }
+        const restartManifest = recoverySink();
+        const restartRecovery = new AccountErasureRecoveryWorker(
+          store, ledger(), restartManifest, 1, 1_000,
+        );
+        await expect(restartRecovery.tick()).resolves.toMatchObject({ claimed: 1, sealed: 1 });
+        const [restartTruth] = await pg<{ deleted: boolean; state: string }[]>`
+          select a.deleted,
+            ${testCase.kind === 'stripe'
+              ? pg`(select state from stripe_checkout_intents where id=${restartIntent})`
+              : pg`(select state from channel_outbound_post_intents where id=${restartIntent})`} state
+          from accounts a where a.id=${restartAccount}`;
+        expect(restartTruth).toEqual({ deleted: true, state: 'failed' });
+        continue;
+      }
       expect(manifest.encryptWriteAndConfirm).not.toHaveBeenCalled();
       const [before] = await pg<{
         deleted: boolean; state: string; inventoried_at: Date | null;
@@ -1044,9 +1127,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       expect(manifest.encryptWriteAndConfirm).not.toHaveBeenCalled();
 
       if (testCase.kind === 'stripe') {
-        const terminal = testCase.state === 'preparing'
-          ? ['failed', null, 'erasure_cancelled_before_provider'] as const
-          : ['created', `cs_independent_${index}`, null] as const;
+        const terminal = ['created', `cs_independent_${index}`, null] as const;
         await expect(ordinaryPg`select account_erasure_record_stripe_checkout_terminal(
           ${randomUUID()},${intentId},${terminal[0]},${terminal[1]},${terminal[2]}) recorded`)
           .resolves.toEqual([{ recorded: false }]);
@@ -1057,9 +1138,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
           ${accountId},${intentId},${terminal[0]},${terminal[1]},${terminal[2]}) recorded`)
           .resolves.toEqual([{ recorded: true }]);
       } else {
-        const terminal = testCase.state === 'preparing'
-          ? ['failed', null, 'erasure_cancelled_before_provider'] as const
-          : ['succeeded', `post_independent_${index}`, null] as const;
+        const terminal = ['succeeded', `post_independent_${index}`, null] as const;
         await expect(ordinaryPg`select account_erasure_record_outbound_post_terminal(
           ${randomUUID()},${intentId},${terminal[0]},${terminal[1]},${terminal[2]}) recorded`)
           .resolves.toEqual([{ recorded: false }]);

@@ -36,6 +36,9 @@ CREATE OR REPLACE FUNCTION public.account_erasure_stripe_checkout_intent_guard()
 LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
 BEGIN
 	IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+	IF NOT EXISTS (SELECT 1 FROM public.accounts a
+		WHERE a.id=NEW.account_id AND a.type='user')
+	THEN RAISE EXCEPTION 'checkout intent owner must be a human account'; END IF;
 	IF TG_OP='INSERT' THEN
 		IF NEW.state<>'preparing' OR NEW.stripe_session_id IS NOT NULL
 			OR NEW.last_error_code IS NOT NULL THEN
@@ -95,6 +98,9 @@ CREATE OR REPLACE FUNCTION public.account_erasure_channel_outbound_intent_guard(
 LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
 BEGIN
 	IF TG_OP='DELETE' THEN RETURN OLD; END IF;
+	IF NOT EXISTS (SELECT 1 FROM public.channel_connections c
+		WHERE c.id=NEW.connection_id AND c.account_id=NEW.account_id AND c.channel='x')
+	THEN RAISE EXCEPTION 'outbound intent must match its owned X connection'; END IF;
 	IF TG_OP='INSERT' THEN
 		IF NEW.state<>'preparing' OR NEW.provider_post_id IS NOT NULL OR NEW.last_error_code IS NOT NULL
 		THEN RAISE EXCEPTION 'outbound intent must begin preparing'; END IF;
@@ -500,8 +506,9 @@ BEGIN
 		AND v_new->>'stripe_session_id' IS NULL
 		AND (v_new-'state'-'last_error_code'-'updated_at')=
 			(v_old-'state'-'last_error_code'-'updated_at')
-		AND current_user='eden3_erasure_guard'
-		AND public.account_erasure_principal_has_active_job((v_old->>'account_id')::uuid)
+		AND v_job IS NOT NULL
+		AND (public.account_erasure_unclaimed_seal_matches((v_old->>'account_id')::uuid)
+			OR public.account_erasure_job_claim_tuple_matches((v_old->>'account_id')::uuid))
 	THEN RETURN NEW; END IF;
 	IF TG_TABLE_NAME='channel_outbound_post_intents' AND TG_OP='UPDATE'
 		AND v_old->>'state'='preparing' AND v_new->>'state'='failed'
@@ -509,8 +516,9 @@ BEGIN
 		AND v_new->>'provider_post_id' IS NULL
 		AND (v_new-'state'-'last_error_code'-'updated_at')=
 			(v_old-'state'-'last_error_code'-'updated_at')
-		AND current_user='eden3_erasure_guard'
-		AND public.account_erasure_principal_has_active_job((v_old->>'account_id')::uuid)
+		AND v_job IS NOT NULL
+		AND (public.account_erasure_unclaimed_seal_matches((v_old->>'account_id')::uuid)
+			OR public.account_erasure_job_claim_tuple_matches((v_old->>'account_id')::uuid))
 	THEN RETURN NEW; END IF;
 	IF TG_TABLE_NAME='stripe_checkout_intents' AND TG_OP='UPDATE'
 		AND current_user='eden3_erasure_guard'
@@ -838,15 +846,11 @@ BEGIN
 		RAISE EXCEPTION 'provider terminal evidence requires the trusted application role' USING ERRCODE='42501';
 	END IF;
 	IF NOT ((p_state='created' AND p_session_id ~ '^cs_[A-Za-z0-9_]{3,252}$' AND p_error_code IS NULL)
-		OR (p_state='failed' AND p_session_id IS NULL
-			AND p_error_code IN ('erasure_cancelled_before_provider','provider_confirmed_failed')))
+		OR (p_state='failed' AND p_session_id IS NULL AND p_error_code='provider_confirmed_failed'))
 	THEN RETURN false; END IF;
 	UPDATE public.stripe_checkout_intents i SET state=p_state,stripe_session_id=p_session_id,
 		last_error_code=p_error_code,updated_at=statement_timestamp()
-	WHERE i.id=p_intent AND i.account_id=p_account
-		AND ((i.state='preparing' AND p_state='failed' AND p_error_code='erasure_cancelled_before_provider')
-			OR (i.state='provider_started' AND NOT (p_state='failed'
-				AND p_error_code='erasure_cancelled_before_provider')))
+	WHERE i.id=p_intent AND i.account_id=p_account AND i.state='provider_started'
 		AND EXISTS (SELECT 1 FROM public.account_erasure_jobs j
 			WHERE j.account_id=p_account AND j.state<>'succeeded')
 	RETURNING i.id INTO v_updated;
@@ -872,16 +876,12 @@ BEGIN
 	END IF;
 	IF NOT ((p_state='succeeded' AND p_provider_post_id ~ '^[A-Za-z0-9_:-]{1,255}$' AND p_error_code IS NULL)
 		OR (p_state='failed' AND p_provider_post_id IS NULL
-			AND p_error_code IN ('erasure_cancelled_before_provider','invalid_credentials','revoked',
-				'rate_limited','operator_confirmed_failed')))
+			AND p_error_code IN ('invalid_credentials','revoked','rate_limited','operator_confirmed_failed')))
 	THEN RETURN false; END IF;
 	UPDATE public.channel_outbound_post_intents i SET state=p_state,
 		provider_post_id=p_provider_post_id,last_error_code=p_error_code,
 		updated_at=statement_timestamp()
-	WHERE i.id=p_intent AND i.account_id=p_account
-		AND ((i.state='preparing' AND p_state='failed' AND p_error_code='erasure_cancelled_before_provider')
-			OR (i.state='provider_started' AND NOT (p_state='failed'
-				AND p_error_code='erasure_cancelled_before_provider')))
+	WHERE i.id=p_intent AND i.account_id=p_account AND i.state='provider_started'
 		AND EXISTS (SELECT 1 FROM public.account_erasure_jobs j
 			WHERE j.account_id=p_account AND j.state<>'succeeded')
 	RETURNING i.id INTO v_updated;
@@ -1097,6 +1097,19 @@ BEGIN
 	SELECT * INTO v_job FROM public.account_erasure_jobs WHERE id=p_job FOR UPDATE;
 	IF NOT FOUND OR p_job<>public.account_erasure_current_seal_job()
 	THEN RAISE EXCEPTION 'reconciliation requires exact live sealing tuple'; END IF;
+
+	-- preparing is the durable proof that provider admission never committed.
+	-- Cancel it under the exact account/job seal tuple before checking open work.
+	-- provider_started is deliberately untouched until authenticated provider
+	-- truth arrives through the narrow terminal functions above.
+	UPDATE public.stripe_checkout_intents i SET state='failed',
+		last_error_code='erasure_cancelled_before_provider',updated_at=statement_timestamp()
+	WHERE i.state='preparing' AND public.account_erasure_principal_matches(v_job.account_id,i.account_id);
+	GET DIAGNOSTICS v_rows=ROW_COUNT; v_count:=v_count+v_rows;
+	UPDATE public.channel_outbound_post_intents i SET state='failed',
+		last_error_code='erasure_cancelled_before_provider',updated_at=statement_timestamp()
+	WHERE i.state='preparing' AND public.account_erasure_principal_matches(v_job.account_id,i.account_id);
+	GET DIAGNOSTICS v_rows=ROW_COUNT; v_count:=v_count+v_rows;
 
 	FOR v_auth IN
 		WITH principals AS (SELECT v_job.account_id id UNION SELECT account_id FROM public.agents WHERE owner_id=v_job.account_id)

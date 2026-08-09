@@ -97,8 +97,14 @@ describe('0041 account erasure reconciliation', () => {
     expect(sql).toContain("WHERE o.state IN ('preparing','provider_started')");
     expect(sql).toContain('account_erasure_record_stripe_checkout_terminal');
     expect(sql).toContain('account_erasure_record_outbound_post_terminal');
-    expect(sql).toContain("p_error_code IN ('erasure_cancelled_before_provider','provider_confirmed_failed')");
-    expect(sql).toContain("p_error_code IN ('erasure_cancelled_before_provider','invalid_credentials','revoked',");
+    expect(sql).toContain('checkout intent owner must be a human account');
+    expect(sql).toContain('outbound intent must match its owned X connection');
+    expect(sql).toContain("c.id=NEW.connection_id AND c.account_id=NEW.account_id AND c.channel='x'");
+    expect(sql).toContain("p_error_code='provider_confirmed_failed'");
+    expect(sql).toContain("p_error_code IN ('invalid_credentials','revoked','rate_limited','operator_confirmed_failed')");
+    expect(reconcileSql).toContain("last_error_code='erasure_cancelled_before_provider'");
+    expect(reconcileSql).toContain("WHERE i.state='preparing'");
+    expect(reconcileSql).not.toContain("i.state='provider_started'");
     expect(sql).toContain("current_user='eden3_erasure_guard'");
     expect(sql).toContain("pg_has_role(session_user,'eden3_erasure_terminal_writer','member')");
     expect(sql).toContain('REVOKE EXECUTE ON FUNCTION public.account_erasure_record_stripe_checkout_terminal');
