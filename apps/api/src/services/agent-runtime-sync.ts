@@ -8,7 +8,7 @@ import {
   DEFAULT_AGENT_TOOL_GROUPS,
 } from '@eden3/shared';
 
-import { logSafeRequestWarning } from '../errors';
+import { ApiError, logSafeRequestWarning } from '../errors';
 import {
   defaultOpenclawDataDir,
   type ProvisionerLike,
@@ -70,6 +70,57 @@ export type AgentRuntimeSyncResult =
   | { status: 'pending'; version: number; reason: 'runtime_error' }
   | { status: 'idle' | 'ineligible' };
 
+type PgTransaction = Parameters<Parameters<typeof pg.begin>[1]>[0];
+
+export class AgentRuntimePublicationRefusedError extends ApiError {
+  constructor(code: 'account_erasure_active' | 'runtime_unavailable', message: string) {
+    super(409, code, message);
+    this.name = 'AgentRuntimePublicationRefusedError';
+  }
+}
+
+/**
+ * Keep the exact human owner protected from erasure while runtime bytes and
+ * OpenClaw configuration are being published. The owner row is the first
+ * durable row lock, matching account erasure's coordinate. Erasure-first is
+ * refused before the callback; writer-first holds deletion until the claim
+ * and all external effects have settled.
+ */
+export async function withAgentRuntimePublicationFence<T>(
+  agentAccountId: string,
+  publish: (ownerAccountId: string) => Promise<T>,
+  client: typeof pg = pg,
+): Promise<T> {
+  return await (client.begin(async (tx: PgTransaction) => {
+    const [current] = await tx<{ owner_account_id: string }[]>`
+      select owner_account.id as owner_account_id
+      from agents ag
+      join accounts agent_account on agent_account.id=ag.account_id
+      join accounts owner_account on owner_account.id=coalesce(ag.owner_id,ag.account_id)
+      where ag.account_id=${agentAccountId}
+        and agent_account.deleted=false
+        and owner_account.deleted=false
+      for key share of owner_account`;
+    if (!current) {
+      throw new AgentRuntimePublicationRefusedError(
+        'runtime_unavailable',
+        'current agent runtime is unavailable',
+      );
+    }
+    const activeErasure = await tx`
+      select 1 from account_erasure_jobs
+      where account_id=${current.owner_account_id} and state<>'succeeded'
+      limit 1`;
+    if (activeErasure.length > 0) {
+      throw new AgentRuntimePublicationRefusedError(
+        'account_erasure_active',
+        'account erasure is active',
+      );
+    }
+    return await publish(current.owner_account_id);
+  }) as unknown as Promise<T>);
+}
+
 function canonicalWorkspace(row: RuntimeSyncRow, dataDir: string): boolean {
   if (
     row.provision_status !== 'ready' ||
@@ -126,6 +177,7 @@ async function withAgentRuntimeSyncLock<T>(
 async function claimAgentRuntimeSync(
   accountId: string,
   dataDir: string,
+  ownerAccountId: string,
 ): Promise<ClaimedRuntimeSync | null | 'ineligible'> {
   return pg.begin(async (tx) => {
     const rows = await tx<RuntimeSyncRow[]>`
@@ -136,6 +188,7 @@ async function claimAgentRuntimeSync(
       from agents g
       join accounts a on a.id = g.account_id
       where g.account_id = ${accountId}
+        and coalesce(g.owner_id,g.account_id) = ${ownerAccountId}
       for update
     `;
     const row = rows[0];
@@ -202,116 +255,131 @@ export async function reconcileAgentRuntime(
 ): Promise<AgentRuntimeSyncResult> {
   const dataDir = deps.dataDir ?? defaultOpenclawDataDir();
   return await withAgentRuntimeSyncLock(accountId, async () => {
-    for (let revisionRound = 0; revisionRound < MAX_IMMEDIATE_REVISIONS; revisionRound += 1) {
-      const claim = await claimAgentRuntimeSync(accountId, dataDir);
-      if (claim === 'ineligible') return { status: 'ineligible' };
-      if (!claim) return { status: 'idle' };
+    try {
+      return await withAgentRuntimePublicationFence(accountId, async (ownerAccountId) => {
+        for (
+          let revisionRound = 0;
+          revisionRound < MAX_IMMEDIATE_REVISIONS;
+          revisionRound += 1
+        ) {
+          const claim = await claimAgentRuntimeSync(accountId, dataDir, ownerAccountId);
+          if (claim === 'ineligible') return { status: 'ineligible' };
+          if (!claim) return { status: 'idle' };
 
-      let heartbeatInFlight = false;
-      const heartbeat = setInterval(() => {
-        if (heartbeatInFlight) return;
-        heartbeatInFlight = true;
-        void pg`
-          update agents
-          set runtime_sync_lease_expires_at = now() + ${CLAIM_LEASE_MINUTES} * interval '1 minute'
-          where account_id = ${claim.account_id}
-            and runtime_sync_claim_token = ${claim.claimToken}::uuid
-        `.catch((error) => {
-          if (deps.logger) {
-            logSafeRequestWarning(
-              deps.logger,
-              error,
-              { accountId: claim.account_id },
-              'agent runtime sync heartbeat failed',
+          let heartbeatInFlight = false;
+          const heartbeat = setInterval(() => {
+            if (heartbeatInFlight) return;
+            heartbeatInFlight = true;
+            void pg`
+              update agents
+              set runtime_sync_lease_expires_at = now() + ${CLAIM_LEASE_MINUTES} * interval '1 minute'
+              where account_id = ${claim.account_id}
+                and runtime_sync_claim_token = ${claim.claimToken}::uuid
+            `
+              .catch((error) => {
+                if (deps.logger) {
+                  logSafeRequestWarning(
+                    deps.logger,
+                    error,
+                    { accountId: claim.account_id },
+                    'agent runtime sync heartbeat failed',
+                  );
+                }
+              })
+              .finally(() => {
+                heartbeatInFlight = false;
+              });
+          }, CLAIM_HEARTBEAT_MS);
+          heartbeat.unref?.();
+
+          try {
+            await deps.provisioner.updateAgentPersona({
+              openclawId: claim.openclaw_id!,
+              name: claim.name ?? claim.username,
+              username: claim.username,
+              description: claim.description ?? '',
+              persona: claim.persona ?? '',
+              greeting: claim.greeting ?? '',
+              voice: claim.voice ?? '',
+              thinkingLevel: claim.thinking_level ?? DEFAULT_AGENT_THINKING_LEVEL,
+            });
+            await deps.provisioner.provisionAgent({
+              openclawId: claim.openclaw_id!,
+              name: claim.name ?? claim.username,
+              username: claim.username,
+              description: claim.description ?? '',
+              persona: claim.persona ?? '',
+              greeting: claim.greeting ?? '',
+              voice: claim.voice ?? '',
+              thinkingLevel: claim.thinking_level ?? DEFAULT_AGENT_THINKING_LEVEL,
+              model: claim.model ?? DEFAULT_AGENT_MODEL,
+            });
+            if (deps.skillSync) {
+              await projectApprovedAgentSkills({
+                agentId: claim.account_id,
+                openclawId: claim.openclaw_id!,
+                workspacePath: claim.workspace_path!,
+                skillSync: deps.skillSync,
+              });
+            }
+            await deps.toolSync.syncAgentToolGroups({
+              openclawId: claim.openclaw_id!,
+              toolGroups: normalizedToolGroups(claim.tool_groups),
+            });
+            const currentVersion = await finishRuntimeSync(claim);
+            if (currentVersion === null) {
+              // No code path may mutate the runtime outside this advisory lock.
+              // If an operator changed the claim row manually, leave the desired
+              // revision pending instead of asserting an unsafe completion.
+              return {
+                status: 'pending',
+                version: claim.runtime_sync_version,
+                reason: 'runtime_error',
+              };
+            }
+            if (currentVersion > claim.runtime_sync_version) {
+              // Keep the same session lock while rendering the newest committed
+              // winner. No older claimant can resume after the authoritative
+              // revision and clobber its filesystem/config side effects.
+              if (revisionRound + 1 < MAX_IMMEDIATE_REVISIONS) continue;
+              return {
+                status: 'pending',
+                version: currentVersion,
+                reason: 'runtime_error',
+              };
+            }
+            deps.logger?.info(
+              { accountId: claim.account_id, version: claim.runtime_sync_version },
+              'agent runtime configuration synchronized',
             );
+            return { status: 'synced', version: claim.runtime_sync_version };
+          } catch (error) {
+            await failRuntimeSync(claim);
+            if (deps.logger) {
+              logSafeRequestWarning(
+                deps.logger,
+                error,
+                { accountId: claim.account_id, version: claim.runtime_sync_version },
+                'agent runtime synchronization deferred for retry',
+              );
+            }
+            return {
+              status: 'pending',
+              version: claim.runtime_sync_version,
+              reason: 'runtime_error',
+            };
+          } finally {
+            clearInterval(heartbeat);
           }
-        }).finally(() => {
-          heartbeatInFlight = false;
-        });
-      }, CLAIM_HEARTBEAT_MS);
-      heartbeat.unref?.();
-
-      try {
-        await deps.provisioner.updateAgentPersona({
-          openclawId: claim.openclaw_id!,
-          name: claim.name ?? claim.username,
-          username: claim.username,
-          description: claim.description ?? '',
-          persona: claim.persona ?? '',
-          greeting: claim.greeting ?? '',
-          voice: claim.voice ?? '',
-          thinkingLevel: claim.thinking_level ?? DEFAULT_AGENT_THINKING_LEVEL,
-        });
-        await deps.provisioner.provisionAgent({
-          openclawId: claim.openclaw_id!,
-          name: claim.name ?? claim.username,
-          username: claim.username,
-          description: claim.description ?? '',
-          persona: claim.persona ?? '',
-          greeting: claim.greeting ?? '',
-          voice: claim.voice ?? '',
-          thinkingLevel: claim.thinking_level ?? DEFAULT_AGENT_THINKING_LEVEL,
-          model: claim.model ?? DEFAULT_AGENT_MODEL,
-        });
-        if (deps.skillSync) {
-          await projectApprovedAgentSkills({
-            agentId: claim.account_id,
-            openclawId: claim.openclaw_id!,
-            workspacePath: claim.workspace_path!,
-            skillSync: deps.skillSync,
-          });
         }
-        await deps.toolSync.syncAgentToolGroups({
-          openclawId: claim.openclaw_id!,
-          toolGroups: normalizedToolGroups(claim.tool_groups),
-        });
-        const currentVersion = await finishRuntimeSync(claim);
-        if (currentVersion === null) {
-          // No code path may mutate the runtime outside this advisory lock.
-          // If an operator changed the claim row manually, leave the desired
-          // revision pending instead of asserting an unsafe completion.
-          return {
-            status: 'pending',
-            version: claim.runtime_sync_version,
-            reason: 'runtime_error',
-          };
-        }
-        if (currentVersion > claim.runtime_sync_version) {
-          // Keep the same session lock while rendering the newest committed
-          // winner. No older claimant can resume after the authoritative
-          // revision and clobber its filesystem/config side effects.
-          if (revisionRound + 1 < MAX_IMMEDIATE_REVISIONS) continue;
-          return {
-            status: 'pending',
-            version: currentVersion,
-            reason: 'runtime_error',
-          };
-        }
-        deps.logger?.info(
-          { accountId: claim.account_id, version: claim.runtime_sync_version },
-          'agent runtime configuration synchronized',
-        );
-        return { status: 'synced', version: claim.runtime_sync_version };
-      } catch (error) {
-        await failRuntimeSync(claim);
-        if (deps.logger) {
-          logSafeRequestWarning(
-            deps.logger,
-            error,
-            { accountId: claim.account_id, version: claim.runtime_sync_version },
-            'agent runtime synchronization deferred for retry',
-          );
-        }
-        return {
-          status: 'pending',
-          version: claim.runtime_sync_version,
-          reason: 'runtime_error',
-        };
-      } finally {
-        clearInterval(heartbeat);
+        return { status: 'idle' };
+      });
+    } catch (error) {
+      if (error instanceof AgentRuntimePublicationRefusedError) {
+        return { status: 'ineligible' };
       }
+      throw error;
     }
-    return { status: 'idle' };
   });
 }
 

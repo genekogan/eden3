@@ -46,6 +46,7 @@ import {
 import { PostgresUploadMultipartCleanupStore } from '../../src/services/upload-multipart-cleanup-postgres';
 import { UploadMultipartCleanupWorker } from '../../src/services/upload-multipart-cleanup';
 import { HistorySync } from '../../src/services/history-sync';
+import { reconcileAgentRuntime } from '../../src/services/agent-runtime-sync';
 import { legacyMediaIsPubliclyReachable } from '../../src/services/legacy-media-visibility';
 import {
   admitStudioGeneration,
@@ -63,6 +64,7 @@ import {
   ChannelTurnMeteringService,
   PostgresChannelTurnStore,
 } from '../../src/services/channel-metering';
+import { makeFakeProvisioner, makeFakeToolSync } from '../fixtures';
 
 const databaseName = new URL(process.env.DATABASE_URL ?? 'postgres://invalid/invalid')
   .pathname.slice(1);
@@ -309,6 +311,98 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       select has_table_privilege(session_user,'account_erasure_jobs','select') permitted`
     ).resolves.toEqual([{ permitted: true }]);
   });
+
+  it('serializes runtime projection with owner erasure admission in both lock orders', async () => {
+    const dataDir = join(tmpdir(), 'eden3-runtime-erasure-fence');
+    const writerOwner = randomUUID();
+    const writerAgent = randomUUID();
+    const deniedOwner = randomUUID();
+    const deniedAgent = randomUUID();
+    const writerUsername = `runtime_writer_${writerOwner.slice(0, 8)}`;
+    const writerOpenclawId = `runtime-agent-${writerAgent.slice(0, 8)}`;
+    const deniedUsername = `runtime_denied_${deniedOwner.slice(0, 8)}`;
+    const deniedOpenclawId = `runtime-denied-${deniedAgent.slice(0, 8)}`;
+    const provisioner = makeFakeProvisioner();
+    const toolSync = makeFakeToolSync();
+    const originalPersonaUpdate = provisioner.updateAgentPersona.bind(provisioner);
+    let releaseWriter!: () => void;
+    let writerEntered!: () => void;
+    const release = new Promise<void>((resolve) => { releaseWriter = resolve; });
+    const entered = new Promise<void>((resolve) => { writerEntered = resolve; });
+    const outstanding = new Set<Promise<unknown>>();
+    provisioner.updateAgentPersona = async (params) => {
+      writerEntered();
+      await release;
+      return await originalPersonaUpdate(params);
+    };
+    try {
+      await pg`
+        insert into accounts(id,type,username) values
+          (${writerOwner},'user',${writerUsername}),
+          (${writerAgent},'agent',${`runtime_writer_agent_${writerAgent.slice(0, 8)}`}),
+          (${deniedOwner},'user',${deniedUsername}),
+          (${deniedAgent},'agent',${`runtime_denied_agent_${deniedAgent.slice(0, 8)}`})`;
+      await pg`
+        insert into agents
+          (account_id,owner_id,name,persona,openclaw_id,workspace_path,provision_status,
+           runtime_sync_version,runtime_synced_version)
+        values
+          (${writerAgent},${writerOwner},'runtime writer','writer persona',${writerOpenclawId},
+           ${join(dataDir, `workspace-${writerOpenclawId}`)},'ready',1,0),
+          (${deniedAgent},${deniedOwner},'runtime denied','denied persona',${deniedOpenclawId},
+           ${join(dataDir, `workspace-${deniedOpenclawId}`)},'ready',1,0)`;
+
+      const writer = reconcileAgentRuntime(writerAgent, { provisioner, toolSync, dataDir });
+      outstanding.add(writer);
+      await entered;
+      let intentSettled = false;
+      const store = erasureStore();
+      const intent = store.acceptIntent({
+        accountId: writerOwner,
+        confirmUsername: writerUsername,
+      }).finally(() => { intentSettled = true; });
+      outstanding.add(intent);
+      await waitForOperatorOwnerLockWait(writerOwner, () => intentSettled);
+      expect(intentSettled).toBe(false);
+
+      releaseWriter();
+      await expect(writer).resolves.toEqual({ status: 'synced', version: 1 });
+      const accepted = await intent;
+      const manifestSink = recoverySink();
+      await expect(requestAccountErasure({
+        actorAccountId: writerOwner,
+        actorUsername: writerUsername,
+        actorIsAdmin: false,
+        confirmUsername: writerUsername,
+      }, store, ledger(), manifestSink)).resolves.toEqual({
+        jobId: accepted.jobId,
+        status: 'pending',
+      });
+      const manifest = vi.mocked(manifestSink.encryptWriteAndConfirm).mock.calls[0]![0];
+      expect(manifest.locators).toContainEqual(expect.objectContaining({
+        kind: 'agent_runtime',
+        resourceId: writerAgent,
+      }));
+
+      await expect(erasureStore().acceptIntent({
+        accountId: deniedOwner,
+        confirmUsername: deniedUsername,
+      })).resolves.toMatchObject({ state: 'intent_pending' });
+      const callsBeforeDenied = {
+        persona: provisioner.personaUpdates.length,
+        provision: provisioner.provisions.length,
+        tools: toolSync.calls.length,
+      };
+      await expect(reconcileAgentRuntime(deniedAgent, { provisioner, toolSync, dataDir }))
+        .resolves.toEqual({ status: 'ineligible' });
+      expect(provisioner.personaUpdates).toHaveLength(callsBeforeDenied.persona);
+      expect(provisioner.provisions).toHaveLength(callsBeforeDenied.provision);
+      expect(toolSync.calls).toHaveLength(callsBeforeDenied.tools);
+    } finally {
+      releaseWriter();
+      await Promise.allSettled([...outstanding]);
+    }
+  }, 30_000);
 
   it('serializes concept media publication with owner erasure admission in both lock orders', async () => {
     const mediaRoot = await mkdtemp(join(tmpdir(), 'eden3-concept-erasure-race-'));

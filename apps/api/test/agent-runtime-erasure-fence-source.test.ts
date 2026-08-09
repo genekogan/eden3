@@ -92,6 +92,16 @@ function runtimeFenceErrors(input: string): string[] {
   return errors;
 }
 
+function runtimeFenceSqlErrors(input: string): string[] {
+  const required = [
+    'join accounts owner_account on owner_account.id=coalesce(ag.owner_id,ag.account_id)',
+    'for key share of owner_account',
+    "where account_id=${current.owner_account_id} and state<>'succeeded'",
+    'and coalesce(g.owner_id,g.account_id) = ${ownerAccountId}',
+  ];
+  return required.filter((snippet) => !input.includes(snippet));
+}
+
 function moveCallBeforeFence(input: string, callName: string): string {
   const file = ts.createSourceFile('agent-runtime-sync.ts', input, ts.ScriptTarget.Latest, true);
   const reconcile = file.statements.find((node): node is ts.FunctionDeclaration =>
@@ -103,8 +113,10 @@ function moveCallBeforeFence(input: string, callName: string): string {
   const call = descendants(callback, (node): node is ts.CallExpression =>
     ts.isCallExpression(node) && calledName(node) === callName)[0]!;
   let statement: ts.Node = call;
-  while (statement.parent && !ts.isExpressionStatement(statement)) statement = statement.parent;
-  if (!ts.isExpressionStatement(statement) || !reconcile.body) throw new Error('missing call statement');
+  while (statement.parent && !ts.isBlock(statement.parent)) statement = statement.parent;
+  if (!statement.parent || !ts.isBlock(statement.parent) || !reconcile.body) {
+    throw new Error('missing call statement');
+  }
   const statementText = statement.getText(file);
   const bodyStart = reconcile.body.getStart(file) + 1;
   return `${input.slice(0, bodyStart)}\n  ${statementText}\n${input.slice(bodyStart, statement.getFullStart())}${input.slice(statement.getEnd())}`;
@@ -165,8 +177,20 @@ describe('agent runtime publication erasure fence', () => {
     expect(source).toContain('coalesce(ag.owner_id,ag.account_id)');
     expect(source).toContain('from account_erasure_jobs');
     expect(runtimeFenceErrors(source)).toEqual([]);
+    expect(runtimeFenceSqlErrors(source)).toEqual([]);
     for (const name of ['updateAgentPersona', 'projectApprovedAgentSkills', 'finishRuntimeSync']) {
       expect(runtimeFenceErrors(moveCallBeforeFence(source, name))).not.toEqual([]);
+    }
+    for (const mutant of [
+      source.replace('for key share of owner_account', ''),
+      source.replace(
+        'join accounts owner_account on owner_account.id=coalesce(ag.owner_id,ag.account_id)',
+        'join accounts owner_account on owner_account.id=ag.account_id',
+      ),
+      source.replace("where account_id=${current.owner_account_id} and state<>'succeeded'", 'where false'),
+      source.replace('and coalesce(g.owner_id,g.account_id) = ${ownerAccountId}', ''),
+    ]) {
+      expect(runtimeFenceSqlErrors(mutant)).not.toEqual([]);
     }
   });
 });
