@@ -858,6 +858,131 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
     expect(reservations[WORK_TURN_OUTPUT]).toBeDefined();
   }, 30_000);
 
+  it('holds unresolved Stripe and outbound effects before inventory in direct and recovery paths', async () => {
+    const activeAccount = randomUUID();
+    const activeUsername = `erase_effect_active_${activeAccount.slice(0, 8)}`;
+    const activeConnection = randomUUID();
+    const activeStripePreparing = randomUUID();
+    const activeStripeStarted = randomUUID();
+    const activePostPreparing = randomUUID();
+    const activePostStarted = randomUUID();
+    await pg`insert into accounts(id,type,username) values (${activeAccount},'user',${activeUsername})`;
+    await pg`
+      insert into channel_connections
+        (id,account_id,channel,token_ciphertext,token_iv,token_auth_tag,token_sha256)
+      values (${activeConnection},${activeAccount},'x','cipher','iv','tag',${sha('active-effect-token')})`;
+    await pg`
+      insert into stripe_checkout_intents(id,account_id,kind,request_key_sha256) values
+        (${activeStripePreparing},${activeAccount},'manna_topup',${sha('active-stripe-preparing')}),
+        (${activeStripeStarted},${activeAccount},'manna_topup',${sha('active-stripe-started')})`;
+    await pg`update stripe_checkout_intents set state='provider_started'
+      where id=${activeStripeStarted}`;
+    await pg`
+      insert into channel_outbound_post_intents(id,account_id,connection_id) values
+        (${activePostPreparing},${activeAccount},${activeConnection}),
+        (${activePostStarted},${activeAccount},${activeConnection})`;
+    await pg`update channel_outbound_post_intents set state='provider_started'
+      where id=${activePostStarted}`;
+
+    const activeStore = erasureStore();
+    const directManifest = recoverySink();
+    await expect(requestAccountErasure({
+      actorAccountId: activeAccount,
+      actorUsername: activeUsername,
+      actorIsAdmin: false,
+      confirmUsername: activeUsername,
+    }, activeStore, ledger(), directManifest)).resolves.toEqual({
+      jobId: expect.any(String), status: 'pending',
+    });
+    expect(directManifest.encryptWriteAndConfirm).not.toHaveBeenCalled();
+    const [directState] = await pg<{
+      deleted: boolean; state: string; inventoried_at: Date | null; active_effects: number;
+    }[]>`
+      select a.deleted,j.state,j.inventoried_at,
+        ((select count(*) from stripe_checkout_intents where account_id=${activeAccount}
+            and state in ('preparing','provider_started'))+
+         (select count(*) from channel_outbound_post_intents where account_id=${activeAccount}
+            and state in ('preparing','provider_started')))::int active_effects
+      from accounts a join account_erasure_jobs j on j.account_id=a.id where a.id=${activeAccount}`;
+    expect(directState).toEqual({
+      deleted: false, state: 'intent_pending', inventoried_at: null, active_effects: 4,
+    });
+
+    const recoveryManifest = recoverySink();
+    const recovery = new AccountErasureRecoveryWorker(
+      activeStore, ledger(), recoveryManifest, 1, 1_000,
+    );
+    await expect(recovery.tick()).resolves.toMatchObject({
+      claimed: 1, sealed: 0, retried: 1,
+    });
+    expect(recoveryManifest.encryptWriteAndConfirm).not.toHaveBeenCalled();
+    const [recoveryState] = await pg<{
+      deleted: boolean; state: string; inventoried_at: Date | null; attempt_count: number;
+    }[]>`
+      select a.deleted,j.state,j.inventoried_at,j.attempt_count::int attempt_count
+      from accounts a join account_erasure_jobs j on j.account_id=a.id where a.id=${activeAccount}`;
+    expect(recoveryState).toEqual({
+      deleted: false, state: 'intent_pending', inventoried_at: null, attempt_count: 1,
+    });
+
+    const terminalAccount = randomUUID();
+    const terminalUsername = `erase_effect_terminal_${terminalAccount.slice(0, 8)}`;
+    const terminalConnection = randomUUID();
+    const terminalStripeCreated = randomUUID();
+    const terminalStripeFailed = randomUUID();
+    const terminalPostSucceeded = randomUUID();
+    const terminalPostFailed = randomUUID();
+    await pg`insert into accounts(id,type,username) values (${terminalAccount},'user',${terminalUsername})`;
+    await pg`
+      insert into channel_connections
+        (id,account_id,channel,token_ciphertext,token_iv,token_auth_tag,token_sha256)
+      values (${terminalConnection},${terminalAccount},'x','cipher','iv','tag',${sha('terminal-effect-token')})`;
+    await pg`
+      insert into stripe_checkout_intents(id,account_id,kind,request_key_sha256) values
+        (${terminalStripeCreated},${terminalAccount},'manna_topup',${sha('terminal-stripe-created')}),
+        (${terminalStripeFailed},${terminalAccount},'manna_topup',${sha('terminal-stripe-failed')})`;
+    await pg`update stripe_checkout_intents set state='provider_started'
+      where id=${terminalStripeCreated}`;
+    await pg`update stripe_checkout_intents set state='created',stripe_session_id='cs_terminal_created'
+      where id=${terminalStripeCreated}`;
+    await pg`update stripe_checkout_intents set state='failed',last_error_code='provider_failed'
+      where id=${terminalStripeFailed}`;
+    await pg`
+      insert into channel_outbound_post_intents(id,account_id,connection_id) values
+        (${terminalPostSucceeded},${terminalAccount},${terminalConnection}),
+        (${terminalPostFailed},${terminalAccount},${terminalConnection})`;
+    await pg`update channel_outbound_post_intents set state='provider_started'
+      where id=${terminalPostSucceeded}`;
+    await pg`update channel_outbound_post_intents set state='succeeded',provider_post_id='post_terminal'
+      where id=${terminalPostSucceeded}`;
+    await pg`update channel_outbound_post_intents set state='failed',last_error_code='provider_failed'
+      where id=${terminalPostFailed}`;
+
+    const terminalManifest = recoverySink();
+    await expect(requestAccountErasure({
+      actorAccountId: terminalAccount,
+      actorUsername: terminalUsername,
+      actorIsAdmin: false,
+      confirmUsername: terminalUsername,
+    }, erasureStore(), ledger(), terminalManifest)).resolves.toMatchObject({ status: 'pending' });
+    expect(terminalManifest.encryptWriteAndConfirm).toHaveBeenCalledTimes(1);
+    const [terminalState] = await pg<{
+      deleted: boolean; inventoried: boolean; stripe_states: string[]; post_states: string[];
+    }[]>`
+      select a.deleted,(j.inventoried_at is not null) inventoried,
+        (select array_agg(state order by state) from stripe_checkout_intents
+          where account_id=${terminalAccount}) stripe_states,
+        (select array_agg(state order by state) from channel_outbound_post_intents
+          where account_id=${terminalAccount}) post_states
+      from accounts a join account_erasure_jobs j on j.account_id=a.id where a.id=${terminalAccount}`;
+    expect(terminalState).toEqual({
+      deleted: true,
+      inventoried: true,
+      stripe_states: ['created', 'failed'],
+      post_states: ['failed', 'succeeded'],
+    });
+  }, 30_000);
+
   it('records real provider terminal-no-output after Tx1 freezes reversal, then recovery refunds once', async () => {
     const accountId = randomUUID();
     const agentId = randomUUID();
@@ -1233,15 +1358,20 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
 
   it('fails closed on malformed foreign collection contributor provenance', async () => {
     const accountId = randomUUID();
-    const collectionId = randomUUID();
+    const objectCollectionId = randomUUID();
+    const nullCollectionId = randomUUID();
+    const numberCollectionId = randomUUID();
     const username = `erase_bad_contributors_${accountId.slice(0, 8)}`;
     await pg`
       insert into accounts (id,type,username,external_id)
       values (${accountId},'user',${username},${`legacy-${accountId}`})`;
     await pg`
       insert into collections (id,user_id,name,contributors)
-      values (${collectionId},${FOREIGN},'foreign malformed provenance',
-        ${JSON.stringify({ contributor: `legacy-${accountId}` })}::jsonb)`;
+      values
+        (${objectCollectionId},${FOREIGN},'foreign malformed object provenance',
+          ${JSON.stringify({ contributor: `legacy-${accountId}` })}::jsonb),
+        (${nullCollectionId},${FOREIGN},'foreign malformed null provenance','[null]'::jsonb),
+        (${numberCollectionId},${FOREIGN},'foreign malformed number provenance','[42]'::jsonb)`;
 
     await expect(requestAccountErasure({
       actorAccountId: accountId,
@@ -1251,14 +1381,22 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
     }, erasureStore(), ledger(), recoverySink())).rejects.toThrow(
       'account_erasure_collection_contributors_invalid',
     );
-    const [state] = await pg<{ deleted: boolean; contributors: unknown; inventoried_at: Date | null }[]>`
-      select a.deleted,c.contributors,j.inventoried_at
+    const [state] = await pg<{
+      deleted: boolean; object_contributors: unknown; null_contributors: unknown;
+      number_contributors: unknown; inventoried_at: Date | null;
+    }[]>`
+      select a.deleted,
+        (select contributors from collections where id=${objectCollectionId}) object_contributors,
+        (select contributors from collections where id=${nullCollectionId}) null_contributors,
+        (select contributors from collections where id=${numberCollectionId}) number_contributors,
+        j.inventoried_at
       from accounts a join account_erasure_jobs j on j.account_id=a.id
-      join collections c on c.id=${collectionId}
       where a.id=${accountId}`;
     expect(state).toEqual({
       deleted: false,
-      contributors: { contributor: `legacy-${accountId}` },
+      object_contributors: { contributor: `legacy-${accountId}` },
+      null_contributors: [null],
+      number_contributors: [42],
       inventoried_at: null,
     });
   }, 30_000);

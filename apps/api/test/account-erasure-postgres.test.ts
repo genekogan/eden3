@@ -80,6 +80,20 @@ async function boundary(client: PgClient) {
 }
 
 describe('PostgresAccountErasureStore transaction boundary', () => {
+  it('blocks unresolved Stripe and outbound-post effects before inventory', () => {
+    expect(source).toContain("from stripe_checkout_intents c join principals p on p.id=c.account_id");
+    expect(source).toContain("from channel_outbound_post_intents o join principals p on p.id=o.account_id");
+    expect(source.match(/where c\.state in \('preparing','provider_started'\)/g)).toHaveLength(1);
+    expect(source.match(/where o\.state in \('preparing','provider_started'\)/g)).toHaveLength(1);
+    expect(source).toContain("'erasure_work_in_flight'");
+  });
+
+  it('rejects malformed foreign contributor arrays before privacy mutation', () => {
+    expect(source).toContain("jsonb_typeof(c.contributors)<>'array' or exists");
+    expect(source).toContain("where jsonb_typeof(item.value)<>'string'");
+    expect(source).toContain('account_erasure_collection_contributors_invalid');
+  });
+
   it('attests both exact ordinary database handles and rejects identity or role drift', async () => {
     const { client: operatorClient } = fakeClient({ username: 'owner', type: 'user', deleted: false });
     const valid = {

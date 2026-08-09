@@ -252,27 +252,40 @@ export class PostgresAccountErasurePresealReconciler implements AccountErasurePr
     claimToken?: string;
     claimExpiresAt?: string;
   }): Promise<void> {
-    await this.client.begin(async (tx) => {
-      await tx`select account_erasure_begin_operation()`;
-      await tx`select set_config('eden3.erasure_job_id',${input.jobId},true)`;
-      await tx`select set_config('eden3.erasure_inventory_mode','seal_inventory',true)`;
-      if (input.mode === 'claimed') {
-        await tx`select set_config('eden3.erasure_job_claim_token',${input.claimToken!},true)`;
-        await tx`select set_config('eden3.erasure_job_claim_expires_at',${input.claimExpiresAt!},true)`;
+    try {
+      await this.client.begin(async (tx) => {
+        await tx`select account_erasure_begin_operation()`;
+        await tx`select set_config('eden3.erasure_job_id',${input.jobId},true)`;
+        await tx`select set_config('eden3.erasure_inventory_mode','seal_inventory',true)`;
+        if (input.mode === 'claimed') {
+          await tx`select set_config('eden3.erasure_job_claim_token',${input.claimToken!},true)`;
+          await tx`select set_config('eden3.erasure_job_claim_expires_at',${input.claimExpiresAt!},true)`;
+        }
+        await tx`select id from accounts where id=${input.accountId} for update`;
+        await tx`
+          select a.id from accounts a join agents ag on ag.account_id=a.id
+          where ag.owner_id=${input.accountId} order by a.id for update of a`;
+        await tx`select account_id from agents where owner_id=${input.accountId} order by account_id for update`;
+        const [job] = await tx<{ id: string }[]>`
+          select id from account_erasure_jobs where id=${input.jobId} and account_id=${input.accountId}
+            and (state='intent_pending' or (state='claimed' and claim_token=${input.claimToken ?? null}
+              and claim_expires_at=${input.claimExpiresAt ?? null}::timestamptz
+              and claim_expires_at>statement_timestamp())) for update`;
+        if (!job) return;
+        await tx`select account_erasure_reconcile_open_work(${input.jobId})`;
+      });
+    } catch (error) {
+      if (error instanceof Error &&
+          (error as Error & { code?: string }).code === '55000' &&
+          error.message === 'open money, provider, or multipart work blocks erasure completion') {
+        throw new ApiError(
+          409,
+          'erasure_work_in_flight',
+          'Account has work requiring provider-free reconciliation',
+        );
       }
-      await tx`select id from accounts where id=${input.accountId} for update`;
-      await tx`
-        select a.id from accounts a join agents ag on ag.account_id=a.id
-        where ag.owner_id=${input.accountId} order by a.id for update of a`;
-      await tx`select account_id from agents where owner_id=${input.accountId} order by account_id for update`;
-      const [job] = await tx<{ id: string }[]>`
-        select id from account_erasure_jobs where id=${input.jobId} and account_id=${input.accountId}
-          and (state='intent_pending' or (state='claimed' and claim_token=${input.claimToken ?? null}
-            and claim_expires_at=${input.claimExpiresAt ?? null}::timestamptz
-            and claim_expires_at>statement_timestamp())) for update`;
-      if (!job) return;
-      await tx`select account_erasure_reconcile_open_work(${input.jobId})`;
-    });
+      throw error;
+    }
   }
 }
 
@@ -554,6 +567,10 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           union all select r.id::text from memory_dream_runs r join principals p on p.id=r.agent_account_id
             where r.status in ('running','recovery_pending') or r.provider_status in ('started','indeterminate')
           union all select q.agent_account_id::text from agent_provision_jobs q join principals p on p.id=q.agent_account_id where q.state in ('pending','running')
+          union all select c.id::text from stripe_checkout_intents c join principals p on p.id=c.account_id
+            where c.state in ('preparing','provider_started')
+          union all select o.id::text from channel_outbound_post_intents o join principals p on p.id=o.account_id
+            where o.state in ('preparing','provider_started')
           union all select t.id::text from triggers t join principals p on p.id in (t.user_id,t.agent_id) where t.pending_occurrence_id is not null
         ) select count(*)::int as open_count from open_work`;
       if ((open?.open_count ?? 0) > 0) {
@@ -778,7 +795,10 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           select 1 from collections c
           where (c.user_id is null or c.user_id not in (select id from principals))
             and c.contributors is not null
-            and jsonb_typeof(c.contributors)<>'array'
+            and (jsonb_typeof(c.contributors)<>'array' or exists (
+              select 1 from jsonb_array_elements(c.contributors) item(value)
+              where jsonb_typeof(item.value)<>'string'
+            ))
             and exists (select 1 from deleting_external_ids)
         ) invalid`;
       if (invalidCollectionContributors?.invalid) {
