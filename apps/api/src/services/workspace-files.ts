@@ -198,104 +198,105 @@ export async function listWorkspaceTree(
   const maxScannedEntries = Math.max(maxEntries * 4, maxEntries + 1_024);
   let scannedEntries = 0;
 
-  const pendingDirectories = [''];
-  while (pendingDirectories.length > 0 && !truncated) {
-    const relPrefix = pendingDirectories.pop()!;
-    let directory: PinnedWorkspaceDirectory;
+  async function walk(
+    directory: PinnedWorkspaceDirectory,
+    relPrefix: string,
+    depth: number,
+  ): Promise<void> {
+    const candidates: Array<{ name: string; directoryHint: boolean }> = [];
+    const dir = await fs.opendir(directoryAccessPath(directory));
     try {
-      directory = await openPinnedDirectoryPath(root, relPrefix, false);
-    } catch (error) {
-      // A never-provisioned, concurrently moved, or wiped directory simply
-      // disappears from this point-in-time listing.
-      if (isNotFoundError(error) || isPathRaceOrTypeError(error)) continue;
-      throw error;
+      for await (const dirent of dir) {
+        scannedEntries += 1;
+        if (scannedEntries > maxScannedEntries) {
+          truncated = true;
+          break;
+        }
+        if (isHiddenName(dirent.name) || dirent.isSymbolicLink()) continue;
+        if (candidates.length >= Math.max(0, maxEntries - entries.length)) {
+          truncated = true;
+          break;
+        }
+        candidates.push({ name: dirent.name, directoryHint: dirent.isDirectory() });
+      }
+    } finally {
+      await dir.close().catch(() => {});
     }
 
-    const candidates: Array<{ name: string; directoryHint: boolean }> = [];
-    try {
-      const dir = await fs.opendir(directoryAccessPath(directory));
-      try {
-        for await (const dirent of dir) {
-          scannedEntries += 1;
-          if (scannedEntries > maxScannedEntries) {
-            truncated = true;
-            break;
-          }
-          if (isHiddenName(dirent.name) || dirent.isSymbolicLink()) continue;
-          if (candidates.length >= Math.max(0, maxEntries - entries.length)) {
-            truncated = true;
-            break;
-          }
-          candidates.push({ name: dirent.name, directoryHint: dirent.isDirectory() });
-        }
-      } finally {
-        await dir.close().catch(() => {});
+    candidates.sort((a, b) => {
+      if (a.directoryHint !== b.directoryHint) return a.directoryHint ? -1 : 1;
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+    });
+    const directoryEnumerationTruncated = truncated;
+
+    for (const candidate of candidates) {
+      if (entries.length >= maxEntries) {
+        truncated = true;
+        return;
       }
-
-      candidates.sort((a, b) => {
-        if (a.directoryHint !== b.directoryHint) return a.directoryHint ? -1 : 1;
-        return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
-      });
-
-      const childDirectories: string[] = [];
-      for (const candidate of candidates) {
-        if (entries.length >= maxEntries) {
-          truncated = true;
-          break;
-        }
-        const rel = relPrefix === '' ? candidate.name : `${relPrefix}/${candidate.name}`;
-        const depth = relPrefix === '' ? 1 : relPrefix.split('/').length + 1;
-        if (
-          depth > WORKSPACE_TREE_MAX_DEPTH
-          || Buffer.byteLength(rel, 'utf8') > WORKSPACE_TREE_MAX_PATH_BYTES
-        ) {
-          truncated = true;
-          break;
-        }
-        if (candidate.directoryHint) {
-          let child: PinnedWorkspaceDirectory | null = null;
-          try {
-            child = await openPinnedChildDirectory(directory, candidate.name, false);
-            entries.push({
-              path: rel,
-              kind: 'dir',
-              sizeBytes: 0,
-              mtime: child.stat.mtime.toISOString(),
-            });
-            childDirectories.push(rel);
-          } catch (error) {
-            if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
-          } finally {
-            await child?.handle.close().catch(() => {});
-          }
-          continue;
-        }
-
-        let file: PinnedWorkspaceFile | null = null;
+      const rel = relPrefix === '' ? candidate.name : `${relPrefix}/${candidate.name}`;
+      const childDepth = depth + 1;
+      if (
+        childDepth > WORKSPACE_TREE_MAX_DEPTH
+        || Buffer.byteLength(rel, 'utf8') > WORKSPACE_TREE_MAX_PATH_BYTES
+      ) {
+        truncated = true;
+        return;
+      }
+      if (candidate.directoryHint) {
+        let child: PinnedWorkspaceDirectory | null = null;
         try {
-          file = await openPinnedRegularAt(directory, candidate.name, rel, false);
-          const entry: WorkspaceTreeEntry = {
+          child = await openPinnedChildDirectory(directory, candidate.name, false);
+          entries.push({
             path: rel,
-            kind: 'file',
-            sizeBytes: file.stat.size,
-            mtime: file.stat.mtime.toISOString(),
-          };
-          if (withHashes && file.stat.size <= WORKSPACE_HASH_MAX_BYTES) {
-            entry.sha256 = sha256Hex(await readPinnedSnapshot(file.handle, file.stat.size));
-          }
-          entries.push(entry);
+            kind: 'dir',
+            sizeBytes: 0,
+            mtime: child.stat.mtime.toISOString(),
+          });
+          if (!directoryEnumerationTruncated) await walk(child, rel, childDepth);
+          if (truncated && !directoryEnumerationTruncated) return;
         } catch (error) {
           if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
         } finally {
-          await file?.handle.close().catch(() => {});
+          await child?.handle.close().catch(() => {});
         }
+        continue;
       }
-      // Stack in reverse so the visible traversal remains alphabetic while no
-      // ancestor descriptor is retained across a child walk.
-      pendingDirectories.push(...childDirectories.reverse());
-    } finally {
-      await directory.handle.close().catch(() => {});
+
+      let file: PinnedWorkspaceFile | null = null;
+      try {
+        file = await openPinnedRegularAt(directory, candidate.name, rel, false);
+        const entry: WorkspaceTreeEntry = {
+          path: rel,
+          kind: 'file',
+          sizeBytes: file.stat.size,
+          mtime: file.stat.mtime.toISOString(),
+        };
+        if (withHashes && file.stat.size <= WORKSPACE_HASH_MAX_BYTES) {
+          entry.sha256 = sha256Hex(await readPinnedSnapshot(file.handle, file.stat.size));
+        }
+        entries.push(entry);
+      } catch (error) {
+        if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
+      } finally {
+        await file?.handle.close().catch(() => {});
+      }
     }
+  }
+
+  let rootDirectory: PinnedWorkspaceDirectory;
+  try {
+    rootDirectory = await openPinnedWorkspaceRoot(root);
+  } catch (error) {
+    if (isNotFoundError(error) || isPathRaceOrTypeError(error)) {
+      return { entries: [], truncated: false };
+    }
+    throw error;
+  }
+  try {
+    await walk(rootDirectory, '', 0);
+  } finally {
+    await rootDirectory.handle.close().catch(() => {});
   }
   return { entries, truncated };
 }

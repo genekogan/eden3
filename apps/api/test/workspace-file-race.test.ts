@@ -314,11 +314,58 @@ describe('workspace file descriptor pinning', () => {
       expect(tree.truncated).toBe(true);
       expect(tree.entries.filter((entry) => entry.kind === 'dir').length)
         .toBeLessThanOrEqual(WORKSPACE_TREE_MAX_DEPTH + 1);
-      expect(peakDirectories).toBeLessThanOrEqual(2);
+      expect(peakDirectories).toBeLessThanOrEqual(WORKSPACE_TREE_MAX_DEPTH + 1);
       expect(activeDirectories).toBe(0);
-      // Reopening a bounded chain remains tightly finite instead of scaling to
-      // millions of opens at the public 2,000/10,000 entry caps.
-      expect(directoryOpenCount).toBeLessThan(2_300);
+      expect(directoryOpenCount).toBeLessThan(100);
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('opens each directory once across a deep trunk with broad fan-out', async () => {
+    const fixture = await freshFixture();
+    let cursor = fixture.root;
+    for (let depth = 0; depth < WORKSPACE_TREE_MAX_DEPTH - 1; depth += 1) {
+      cursor = path.join(cursor, `t${depth}`);
+      await fs.mkdir(cursor);
+    }
+    await Promise.all(Array.from({ length: 200 }, (_, index) =>
+      fs.mkdir(path.join(cursor, `leaf-${index}`))));
+
+    const originalOpen = fs.open.bind(fs);
+    let directoryOpenCount = 0;
+    let activeDirectories = 0;
+    let peakDirectories = 0;
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const flags = args[1];
+      if (typeof flags === 'number' && (flags & constants.O_DIRECTORY) !== 0) {
+        directoryOpenCount += 1;
+        activeDirectories += 1;
+        peakDirectories = Math.max(peakDirectories, activeDirectories);
+        const originalClose = handle.close.bind(handle);
+        let counted = true;
+        vi.spyOn(handle, 'close').mockImplementation(async () => {
+          try {
+            return await originalClose();
+          } finally {
+            if (counted) {
+              counted = false;
+              activeDirectories -= 1;
+            }
+          }
+        });
+      }
+      return handle;
+    });
+
+    try {
+      const tree = await listWorkspaceTree(fixture.root, { maxEntries: 300, withHashes: false });
+      expect(tree.truncated).toBe(false);
+      expect(tree.entries.filter((entry) => entry.kind === 'dir')).toHaveLength(264);
+      expect(directoryOpenCount).toBeLessThan(300);
+      expect(peakDirectories).toBeLessThanOrEqual(WORKSPACE_TREE_MAX_DEPTH + 1);
+      expect(activeDirectories).toBe(0);
     } finally {
       await fs.rm(fixture.parent, { recursive: true, force: true });
     }
