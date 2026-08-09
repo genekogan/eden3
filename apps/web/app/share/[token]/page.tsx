@@ -14,7 +14,7 @@ export const fetchCache = "force-no-store";
 export const revalidate = 0;
 
 const description = "An unlisted conversation shared from Eden.";
-const shareMetadata: Metadata = {
+export const metadata: Metadata = {
   title: "Shared conversation",
   description,
   referrer: "no-referrer",
@@ -40,20 +40,6 @@ function decodeToken(raw: string): string {
 function safeTitle(share: PublicSessionShareDto): string {
   const title = share.share.title ?? share.snapshot.sessionTitle ?? "Shared conversation";
   return title.length > 70 ? `${title.slice(0, 69)}…` : title;
-}
-
-/**
- * Resolve revocation before Next starts streaming static metadata. Otherwise a
- * later `notFound()` becomes a soft 200 even though the capability is gone.
- */
-export async function generateMetadata({ params }: Props): Promise<Metadata> {
-  const { token } = await params;
-  try {
-    await loadShare(decodeToken(token));
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 404) notFound();
-  }
-  return shareMetadata;
 }
 
 export default async function SharedSessionPage({ params }: Props) {
