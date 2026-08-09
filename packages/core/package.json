@@ -5,7 +5,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./database-url": "./src/database-url.ts"
+    "./database-url": "./src/database-url.ts",
+    "./env": "./src/env.ts"
   },
   "scripts": {
     "test": "vitest run",
