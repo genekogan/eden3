@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
 import {
@@ -1298,15 +1299,56 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         );
       }
 
-      const stored = await getStore().put(buffer, { mime });
-      const [updatedAccount] = await db
-        .update(accounts)
-        .set({ userImage: stored.url, updatedAt: new Date() })
-        .where(eq(accounts.id, account.id))
-        .returning();
+      const ownerAccountId = agent.ownerId ?? account.id;
+      const expectedSha256 = createHash('sha256').update(buffer).digest('hex');
+      const stored = await pg.begin(async (tx) => {
+        const owners = await tx<{ id: string }[]>`
+          select id from accounts
+          where id=${ownerAccountId} and deleted=false
+          for key share`;
+        if (owners.length !== 1) {
+          throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+        }
+        const activeErasure = await tx`
+          select 1 from account_erasure_jobs
+          where account_id=${ownerAccountId} and state <> 'succeeded'
+          limit 1`;
+        if (activeErasure.length > 0) {
+          throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+        }
+        const current = await tx`
+          select a.id
+          from accounts a join agents agent on agent.account_id=a.id
+          where a.id=${account.id} and a.deleted=false
+            and coalesce(agent.owner_id,agent.account_id)=${ownerAccountId}
+          for update of a, agent`;
+        if (current.length !== 1) {
+          throw new ApiError(404, 'agent_not_found', `No agent named "${username}"`);
+        }
+        await tx`select account_erasure_lock_legacy_content(
+          ${expectedSha256},${null},${null},${null},${null},
+          ${null},${null},${null},${null},${null})`;
+        const next = await getStore().put(buffer, { mime });
+        if (next.sha256 !== expectedSha256) {
+          throw new Error('avatar media store returned a mismatched content address');
+        }
+        await tx`
+          update agent_avatar_assets set state='retired',retired_at=statement_timestamp(),
+            updated_at=statement_timestamp()
+          where agent_account_id=${account.id} and state='current'`;
+        await tx`
+          insert into agent_avatar_assets
+            (owner_account_id,agent_account_id,url,local_path,sha256,mime,size_bytes)
+          values (${ownerAccountId},${account.id},${next.url},${next.localPath},
+            ${next.sha256},${next.mime},${next.sizeBytes})`;
+        await tx`
+          update accounts set user_image=${next.url},updated_at=statement_timestamp()
+          where id=${account.id}`;
+        return next;
+      });
 
       return {
-        agent: agentDtoFromEntities(updatedAccount ?? account, agent, {
+        agent: agentDtoFromEntities({ ...account, userImage: stored.url }, agent, {
           includePersona: true,
           agentRuntime: await runtimeForModel(agent.model),
         }),
@@ -1329,14 +1371,42 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       return sendError(reply, 403, 'forbidden', 'Only the owner can change this agent avatar');
     }
 
-    const [updatedAccount] = await db
-      .update(accounts)
-      .set({ userImage: null, updatedAt: new Date() })
-      .where(eq(accounts.id, account.id))
-      .returning();
+    const ownerAccountId = agent.ownerId ?? account.id;
+    await pg.begin(async (tx) => {
+      const owners = await tx<{ id: string }[]>`
+        select id from accounts
+        where id=${ownerAccountId} and deleted=false
+        for key share`;
+      if (owners.length !== 1) {
+        throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+      }
+      const activeErasure = await tx`
+        select 1 from account_erasure_jobs
+        where account_id=${ownerAccountId} and state <> 'succeeded'
+        limit 1`;
+      if (activeErasure.length > 0) {
+        throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+      }
+      const current = await tx`
+        select a.id
+        from accounts a join agents agent on agent.account_id=a.id
+        where a.id=${account.id} and a.deleted=false
+          and coalesce(agent.owner_id,agent.account_id)=${ownerAccountId}
+        for update of a, agent`;
+      if (current.length !== 1) {
+        throw new ApiError(404, 'agent_not_found', `No agent named "${username}"`);
+      }
+      await tx`
+        update agent_avatar_assets set state='retired',retired_at=statement_timestamp(),
+          updated_at=statement_timestamp()
+        where agent_account_id=${account.id} and state='current'`;
+      await tx`
+        update accounts set user_image=null,updated_at=statement_timestamp()
+        where id=${account.id}`;
+    });
 
     return {
-      agent: agentDtoFromEntities(updatedAccount ?? account, agent, {
+      agent: agentDtoFromEntities({ ...account, userImage: null }, agent, {
         includePersona: true,
         agentRuntime: await runtimeForModel(agent.model),
       }),

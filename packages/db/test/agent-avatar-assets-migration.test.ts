@@ -34,9 +34,16 @@ describe('agent avatar asset custody migration', () => {
     );
     expect(sql).toContain("'legacy_avatar_asset'");
     expect(sql).toContain('agent_avatar_assets_one_current_uq');
+    expect(sql).toContain('INSERT INTO public.agent_avatar_assets');
+    expect(sql).toContain("a.user_image ~ '^/media/[0-9a-f]{64}[.](png|jpe?g|webp)$'");
     expect(sql).toContain('account_erasure_avatar_asset_guard');
     expect(sql).toContain('account_erasure_avatar_source_guard');
+    expect(sql).toContain('account_erasure_avatar_target_success_guard');
     expect(sql).toContain('account_erasure_legacy_content_ingest_fence');
+    expect(sql).toContain("LEFT JOIN public.agent_avatar_assets av ON t.kind='legacy_avatar_asset'");
+    expect(sql).toContain("account_erasure_target_claim_matches(\n\t\tOLD.owner_account_id,'legacy_avatar_asset',OLD.id)");
+    expect(sql).toContain("eden3.erasure_external_absence_id");
     expect(sql).toContain('account_erasure_target_owned');
+    expect(sql).toContain('GRANT SELECT ON public.agent_avatar_assets TO eden3_erasure_guard');
   });
 });

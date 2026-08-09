@@ -302,6 +302,13 @@
       "when": 1786260975144,
       "tag": "0042_channel_secret_capability_epoch",
       "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1786300944804,
+      "tag": "0043_agent_avatar_asset_custody",
+      "breakpoints": true
     }
   ]
 }

@@ -108,6 +108,7 @@ describe('0040 account erasure lifecycle schema', () => {
       'storage_object',
       'legacy_media_asset',
       'legacy_concept_asset',
+      'legacy_avatar_asset',
       'agent_runtime',
       'channel_runtime',
       'clerk_identity',

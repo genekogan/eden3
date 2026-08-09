@@ -106,6 +106,50 @@ export const agents = pgTable('agents', {
 ]);
 
 // ---------------------------------------------------------------------------
+// agent_avatar_assets — immutable local-media custody for every avatar
+// generation. Retired rows remain durable until reference-safe cleanup or
+// owner erasure confirms physical absence.
+// ---------------------------------------------------------------------------
+export const agentAvatarAssets = pgTable(
+  'agent_avatar_assets',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    ownerAccountId: uuid('owner_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'restrict' }),
+    agentAccountId: uuid('agent_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'restrict' }),
+    url: text('url').notNull(),
+    localPath: text('local_path'),
+    sha256: text('sha256').notNull(),
+    mime: text('mime').notNull(),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }),
+    state: text('state', { enum: ['current', 'retired'] }).notNull().default('current'),
+    retiredAt: timestamptz('retired_at'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('agent_avatar_assets_one_current_uq')
+      .on(t.agentAccountId)
+      .where(sql`${t.state} = 'current'`),
+    index('agent_avatar_assets_owner_state_idx').on(t.ownerAccountId, t.state, t.createdAt),
+    index('agent_avatar_assets_content_idx').on(t.sha256, t.url),
+    check('agent_avatar_assets_sha_check', sql`${t.sha256} ~ '^[0-9a-f]{64}$'`),
+    check('agent_avatar_assets_url_check', sql`${t.url} ~ '^/media/[0-9a-f]{64}[.][a-z0-9]{1,10}$'`),
+    check('agent_avatar_assets_path_check', sql`${t.localPath} is null or length(${t.localPath}) between 1 and 4096`),
+    check('agent_avatar_assets_mime_check', sql`${t.mime} in ('image/png','image/jpeg','image/webp')`),
+    check('agent_avatar_assets_size_check', sql`${t.sizeBytes} is null or ${t.sizeBytes} between 1 and 8388608`),
+    check('agent_avatar_assets_state_check', sql`${t.state} in ('current','retired')`),
+    check(
+      'agent_avatar_assets_retired_shape_check',
+      sql`(${t.state}='current' and ${t.retiredAt} is null) or (${t.state}='retired' and ${t.retiredAt} is not null)`,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // sessions
 // ---------------------------------------------------------------------------
 export const sessions = pgTable(
@@ -1945,7 +1989,7 @@ export const accountErasureTargets = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     jobId: uuid('job_id').notNull().references(() => accountErasureJobs.id, { onDelete: 'restrict' }),
     kind: text('kind', {
-      enum: ['storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone'],
+      enum: ['storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'legacy_avatar_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone'],
     }).notNull(),
     resourceId: uuid('resource_id').notNull(),
     state: text('state', { enum: ['pending', 'claimed', 'attention', 'succeeded'] })
@@ -1963,7 +2007,7 @@ export const accountErasureTargets = pgTable(
     uniqueIndex('account_erasure_targets_job_kind_resource_uq').on(t.jobId, t.kind, t.resourceId),
     index('account_erasure_targets_due_idx').on(t.nextAttemptAt, t.id).where(sql`${t.state} = 'pending'`),
     index('account_erasure_targets_claim_expiry_idx').on(t.claimExpiresAt, t.id).where(sql`${t.state} = 'claimed'`),
-    check('account_erasure_targets_kind_check', sql`${t.kind} in ('storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone')`),
+    check('account_erasure_targets_kind_check', sql`${t.kind} in ('storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'legacy_avatar_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone')`),
     check('account_erasure_targets_state_check', sql`${t.state} in ('pending', 'claimed', 'attention', 'succeeded')`),
     check('account_erasure_targets_attempt_check', sql`${t.attemptCount} >= 0`),
     check('account_erasure_targets_error_check', sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z][a-z0-9_]{0,99}$'`),

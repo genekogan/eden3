@@ -243,6 +243,8 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
   await pg`delete from session_agents where agent_account_id = any(${ids}::uuid[])`;
   await pg`delete from session_users where user_account_id = any(${ids}::uuid[])`;
   await pg`delete from sessions where owner_id = any(${ids}::uuid[])`;
+  await pg`delete from agent_avatar_assets where owner_account_id = any(${ids}::uuid[])
+    or agent_account_id = any(${ids}::uuid[])`;
   // Detach agents owned by fixture accounts but created under other usernames
   // (e.g. the integration test's apitest-* agent) so the account delete works
   // even when a crashed run left them behind.

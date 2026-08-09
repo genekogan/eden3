@@ -129,6 +129,22 @@ describe('AccountErasureTargetWorker', () => {
     })).resolves.toEqual({ confirmedAbsent: true });
     await expect(readFile(urlOnly)).rejects.toMatchObject({ code: 'ENOENT' });
 
+    const avatarSha = 'e'.repeat(64);
+    const avatar = join(root, `${avatarSha}.webp`);
+    await writeFile(avatar, 'avatar private bytes');
+    await expect(executor.erase({
+      ...localClaim,
+      kind: 'legacy_avatar_asset',
+      signal: new AbortController().signal,
+      locator: JSON.stringify({
+        localPath: avatar,
+        url: `/media/${avatarSha}.webp`,
+        sha256: avatarSha,
+        deletePhysical: true,
+      }),
+    })).resolves.toEqual({ confirmedAbsent: true });
+    await expect(readFile(avatar)).rejects.toMatchObject({ code: 'ENOENT' });
+
     await expect(executor.erase({
       ...localClaim,
       signal: new AbortController().signal,

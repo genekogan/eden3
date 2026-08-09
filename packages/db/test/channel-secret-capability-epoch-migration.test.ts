@@ -36,7 +36,7 @@ describe('0042 channel SecretRef capability epoch', () => {
     const journal = JSON.parse(await readFile(JOURNAL, 'utf8')) as {
       entries: Array<{ idx: number; version: string; tag: string; breakpoints: boolean }>;
     };
-    expect(journal.entries.at(-1)).toEqual({
+    expect(journal.entries.find((entry) => entry.idx === 42)).toEqual({
       idx: 42,
       version: '7',
       when: expect.any(Number),

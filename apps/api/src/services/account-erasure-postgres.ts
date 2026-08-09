@@ -32,6 +32,7 @@ type ErasureKind =
   | 'storage_object'
   | 'legacy_media_asset'
   | 'legacy_concept_asset'
+  | 'legacy_avatar_asset'
   | 'agent_runtime'
   | 'channel_runtime'
   | 'clerk_identity'
@@ -629,6 +630,22 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           sha256: row.sha256,
         }),
       })));
+      const avatarAssets = await tx<{
+        id: string; local_path: string | null; url: string; sha256: string;
+      }[]>`
+        select av.id,av.local_path,av.url,av.sha256
+        from agent_avatar_assets av
+        where av.owner_account_id=${input.accountId}
+        order by av.id for update`;
+      targets.push(...avatarAssets.map((row) => ({
+        kind: 'legacy_avatar_asset' as const,
+        resourceId: row.id,
+        locator: locator('legacy_avatar_asset', {
+          localPath: row.local_path,
+          url: row.url,
+          sha256: row.sha256,
+        }),
+      })));
       const agents = await tx<{ account_id: string; openclaw_id: string | null; workspace_path: string | null }[]>`
         select account_id, openclaw_id, workspace_path from agents
         where owner_id=${input.accountId} order by account_id for update`;
@@ -1169,13 +1186,17 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
       concept_local_path: string | null;
       concept_url: string | null;
       concept_sha256: string | null;
+      avatar_local_path: string | null;
+      avatar_url: string | null;
+      avatar_sha256: string | null;
     }[]>`
       select t.kind,t.resource_id,a.clerk_user_id,c.channel,c.runtime_account_id,
         ag.openclaw_id,ag.workspace_path,
         so.backing_store,so.backing_key,
         coalesce(so.verified_sha256,so.declared_sha256) storage_sha256,
         ma.source_path,ma.local_path media_local_path,ma.url media_url,ma.sha256 media_sha256,
-        ci.local_path concept_local_path,ci.url concept_url,ci.sha256 concept_sha256
+        ci.local_path concept_local_path,ci.url concept_url,ci.sha256 concept_sha256,
+        av.local_path avatar_local_path,av.url avatar_url,av.sha256 avatar_sha256
       from account_erasure_targets t
       left join accounts a on t.kind='clerk_identity' and a.id=t.resource_id
       left join channel_connections c on t.kind='channel_runtime' and c.id=t.resource_id
@@ -1183,9 +1204,10 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
       left join storage_objects so on t.kind='storage_object' and so.id=t.resource_id
       left join media_assets ma on t.kind='legacy_media_asset' and ma.id=t.resource_id
       left join concept_images ci on t.kind='legacy_concept_asset' and ci.id=t.resource_id
+      left join agent_avatar_assets av on t.kind='legacy_avatar_asset' and av.id=t.resource_id
       where t.job_id=${job.id}
         and t.kind in ('clerk_identity','stripe_customer','channel_runtime','agent_runtime',
-          'storage_object','legacy_media_asset','legacy_concept_asset')
+          'storage_object','legacy_media_asset','legacy_concept_asset','legacy_avatar_asset')
       order by t.kind,t.resource_id`;
     const locators: AccountErasureRecoveryLocator[] = [];
     for (const row of rows) {
@@ -1232,6 +1254,12 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           localPath: row.concept_local_path,
           url: row.concept_url,
           sha256: row.concept_sha256,
+        });
+      } else if (row.kind === 'legacy_avatar_asset') {
+        rebuilt = locator(row.kind, {
+          localPath: row.avatar_local_path,
+          url: row.avatar_url,
+          sha256: row.avatar_sha256,
         });
       }
       if (rebuilt) locators.push({
@@ -1384,7 +1412,7 @@ function legacyDisposition(row: LegacySourceLocator, mediaRoot: string): LegacyD
 }
 
 interface LegacyMatchingSource extends LegacySourceLocator {
-  source_kind: 'legacy_media_asset' | 'legacy_concept_asset';
+  source_kind: 'legacy_media_asset' | 'legacy_concept_asset' | 'legacy_avatar_asset';
   source_id: string;
   active_target_ids: string[];
 }
@@ -1467,16 +1495,43 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
               where t.kind='legacy_concept_asset' and t.resource_id=i.id
                 and t.state<>'succeeded' and j.state<>'succeeded'),array[]::text[]) active_target_ids
           from concept_images i where ${matchValue} in (i.url,i.local_path)`;
+    const avatars = disposition.kind === 'local'
+      ? await tx<LegacyMatchingSource[]>`
+          select 'legacy_avatar_asset'::text source_kind,av.id source_id,
+            av.sha256,av.url,av.local_path,null::text source_path,
+            coalesce(array(select t.id::text from account_erasure_targets t
+              join account_erasure_jobs j on j.id=t.job_id
+              where t.kind='legacy_avatar_asset' and t.resource_id=av.id
+                and t.state<>'succeeded' and j.state<>'succeeded'),array[]::text[]) active_target_ids
+          from agent_avatar_assets av where av.url=${matchValue}
+            or (${localPath}::text is not null and av.local_path=${localPath})`
+      : await tx<LegacyMatchingSource[]>`
+          select 'legacy_avatar_asset'::text source_kind,av.id source_id,
+            av.sha256,av.url,av.local_path,null::text source_path,
+            coalesce(array(select t.id::text from account_erasure_targets t
+              join account_erasure_jobs j on j.id=t.job_id
+              where t.kind='legacy_avatar_asset' and t.resource_id=av.id
+                and t.state<>'succeeded' and j.state<>'succeeded'),array[]::text[]) active_target_ids
+          from agent_avatar_assets av where ${matchValue} in (av.url,av.local_path)`;
     const [creation] = await tx<{ shared: boolean }[]>`
       select exists(select 1 from creations c where ${matchValue} in (c.url,c.thumbnail_url)) shared`;
-    const classifiedSources = [...media, ...concepts].map((source) => ({
+    const [avatarShared] = await tx<{ shared: boolean }[]>`
+      select exists(
+        select 1 from accounts a
+        where a.user_image=${matchValue} and a.deleted=false
+          and not exists (
+            select 1 from agent_avatar_assets av
+            where av.agent_account_id=a.id and av.url=${matchValue}
+          )
+      ) shared`;
+    const classifiedSources = [...media, ...concepts, ...avatars].map((source) => ({
       source,
       disposition: legacyDisposition(source, this.legacyMediaRoot),
     }));
     const exactSources = classifiedSources.filter(({ disposition: sourceDisposition }) => {
       return sourceDisposition.kind !== 'ambiguous' && sourceDisposition.key === disposition.key;
     }).map(({ source }) => source);
-    const foreignShared = creation?.shared === true || classifiedSources.some(
+    const foreignShared = creation?.shared === true || avatarShared?.shared === true || classifiedSources.some(
       ({ source, disposition: sourceDisposition }) =>
         sourceDisposition.kind === 'ambiguous' || sourceDisposition.key !== disposition.key ||
         source.active_target_ids.length === 0,
@@ -1521,6 +1576,28 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
       }[]>`
         select i.local_path,i.url,i.sha256
         from concept_images i where i.id=${target.resource_id} for update`;
+      if (!row) return null;
+      const disposition = legacyDisposition({ ...row, source_path: null }, this.legacyMediaRoot);
+      if (disposition.kind === 'ambiguous') return null;
+      await tx`select account_erasure_lock_legacy_content(
+        ${row.sha256},${row.url},${null},${row.local_path},${null},
+        ${null},${null},${null},${null},${null})`;
+      const election = await this.legacyDispositionElection(tx, target, disposition);
+      return JSON.stringify({
+        localPath: row.local_path,
+        url: row.url,
+        sha256: row.sha256,
+        dispositionKey: disposition.key,
+        deletePhysical: election.elected && disposition.kind === 'local',
+        externalDisposition: election.elected && disposition.kind === 'external',
+      });
+    }
+    if (target.kind === 'legacy_avatar_asset') {
+      const [row] = await tx<{
+        local_path: string | null; url: string; sha256: string;
+      }[]>`
+        select av.local_path,av.url,av.sha256
+        from agent_avatar_assets av where av.id=${target.resource_id} for update`;
       if (!row) return null;
       const disposition = legacyDisposition({ ...row, source_path: null }, this.legacyMediaRoot);
       if (disposition.kind === 'ambiguous') return null;
@@ -1692,7 +1769,7 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
       if (!claimed) return null;
       let resolvedLocator = await this.resolveLocator(tx, target);
       if (!resolvedLocator && [
-        'storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'agent_runtime',
+        'storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'legacy_avatar_asset', 'agent_runtime',
         'channel_runtime', 'clerk_identity', 'stripe_customer',
       ].includes(target.kind)) {
         const [sealed] = await tx<{ recovery_manifest_sha256: string | null }[]>`
@@ -1770,6 +1847,9 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
       } else if (claim.kind === 'legacy_concept_asset') {
         await tx`select set_config('eden3.erasure_external_absence_id', ${claim.resourceId}, true)`;
         await tx`delete from concept_images where id=${claim.resourceId}`;
+      } else if (claim.kind === 'legacy_avatar_asset') {
+        await tx`select set_config('eden3.erasure_external_absence_id', ${claim.resourceId}, true)`;
+        await tx`delete from agent_avatar_assets where id=${claim.resourceId}`;
       } else if (claim.kind === 'agent_runtime') {
         await tx`update agents set openclaw_id=null,workspace_path=null where account_id=${claim.resourceId}`;
       } else if (claim.kind === 'channel_runtime') {
@@ -1855,7 +1935,8 @@ export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor 
   private readonly mediaRoot: string;
 
   async erase(input: Parameters<AccountErasureTargetExecutor['erase']>[0]): Promise<{ confirmedAbsent: true }> {
-    if (input.kind !== 'legacy_media_asset' && input.kind !== 'legacy_concept_asset') {
+    if (input.kind !== 'legacy_media_asset' && input.kind !== 'legacy_concept_asset' &&
+        input.kind !== 'legacy_avatar_asset') {
       return await this.external.erase(input);
     }
     let parsed: unknown;

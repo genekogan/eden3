@@ -25,6 +25,7 @@ import { ApiError } from '../../src/errors';
 import { EventsBus } from '../../src/events-bus';
 import { collectionsRoutes } from '../../src/routes/collections';
 import { conceptsRoutes } from '../../src/routes/concepts';
+import { agentsRoutes } from '../../src/routes/agents';
 import {
   AccountErasureRecoveryWorker,
   accountErasureLedgerSha256,
@@ -141,7 +142,7 @@ const PNG_1PX = Buffer.from(
   'base64',
 );
 
-class PausingConceptMediaStore implements MediaStore {
+class PausingMediaStore implements MediaStore {
   readonly published: Promise<MediaPutResult>;
   putCount = 0;
   private publishedResult: ((result: MediaPutResult) => void) | null = null;
@@ -169,6 +170,47 @@ class PausingConceptMediaStore implements MediaStore {
     this.releasePut?.();
     this.releasePut = null;
   }
+}
+
+async function waitForOperatorOwnerLockWait(
+  accountId: string,
+  intentSettled: () => boolean,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    if (intentSettled()) {
+      throw new Error('erasure intent settled before reaching the owner-account lock wait');
+    }
+    const [operatorActivity] = await pg<{
+      state: string;
+      wait_event_type: string | null;
+      query: string;
+      active_job: boolean;
+    }[]>`
+      select activity.state,activity.wait_event_type,activity.query,
+        exists (
+          select 1 from account_erasure_jobs
+          where account_id=${accountId} and state <> 'succeeded'
+        ) active_job
+      from pg_stat_activity activity
+      where activity.usename=${OPERATOR_LOGIN}
+        and activity.datname=${databaseName}
+      order by activity.backend_start desc
+      limit 1
+    `;
+    if (operatorActivity?.active_job) {
+      throw new Error('erasure intent committed before the paused media write');
+    }
+    if (
+      operatorActivity?.state === 'active' &&
+      operatorActivity.wait_event_type === 'Lock' &&
+      /from\s+accounts\s+where\s+id\s*=\s*\$\d+\s+for\s+update/i.test(
+        operatorActivity.query,
+      )
+    ) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error('erasure operator did not reach the exact owner-account lock wait');
 }
 
 function ledger(): AccountErasureLedgerSink {
@@ -209,9 +251,9 @@ beforeAll(async () => {
   await pg.unsafe(`grant eden3_erasure_terminal_writer to "${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant connect on database "${databaseName}" to "${OPERATOR_LOGIN}","${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant usage on schema public to "${ORDINARY_LOGIN}"`);
-  await pg.unsafe(`grant select on accounts,agents,sessions,session_users,session_agents,messages,account_erasure_jobs,account_erasure_targets,media_assets,concept_images,creations,concepts to "${ORDINARY_LOGIN}"`);
+  await pg.unsafe(`grant select on accounts,agents,sessions,session_users,session_agents,messages,account_erasure_jobs,account_erasure_targets,media_assets,concept_images,agent_avatar_assets,creations,concepts to "${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant update on accounts,agents to "${ORDINARY_LOGIN}"`);
-  await pg.unsafe(`grant insert,update,delete on media_assets,concept_images,creations to "${ORDINARY_LOGIN}"`);
+  await pg.unsafe(`grant insert,update,delete on media_assets,concept_images,agent_avatar_assets,creations to "${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant select,insert,update on manna_accounts,manna_transactions,turn_authorizations,turn_provider_runs,usage_events,messages,sessions,session_users,session_agents,channel_turns to "${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant select,update on channel_connections to "${ORDINARY_LOGIN}"`);
   await pg.unsafe(`grant select,update on stripe_checkout_intents,channel_outbound_post_intents to "${ORDINARY_LOGIN}"`);
@@ -278,7 +320,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       [uploadOwner, uploadUsername],
       [deniedOwner, deniedUsername],
     ]);
-    const pausingStore = new PausingConceptMediaStore(new LocalMediaStore({
+    const pausingStore = new PausingMediaStore(new LocalMediaStore({
       mediaDir: mediaRoot,
       baseUrl: '/media',
     }));
@@ -333,45 +375,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         intentSettled = true;
       });
       outstanding.add(intentRequest);
-      const lockWaitDeadline = Date.now() + 5_000;
-      let operatorOwnerLockWaitObserved = false;
-      while (Date.now() < lockWaitDeadline) {
-        if (intentSettled) {
-          throw new Error('erasure intent settled before reaching the owner-account lock wait');
-        }
-        const [operatorActivity] = await pg<{
-          state: string;
-          wait_event_type: string | null;
-          query: string;
-          active_job: boolean;
-        }[]>`
-          select activity.state,activity.wait_event_type,activity.query,
-            exists (
-              select 1 from account_erasure_jobs
-              where account_id=${uploadOwner} and state <> 'succeeded'
-            ) active_job
-          from pg_stat_activity activity
-          where activity.usename=${OPERATOR_LOGIN}
-            and activity.datname=${databaseName}
-          order by activity.backend_start desc
-          limit 1
-        `;
-        if (operatorActivity?.active_job) {
-          throw new Error('erasure intent committed before the paused media write');
-        }
-        if (
-          operatorActivity?.state === 'active' &&
-          operatorActivity.wait_event_type === 'Lock' &&
-          /from\s+accounts\s+where\s+id\s*=\s*\$\d+\s+for\s+update/i.test(
-            operatorActivity.query,
-          )
-        ) {
-          operatorOwnerLockWaitObserved = true;
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      expect(operatorOwnerLockWaitObserved).toBe(true);
+      await waitForOperatorOwnerLockWait(uploadOwner, () => intentSettled);
       expect(intentSettled).toBe(false);
 
       pausingStore.resume();
@@ -429,6 +433,187 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       await expect(readFile(join(mediaRoot, `${deniedSha}.png`))).rejects.toMatchObject({
         code: 'ENOENT',
       });
+    } finally {
+      pausingStore.resume();
+      await Promise.allSettled([...outstanding]);
+      await app.close();
+      await rm(mediaRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('keeps avatar publication, history, shared-byte election, and erasure cleanup exact', async () => {
+    const mediaRoot = await mkdtemp(join(tmpdir(), 'eden3-avatar-erasure-race-'));
+    const uploadOwner = randomUUID();
+    const uploadAgent = randomUUID();
+    const deniedOwner = randomUUID();
+    const deniedAgent = randomUUID();
+    const foreignOwner = randomUUID();
+    const foreignAgent = randomUUID();
+    const uploadUsername = `avatar_upload_${uploadOwner.slice(0, 8)}`;
+    const uploadAgentUsername = `avatar_agent_${uploadAgent.slice(0, 8)}`;
+    const deniedUsername = `avatar_denied_${deniedOwner.slice(0, 8)}`;
+    const deniedAgentUsername = `avatar_denied_agent_${deniedAgent.slice(0, 8)}`;
+    const foreignUsername = `avatar_foreign_${foreignOwner.slice(0, 8)}`;
+    const foreignAgentUsername = `avatar_foreign_agent_${foreignAgent.slice(0, 8)}`;
+    const authorized = new Map<string, string>([
+      [uploadOwner, uploadUsername],
+      [deniedOwner, deniedUsername],
+    ]);
+    const pausingStore = new PausingMediaStore(new LocalMediaStore({
+      mediaDir: mediaRoot,
+      baseUrl: '/media',
+    }));
+    const outstanding = new Set<Promise<unknown>>();
+    const app = Fastify();
+    app.decorateRequest('account', null);
+    app.decorate('requireAuth', requireAuth);
+    app.decorate('accessAllowlist', new Set<string>());
+    app.decorate('gatewayGlue', {
+      modelRuntime: {
+        getRuntime: async () => 'openclaw',
+        getCatalog: async () => [],
+      },
+    } as never);
+    app.addHook('onRequest', async (request) => {
+      const value = request.headers['x-test-account-id'];
+      const accountId = Array.isArray(value) ? value[0] : value;
+      const username = accountId ? authorized.get(accountId) : undefined;
+      request.account = accountId && username
+        ? { accountId, username, isAdmin: false }
+        : null;
+    });
+    await app.register(agentsRoutes, { prefix: '/agents', store: pausingStore });
+    try {
+      await pg`
+        insert into accounts (id,type,username) values
+          (${uploadOwner},'user',${uploadUsername}),
+          (${uploadAgent},'agent',${uploadAgentUsername}),
+          (${deniedOwner},'user',${deniedUsername}),
+          (${deniedAgent},'agent',${deniedAgentUsername}),
+          (${foreignOwner},'user',${foreignUsername}),
+          (${foreignAgent},'agent',${foreignAgentUsername})`;
+      await pg`
+        insert into agents (account_id,owner_id,name,public) values
+          (${uploadAgent},${uploadOwner},'upload first avatar agent',false),
+          (${deniedAgent},${deniedOwner},'erasure first avatar agent',false),
+          (${foreignAgent},${foreignOwner},'foreign shared avatar agent',false)`;
+
+      const uploadRequest = app.inject({
+        method: 'POST',
+        url: `/agents/${uploadAgentUsername}/avatar`,
+        headers: { 'x-test-account-id': uploadOwner },
+        payload: {
+          mime: 'image/png',
+          filename: 'upload-first-avatar.png',
+          dataBase64: PNG_1PX.toString('base64'),
+        },
+      });
+      outstanding.add(uploadRequest);
+      const stored = await pausingStore.published;
+      let intentSettled = false;
+      const intentStore = erasureStore();
+      const intentRequest = intentStore.acceptIntent({
+        accountId: uploadOwner,
+        confirmUsername: uploadUsername,
+      }).finally(() => {
+        intentSettled = true;
+      });
+      outstanding.add(intentRequest);
+      await waitForOperatorOwnerLockWait(uploadOwner, () => intentSettled);
+
+      pausingStore.resume();
+      expect((await uploadRequest).statusCode).toBe(200);
+      const accepted = await intentRequest;
+      const [avatar] = await pg<{
+        id: string; url: string; local_path: string; sha256: string; state: string;
+      }[]>`
+        select id,url,local_path,sha256,state from agent_avatar_assets
+        where agent_account_id=${uploadAgent} and state='current'`;
+      expect(avatar).toMatchObject({
+        url: stored.url,
+        local_path: stored.localPath,
+        sha256: stored.sha256,
+        state: 'current',
+      });
+      const [foreignAvatar] = await pg<{ id: string }[]>`
+        insert into agent_avatar_assets
+          (owner_account_id,agent_account_id,url,local_path,sha256,mime,size_bytes)
+        values (${foreignOwner},${foreignAgent},${stored.url},${stored.localPath},
+          ${stored.sha256},${stored.mime},${stored.sizeBytes}) returning id`;
+      await pg`update accounts set user_image=${stored.url} where id=${foreignAgent}`;
+
+      const manifestSink = recoverySink();
+      await expect(requestAccountErasure({
+        actorAccountId: uploadOwner,
+        actorUsername: uploadUsername,
+        actorIsAdmin: false,
+        confirmUsername: uploadUsername,
+      }, intentStore, ledger(), manifestSink)).resolves.toEqual({
+        jobId: accepted.jobId,
+        status: 'pending',
+      });
+      const manifest = vi.mocked(manifestSink.encryptWriteAndConfirm).mock.calls[0]![0];
+      const locator = manifest.locators.find((entry) =>
+        entry.kind === 'legacy_avatar_asset' && entry.resourceId === avatar!.id);
+      expect(JSON.parse(locator!.locator)).toEqual({
+        kind: 'legacy_avatar_asset',
+        localPath: stored.localPath,
+        url: stored.url,
+        sha256: stored.sha256,
+      });
+      const targetStore = erasureTargetStore(mediaRoot);
+      const claim = await targetStore.claimTarget();
+      if (!claim || 'status' in claim) throw new Error('expected avatar erasure target claim');
+      expect(claim).toMatchObject({ kind: 'legacy_avatar_asset', resourceId: avatar!.id });
+      const executor = new LocalLegacyErasureExecutor(targetStore.legacyMediaBoundary, {
+        erase: async () => { throw new Error('local avatar must not use external erasure'); },
+      });
+      await expect(executor.erase({ ...claim, signal: AbortSignal.timeout(5_000) }))
+        .resolves.toEqual({ confirmedAbsent: true });
+      await expect(targetStore.completeTarget(claim)).resolves.toBe('completed');
+      await expect(readFile(stored.localPath)).resolves.toBeInstanceOf(Buffer);
+      const [foreignPointer] = await pg<{ user_image: string | null }[]>`
+        select user_image from accounts where id=${foreignAgent}`;
+      expect(foreignPointer?.user_image).toBe(stored.url);
+
+      await expect(requestAccountErasure({
+        actorAccountId: foreignOwner,
+        actorUsername: foreignUsername,
+        actorIsAdmin: false,
+        confirmUsername: foreignUsername,
+      }, erasureStore(), ledger(), recoverySink())).resolves.toMatchObject({ status: 'pending' });
+      const foreignClaim = await targetStore.claimTarget();
+      if (!foreignClaim || 'status' in foreignClaim) {
+        throw new Error('expected last avatar owner erasure target claim');
+      }
+      expect(foreignClaim).toMatchObject({
+        kind: 'legacy_avatar_asset',
+        resourceId: foreignAvatar!.id,
+      });
+      await expect(executor.erase({ ...foreignClaim, signal: AbortSignal.timeout(5_000) }))
+        .resolves.toEqual({ confirmedAbsent: true });
+      await expect(targetStore.completeTarget(foreignClaim)).resolves.toBe('completed');
+      await expect(readFile(stored.localPath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+      await expect(intentStore.acceptIntent({
+        accountId: deniedOwner,
+        confirmUsername: deniedUsername,
+      })).resolves.toMatchObject({ accountId: deniedOwner, state: 'intent_pending' });
+      const putCountBeforeDenied = pausingStore.putCount;
+      const denied = await app.inject({
+        method: 'POST',
+        url: `/agents/${deniedAgentUsername}/avatar`,
+        headers: { 'x-test-account-id': deniedOwner },
+        payload: {
+          mime: 'image/png',
+          filename: 'erasure-first-avatar.png',
+          dataBase64: Buffer.concat([PNG_1PX, Buffer.from([0x51])]).toString('base64'),
+        },
+      });
+      expect(denied.statusCode).toBe(409);
+      expect(pausingStore.putCount).toBe(putCountBeforeDenied);
+      await expect(pg`select 1 from agent_avatar_assets where agent_account_id=${deniedAgent}`)
+        .resolves.toHaveLength(0);
     } finally {
       pausingStore.resume();
       await Promise.allSettled([...outstanding]);
