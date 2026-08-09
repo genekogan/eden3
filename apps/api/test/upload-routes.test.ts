@@ -123,4 +123,66 @@ describe('uploadsRoutes tenant boundary', () => {
     });
     expect(response.statusCode).toBe(404);
   });
+
+  it('rejects invalid local capabilities before invoking the octet-stream parser', async () => {
+    let now = new Date('2026-08-09T12:00:00.000Z');
+    let parserCalls = 0;
+    const app = Fastify();
+    apps.push(app);
+    app.addContentTypeParser(
+      'application/octet-stream',
+      { parseAs: 'buffer', bodyLimit: UploadService.MAX_OBJECT_BYTES },
+      (_request, body, done) => {
+        parserCalls += 1;
+        done(null, body);
+      },
+    );
+    app.decorateRequest('account', null);
+    app.decorate('requireAuth', async () => undefined);
+    const backend = new RouteBackend();
+    const service = new UploadService({
+      repository: new InMemoryUploadRepository(),
+      backend,
+      capabilityKey: Buffer.alloc(32, 9),
+      backingStore: 'local',
+      securityMode: 'test',
+      now: () => now,
+    });
+    await app.register(uploadsRoutes, { service });
+    const bytes = Buffer.from('bounded');
+    const reservation = await service.initiate(A, {
+      displayName: 'bounded.txt',
+      purpose: 'chat',
+      declaredSizeBytes: bytes.length,
+      declaredMime: 'text/plain',
+      declaredSha256: digest(bytes),
+      partSizeBytes: bytes.length,
+    });
+    const signed = await service.signPart(A, reservation.uploadId, 1, {
+      checksumSha256: digest(bytes),
+    });
+    const capability = signed.requiredHeaders['x-eden-upload-capability']!;
+    const put = (url: string, token?: string) => app.inject({
+      method: 'PUT',
+      url,
+      headers: {
+        'content-type': 'application/octet-stream',
+        ...(token ? { 'x-eden-upload-capability': token } : {}),
+      },
+      payload: bytes,
+    });
+
+    const responses = [
+      await put(`/uploads/${reservation.uploadId}/parts/1`),
+      await put(`/uploads/${reservation.uploadId}/parts/1`, 'malformed'),
+      await put('/uploads/00000000-0000-4000-8000-000000000001/parts/1', capability),
+      await put(`/uploads/${reservation.uploadId}/parts/2`, capability),
+    ];
+    now = new Date('2026-08-09T12:10:00.000Z');
+    responses.push(await put(`/uploads/${reservation.uploadId}/parts/1`, capability));
+
+    expect(responses.every((response) => response.statusCode >= 400)).toBe(true);
+    expect(parserCalls).toBe(0);
+    expect([...backend.parts.values()].every((parts) => parts.size === 0)).toBe(true);
+  });
 });
