@@ -3,8 +3,6 @@ import { fileURLToPath } from 'node:url';
 
 import { readMigrationFiles } from 'drizzle-orm/migrator';
 
-import { pg } from './client';
-
 const migrationsFolder = fileURLToPath(new URL('../migrations', import.meta.url));
 const journal = JSON.parse(
   readFileSync(new URL('../migrations/meta/_journal.json', import.meta.url), 'utf8'),
@@ -34,6 +32,10 @@ export interface SchemaReadiness {
 export type AppliedMigrationReader = () => Promise<readonly string[]>;
 
 async function readAppliedMigrationHashes(): Promise<readonly string[]> {
+  // Keep the deterministic catalog/readiness classifier importable without a
+  // database. Only the production default reader loads the environment-bound
+  // client; tests and offline tooling inject their own applied-hash reader.
+  const { pg } = await import('./client');
   const rows = await pg<{ hash: string }[]>`
     select hash from drizzle.__drizzle_migrations
   `;
