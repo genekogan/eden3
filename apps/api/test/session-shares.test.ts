@@ -278,5 +278,7 @@ describe('session share service', () => {
     expect(source).toContain('session_owner.deleted = false');
     expect(source).toContain('creator.id = sl.created_by');
     expect(source).toContain('creator.deleted = false');
+    expect(source).toContain('${tx.json(JSON.stringify(snapshot))}');
+    expect(source).not.toContain('${tx.json(snapshot)}');
   });
 });

@@ -100,7 +100,7 @@ export class ResumableUploader {
 
   constructor(options: ResumableUploaderOptions = {}) {
     this.apiBaseUrl = (options.apiBaseUrl ?? '').replace(/\/$/, '');
-    this.fetcher = options.fetch ?? fetch;
+    this.fetcher = options.fetch ?? fetch.bind(globalThis);
     this.getAuthToken = options.getAuthToken;
     this.refreshCredentials = options.refreshCredentials;
     this.maxPartAttempts = options.maxPartAttempts ?? 3;
@@ -244,7 +244,9 @@ export class ResumableUploader {
         ...init,
         credentials: 'include',
         headers: {
-          'content-type': 'application/json',
+          ...(init.body === undefined || init.body === null
+            ? {}
+            : { 'content-type': 'application/json' }),
           ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
           ...init.headers,
         },

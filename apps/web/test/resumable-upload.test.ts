@@ -12,6 +12,25 @@ function fixture(contents: string, name = 'fixture.txt') {
 }
 
 describe('ResumableUploader', () => {
+  it('binds the default browser fetch to the global window authority', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetcher = vi.fn(function (this: unknown) {
+      expect(this).toBe(globalThis);
+      return Promise.resolve(json({ error: { code: 'diagnostic_stop', message: 'stop' } }, 503));
+    });
+    globalThis.fetch = fetcher as typeof fetch;
+    try {
+      const uploader = new ResumableUploader({ apiBaseUrl: '/api' });
+      await expect(uploader.uploadFile(fixture('abc'), { purpose: 'chat' })).rejects.toMatchObject({
+        status: 503,
+        code: 'diagnostic_stop',
+      });
+      expect(fetcher).toHaveBeenCalledOnce();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('reports a durable session before status transfer and authenticates control calls', async () => {
     const sessions: Array<{ uploadId: string; objectId: string }> = [];
     const fetcher = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -69,6 +88,8 @@ describe('ResumableUploader', () => {
       }
       if (url === '/api/uploads/local-1/parts/1/complete') return json({ partNumber: 1 });
       if (url === '/api/uploads/local-1/complete') {
+        expect(headers.get('content-type')).toBeNull();
+        expect(init.body).toBeUndefined();
         return json({ object: { id: 'object-1', url: '/media/object-1' } });
       }
       throw new Error(`Unexpected ${method} ${url}`);

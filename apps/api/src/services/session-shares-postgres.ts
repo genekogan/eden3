@@ -201,7 +201,7 @@ export class PostgresSessionShareRepository implements SessionShareRepository {
             snapshot_boundary_message_id, snapshot_payload, created_at, updated_at
           ) values (
             ${access.session.id}, ${command.actorId}, ${command.tokenHash}, ${command.mode},
-            ${command.title}, ${snapshot.boundaryMessageId}, ${tx.json(snapshot)},
+            ${command.title}, ${snapshot.boundaryMessageId}, ${tx.json(JSON.stringify(snapshot))},
             ${command.createdAt}, ${command.createdAt}
           )
           returning id, session_id, mode, title, snapshot_payload,
