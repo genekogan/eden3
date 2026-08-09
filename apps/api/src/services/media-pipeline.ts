@@ -154,6 +154,20 @@ export interface MediaLogger {
 
 const silentLogger: MediaLogger = { info() {}, warn() {}, error() {} };
 
+/** Publish best-effort SSE events without logging throwable/provider detail. */
+export function publishMediaEventsSafely(
+  logger: MediaLogger,
+  sha256: string,
+  phase: 'ingest' | 'rehome',
+  publish: () => void,
+): void {
+  try {
+    publish();
+  } catch {
+    logger.error(`media-pipeline: ${phase} event publish failed for sha256 ${sha256}`);
+  }
+}
+
 export interface MediaPipelineOptions {
   /** Media store (default: LocalMediaStore over env MEDIA_DIR/MEDIA_BASE_URL). */
   store?: MediaStore;
@@ -346,21 +360,20 @@ export class MediaPipeline {
             attachTo.id,
             rehomed.creation?.id ?? existing.creationId,
           );
-          if (this.bus && rehomed.creation) {
-            try {
-              this.bus.publish(sessionId as string, {
+          const rehomeBus = this.bus;
+          const rehomeCreation = rehomed.creation;
+          const completionMessage = attachTo;
+          if (rehomeBus && rehomeCreation) {
+            publishMediaEventsSafely(this.log, put.sha256, 'rehome', () => {
+              rehomeBus.publish(sessionId as string, {
                 type: 'media.attached',
                 sessionId: sessionId as string,
-                messageId: attachTo.id,
+                messageId: completionMessage.id,
                 url: put.url,
                 mime: put.mime,
-                creationId: rehomed.creation.id,
+                creationId: rehomeCreation.id,
               });
-            } catch (err) {
-              this.log.error(
-                `media-pipeline: rehome event publish failed for ${put.sha256}: ${String(err)}`,
-              );
-            }
+            });
           }
           return {
             asset: existing,
@@ -611,9 +624,10 @@ export class MediaPipeline {
     const billedAccountId = mediaAuthorization?.accountId ?? null;
 
     // --- SSE fan-out ------------------------------------------------------
-    if (this.bus && sessionId && message && creation) {
-      try {
-        this.bus.publish(sessionId, {
+    const ingestBus = this.bus;
+    if (ingestBus && sessionId && message && creation) {
+      publishMediaEventsSafely(this.log, put.sha256, 'ingest', () => {
+        ingestBus.publish(sessionId, {
           type: 'media.attached',
           sessionId,
           messageId: message.id,
@@ -622,15 +636,13 @@ export class MediaPipeline {
           creationId: creation.id,
         });
         if (mediaAuthorization && billedAccountId) {
-          this.bus.publish(sessionId, {
+          ingestBus.publish(sessionId, {
             type: 'manna.updated',
             accountId: billedAccountId,
             balance: mediaAuthorization.balance,
           });
         }
-      } catch (err) {
-        this.log.error(`media-pipeline: event publish failed for ${put.sha256}: ${String(err)}`);
-      }
+      });
     }
 
     return {
