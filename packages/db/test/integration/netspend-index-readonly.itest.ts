@@ -32,8 +32,8 @@ describe('explicit protected-DB read-only index verification', () => {
   it('uses a read-only transaction and verifies the exact index and migration hash', async () => {
     const target = exactProtectedDatabaseUrl();
     const client = postgres(target.url, { max: 1, onnotice: () => {} });
-    await client.unsafe('begin transaction read only');
     try {
+      await client.unsafe('begin transaction read only');
       const [identity] = await client<{
         database: string;
         read_only: string;
