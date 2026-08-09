@@ -12,6 +12,7 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "test:api-full": "pnpm --filter @eden3/api test:full",
+    "test:db-scratch-full": "pnpm --filter @eden3/db test:scratch-full",
     "typecheck": "pnpm -r typecheck",
     "etl": "pnpm --filter @eden3/etl etl",
     "etl:verify": "pnpm --filter @eden3/etl etl:verify",

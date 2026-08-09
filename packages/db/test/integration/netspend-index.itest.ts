@@ -18,9 +18,9 @@ import {
  * T08-U01 integration proofs for the `idx_manna_tx_refunds_tx` migration
  * (RUNBOOK §12 "Missing ledger index" codification).
  *
- * All DDL-exercising cases run on scratch databases this file creates and
- * drops itself; every scratch connection is verified with current_database()
- * before use. The shared operator databases are verified READ-ONLY.
+ * Every case runs on a scratch database this file creates and drops itself;
+ * every scratch connection is verified with current_database() before use.
+ * Protected read-only verification has its own explicit config and file.
  */
 
 loadRootEnv();
@@ -52,10 +52,6 @@ function sourceDatabaseUrl(): string {
  */
 function urlForDb(dbName: string): string {
   return localDisposableDatabaseUrl(sourceDatabaseUrl(), dbName, scratchPattern);
-}
-
-function targetDbName(): string {
-  return localSourceDatabaseName(sourceDatabaseUrl());
 }
 
 /** Admin connection to the maintenance DB for CREATE/DROP DATABASE. */
@@ -311,24 +307,6 @@ describe('scratch-DB migration paths (DDL confined to self-created, verified dat
         /does not match the expected definition/,
       );
       expect(await journalHasMigration(client)).toBe(false);
-    } finally {
-      await client.end();
-    }
-  });
-});
-
-describe('shared-DB read-only verification (target = DATABASE_URL)', () => {
-  it('the migrated target database carries the valid index and the journaled migration', async () => {
-    const target = targetDbName();
-    const client = postgres(sourceDatabaseUrl(), { max: 1, onnotice: () => {} });
-    try {
-      const rows = await indexRow(client);
-      expect(rows, `index missing on ${target}`).toHaveLength(1);
-      expect(rows[0]?.indexdef).toBe(EXPECTED_INDEXDEF);
-      expect(rows[0]?.indisvalid).toBe(true);
-      expect(await journalHasMigration(client), `migration 0027 not journaled on ${target}`).toBe(
-        true,
-      );
     } finally {
       await client.end();
     }

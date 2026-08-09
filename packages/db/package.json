@@ -17,6 +17,8 @@
     "ready": "tsx src/ready.ts",
     "test": "vitest run --passWithNoTests",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:catalog-readonly": "vitest run --config vitest.readonly-catalog.config.ts",
+    "test:scratch-full": "pnpm test && pnpm test:integration",
     "typecheck": "tsc --noEmit",
     "build": "tsc --noEmit"
   },
