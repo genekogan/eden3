@@ -355,10 +355,10 @@ describe('FG-VAULT — channel-secret custody attack battery (deployed path)', (
     ]);
   });
 
-  it('EPOCH REVOCATION (deployed): a correctly-MACed stale-epoch capability fails closed against the deployed resolver — zero decrypts', async () => {
-    // Row exists and is active; the deployed resolver pins the epoch to the c1
-    // constant, so a genuine c2-minted capability (valid MAC for the c2 scope)
-    // is rejected at the deployed epoch check (server.mjs), not the TS one.
+  it('EPOCH MISMATCH (deployed): a correctly-MACed future-epoch capability fails closed against the deployed resolver — zero decrypts', async () => {
+    // Row exists, is active, and currently carries epoch 1. A genuine
+    // c2-minted capability (valid MAC for the c2 scope) is rejected against the
+    // row's durable current epoch by the deployed server.mjs path.
     const row = connectionRow();
     rows = [row];
     await start();
