@@ -89,6 +89,19 @@ interface SessionEventAccessCheck<TSession extends { id: string }> {
   canAccess(session: TSession, account: AuthSession): Promise<boolean>;
 }
 
+interface AccountEventAccessCheck {
+  expectedAccountId: string;
+  getSession(): Promise<AuthSession | null>;
+}
+
+/** Revalidate the exact account that admitted an account-scoped event stream. */
+export async function accountEventAccessStillValid(
+  check: AccountEventAccessCheck,
+): Promise<boolean> {
+  const account = await check.getSession();
+  return account !== null && account.accountId === check.expectedAccountId;
+}
+
 /** Revalidate every authority that admitted one long-lived event stream. */
 export async function sessionEventAccessStillValid<TSession extends { id: string }>(
   check: SessionEventAccessCheck<TSession>,

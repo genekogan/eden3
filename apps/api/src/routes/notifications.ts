@@ -2,7 +2,11 @@ import { encodeSseComment } from '@eden3/shared';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { KEEPALIVE_INTERVAL_MS } from '../events-bus';
+import {
+  accountEventAccessStillValid,
+  KEEPALIVE_INTERVAL_MS,
+  SessionEventAuthorizationLease,
+} from '../events-bus';
 import { sendError } from '../errors';
 import {
   type AppNotificationStore,
@@ -18,6 +22,8 @@ const idParamsSchema = z.object({ id: z.string().uuid() });
 
 export interface NotificationsRoutesOptions {
   store?: AppNotificationStore;
+  /** Test-only cadence override; production retains the fixed 15-second lease budget. */
+  keepaliveIntervalMs?: number;
 }
 
 export const notificationsRoutes: FastifyPluginAsync<NotificationsRoutesOptions> = async (
@@ -25,6 +31,14 @@ export const notificationsRoutes: FastifyPluginAsync<NotificationsRoutesOptions>
   opts,
 ) => {
   const store = opts.store ?? new PostgresAppNotificationStore();
+  const keepaliveIntervalMs = opts.keepaliveIntervalMs ?? KEEPALIVE_INTERVAL_MS;
+  if (
+    !Number.isSafeInteger(keepaliveIntervalMs) ||
+    keepaliveIntervalMs < 10 ||
+    keepaliveIntervalMs > KEEPALIVE_INTERVAL_MS
+  ) {
+    throw new Error('notification keepalive interval must be an integer from 10ms to 10000ms');
+  }
 
   app.get('/', { preHandler: app.requireAuth }, async (req, reply) => {
     if (!req.account) return sendError(reply, 401, 'unauthorized', 'Authentication required');
@@ -60,11 +74,32 @@ export const notificationsRoutes: FastifyPluginAsync<NotificationsRoutesOptions>
   });
 
   app.get('/events', { preHandler: app.requireAuth }, async (req, reply) => {
-    if (!req.account) return sendError(reply, 401, 'unauthorized', 'Authentication required');
-    const channel = notificationChannel(req.account.accountId);
+    const account = req.account;
+    if (!account) return sendError(reply, 401, 'unauthorized', 'Authentication required');
+    const channel = notificationChannel(account.accountId);
 
     reply.hijack();
-    reply.raw.on('error', () => {});
+    const writable = (): boolean => !reply.raw.destroyed && !reply.raw.writableEnded;
+    let closed = false;
+    let keepalive: NodeJS.Timeout | null = null;
+    let unsubscribe = () => {};
+    let authorizationLease: SessionEventAuthorizationLease | null = null;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      if (keepalive) clearInterval(keepalive);
+      unsubscribe();
+    };
+    const terminate = () => {
+      authorizationLease?.stop();
+      cleanup();
+      try {
+        if (writable()) reply.raw.end();
+      } catch {
+        // The subscriber and timers are already gone; the stream stays dead.
+      }
+    };
+    reply.raw.on('error', terminate);
     const staged: Record<string, number | string | string[]> = {};
     for (const [name, value] of Object.entries(reply.getHeaders())) {
       if (value !== undefined) staged[name] = value;
@@ -78,16 +113,31 @@ export const notificationsRoutes: FastifyPluginAsync<NotificationsRoutesOptions>
     });
     reply.raw.write(encodeSseComment('connected'));
 
-    const unsubscribe = app.eventsBus.subscribe(channel, reply.raw);
-    const keepalive = setInterval(() => {
-      if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+    unsubscribe = app.eventsBus.subscribe(channel, reply.raw);
+    authorizationLease = new SessionEventAuthorizationLease(
+      async () => {
+        if (!writable()) return false;
+        return accountEventAccessStillValid({
+          expectedAccountId: account.accountId,
+          getSession: () => app.authProvider.getSession(req),
+        });
+      },
+      () => {
+        if (!writable()) {
+          terminate();
+          return;
+        }
         reply.raw.write(encodeSseComment('ping'));
-      }
-    }, KEEPALIVE_INTERVAL_MS);
+      },
+      terminate,
+    );
+    keepalive = setInterval(() => {
+      void authorizationLease.reauthorize();
+    }, keepaliveIntervalMs);
     keepalive.unref();
     reply.raw.on('close', () => {
-      clearInterval(keepalive);
-      unsubscribe();
+      authorizationLease?.stop();
+      cleanup();
     });
   });
 };
