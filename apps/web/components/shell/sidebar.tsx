@@ -176,11 +176,19 @@ function AgentNav({
   const { username } = useSelectedAgent();
   const { agents, phase } = useMyAgents();
 
+  if (isEveUsername(username)) {
+    return (
+      <EveSidebarEntry
+        onNavigate={onNavigate}
+        labelsAlways={labels === "always"}
+      />
+    );
+  }
+
   if (
     phase === "ready" &&
     agents !== null &&
-    agents.length === 0 &&
-    !isEveUsername(username)
+    agents.length === 0
   ) {
     return (
       <EveSidebarEntry

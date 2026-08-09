@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
@@ -34,6 +35,16 @@ function item(overrides: Partial<UploadQueueItem> = {}): UploadQueueItem {
 }
 
 describe("upload queue", () => {
+  it("aborts an active upload only when the panel unmounts", () => {
+    const source = readFileSync(
+      new URL("../components/uploads/upload-panel.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(source).toMatch(
+      /useEffect\(\s*\(\) => \(\) => \{\s*active\.current\?\.controller\.abort\(\);\s*\},\s*\[\],\s*\);/,
+    );
+  });
+
   it("offers supported photo and video sources without forcing camera capture", () => {
     expect(MOBILE_LIBRARY_ACCEPT.split(",")).toEqual(
       expect.arrayContaining(["image/*", "video/*"]),

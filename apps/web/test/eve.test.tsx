@@ -55,6 +55,7 @@ describe("eve empty-state entry", () => {
 
     expect(directory).toContain("<EveEmptyState />");
     expect(sidebar).toContain("<EveSidebarEntry");
+    expect(sidebar).toContain("if (isEveUsername(username))");
     expect(selector).toContain("@eve · Eden guide");
   });
 });

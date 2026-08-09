@@ -265,6 +265,7 @@ export function UploadPanel({ uploader: providedUploader }: { uploader?: UploadR
     () => () => {
       active.current?.controller.abort();
     },
+    [],
   );
 
   const addFiles = (files: FileList | File[]) => {
