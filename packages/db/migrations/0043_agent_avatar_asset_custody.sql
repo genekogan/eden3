@@ -223,6 +223,8 @@ EXECUTE FUNCTION public.account_erasure_avatar_target_success_guard();
 REVOKE EXECUTE ON FUNCTION public.account_erasure_avatar_asset_guard() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.account_erasure_avatar_source_guard() FROM PUBLIC;
 GRANT SELECT ON public.agent_avatar_assets TO eden3_erasure_guard;
+GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE public.agent_avatar_assets
+	TO eden3_erasure_operator;
 ALTER FUNCTION public.account_erasure_avatar_asset_guard() OWNER TO eden3_erasure_guard;
 ALTER FUNCTION public.account_erasure_avatar_source_guard() OWNER TO eden3_erasure_guard;
 ALTER FUNCTION public.account_erasure_legacy_content_ingest_fence() OWNER TO eden3_erasure_guard;

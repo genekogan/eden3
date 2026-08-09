@@ -262,6 +262,12 @@ beforeAll(async () => {
   const ordinaryUrl = new URL(base); ordinaryUrl.username = ORDINARY_LOGIN; ordinaryUrl.password = ORDINARY_PASSWORD;
   operatorPg = postgres(operatorUrl.toString(), { max: 1 });
   ordinaryPg = postgres(ordinaryUrl.toString(), { max: 1 });
+  await expect(operatorPg`
+    select has_table_privilege(session_user,'public.agent_avatar_assets','select') as can_select,
+      has_table_privilege(session_user,'public.agent_avatar_assets','insert') as can_insert,
+      has_table_privilege(session_user,'public.agent_avatar_assets','update') as can_update,
+      has_table_privilege(session_user,'public.agent_avatar_assets','delete') as can_delete`
+  ).resolves.toEqual([{ can_select: true, can_insert: true, can_update: true, can_delete: true }]);
   ordinaryDb = drizzle(ordinaryPg) as DbHandle;
   ERASURE_DB_BOUNDARY = await attestAccountErasureDatabaseBoundary({
     operatorClient: operatorPg as never,

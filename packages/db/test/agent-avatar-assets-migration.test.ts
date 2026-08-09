@@ -45,5 +45,9 @@ describe('agent avatar asset custody migration', () => {
     expect(sql).toContain("eden3.erasure_external_absence_id");
     expect(sql).toContain('account_erasure_target_owned');
     expect(sql).toContain('GRANT SELECT ON public.agent_avatar_assets TO eden3_erasure_guard');
+    expect(sql).toContain(
+      'GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE public.agent_avatar_assets',
+    );
+    expect(sql).toContain('TO eden3_erasure_operator');
   });
 });
