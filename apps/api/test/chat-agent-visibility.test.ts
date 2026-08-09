@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assertChatAgentVisible,
+  createSession,
   ensureChattableAgent,
   selectChatAgentForInvocation,
 } from '../src/routes/chat';
@@ -58,6 +59,53 @@ describe('chat agent visibility boundary', () => {
     expect(poisonReads).toBe(0);
   });
 
+  it('freshly resolves after a public precheck and refuses a concurrent private flip before side effects', async () => {
+    const publicResolution = {
+      account: agentAccount,
+      agent: {
+        ...privateAgent,
+        public: true,
+        openclawId: 'private-agent-runtime',
+        provisionStatus: 'ready',
+      },
+    };
+    assertChatAgentVisible(
+      stranger,
+      publicResolution.account,
+      publicResolution.agent,
+    );
+
+    let freshResolutions = 0;
+    let poisonReads = 0;
+    const poisonGateway = new Proxy({}, {
+      get() {
+        poisonReads += 1;
+        throw new Error('DB/provision/model/session/runTurn poison was reached');
+      },
+    });
+    const freshPrivateResolution = {
+      account: agentAccount,
+      agent: {
+        ...publicResolution.agent,
+        public: false,
+      },
+    };
+
+    await expect(createSession(
+      stranger,
+      agentAccount.username,
+      'must not create or run',
+      poisonGateway as Parameters<typeof createSession>[3],
+      async (username) => {
+        freshResolutions += 1;
+        expect(username).toBe(agentAccount.username);
+        return freshPrivateResolution as Parameters<typeof ensureChattableAgent>[1];
+      },
+    )).rejects.toMatchObject({ statusCode: 404, code: 'agent_not_found' });
+    expect(freshResolutions).toBe(1);
+    expect(poisonReads).toBe(0);
+  });
+
   it('rechecks current visibility when selecting an existing-session agent', () => {
     const privateRow = {
       accountId: agentAccount.id,
@@ -76,7 +124,7 @@ describe('chat agent visibility boundary', () => {
       .toMatchObject({ accountId: agentAccount.id });
   });
 
-  it('mutation-pins all three pre-side-effect checks and the existing-row public projection', async () => {
+  it('mutation-pins both new-session reads, all pre-side-effect checks, and the existing-row public projection', async () => {
     const source = await readFile(new URL('../src/routes/chat.ts', import.meta.url), 'utf8');
     const assertBoundary = (candidate: string) => {
       expect(candidate).toContain(
@@ -90,6 +138,20 @@ describe('chat agent visibility boundary', () => {
       expect(newAuth).toBeGreaterThanOrEqual(0);
       expect(newAuth).toBeLessThan(newPath.indexOf('assertTurnAdmissible('));
       expect(newAuth).toBeLessThan(newPath.indexOf('createSession('));
+      expect(newPath).toContain(
+        'createSession(account, body.agentUsername, body.content, app.gatewayGlue)',
+      );
+
+      const createStart = candidate.indexOf('export async function createSession(');
+      const createEnd = candidate.indexOf('\n/** Resolve an existing session', createStart);
+      const createPath = candidate.slice(createStart, createEnd);
+      const freshResolve = createPath.indexOf('const resolved = await resolver(agentUsername);');
+      const freshAuth = createPath.indexOf('assertChatAgentVisible(viewer, resolved.account, resolved.agent);');
+      const ensureAt = createPath.indexOf('ensureChattableAgent(viewer, resolved, gatewayGlue)');
+      expect(freshResolve).toBeGreaterThanOrEqual(0);
+      expect(freshAuth).toBeGreaterThan(freshResolve);
+      expect(ensureAt).toBeGreaterThan(freshAuth);
+      expect(createPath).not.toContain('preResolved');
 
       const ensureStart = candidate.indexOf('export async function ensureChattableAgent(');
       const ensureEnd = candidate.indexOf('\nasync function createSession(', ensureStart);
@@ -110,7 +172,7 @@ describe('chat agent visibility boundary', () => {
 
     assertBoundary(source);
     const newCheck = 'assertChatAgentVisible(account, preResolved.account, preResolved.agent);';
-    const createCall = 'target = await createSession(account, preResolved, body.content, app.gatewayGlue);';
+    const createCall = 'target = await createSession(account, body.agentUsername, body.content, app.gatewayGlue);';
     const movedNewCheck = source
       .replace(newCheck, '// new-session visibility moved')
       .replace(createCall, `${createCall}\n        ${newCheck}`);
@@ -131,6 +193,18 @@ describe('chat agent visibility boundary', () => {
       ),
       movedNewCheck,
       movedProvisioningCheck,
+      source.replace(
+        'const resolved = await resolver(agentUsername);',
+        'const resolved = preResolved;',
+      ),
+      source.replace(
+        'assertChatAgentVisible(viewer, resolved.account, resolved.agent);',
+        '// fresh create visibility removed',
+      ),
+      source.replace(
+        'createSession(account, body.agentUsername, body.content, app.gatewayGlue)',
+        'createSession(account, preResolved, body.content, app.gatewayGlue)',
+      ),
       source.replace(
         'selectChatAgentForInvocation(rows, account)',
         'rows.find((row) => row.openclawId !== null) ?? rows[0] ?? null',
