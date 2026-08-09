@@ -15,6 +15,10 @@ describe("public session share cache and metadata boundary", () => {
     expect(source).toContain("export const revalidate = 0");
     expect(source).toContain("unstable_noStore()");
     expect(source).not.toContain('import { cache } from "react"');
+    expect(source).toContain("export async function generateMetadata");
+    expect(source.indexOf("await loadShare(decodeToken(token))")).toBeLessThan(
+      source.indexOf("export default async function SharedSessionPage"),
+    );
     expect(source).toContain('referrer: "no-referrer"');
     expect(source).not.toMatch(/canonical\s*:/);
     expect(source).not.toMatch(/openGraph:\s*\{[^}]*url\s*:/s);
