@@ -129,6 +129,20 @@ describe('DB PostgreSQL test manifest', () => {
     expect(readonlySource).toContain("await client.unsafe('begin transaction read only')");
     expect(readonlySource).toContain("current_setting('transaction_read_only')");
     expect(readonlySource).not.toContain('loadRootEnv');
+    const tryOffset = readonlySource.indexOf('try {');
+    const beginOffset = readonlySource.indexOf("await client.unsafe('begin transaction read only')");
+    const identityOffset = readonlySource.indexOf('select current_database() as database');
+    const catalogOffset = readonlySource.indexOf('select pg_get_indexdef');
+    const finallyOffset = readonlySource.indexOf('} finally {');
+    const rollbackOffset = readonlySource.indexOf("await client.unsafe('rollback')");
+    const closeOffset = readonlySource.indexOf('await client.end()');
+    expect(tryOffset).toBeGreaterThanOrEqual(0);
+    expect(beginOffset).toBeGreaterThan(tryOffset);
+    expect(identityOffset).toBeGreaterThan(beginOffset);
+    expect(catalogOffset).toBeGreaterThan(identityOffset);
+    expect(finallyOffset).toBeGreaterThan(catalogOffset);
+    expect(rollbackOffset).toBeGreaterThan(finallyOffset);
+    expect(closeOffset).toBeGreaterThan(rollbackOffset);
   });
 
   it('never discloses database credentials in a boundary refusal', () => {
