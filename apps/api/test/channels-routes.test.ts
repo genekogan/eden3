@@ -41,11 +41,6 @@ import {
 loadRootEnv();
 
 const marker = makeMarker('channels');
-const databaseUrl = new URL(process.env.DATABASE_URL ?? 'postgres://invalid/invalid');
-const databaseName = databaseUrl.pathname.slice(1);
-const isDisposableErasureScratch = databaseUrl.hostname === '127.0.0.1'
-  && databaseUrl.port === '5433'
-  && /^t12u03_runtime_0041_[a-f0-9]{8}$/.test(databaseName);
 const originalChannelConnectionLimit = process.env.MAX_CHANNEL_CONNECTIONS_PER_USER;
 const vault = new AesGcmSecretVault({ key: randomBytes(32).toString('base64') });
 const runtimeToken = 'channel-runtime-test-credential';
@@ -58,6 +53,7 @@ let secondAgentId = '';
 let secondAgentUsername = '';
 let adminAgentUsername = '';
 let app: FastifyInstance;
+let preserveTombstonedFixtures = false;
 
 const ensureCalls: Array<Record<string, unknown>> = [];
 const removeCalls: Array<Record<string, unknown>> = [];
@@ -349,7 +345,7 @@ beforeAll(async () => {
 afterAll(async () => {
   try {
     await app?.close();
-    if (!isDisposableErasureScratch) await deleteFixturesByMarker(marker);
+    if (!preserveTombstonedFixtures) await deleteFixturesByMarker(marker);
   } finally {
     await pg.end({ timeout: 5 });
     if (originalChannelConnectionLimit === undefined) {
@@ -2063,87 +2059,93 @@ describe('Postgres channel group identity isolation', () => {
 
   });
 
-  it.runIf(isDisposableErasureScratch)(
+  it(
     'fails closed for deleted owners and agents without resurrecting tombstoned fixtures',
     async () => {
-    const deletedOwnerId = await insertUserAccount(`${marker}_deleted_owner`);
-    const deletedOwnerAgentUsername = `${marker}-deleted-owner-agent`;
-    await insertAgentAccount(deletedOwnerAgentUsername, {
-      ownerId: deletedOwnerId,
-      public: true,
-      openclawId: deletedOwnerAgentUsername,
-      provisionStatus: 'ready',
-    });
-    const ownerConnection = await createConnection({
-      token: `valid_${marker}_deleted_owner`,
-      agentUsername: deletedOwnerAgentUsername,
-      ownerAccountId: deletedOwnerId,
-    });
-    expect((await app.inject({
-      method: 'POST',
-      url: `/channels/connections/${ownerConnection.id}/activate`,
-      headers: { cookie: devCookie(deletedOwnerId) },
-      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
-    })).statusCode).toBe(200);
-    const ownerRuntime = await runtimeCoordinates(ownerConnection.id);
-    const ownerRuntimeBody = {
-      connectionId: ownerConnection.id,
-      runtimeAccountId: ownerConnection.runtimeAccountId,
-      ...ownerRuntime,
-      gatewaySessionKey: `agent:${marker}:discord:${ownerConnection.runtimeAccountId}:direct:deleted-owner`,
-      peerId: '77889944',
-      externalMessageId: `${marker}:deleted-owner`,
-      role: 'user',
-      content: 'must not reach session sync',
-      createdAt: new Date().toISOString(),
-    };
-    const callsBefore = sessionSync.syncMessage.mock.calls.length;
-    await pg`update accounts set deleted = true, updated_at = now() where id = ${deletedOwnerId}`;
-    const deletedOwner = await app.inject({
-      method: 'POST',
-      url: '/channels/runtime/messages',
-      headers: { authorization: `Bearer ${runtimeToken}` },
-      payload: ownerRuntimeBody,
-    });
-    expect(deletedOwner.statusCode).toBe(404);
+      // The required API PostgreSQL config already admits only a disposable
+      // scratch database. This case deliberately creates 0041 tombstones that
+      // must never be resurrected just to make generic fixture cleanup pass;
+      // retain its unique marker rows until the mandatory scratch drop.
+      preserveTombstonedFixtures = true;
+      const deletedOwnerId = await insertUserAccount(`${marker}_deleted_owner`);
+      const deletedOwnerAgentUsername = `${marker}-deleted-owner-agent`;
+      await insertAgentAccount(deletedOwnerAgentUsername, {
+        ownerId: deletedOwnerId,
+        public: true,
+        openclawId: deletedOwnerAgentUsername,
+        provisionStatus: 'ready',
+      });
+      const ownerConnection = await createConnection({
+        token: `valid_${marker}_deleted_owner`,
+        agentUsername: deletedOwnerAgentUsername,
+        ownerAccountId: deletedOwnerId,
+      });
+      expect((await app.inject({
+        method: 'POST',
+        url: `/channels/connections/${ownerConnection.id}/activate`,
+        headers: { cookie: devCookie(deletedOwnerId) },
+        payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
+      })).statusCode).toBe(200);
+      const ownerRuntime = await runtimeCoordinates(ownerConnection.id);
+      const ownerRuntimeBody = {
+        connectionId: ownerConnection.id,
+        runtimeAccountId: ownerConnection.runtimeAccountId,
+        ...ownerRuntime,
+        gatewaySessionKey: `agent:${marker}:discord:${ownerConnection.runtimeAccountId}:direct:deleted-owner`,
+        peerId: '77889944',
+        externalMessageId: `${marker}:deleted-owner`,
+        role: 'user',
+        content: 'must not reach session sync',
+        createdAt: new Date().toISOString(),
+      };
+      const callsBefore = sessionSync.syncMessage.mock.calls.length;
+      await pg`update accounts set deleted = true, updated_at = now() where id = ${deletedOwnerId}`;
+      const deletedOwner = await app.inject({
+        method: 'POST',
+        url: '/channels/runtime/messages',
+        headers: { authorization: `Bearer ${runtimeToken}` },
+        payload: ownerRuntimeBody,
+      });
+      expect(deletedOwner.statusCode).toBe(404);
 
-    const deletedAgentOwnerId = await insertUserAccount(`${marker}_deleted_agent_owner`);
-    const deletedAgentUsername = `${marker}-deleted-agent`;
-    const deletedAgentId = await insertAgentAccount(deletedAgentUsername, {
-      ownerId: deletedAgentOwnerId,
-      public: true,
-      openclawId: deletedAgentUsername,
-      provisionStatus: 'ready',
-    });
-    const agentConnection = await createConnection({
-      token: `valid_${marker}_deleted_agent`,
-      agentUsername: deletedAgentUsername,
-      ownerAccountId: deletedAgentOwnerId,
-    });
-    expect((await app.inject({
-      method: 'POST',
-      url: `/channels/connections/${agentConnection.id}/activate`,
-      headers: { cookie: devCookie(deletedAgentOwnerId) },
-      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
-    })).statusCode).toBe(200);
-    const agentRuntime = await runtimeCoordinates(agentConnection.id);
-    await pg`update accounts set deleted = true, updated_at = now() where id = ${deletedAgentId}`;
-    const deletedAgent = await app.inject({
-      method: 'POST',
-      url: '/channels/runtime/messages',
-      headers: { authorization: `Bearer ${runtimeToken}` },
-      payload: {
-        ...ownerRuntimeBody,
-        connectionId: agentConnection.id,
-        runtimeAccountId: agentConnection.runtimeAccountId,
-        ...agentRuntime,
-        gatewaySessionKey: `agent:${marker}:discord:${agentConnection.runtimeAccountId}:direct:deleted-agent`,
-        externalMessageId: `${marker}:deleted-agent`,
-      },
-    });
-    expect(deletedAgent.statusCode).toBe(404);
-    expect(sessionSync.syncMessage).toHaveBeenCalledTimes(callsBefore);
-  });
+      const deletedAgentOwnerId = await insertUserAccount(`${marker}_deleted_agent_owner`);
+      const deletedAgentUsername = `${marker}-deleted-agent`;
+      const deletedAgentId = await insertAgentAccount(deletedAgentUsername, {
+        ownerId: deletedAgentOwnerId,
+        public: true,
+        openclawId: deletedAgentUsername,
+        provisionStatus: 'ready',
+      });
+      const agentConnection = await createConnection({
+        token: `valid_${marker}_deleted_agent`,
+        agentUsername: deletedAgentUsername,
+        ownerAccountId: deletedAgentOwnerId,
+      });
+      expect((await app.inject({
+        method: 'POST',
+        url: `/channels/connections/${agentConnection.id}/activate`,
+        headers: { cookie: devCookie(deletedAgentOwnerId) },
+        payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [] },
+      })).statusCode).toBe(200);
+      const agentRuntime = await runtimeCoordinates(agentConnection.id);
+      await pg`update accounts set deleted = true, updated_at = now() where id = ${deletedAgentId}`;
+      const deletedAgent = await app.inject({
+        method: 'POST',
+        url: '/channels/runtime/messages',
+        headers: { authorization: `Bearer ${runtimeToken}` },
+        payload: {
+          ...ownerRuntimeBody,
+          connectionId: agentConnection.id,
+          runtimeAccountId: agentConnection.runtimeAccountId,
+          ...agentRuntime,
+          gatewaySessionKey: `agent:${marker}:discord:${agentConnection.runtimeAccountId}:direct:deleted-agent`,
+          externalMessageId: `${marker}:deleted-agent`,
+        },
+      });
+      expect(deletedAgent.statusCode).toBe(404);
+      expect(sessionSync.syncMessage).toHaveBeenCalledTimes(callsBefore);
+    },
+  );
 });
 
 describe('channel money crash boundaries against Postgres', () => {

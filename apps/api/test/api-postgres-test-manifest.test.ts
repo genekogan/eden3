@@ -135,5 +135,28 @@ describe('API Postgres test manifest', () => {
     );
     expect(notificationProof).not.toMatch(/describe\.skip|enabled\s*\?\s*describe/);
     expect(fixtureProof).not.toMatch(/describe\.skip|enabled\s*\?\s*describe/);
+
+    for (const file of API_ALL_POSTGRES_TEST_FILES) {
+      const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
+      expect(source, file).not.toMatch(/\b(?:describe|it|test)\.(?:skip|skipIf|runIf|todo)\b/);
+    }
+
+    const channelsSource = readFileSync(
+      new URL('./channels-routes.test.ts', import.meta.url),
+      'utf8',
+    );
+    const tombstoneCase = channelsSource.indexOf(
+      'fails closed for deleted owners and agents without resurrecting tombstoned fixtures',
+    );
+    const preserveBeforeWrite = channelsSource.indexOf('preserveTombstonedFixtures = true');
+    const firstTombstoneFixture = channelsSource.indexOf(
+      'insertUserAccount(`${marker}_deleted_owner`)',
+    );
+    expect(channelsSource).toContain(
+      'if (!preserveTombstonedFixtures) await deleteFixturesByMarker(marker)',
+    );
+    expect(tombstoneCase).toBeGreaterThanOrEqual(0);
+    expect(preserveBeforeWrite).toBeGreaterThan(tombstoneCase);
+    expect(firstTombstoneFixture).toBeGreaterThan(preserveBeforeWrite);
   });
 });
