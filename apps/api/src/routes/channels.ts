@@ -984,7 +984,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     }
     const row = admitted.row;
     if (!row) return sendError(reply, 404, 'x_connection_not_found', 'X connection not found');
-    const result = await pg.begin(async (tx) => {
+    const started = await pg.begin(async (tx) => {
       const owners = await tx`select id from accounts where id=${account.accountId} and deleted=false for key share`;
       if (owners.length !== 1) return null;
       const active = await tx`select 1 from account_erasure_jobs
@@ -1000,24 +1000,39 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         where id=${admitted.intentId} and account_id=${account.accountId}
           and connection_id=${row.id} and state='preparing' returning id`;
       if (!started) return null;
-      const outcome = await xConnector.post(xChannelSecretHandle(live[0]), body.text);
-      if (outcome.ok) {
-        await tx`update channel_outbound_post_intents set state='succeeded',
-          provider_post_id=${outcome.value.id},updated_at=statement_timestamp()
-          where id=${admitted.intentId} and state='provider_started'`;
-      } else if (outcome.code !== 'provider_unavailable') {
-        await tx`update channel_outbound_post_intents set state='failed',
-          last_error_code=${outcome.code},updated_at=statement_timestamp()
-          where id=${admitted.intentId} and state='provider_started'`;
-      }
-      // A transport/provider-unavailable result has unknown external outcome.
-      // Keep the durable provider_started intent open so erasure cannot seal
-      // until an operator/provider reconciliation supplies exact post truth.
-      return outcome;
+      return live[0];
     });
-    if (result === null) {
+    if (started === null) {
       return sendError(reply, 409, 'account_erasure_active', 'Account deletion is in progress');
     }
+    // Provider admission is committed before the external call. Tx1 may win
+    // afterward, but it can only freeze new work; exact terminal evidence below
+    // remains monotonic and recoverable.
+    const result = await xConnector.post(xChannelSecretHandle(started), body.text);
+    if (result.ok || result.code !== 'provider_unavailable') {
+      const state = result.ok ? 'succeeded' : 'failed';
+      const providerPostId = result.ok ? result.value.id : null;
+      const errorCode = result.ok ? null : result.code;
+      try {
+        const updated = await pg`update channel_outbound_post_intents set state=${state},
+          provider_post_id=${providerPostId},last_error_code=${errorCode},
+          updated_at=statement_timestamp()
+          where id=${admitted.intentId} and account_id=${account.accountId}
+            and state='provider_started' returning id`;
+        if (updated.length !== 1) throw new Error('Outbound post terminal state was not recorded');
+      } catch (error) {
+        if ((error as { code?: string }).code !== '55000') throw error;
+        const [recorded] = await pg<{ recorded: boolean }[]>`
+          select account_erasure_record_outbound_post_terminal(
+            ${account.accountId},${admitted.intentId},${state},${providerPostId},${errorCode}
+          ) recorded`;
+        if (recorded?.recorded !== true) {
+          throw new Error('Outbound post terminal evidence was rejected');
+        }
+      }
+    }
+    // provider_unavailable has unknown external outcome. Keep provider_started
+    // until exact provider lookup/operator evidence uses the same narrow seam.
     if (!result.ok) {
       if (result.code === 'revoked') {
         await xConnector.revoke(xChannelSecretHandle(row));

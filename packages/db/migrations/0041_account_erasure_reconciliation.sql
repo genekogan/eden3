@@ -494,6 +494,38 @@ BEGIN
 	-- Existing provider work may write only monotonic terminal evidence after
 	-- Tx1 freezes admission. The recovery worker consumes this durable evidence;
 	-- it never infers no-output merely from elapsed time.
+	IF TG_TABLE_NAME='stripe_checkout_intents' AND TG_OP='UPDATE'
+		AND v_old->>'state'='preparing' AND v_new->>'state'='failed'
+		AND v_new->>'last_error_code'='erasure_cancelled_before_provider'
+		AND v_new->>'stripe_session_id' IS NULL
+		AND (v_new-'state'-'last_error_code'-'updated_at')=
+			(v_old-'state'-'last_error_code'-'updated_at')
+		AND current_user='eden3_erasure_guard'
+		AND public.account_erasure_principal_has_active_job((v_old->>'account_id')::uuid)
+	THEN RETURN NEW; END IF;
+	IF TG_TABLE_NAME='channel_outbound_post_intents' AND TG_OP='UPDATE'
+		AND v_old->>'state'='preparing' AND v_new->>'state'='failed'
+		AND v_new->>'last_error_code'='erasure_cancelled_before_provider'
+		AND v_new->>'provider_post_id' IS NULL
+		AND (v_new-'state'-'last_error_code'-'updated_at')=
+			(v_old-'state'-'last_error_code'-'updated_at')
+		AND current_user='eden3_erasure_guard'
+		AND public.account_erasure_principal_has_active_job((v_old->>'account_id')::uuid)
+	THEN RETURN NEW; END IF;
+	IF TG_TABLE_NAME='stripe_checkout_intents' AND TG_OP='UPDATE'
+		AND current_user='eden3_erasure_guard'
+		AND v_old->>'state'='provider_started' AND v_new->>'state' IN ('created','failed')
+		AND (v_new-'state'-'stripe_session_id'-'last_error_code'-'updated_at')=
+			(v_old-'state'-'stripe_session_id'-'last_error_code'-'updated_at')
+		AND public.account_erasure_principal_has_active_job((v_old->>'account_id')::uuid)
+	THEN RETURN NEW; END IF;
+	IF TG_TABLE_NAME='channel_outbound_post_intents' AND TG_OP='UPDATE'
+		AND current_user='eden3_erasure_guard'
+		AND v_old->>'state'='provider_started' AND v_new->>'state' IN ('succeeded','failed')
+		AND (v_new-'state'-'provider_post_id'-'last_error_code'-'updated_at')=
+			(v_old-'state'-'provider_post_id'-'last_error_code'-'updated_at')
+		AND public.account_erasure_principal_has_active_job((v_old->>'account_id')::uuid)
+	THEN RETURN NEW; END IF;
 	IF TG_TABLE_NAME='turn_provider_runs' AND TG_OP='UPDATE'
 		AND v_old->>'usable_output_at' IS NULL AND v_new->>'usable_output_at' IS NOT NULL
 		AND (v_new-'usable_output_at')=(v_old-'usable_output_at')
@@ -792,6 +824,77 @@ BEGIN
 	IF TG_OP='DELETE' THEN RETURN OLD; END IF; RETURN NEW;
 END;
 $$;
+--> statement-breakpoint
+
+-- Provider-started outbound effects can become terminal after Tx1 wins the
+-- account lock. Only the attested ordinary runtime may record exact provider
+-- truth, and only against the immutable intent owned by the active job.
+CREATE OR REPLACE FUNCTION public.account_erasure_record_stripe_checkout_terminal(
+	p_account uuid,p_intent uuid,p_state text,p_session_id text,p_error_code text
+) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE v_updated uuid;
+BEGIN
+	IF NOT pg_has_role(session_user,'eden3_erasure_terminal_writer','member') THEN
+		RAISE EXCEPTION 'provider terminal evidence requires the trusted application role' USING ERRCODE='42501';
+	END IF;
+	IF NOT ((p_state='created' AND p_session_id ~ '^cs_[A-Za-z0-9_]{3,252}$' AND p_error_code IS NULL)
+		OR (p_state='failed' AND p_session_id IS NULL
+			AND p_error_code IN ('erasure_cancelled_before_provider','provider_confirmed_failed')))
+	THEN RETURN false; END IF;
+	UPDATE public.stripe_checkout_intents i SET state=p_state,stripe_session_id=p_session_id,
+		last_error_code=p_error_code,updated_at=statement_timestamp()
+	WHERE i.id=p_intent AND i.account_id=p_account
+		AND ((i.state='preparing' AND p_state='failed' AND p_error_code='erasure_cancelled_before_provider')
+			OR (i.state='provider_started' AND NOT (p_state='failed'
+				AND p_error_code='erasure_cancelled_before_provider')))
+		AND EXISTS (SELECT 1 FROM public.account_erasure_jobs j
+			WHERE j.account_id=p_account AND j.state<>'succeeded')
+	RETURNING i.id INTO v_updated;
+	RETURN v_updated IS NOT NULL;
+END;
+$$;
+--> statement-breakpoint
+REVOKE EXECUTE ON FUNCTION public.account_erasure_record_stripe_checkout_terminal(uuid,uuid,text,text,text) FROM PUBLIC;
+GRANT SELECT,UPDATE ON public.stripe_checkout_intents TO eden3_erasure_guard;
+GRANT EXECUTE ON FUNCTION public.account_erasure_record_stripe_checkout_terminal(uuid,uuid,text,text,text)
+	TO eden3_erasure_terminal_writer;
+ALTER FUNCTION public.account_erasure_record_stripe_checkout_terminal(uuid,uuid,text,text,text)
+	OWNER TO eden3_erasure_guard;
+--> statement-breakpoint
+
+CREATE OR REPLACE FUNCTION public.account_erasure_record_outbound_post_terminal(
+	p_account uuid,p_intent uuid,p_state text,p_provider_post_id text,p_error_code text
+) RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+DECLARE v_updated uuid;
+BEGIN
+	IF NOT pg_has_role(session_user,'eden3_erasure_terminal_writer','member') THEN
+		RAISE EXCEPTION 'provider terminal evidence requires the trusted application role' USING ERRCODE='42501';
+	END IF;
+	IF NOT ((p_state='succeeded' AND p_provider_post_id ~ '^[A-Za-z0-9_:-]{1,255}$' AND p_error_code IS NULL)
+		OR (p_state='failed' AND p_provider_post_id IS NULL
+			AND p_error_code IN ('erasure_cancelled_before_provider','invalid_credentials','revoked',
+				'rate_limited','operator_confirmed_failed')))
+	THEN RETURN false; END IF;
+	UPDATE public.channel_outbound_post_intents i SET state=p_state,
+		provider_post_id=p_provider_post_id,last_error_code=p_error_code,
+		updated_at=statement_timestamp()
+	WHERE i.id=p_intent AND i.account_id=p_account
+		AND ((i.state='preparing' AND p_state='failed' AND p_error_code='erasure_cancelled_before_provider')
+			OR (i.state='provider_started' AND NOT (p_state='failed'
+				AND p_error_code='erasure_cancelled_before_provider')))
+		AND EXISTS (SELECT 1 FROM public.account_erasure_jobs j
+			WHERE j.account_id=p_account AND j.state<>'succeeded')
+	RETURNING i.id INTO v_updated;
+	RETURN v_updated IS NOT NULL;
+END;
+$$;
+--> statement-breakpoint
+REVOKE EXECUTE ON FUNCTION public.account_erasure_record_outbound_post_terminal(uuid,uuid,text,text,text) FROM PUBLIC;
+GRANT SELECT,UPDATE ON public.channel_outbound_post_intents TO eden3_erasure_guard;
+GRANT EXECUTE ON FUNCTION public.account_erasure_record_outbound_post_terminal(uuid,uuid,text,text,text)
+	TO eden3_erasure_terminal_writer;
+ALTER FUNCTION public.account_erasure_record_outbound_post_terminal(uuid,uuid,text,text,text)
+	OWNER TO eden3_erasure_guard;
 --> statement-breakpoint
 
 CREATE OR REPLACE FUNCTION public.account_erasure_record_provider_terminal_no_output(p_turn uuid)

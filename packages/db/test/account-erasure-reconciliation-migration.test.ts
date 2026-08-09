@@ -95,6 +95,14 @@ describe('0041 account erasure reconciliation', () => {
     expect(sql).toContain("u.status IN ('pending','provider_admitted','running','refund_pending')");
     expect(sql).toContain("WHERE c.state IN ('preparing','provider_started')");
     expect(sql).toContain("WHERE o.state IN ('preparing','provider_started')");
+    expect(sql).toContain('account_erasure_record_stripe_checkout_terminal');
+    expect(sql).toContain('account_erasure_record_outbound_post_terminal');
+    expect(sql).toContain("p_error_code IN ('erasure_cancelled_before_provider','provider_confirmed_failed')");
+    expect(sql).toContain("p_error_code IN ('erasure_cancelled_before_provider','invalid_credentials','revoked',");
+    expect(sql).toContain("current_user='eden3_erasure_guard'");
+    expect(sql).toContain("pg_has_role(session_user,'eden3_erasure_terminal_writer','member')");
+    expect(sql).toContain('REVOKE EXECUTE ON FUNCTION public.account_erasure_record_stripe_checkout_terminal');
+    expect(sql).toContain('REVOKE EXECUTE ON FUNCTION public.account_erasure_record_outbound_post_terminal');
     expect(sql).not.toContain('UNION ALL SELECT 1 FROM public.stripe_checkout_intents c JOIN principals p ON p.id=c.account_id\n\t\tUNION ALL');
     expect(reconcileSql).toContain('EXISTS (SELECT 1 FROM principals p WHERE p.id IN (a.account_id,a.agent_account_id))');
     expect(reconcileSql).toContain('EXISTS (SELECT 1 FROM principals p WHERE p.id IN (u.user_id,u.agent_id))');

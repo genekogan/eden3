@@ -920,41 +920,55 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
     });
     if (!admitted) throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
 
-    const outcome = await pg.begin(async (tx) => {
+    const started = await pg.begin(async (tx) => {
       const owners = await tx`select id from accounts where id=${account.accountId}
         and deleted=false for key share`;
-      if (owners.length !== 1) return { kind: 'fenced' as const };
+      if (owners.length !== 1) return false;
       const active = await tx`select 1 from account_erasure_jobs
         where account_id=${account.accountId} and state<>'succeeded' limit 1`;
-      if (active.length > 0) return { kind: 'fenced' as const };
-      const [started] = await tx<{ id: string }[]>`
+      if (active.length > 0) return false;
+      const [intent] = await tx<{ id: string }[]>`
         update stripe_checkout_intents set state='provider_started',updated_at=statement_timestamp()
         where id=${checkoutIntentId} and account_id=${account.accountId} and state='preparing'
         returning id`;
-      if (!started) return { kind: 'fenced' as const };
-      try {
-        const session = await stripeClient.createCheckoutSession(
-          params,
-          env.STRIPE_SECRET_KEY!,
-          checkoutRequestKey,
-        );
-        await tx`update stripe_checkout_intents set state='created',stripe_session_id=${session.id},
-          updated_at=statement_timestamp() where id=${checkoutIntentId} and state='provider_started'`;
-        return { kind: 'created' as const, session };
-      } catch {
-        // The provider call may have committed remotely before the transport
-        // failed. Keep the durable intent in-flight so erasure cannot seal or
-        // discard the idempotency identity without operator/provider proof.
-        return { kind: 'failed' as const };
-      }
+      return Boolean(intent);
     });
-    if (outcome.kind === 'fenced') {
+    if (!started) {
       throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
     }
-    if (outcome.kind === 'failed') {
+
+    let session: Awaited<ReturnType<typeof stripeClient.createCheckoutSession>>;
+    try {
+      // provider_started is committed before external I/O. A crash can leave an
+      // indeterminate started intent, but can never mislabel provider work as
+      // provider-free preparing.
+      session = await stripeClient.createCheckoutSession(
+        params,
+        env.STRIPE_SECRET_KEY!,
+        checkoutRequestKey,
+      );
+    } catch {
+      // The provider call may have committed remotely before the transport
+      // failed. Keep provider_started until exact lookup/operator evidence.
       throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout is unavailable');
     }
-    return { session: outcome.session };
+    try {
+      const updated = await pg`update stripe_checkout_intents set state='created',
+        stripe_session_id=${session.id},updated_at=statement_timestamp()
+        where id=${checkoutIntentId} and account_id=${account.accountId}
+          and state='provider_started' returning id`;
+      if (updated.length !== 1) throw new Error('Stripe checkout intent terminal state was not recorded');
+    } catch (error) {
+      if ((error as { code?: string }).code !== '55000') throw error;
+      const [recorded] = await pg<{ recorded: boolean }[]>`
+        select account_erasure_record_stripe_checkout_terminal(
+          ${account.accountId},${checkoutIntentId},'created',${session.id},null
+        ) recorded`;
+      if (recorded?.recorded !== true) {
+        throw new Error('Stripe checkout terminal evidence was rejected');
+      }
+    }
+    return { session };
   });
 
   await app.register(async (webhook) => {
