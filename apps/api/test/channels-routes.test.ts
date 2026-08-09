@@ -524,6 +524,88 @@ describe('channel custody and validation', () => {
     });
   });
 
+  it('serializes concurrent token retries through epoch projection and leaves the newest ref active', async () => {
+    const connection = await createConnection({
+      token: `valid_${marker}_serialized_rotation_a`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+
+    let releaseEnsure!: () => void;
+    ensurePause = new Promise<void>((resolve) => {
+      releaseEnsure = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      ensureEntered = resolve;
+    });
+    const ensureBefore = ensureCalls.length;
+    const validateSpy = vi.spyOn(providerClient, 'validate');
+    const validateBefore = validateSpy.mock.calls.length;
+    try {
+      const first = app.inject({
+        method: 'POST',
+        url: `/channels/connections/${connection.id}/retry`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { token: `valid_${marker}_serialized_rotation_b` },
+      });
+      await entered;
+      expect(validateSpy).toHaveBeenCalledTimes(validateBefore + 1);
+      const second = app.inject({
+        method: 'POST',
+        url: `/channels/connections/${connection.id}/retry`,
+        headers: { cookie: devCookie(ownerId) },
+        payload: { token: `valid_${marker}_serialized_rotation_c` },
+      });
+
+      expect(await resolvesWithin(second, 100)).toBe(false);
+      expect(validateSpy).toHaveBeenCalledTimes(validateBefore + 1);
+      const during = await pg<Array<{ capability_epoch: number; desired_state: string }>>`
+        select capability_epoch, desired_state
+        from channel_connections where id = ${connection.id}
+      `;
+      expect(during[0]).toEqual({ capability_epoch: 2, desired_state: 'active' });
+      expect(ensureCalls.slice(ensureBefore)).toEqual([
+        expect.objectContaining({ connectionId: connection.id, capabilityEpoch: 'c2' }),
+      ]);
+
+      releaseEnsure();
+      const [firstResponse, secondResponse] = await Promise.all([first, second]);
+      expect(firstResponse.statusCode).toBe(200);
+      expect(secondResponse.statusCode).toBe(200);
+      expect(validateSpy).toHaveBeenCalledTimes(validateBefore + 2);
+    } finally {
+      releaseEnsure();
+      ensurePause = null;
+      ensureEntered = null;
+      validateSpy.mockRestore();
+    }
+
+    const final = await pg<Array<{
+      capability_epoch: number;
+      desired_state: string;
+      observed_state: string;
+    }>>`
+      select capability_epoch, desired_state, observed_state
+      from channel_connections where id = ${connection.id}
+    `;
+    expect(final[0]).toEqual({
+      capability_epoch: 3,
+      desired_state: 'active',
+      observed_state: 'starting',
+    });
+    expect(ensureCalls.slice(ensureBefore)).toEqual([
+      expect.objectContaining({ connectionId: connection.id, capabilityEpoch: 'c2' }),
+      expect.objectContaining({ connectionId: connection.id, capabilityEpoch: 'c3' }),
+    ]);
+    expect(activeRuntimeAccounts.has(connection.runtimeAccountId)).toBe(true);
+  });
+
   it('rejects stale or independent epoch writes and serializes concurrent fixed-epoch rotation', async () => {
     const connection = await createConnection({ token: `valid_${marker}_epoch_guard` });
     const epochOf = async () => {

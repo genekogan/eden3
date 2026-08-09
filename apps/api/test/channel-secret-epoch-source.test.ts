@@ -19,6 +19,9 @@ describe('channel SecretRef durable epoch wiring', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     const rotation = source.slice(start, end);
+    expect(rotation).toContain(
+      "app.post('/connections/:id/retry', { preHandler: app.requireAuth }, lifecycleHandler(async",
+    );
     expect(rotation).toContain('encrypted\n              ? tx`');
     expect(rotation).toContain('capability_epoch = capability_epoch + 1');
     expect(rotation).toContain('capabilityEpoch: capabilityEpochId(fresh.capability_epoch)');
