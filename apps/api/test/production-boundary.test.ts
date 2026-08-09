@@ -58,6 +58,13 @@ describe('production service boundary', () => {
     expect(source).not.toContain("new URL('/.well-known/jwks.json'");
     expect(source).not.toMatch(/\bfetch\s*\(/);
     expect(source).not.toContain('payload.iss');
+
+    const envTemplate = readFileSync(
+      new URL('../../../.env.example', import.meta.url),
+      'utf8',
+    );
+    expect(envTemplate).toContain('CLERK_JWT_KEY is mandatory for clerk and');
+    expect(envTemplate).not.toMatch(/(?:fallback|otherwise).*JWKS/i);
   });
 
   it('preserves explicit local development modes outside production', () => {
