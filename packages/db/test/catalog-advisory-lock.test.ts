@@ -12,6 +12,7 @@ import {
   boundedCatalogCleanup,
   catalogLockTimeoutMs,
 } from '../src/catalog-lock';
+import { assertMigrationDatabaseBoundary } from '../src/migrate';
 
 const PACKAGE_JSON = fileURLToPath(new URL('../package.json', import.meta.url));
 const MIGRATION_RUNNER = fileURLToPath(new URL('../src/migrate.ts', import.meta.url));
@@ -51,6 +52,42 @@ describe('shared PostgreSQL catalog advisory-lock convention', () => {
     expect(source).toContain('withCatalogAdvisoryLock');
     expect(source).toContain('runDrizzleMigrations');
     expect(source).not.toContain('drizzle-kit migrate');
+    expect(source.indexOf('assertMigrationDatabaseBoundary(options.databaseUrl'))
+      .toBeLessThan(source.indexOf('await withCatalogAdvisoryLock'));
+  });
+
+  it('refuses implicit-login and ambiguous migration database targets before connection', () => {
+    expect(assertMigrationDatabaseBoundary(
+      'postgresql://eden3:secret@127.0.0.1:5433/eden3',
+      'eden3',
+    )).toBe('eden3');
+    expect(assertMigrationDatabaseBoundary(
+      'postgres://eden3:secret@127.0.0.1:5433/t12u03_runtime_0041_deadbeef?sslmode=disable',
+      't12u03_runtime_0041_deadbeef',
+    )).toBe('t12u03_runtime_0041_deadbeef');
+
+    for (const url of [
+      'postgresql://eden3:secret@127.0.0.1:5433',
+      'postgresql://eden3:secret@127.0.0.1:5433/',
+      'postgresql://eden3:secret@127.0.0.1:5433/%65den3',
+      'postgresql://eden3:secret@127.0.0.1:5433/eden3/extra',
+      'postgresql://eden3:secret@127.0.0.1:5433/.',
+      'postgresql://eden3:secret@127.0.0.1:5433/scratch/../eden3',
+      'postgresql://eden3:secret@127.0.0.1:5433/scratch/%2e%2e/eden3',
+      'postgresql://eden3:secret@127.0.0.1:5433/./eden3',
+    ]) {
+      expect(() => assertMigrationDatabaseBoundary(url), url).toThrow(
+        /explicit safe database pathname/i,
+      );
+    }
+    expect(() => assertMigrationDatabaseBoundary(
+      'postgresql://eden3:secret@127.0.0.1:5433/eden3',
+      'different_database',
+    )).toThrow(/does not match EDEN3_DATABASE_NAME/i);
+    expect(() => assertMigrationDatabaseBoundary(
+      'postgresql://eden3:secret@127.0.0.1:5433/eden3',
+      '',
+    )).toThrow(/EDEN3_DATABASE_NAME/i);
   });
 
   it('adapts only callback transactions on the same ReservedSql handle', async () => {
