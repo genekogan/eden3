@@ -21,7 +21,7 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
 import { serviceAuthenticatedCallback } from '../auth-plugin';
-import { ApiError, sendError } from '../errors';
+import { ApiError, logSafeRequestError, logSafeRequestWarning, sendError } from '../errors';
 import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
   ChannelTurnMeteringService,
@@ -2158,7 +2158,12 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             telegramGroups: connection.channel === 'telegram' ? config.telegramGroups : [],
           });
         } catch (error) {
-          app.log.warn({ err: error, requestId }, 'channel pairing resume apply failed');
+          logSafeRequestWarning(
+            app.log,
+            error,
+            { requestId },
+            'channel pairing resume apply failed',
+          );
           throw new ApiError(502, 'configuration_error', SAFE_RUNTIME_ERRORS.configuration_error!);
         }
         const cleaned = await pg.begin(async (tx) => {
@@ -2561,7 +2566,12 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             where id = ${prepared.connection.id}
           `;
         }
-        app.log.warn({ err: error, requestId }, 'channel pairing runtime apply failed');
+        logSafeRequestWarning(
+          app.log,
+          error,
+          { requestId },
+          'channel pairing runtime apply failed',
+        );
         throw new ApiError(502, 'configuration_error', SAFE_RUNTIME_ERRORS.configuration_error!);
       }
 
@@ -2613,7 +2623,12 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           return true;
         });
       } catch (error) {
-        app.log.error({ err: error, requestId }, 'channel pairing marker cleanup failed');
+        logSafeRequestError(
+          app.log,
+          error,
+          { requestId },
+          'channel pairing marker cleanup failed',
+        );
       }
       if (!cleanupSucceeded) {
         try {

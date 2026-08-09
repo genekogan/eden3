@@ -3,7 +3,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
 import { serviceAuthenticatedCallback } from '../auth-plugin';
-import { ApiError } from '../errors';
+import { ApiError, logSafeRequestWarning } from '../errors';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
 import {
   canonicalChatMediaProviderArgs,
@@ -92,7 +92,7 @@ export const mediaRuntimeRoutes: FastifyPluginAsync<MediaRuntimeRoutesOptions> =
           providerArgs,
         };
       } catch (err) {
-        req.log.warn({ err }, 'chat media authorization denied');
+        logSafeRequestWarning(req.log, err, {}, 'chat media authorization denied');
         throw new ApiError(409, 'media_authorization_denied', 'Media generation is unavailable');
       }
     },

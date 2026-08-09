@@ -25,7 +25,7 @@ import { eq, sql } from 'drizzle-orm';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, logSafeRequestError, sendError } from '../errors';
+import { ApiError, logSafeRequestError, safeRequestErrorCallback, sendError } from '../errors';
 import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
   agentDtoFromEntities,
@@ -464,7 +464,12 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
           persona: agent.persona,
           workspacePath: agent.workspacePath,
         },
-        (err) => req.log.warn({ err }, `memory distillation failed for "${account.username}"`),
+        safeRequestErrorCallback(
+          req.log,
+          { accountId: account.id },
+          'memory distillation failed',
+          'warn',
+        ),
       );
     }
 
@@ -825,7 +830,12 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         mode: 'manual-reseed',
         actorAccountId: req.account!.accountId,
       },
-      (err) => req.log.warn({ err }, `memory rebuild failed for "${account.username}"`),
+      safeRequestErrorCallback(
+        req.log,
+        { accountId: account.id },
+        'memory rebuild failed',
+        'warn',
+      ),
     );
     const memory = await agentMemoryStatus(agent.openclawId, agent.workspacePath);
     return reply.code(202).send({ queued, memory });

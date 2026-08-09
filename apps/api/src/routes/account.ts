@@ -5,7 +5,7 @@ import { pg } from '@eden3/db';
 import { ZipArchive } from 'archiver';
 import type { FastifyPluginAsync } from 'fastify';
 
-import { ApiError } from '../errors';
+import { ApiError, logSafeRequestError } from '../errors';
 import {
   accountErasureRequestSchema,
   requestAccountErasure,
@@ -522,14 +522,18 @@ export const accountRoutes: FastifyPluginAsync<AccountRoutesOptions> = async (ap
       }
     });
     archive.on('error', (err) => {
-      if (!clientAborted) req.log.error({ err, accountId }, 'account export archive failed');
+      if (!clientAborted) {
+        logSafeRequestError(req.log, err, { accountId }, 'account export archive failed');
+      }
     });
 
     // Let Fastify attach the archive to the HTTP response while the producer
     // runs. Any producer failure destroys the stream; after headers are sent a
     // partial download is safer than substituting an unrelated JSON envelope.
     void streamAccountArchive(archive, accountId).catch((error: unknown) => {
-      if (!clientAborted) req.log.error({ err: error, accountId }, 'account export failed');
+      if (!clientAborted) {
+        logSafeRequestError(req.log, error, { accountId }, 'account export failed');
+      }
       archive.destroy(error instanceof Error ? error : new Error('Account export failed'));
     });
 

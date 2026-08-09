@@ -9,7 +9,7 @@ import { pg, type Account, type Agent } from '@eden3/db';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { sendError } from '../errors';
+import { logSafeRequestWarning, sendError } from '../errors';
 import { isUniqueViolation, pgToIso } from '../route-helpers';
 import {
   activeConceptRows,
@@ -231,7 +231,12 @@ async function reproject(req: FastifyRequest, agentAccountId: string): Promise<v
   try {
     await projectAgentConcepts(agentAccountId);
   } catch (err) {
-    req.log.warn({ err }, `concept projection failed for agent ${agentAccountId}`);
+    logSafeRequestWarning(
+      req.log,
+      err,
+      { accountId: agentAccountId },
+      'concept projection failed',
+    );
   }
 }
 
