@@ -4,6 +4,7 @@ import type {
   ChannelCredentialCustodyLike,
   ChannelSecretHandle,
 } from './channel-connector-custody';
+import { ChannelConnectionQuotaExceededError } from './channel-connection-quota';
 import {
   FetchXUserClient,
   XByoConnectorService,
@@ -196,6 +197,20 @@ describe('XByoConnectorService', () => {
         credentials: CREDENTIALS,
       }),
     ).rejects.toThrow('channel credential custody failed');
+  });
+
+  it('preserves the typed owner-quota refusal without exposing custody details', async () => {
+    const { custody, client } = fixtures();
+    vi.mocked(custody.sealScoped).mockRejectedValue(
+      new ChannelConnectionQuotaExceededError(2),
+    );
+    await expect(
+      new XByoConnectorService(client, custody).connect({
+        accountId: 'account-1',
+        agentId: null,
+        credentials: CREDENTIALS,
+      }),
+    ).rejects.toMatchObject({ code: 'channel_quota_exceeded', limit: 2 });
   });
 
   it('maps rejected posting promises to a service-owned safe failure', async () => {

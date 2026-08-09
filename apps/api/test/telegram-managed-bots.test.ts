@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { ChannelConnectionQuotaExceededError } from '../src/services/channel-connection-quota.js';
+
 import {
   FetchTelegramManagedBotApiClient,
   TelegramManagedBotError,
@@ -228,6 +230,28 @@ describe('Telegram managed-bot metadata and custody', () => {
       .catch((caught) => caught);
     expect(error).toMatchObject({ code: 'channel_custody_unavailable', retryable: true });
     expect(String(error)).not.toContain(MANAGED_BOT_TOKEN);
+  });
+
+  it('preserves the stable owner-quota refusal from encrypted custody', async () => {
+    const service = new TelegramManagedBotsService(
+      { getManagedBotToken: async () => MANAGED_BOT_TOKEN },
+      {
+        storeManagedBotToken: async () => {
+          throw new ChannelConnectionQuotaExceededError(2);
+        },
+      },
+    );
+
+    await expect(
+      service.exchangeAndStore({
+        ownerAccountId: '223e4567-e89b-42d3-a456-426614174000',
+        expectedTelegramOwnerId: '9007199254740001',
+        update: managedBotUpdate(),
+      }),
+    ).rejects.toMatchObject({
+      code: 'channel_quota_exceeded',
+      retryable: false,
+    });
   });
 
   it('binds a manager-bot update to the already paired Telegram owner', async () => {
