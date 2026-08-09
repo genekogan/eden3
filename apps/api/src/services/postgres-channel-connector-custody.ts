@@ -3,6 +3,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { getEnv } from '@eden3/core';
 import { pg } from '@eden3/db';
 import {
+  capabilityEpochId,
   deriveCapabilityKey,
   hostedChannelSecretRef,
 } from '@eden3/gateway';
@@ -27,6 +28,7 @@ interface CustodyRow {
   token_iv: string;
   token_auth_tag: string;
   key_version: string;
+  capability_epoch: number;
 }
 
 export class ChannelCredentialConflictError extends Error {
@@ -42,7 +44,13 @@ function capabilityKey(): Buffer {
   return deriveCapabilityKey(raw);
 }
 
-function handleFor(row: Pick<CustodyRow, 'id' | 'account_id' | 'channel' | 'runtime_account_id'>, capKey: Buffer): ChannelSecretHandle {
+function handleFor(
+  row: Pick<
+    CustodyRow,
+    'id' | 'account_id' | 'channel' | 'runtime_account_id' | 'capability_epoch'
+  >,
+  capKey: Buffer,
+): ChannelSecretHandle {
   return {
     connectionId: row.id,
     secretRefId: hostedChannelSecretRef(
@@ -51,6 +59,7 @@ function handleFor(row: Pick<CustodyRow, 'id' | 'account_id' | 'channel' | 'runt
         accountId: row.account_id,
         channel: row.channel,
         runtimeAccountId: row.runtime_account_id,
+        epoch: capabilityEpochId(row.capability_epoch),
       },
       capKey,
     ).id,
@@ -113,7 +122,7 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
           now(), ${tx.json('{}')}
         )
         returning id, account_id, channel, runtime_account_id,
-                  token_ciphertext, token_iv, token_auth_tag, key_version
+                  token_ciphertext, token_iv, token_auth_tag, key_version, capability_epoch
       `;
       const row = inserted[0];
       if (!row) throw new Error('channel credential custody write failed');
@@ -142,7 +151,7 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
       await tx`select pg_advisory_xact_lock(hashtextextended(${`channel-connector-use:${handle.connectionId}`}, 0))`;
       const rows = await tx<CustodyRow[]>`
         select id, account_id, channel, runtime_account_id,
-               token_ciphertext, token_iv, token_auth_tag, key_version
+               token_ciphertext, token_iv, token_auth_tag, key_version, capability_epoch
         from channel_connections
         where id = ${handle.connectionId} and channel = 'x' and desired_state = 'active'
         limit 1
@@ -183,7 +192,7 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
       await tx`select pg_advisory_xact_lock(hashtextextended(${`channel-connector-use:${handle.connectionId}`}, 0))`;
       const candidates = await tx<CustodyRow[]>`
         select id, account_id, channel, runtime_account_id,
-               token_ciphertext, token_iv, token_auth_tag, key_version
+               token_ciphertext, token_iv, token_auth_tag, key_version, capability_epoch
         from channel_connections
         where id = ${handle.connectionId} and channel = 'x'
         for update
@@ -215,7 +224,10 @@ export class PostgresChannelCredentialCustody implements ChannelCredentialCustod
 }
 
 export function xChannelSecretHandle(
-  row: Pick<CustodyRow, 'id' | 'account_id' | 'channel' | 'runtime_account_id'>,
+  row: Pick<
+    CustodyRow,
+    'id' | 'account_id' | 'channel' | 'runtime_account_id' | 'capability_epoch'
+  >,
   capKey = capabilityKey(),
 ): ChannelSecretHandle {
   if (row.channel !== 'x') throw new Error('not an X connector row');

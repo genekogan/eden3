@@ -11,10 +11,12 @@ import {
   parseSecretId as mjsParse,
   requesterProof as mjsRequesterProof,
   verifySecretId as mjsVerify,
+  capabilityEpochId as mjsCapabilityEpochId,
   CAPABILITY_EPOCH_DEFAULT as MJS_EPOCH,
 } from '../../../infra/channel-secret-resolver/server.mjs';
 import {
   CAPABILITY_EPOCH_DEFAULT,
+  capabilityEpochId,
   deriveCapabilityKey,
   deriveRequesterKey,
   mintCapabilityId,
@@ -37,6 +39,13 @@ describe('capability implementations agree (gateway TS ↔ deployed server.mjs)'
     expect((mjsDeriveKey(vaultKey) as Buffer).equals(deriveCapabilityKey(vaultKey))).toBe(true);
     expect((mjsDeriveKey(vaultKey.toString('hex')) as Buffer).equals(capKey)).toBe(true);
     expect(MJS_EPOCH).toBe(CAPABILITY_EPOCH_DEFAULT);
+    for (const generation of [1, 2, 999_999]) {
+      expect(mjsCapabilityEpochId(generation)).toBe(capabilityEpochId(generation));
+    }
+    for (const generation of [0, 1_000_000, 1.5]) {
+      expect(() => mjsCapabilityEpochId(generation)).toThrow('invalid channel capability epoch');
+      expect(() => capabilityEpochId(generation)).toThrow('invalid channel capability epoch');
+    }
   });
 
   it('derives and signs requester challenges identically', () => {

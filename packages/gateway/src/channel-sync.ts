@@ -12,7 +12,6 @@ import {
   type OpenClawConfig,
 } from './config-gen';
 import {
-  CAPABILITY_EPOCH_DEFAULT,
   deriveCapabilityKey,
   mintCapabilityId,
   type CapabilityScope,
@@ -209,6 +208,8 @@ export interface HostedChannelAccountOptions extends ConfigGenOptions {
   connectionId: string;
   /** channel_connections.account_id (owner) — bound into the capability MAC. */
   accountId: string;
+  /** Exact dedicated channel_connections capability generation encoded as cN. */
+  capabilityEpoch: string;
   label?: string | null;
   bindAgentId: string;
   /** Opaque generation of this exact published runtime mapping. */
@@ -308,10 +309,11 @@ function validateHostedAccountIdentity(runtimeAccountId: string, connectionId: s
  * by a secret derived from CHANNEL_TOKEN_ENCRYPTION_KEY, so the resolver only
  * releases the token to a request bearing this exact capability — a caller in a
  * sandbox/compromised-agent position cannot forge, cross-scope-replay, or
- * enumerate. `epoch` defaults to c1; T12-U02 rotation bumps it to revoke.
+ * enumerate. The caller must project the row's durable capability epoch: a
+ * silent default would re-mint a stale c1 reference after credential rotation.
  */
 export function hostedChannelSecretRef(
-  scope: Omit<CapabilityScope, 'epoch'> & { epoch?: string },
+  scope: CapabilityScope,
   capKey: Buffer,
 ): OpenClawExecSecretRef {
   if (!CONNECTION_UUID.test(scope.connectionId)) {
@@ -325,7 +327,7 @@ export function hostedChannelSecretRef(
       accountId: scope.accountId,
       channel: scope.channel,
       runtimeAccountId: scope.runtimeAccountId,
-      epoch: scope.epoch ?? CAPABILITY_EPOCH_DEFAULT,
+      epoch: scope.epoch,
     }),
   };
 }
@@ -344,12 +346,13 @@ function hostedCapabilityKey(): Buffer {
 }
 
 /** The capability scope for a hosted account, drawn from the connection row. */
-function scopeOf(options: HostedChannelAccountOptions): Omit<CapabilityScope, 'epoch'> {
+function scopeOf(options: HostedChannelAccountOptions): CapabilityScope {
   return {
     connectionId: options.connectionId,
     accountId: options.accountId,
     channel: options.channel,
     runtimeAccountId: options.runtimeAccountId,
+    epoch: options.capabilityEpoch,
   };
 }
 

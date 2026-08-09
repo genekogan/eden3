@@ -21,9 +21,10 @@ import { createHmac, hkdfSync, timingSafeEqual } from 'node:crypto';
  * a sandbox or compromised-agent position cannot forge, cross-scope-replay, or
  * enumerate tokens because it cannot produce a valid MAC for any connection.
  *
- * Rotation / mass-revocation (bumping the epoch), KMS envelope encryption, and
- * the breach drill are T12-U02 — this module ships the epoch field + the
- * revocation-by-epoch hook so U02 can rotate, but performs no rotation itself.
+ * Credential rotation atomically bumps a dedicated database epoch and
+ * republishes the corresponding SecretRef, revoking the previous capability
+ * before decryption. Shared-gateway isolation, KMS envelope encryption, and
+ * the breach drill remain separate hardening work.
  */
 
 /** Domain-separated HKDF derivation from the shared vault key. */
@@ -37,6 +38,7 @@ const SCOPE_DOMAIN = 'eden3-channel-cap-v1';
 /** 128-bit truncated MAC → 22 base64url chars (no padding). */
 export const CAPABILITY_MAC_BYTES = 16;
 export const CAPABILITY_EPOCH_DEFAULT = 'c1';
+export const CAPABILITY_EPOCH_MAX = 999_999;
 export const CHANNEL_SECRET_REQUEST_PROTOCOL_VERSION = 2;
 
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
@@ -52,6 +54,14 @@ export const CAPABILITY_SECRET_ID = new RegExp(
 const EPOCH_RE = new RegExp(`^${EPOCH}$`);
 const UUID_RE = new RegExp(`^${UUID}$`);
 
+/** Encode only the dedicated bounded database generation into the wire id. */
+export function capabilityEpochId(generation: number): string {
+  if (!Number.isSafeInteger(generation) || generation < 1 || generation > CAPABILITY_EPOCH_MAX) {
+    throw new Error('invalid channel capability epoch');
+  }
+  return `c${generation}`;
+}
+
 export interface CapabilityScope {
   /** channel_connections.id (PK). */
   connectionId: string;
@@ -61,7 +71,7 @@ export interface CapabilityScope {
   channel: string;
   /** channel_connections.runtime_account_id — the stable named-account key. */
   runtimeAccountId: string;
-  /** Capability epoch; bumped by T12-U02 rotation to revoke prior capabilities. */
+  /** Dedicated durable capability epoch; bumped exactly once with credential rotation. */
   epoch: string;
 }
 

@@ -27,6 +27,7 @@ const AGREEMENT_REQUESTER_KEY = deriveRequesterKey(AGREEMENT_KEY);
 function activeRow(row) {
   return {
     ...row,
+    capability_epoch: row.capability_epoch ?? 1,
     agent_openclaw_id: row.runtime_account_id,
     agent_owner_id: row.account_id,
     agent_deleted: false,

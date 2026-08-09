@@ -10,6 +10,7 @@ import {
 } from '@eden3/core';
 import { channelConnections, db, pg, secretAccessAuditEvents } from '@eden3/db';
 import {
+  capabilityEpochId,
   ensureHostedChannelAccount,
   removeHostedChannelAccount,
   deriveCapabilityKey,
@@ -288,6 +289,7 @@ interface ChannelConnectionRow {
   token_auth_tag: string;
   token_sha256: string;
   key_version: string;
+  capability_epoch: number;
   last_error_code: string | null;
   last_error_message: string | null;
   last_validated_at: string | null;
@@ -306,6 +308,7 @@ interface XConnectionRow {
   channel: 'x';
   label: string | null;
   runtime_account_id: string;
+  capability_epoch: number;
   desired_state: 'inactive' | 'active';
   status: string;
   last_error_code: string | null;
@@ -545,14 +548,14 @@ function xDto(row: XConnectionRow) {
 const CONNECTION_COLUMNS = pg`
   id, account_id, agent_id, channel, label, runtime_account_id,
   desired_state, observed_state, status, token_ciphertext, token_iv,
-  token_auth_tag, token_sha256, key_version,
+  token_auth_tag, token_sha256, key_version, capability_epoch,
   last_error_code, last_error_message, last_validated_at, retry_count,
   next_retry_at, activated_at, metadata, created_at, updated_at
 `;
 
 const X_CONNECTION_COLUMNS = pg`
   id, account_id, agent_id, channel, label, runtime_account_id,
-  desired_state, status, last_error_code, last_error_message,
+  capability_epoch, desired_state, status, last_error_code, last_error_message,
   last_validated_at, metadata, created_at, updated_at
 `;
 
@@ -1549,7 +1552,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             ${encrypted
               ? tx`, token_ciphertext = ${encrypted.tokenCiphertext}, token_iv = ${encrypted.tokenIv},
                     token_auth_tag = ${encrypted.tokenAuthTag}, token_sha256 = ${encrypted.tokenSha256},
-                    key_version = ${encrypted.keyVersion}`
+                    key_version = ${encrypted.keyVersion}, capability_epoch = capability_epoch + 1`
               : tx``}
         where id = ${row.id}
         returning ${CONNECTION_COLUMNS}
@@ -1590,6 +1593,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           runtimeAccountId: fresh.runtime_account_id,
           connectionId: fresh.id,
           accountId: fresh.account_id,
+          capabilityEpoch: capabilityEpochId(fresh.capability_epoch),
           label: fresh.label,
           bindAgentId: agent.openclawId,
           bindingId: storedChannelRuntimeBindingId(metadata),
@@ -1838,6 +1842,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
         runtimeAccountId: row.runtime_account_id,
         connectionId: row.id,
         accountId: row.account_id,
+        capabilityEpoch: capabilityEpochId(row.capability_epoch),
         label: row.label,
         bindAgentId: agent.openclawId,
         bindingId: storedChannelRuntimeBindingId(metadata),
@@ -2149,6 +2154,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             runtimeAccountId: connection.runtime_account_id,
             connectionId: connection.id,
             accountId: connection.account_id,
+            capabilityEpoch: capabilityEpochId(connection.capability_epoch),
             label: connection.label,
             bindAgentId: agent.openclawId,
             bindingId: storedChannelRuntimeBindingId(connection.metadata),
@@ -2451,6 +2457,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
           runtimeAccountId: prepared.connection.runtime_account_id!,
           connectionId: prepared.connection.id,
           accountId: prepared.connection.account_id,
+          capabilityEpoch: capabilityEpochId(prepared.connection.capability_epoch),
           label: prepared.connection.label,
           bindAgentId: agent.openclawId,
           bindingId: storedChannelRuntimeBindingId(prepared.newConnectionMetadata),
@@ -2473,6 +2480,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
             runtimeAccountId: prepared.connection.runtime_account_id!,
             connectionId: prepared.connection.id,
             accountId: prepared.connection.account_id,
+            capabilityEpoch: capabilityEpochId(prepared.connection.capability_epoch),
             label: prepared.connection.label,
             bindAgentId: agent.openclawId,
             bindingId: storedChannelRuntimeBindingId(prepared.oldConnectionMetadata),

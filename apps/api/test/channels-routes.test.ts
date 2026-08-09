@@ -427,12 +427,20 @@ describe('channel custody and validation', () => {
     const connection = await createConnection({ token: `bad_${marker}_9999` });
     expect(connection.observedState).toBe('error');
     expect(connection.lastError).toMatchObject({ code: 'invalid_token' });
+    const epochOf = async () => {
+      const rows = await pg<Array<{ capability_epoch: number }>>`
+        select capability_epoch from channel_connections where id = ${connection.id}
+      `;
+      return rows[0]!.capability_epoch;
+    };
+    expect(await epochOf()).toBe(1);
 
+    const replacement = `valid_${marker}_replacement_wxyz`;
     const retried = await app.inject({
       method: 'POST',
       url: `/channels/connections/${connection.id}/retry`,
       headers: { cookie: devCookie(ownerId) },
-      payload: { token: `valid_${marker}_replacement_wxyz` },
+      payload: { token: replacement },
     });
     expect(retried.statusCode).toBe(200);
     expect(retried.json()).toMatchObject({
@@ -440,7 +448,26 @@ describe('channel custody and validation', () => {
       connection: { observedState: 'verified', lastError: null },
     });
     expect(retried.json().connection).not.toHaveProperty('tokenPreview');
-    expect(retried.body).not.toContain(`valid_${marker}_replacement_wxyz`);
+    expect(retried.body).not.toContain(replacement);
+    expect(await epochOf()).toBe(2);
+
+    const validated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/retry`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: {},
+    });
+    expect(validated.statusCode).toBe(200);
+    expect(await epochOf()).toBe(2);
+
+    const reused = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/retry`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { token: replacement },
+    });
+    expect(reused.statusCode).toBe(200);
+    expect(await epochOf()).toBe(3);
     const [rotated] = await pg<{ metadata: Record<string, unknown> }[]>`
       select metadata from channel_connections where id = ${connection.id}
     `;
@@ -449,6 +476,92 @@ describe('channel custody and validation', () => {
       select metadata from secret_access_audit_events where secret_id = ${connection.id}
     `;
     expect(JSON.stringify(rotationAudits)).not.toContain('wxyz');
+  });
+
+  it('fails closed after committing a rotated epoch when runtime config projection fails', async () => {
+    const connection = await createConnection({
+      token: `valid_${marker}_projection_a`,
+      agentUsername: firstAgentUsername,
+    });
+    const activated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/activate`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { dmPolicy: 'pairing', allowFrom: [], discordGuilds: [], telegramGroups: [] },
+    });
+    expect(activated.statusCode).toBe(200);
+    expect(ensureCalls.at(-1)).toMatchObject({
+      connectionId: connection.id,
+      capabilityEpoch: 'c1',
+    });
+
+    ensureFailuresRemaining = 1;
+    const rotated = await app.inject({
+      method: 'POST',
+      url: `/channels/connections/${connection.id}/retry`,
+      headers: { cookie: devCookie(ownerId) },
+      payload: { token: `valid_${marker}_projection_b` },
+    });
+    expect(rotated.statusCode).toBe(502);
+    expect(ensureCalls.at(-1)).toMatchObject({
+      connectionId: connection.id,
+      capabilityEpoch: 'c2',
+    });
+    const rows = await pg<Array<{
+      capability_epoch: number;
+      desired_state: string;
+      observed_state: string;
+      last_error_code: string | null;
+    }>>`
+      select capability_epoch, desired_state, observed_state, last_error_code
+      from channel_connections where id = ${connection.id}
+    `;
+    expect(rows[0]).toEqual({
+      capability_epoch: 2,
+      desired_state: 'inactive',
+      observed_state: 'error',
+      last_error_code: 'configuration_error',
+    });
+  });
+
+  it('rejects stale or independent epoch writes and serializes concurrent fixed-epoch rotation', async () => {
+    const connection = await createConnection({ token: `valid_${marker}_epoch_guard` });
+    const epochOf = async () => {
+      const rows = await pg<Array<{ capability_epoch: number }>>`
+        select capability_epoch from channel_connections where id = ${connection.id}
+      `;
+      return rows[0]!.capability_epoch;
+    };
+
+    await pg`
+      update channel_connections set label = ${`${marker}-metadata-only`}
+      where id = ${connection.id}
+    `;
+    expect(await epochOf()).toBe(1);
+    await expect(pg`
+      update channel_connections set capability_epoch = 2 where id = ${connection.id}
+    `).rejects.toThrow(/cannot change without credential rotation/);
+    await expect(pg`
+      update channel_connections
+      set token_ciphertext = token_ciphertext || ${'-missing-epoch'}
+      where id = ${connection.id}
+    `).rejects.toThrow(/must advance capability epoch exactly once/);
+
+    const attempts = await Promise.allSettled([
+      pg`
+        update channel_connections
+        set token_ciphertext = token_ciphertext || ${'-concurrent-a'}, capability_epoch = 2
+        where id = ${connection.id}
+      `,
+      pg`
+        update channel_connections
+        set token_ciphertext = token_ciphertext || ${'-concurrent-b'}, capability_epoch = 2
+        where id = ${connection.id}
+      `,
+    ]);
+    expect(attempts.filter((attempt) => attempt.status === 'fulfilled')).toHaveLength(1);
+    expect(attempts.filter((attempt) => attempt.status === 'rejected')).toHaveLength(1);
+    expect(await epochOf()).toBe(2);
   });
 
   it('discovers Discord destinations only after an audited vault read', async () => {

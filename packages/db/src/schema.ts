@@ -811,6 +811,8 @@ export const channelConnections = pgTable(
     tokenAuthTag: text('token_auth_tag').notNull(),
     tokenSha256: text('token_sha256').notNull(),
     keyVersion: text('key_version').notNull().default('v1'),
+    /** Monotonic credential generation encoded as cN in hosted SecretRefs. */
+    capabilityEpoch: integer('capability_epoch').notNull().default(1),
     lastErrorCode: text('last_error_code'),
     lastErrorMessage: text('last_error_message'),
     lastValidatedAt: timestamptz('last_validated_at'),
@@ -824,6 +826,10 @@ export const channelConnections = pgTable(
   (t) => [
     index('channel_connections_account_idx').on(t.accountId),
     index('channel_connections_agent_idx').on(t.agentId),
+    check(
+      'channel_connections_capability_epoch_chk',
+      sql`${t.capabilityEpoch} between 1 and 999999`,
+    ),
     uniqueIndex('channel_connections_runtime_account_uq')
       .on(t.channel, t.runtimeAccountId)
       .where(sql`${t.runtimeAccountId} is not null`),
