@@ -4,7 +4,16 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { credit, gatewaySessionKey, getBalance, type DbHandle } from '@eden3/core';
+import {
+  credit,
+  gatewaySessionKey,
+  getBalance,
+  LocalMediaStore,
+  type DbHandle,
+  type MediaPutOptions,
+  type MediaPutResult,
+  type MediaStore,
+} from '@eden3/core';
 import { db, pg, sessions } from '@eden3/db';
 import Fastify from 'fastify';
 import postgres from 'postgres';
@@ -15,6 +24,7 @@ import { requireAuth } from '../../src/auth-plugin';
 import { ApiError } from '../../src/errors';
 import { EventsBus } from '../../src/events-bus';
 import { collectionsRoutes } from '../../src/routes/collections';
+import { conceptsRoutes } from '../../src/routes/concepts';
 import {
   AccountErasureRecoveryWorker,
   accountErasureLedgerSha256,
@@ -126,6 +136,40 @@ const WORK_OCCURRENCE = 'b0000000-0000-4000-8000-000000000009';
 const LATE_HUMAN = 'c0000000-0000-4000-8000-000000000001';
 const LATE_ERROR_TURN = 'c0000000-0000-4000-8000-000000000002';
 const LATE_OUTPUT_TURN = 'c0000000-0000-4000-8000-000000000003';
+const PNG_1PX = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64',
+);
+
+class PausingConceptMediaStore implements MediaStore {
+  readonly published: Promise<MediaPutResult>;
+  putCount = 0;
+  private publishedResult: ((result: MediaPutResult) => void) | null = null;
+  private releasePut: (() => void) | null = null;
+  private readonly release = new Promise<void>((resolve) => {
+    this.releasePut = resolve;
+  });
+
+  constructor(private readonly inner: MediaStore) {
+    this.published = new Promise<MediaPutResult>((resolve) => {
+      this.publishedResult = resolve;
+    });
+  }
+
+  async put(file: Buffer | string, options: MediaPutOptions): Promise<MediaPutResult> {
+    this.putCount += 1;
+    const result = await this.inner.put(file, options);
+    this.publishedResult?.(result);
+    this.publishedResult = null;
+    await this.release;
+    return result;
+  }
+
+  resume(): void {
+    this.releasePut?.();
+    this.releasePut = null;
+  }
+}
 
 function ledger(): AccountErasureLedgerSink {
   return {
@@ -217,6 +261,139 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       select has_table_privilege(session_user,'account_erasure_jobs','select') permitted`
     ).resolves.toEqual([{ permitted: true }]);
   });
+
+  it('serializes concept media publication with owner erasure admission in both lock orders', async () => {
+    const mediaRoot = await mkdtemp(join(tmpdir(), 'eden3-concept-erasure-race-'));
+    const uploadOwner = randomUUID();
+    const uploadAgent = randomUUID();
+    const uploadConcept = randomUUID();
+    const deniedOwner = randomUUID();
+    const deniedAgent = randomUUID();
+    const deniedConcept = randomUUID();
+    const uploadUsername = `concept_upload_${uploadOwner.slice(0, 8)}`;
+    const uploadAgentUsername = `concept_agent_${uploadAgent.slice(0, 8)}`;
+    const deniedUsername = `concept_denied_${deniedOwner.slice(0, 8)}`;
+    const deniedAgentUsername = `concept_denied_agent_${deniedAgent.slice(0, 8)}`;
+    const authorized = new Map<string, string>([
+      [uploadOwner, uploadUsername],
+      [deniedOwner, deniedUsername],
+    ]);
+    const pausingStore = new PausingConceptMediaStore(new LocalMediaStore({
+      mediaDir: mediaRoot,
+      baseUrl: '/media',
+    }));
+    const app = Fastify();
+    app.decorateRequest('account', null);
+    app.decorate('requireAuth', requireAuth);
+    app.decorate('accessAllowlist', new Set<string>());
+    app.addHook('onRequest', async (request) => {
+      const value = request.headers['x-test-account-id'];
+      const accountId = Array.isArray(value) ? value[0] : value;
+      const username = accountId ? authorized.get(accountId) : undefined;
+      request.account = accountId && username
+        ? { accountId, username, isAdmin: false }
+        : null;
+    });
+    await app.register(conceptsRoutes, { store: pausingStore });
+    try {
+      await pg`
+        insert into accounts (id,type,username) values
+          (${uploadOwner},'user',${uploadUsername}),
+          (${uploadAgent},'agent',${uploadAgentUsername}),
+          (${deniedOwner},'user',${deniedUsername}),
+          (${deniedAgent},'agent',${deniedAgentUsername})`;
+      await pg`
+        insert into agents (account_id,owner_id,name,public) values
+          (${uploadAgent},${uploadOwner},'upload first agent',false),
+          (${deniedAgent},${deniedOwner},'erasure first agent',false)`;
+      await pg`
+        insert into concepts (id,agent_id,name,slug) values
+          (${uploadConcept},${uploadAgent},'upload first concept','upload-first'),
+          (${deniedConcept},${deniedAgent},'erasure first concept','erasure-first')`;
+
+      const uploadRequest = app.inject({
+        method: 'POST',
+        url: `/${uploadAgentUsername}/concepts/upload-first/images`,
+        headers: { 'x-test-account-id': uploadOwner },
+        payload: {
+          mime: 'image/png',
+          filename: 'upload-first.png',
+          dataBase64: PNG_1PX.toString('base64'),
+        },
+      });
+      const stored = await pausingStore.published;
+      let intentSettled = false;
+      const intentStore = erasureStore();
+      const intentRequest = intentStore.acceptIntent({
+        accountId: uploadOwner,
+        confirmUsername: uploadUsername,
+      }).finally(() => {
+        intentSettled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(intentSettled).toBe(false);
+
+      pausingStore.resume();
+      expect((await uploadRequest).statusCode).toBe(201);
+      const accepted = await intentRequest;
+      const [image] = await pg<{ id: string; url: string; local_path: string; sha256: string }[]>`
+        select id,url,local_path,sha256 from concept_images
+        where concept_id=${uploadConcept} and sha256=${stored.sha256}`;
+      expect(image).toMatchObject({
+        url: stored.url,
+        local_path: stored.localPath,
+        sha256: stored.sha256,
+      });
+
+      const manifestSink = recoverySink();
+      await expect(requestAccountErasure({
+        actorAccountId: uploadOwner,
+        actorUsername: uploadUsername,
+        actorIsAdmin: false,
+        confirmUsername: uploadUsername,
+      }, intentStore, ledger(), manifestSink)).resolves.toEqual({
+        jobId: accepted.jobId,
+        status: 'pending',
+      });
+      const manifest = vi.mocked(manifestSink.encryptWriteAndConfirm).mock.calls[0]![0];
+      const locator = manifest.locators.find((entry) =>
+        entry.kind === 'legacy_concept_asset' && entry.resourceId === image!.id);
+      expect(locator).toBeDefined();
+      expect(JSON.parse(locator!.locator)).toEqual({
+        kind: 'legacy_concept_asset',
+        localPath: stored.localPath,
+        url: stored.url,
+        sha256: stored.sha256,
+      });
+
+      await expect(intentStore.acceptIntent({
+        accountId: deniedOwner,
+        confirmUsername: deniedUsername,
+      })).resolves.toMatchObject({ accountId: deniedOwner, state: 'intent_pending' });
+      const deniedBody = Buffer.concat([PNG_1PX, Buffer.from([0x7f])]);
+      const deniedSha = createHash('sha256').update(deniedBody).digest('hex');
+      const putCountBeforeDenied = pausingStore.putCount;
+      const denied = await app.inject({
+        method: 'POST',
+        url: `/${deniedAgentUsername}/concepts/erasure-first/images`,
+        headers: { 'x-test-account-id': deniedOwner },
+        payload: {
+          mime: 'image/png',
+          filename: 'erasure-first.png',
+          dataBase64: deniedBody.toString('base64'),
+        },
+      });
+      expect(denied.statusCode).toBe(409);
+      expect(pausingStore.putCount).toBe(putCountBeforeDenied);
+      await expect(readFile(join(mediaRoot, `${deniedSha}.png`))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+    } finally {
+      pausingStore.resume();
+      await app.close();
+      await rm(mediaRoot, { recursive: true, force: true });
+    }
+  }, 30_000);
   it('rejects cross-tenant outbound intents and nonhuman Stripe ownership', async () => {
     const owner = randomUUID();
     const foreign = randomUUID();
