@@ -20,7 +20,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api } from "@/lib/api";
+import { api, onDevUserChange } from "@/lib/api";
 import type { AgentDto, DevUser } from "@/lib/types";
 import { clearLastAgent, getLastAgent, setLastAgent } from "@/lib/last-agent";
 
@@ -101,6 +101,17 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const [myAgentsPhase, setMyAgentsPhase] = useState<"loading" | "ready" | "error">("loading");
   const [myAgentsNonce, setMyAgentsNonce] = useState(0);
   const [viewer, setViewer] = useState<DevUser | null>(null);
+
+  // Dev impersonation can change after this provider's initial auth read.
+  // Refresh viewer authority and the owned-agent inventory immediately so
+  // global surfaces such as command search do not retain the signed-out view.
+  useEffect(() => {
+    return onDevUserChange((user) => {
+      setViewer(user);
+      setMyAgentsPhase("loading");
+      setMyAgentsNonce((nonce) => nonce + 1);
+    });
+  }, []);
 
   // ---- viewer (dev-impersonated or Clerk-backed) --------------------------
   useEffect(() => {
