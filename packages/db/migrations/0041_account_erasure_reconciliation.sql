@@ -890,6 +890,7 @@ END;
 $$;
 --> statement-breakpoint
 REVOKE EXECUTE ON FUNCTION public.account_erasure_record_outbound_post_terminal(uuid,uuid,text,text,text) FROM PUBLIC;
+GRANT SELECT ON public.channel_connections TO eden3_erasure_guard;
 GRANT SELECT,UPDATE ON public.channel_outbound_post_intents TO eden3_erasure_guard;
 GRANT EXECUTE ON FUNCTION public.account_erasure_record_outbound_post_terminal(uuid,uuid,text,text,text)
 	TO eden3_erasure_terminal_writer;

@@ -240,7 +240,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       'checkout intent owner must be a human account',
     );
     await expect(pg`insert into stripe_checkout_intents(account_id,kind,request_key_sha256)
-      values (${owner},'manna_topup',${sha('human-stripe-intent')})`).resolves.toHaveLength(1);
+      values (${owner},'manna_topup',${sha('human-stripe-intent')}) returning id`).resolves.toHaveLength(1);
   });
   it('proves money, privacy, multipart gating, worker concurrency, and route-vs-worker fencing', async () => {
     await pg`
@@ -354,13 +354,13 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       insert into channel_connections
         (id,account_id,agent_id,channel,token_ciphertext,token_iv,token_auth_tag,token_sha256,
          runtime_account_id)
-      values (${CHANNEL_CONNECTION},${HUMAN},${AGENT},'discord','ciphertext','iv','tag',
+      values (${CHANNEL_CONNECTION},${HUMAN},${AGENT},'x','ciphertext','iv','tag',
         ${sha('channel-token')},'runtime-private')`;
     await pg`
       insert into secret_access_audit_events
         (actor_account_id,owner_account_id,secret_kind,secret_id,action,metadata)
       values (${HUMAN},${HUMAN},'channel_token',${CHANNEL_CONNECTION},'runtime_retrieve',
-        ${JSON.stringify({ runtimeAccountId: 'runtime-private', provider: 'discord', correlation: 'secret' })}::jsonb)`;
+        ${JSON.stringify({ runtimeAccountId: 'runtime-private', provider: 'x', correlation: 'secret' })}::jsonb)`;
     await pg`
       insert into channel_outbound_post_intents(id,account_id,connection_id)
       values (${OUTBOUND_INTENT},${HUMAN},${CHANNEL_CONNECTION})`;
