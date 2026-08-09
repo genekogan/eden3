@@ -10,8 +10,9 @@
   "scripts": {
     "dev": "concurrently -k -n api,web -c blue,magenta \"pnpm --filter @eden3/api dev\" \"pnpm --filter @eden3/web dev\"",
     "build": "pnpm -r build",
-    "test": "pnpm -r test && pnpm test:semantic-skips",
+    "test": "pnpm -r test && pnpm test:semantic-skips && pnpm test:credential-exposure",
     "test:semantic-skips": "node --test scripts/semantic-test-controls.test.mjs",
+    "test:credential-exposure": "node --test scripts/credential-exposure.test.mjs && node scripts/credential-exposure.mjs",
     "test:api-full": "pnpm --filter @eden3/api test:full",
     "test:db-scratch-full": "pnpm --filter @eden3/db test:scratch-full",
     "typecheck": "pnpm -r typecheck",
