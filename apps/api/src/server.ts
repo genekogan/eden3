@@ -23,9 +23,9 @@ import {
 import {
   ApiError,
   errorEnvelope,
+  logSafeRequestError,
   publicErrorCode,
   publicErrorMessage,
-  safeServerErrorLog,
 } from './errors';
 import { EventsBus, sessionEventsRoutes } from './events-bus';
 import { GatewayGlue, defaultOpenclawDataDir, type GatewayGlueOptions } from './gateway-glue';
@@ -180,6 +180,11 @@ export interface BuildServerOptions {
   shares?: { repository: SessionShareRepository };
   notifications?: NotificationsRoutesOptions;
   accountErasure?: AccountErasureRuntimeBundle;
+  /** Deterministic DB-free startup seams; production always uses the defaults. */
+  bootstrap?: {
+    ensureBuiltinSkills: typeof ensureBuiltinSkills;
+    ensureEveAssistant: typeof ensureEveAssistant;
+  };
 }
 
 const SAFE_HEALTH_IDENTIFIER = /^[a-z0-9][a-z0-9._-]{0,127}$/;
@@ -307,7 +312,17 @@ export function registerApiErrorHandler(
       reply.statusCode,
       typeof candidate === 'string' ? candidate : 'internal_error',
     );
-    reply.removeHeader('content-length');
+    for (const header of [
+      'accept-ranges',
+      'content-encoding',
+      'content-length',
+      'content-range',
+      'digest',
+      'etag',
+      'last-modified',
+    ]) {
+      reply.removeHeader(header);
+    }
     reply.header('content-type', 'application/json; charset=utf-8');
     return JSON.stringify(errorEnvelope(reply.statusCode, code, ''));
   });
@@ -340,13 +355,10 @@ export function registerApiErrorHandler(
     code = publicErrorCode(statusCode, code);
     const capabilityRequest = isShareCapabilityRequest(req.url);
     if (statusCode >= 500) {
-      req.log.error(
-        {
-          requestId: req.id,
-          statusCode,
-          code,
-          ...safeServerErrorLog(err),
-        },
+      logSafeRequestError(
+        req.log,
+        err,
+        { requestId: req.id, statusCode, code },
         capabilityRequest ? 'share capability request failed' : 'request failed',
       );
     }
@@ -764,9 +776,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     memoryDreamScheduler?.stop();
   });
   if (opts.scheduler?.autoStart === true) memoryDreamScheduler?.start();
-  await ensureBuiltinSkills();
+  await (opts.bootstrap?.ensureBuiltinSkills ?? ensureBuiltinSkills)();
   if (opts.scheduler?.autoStart === true) agentProvisioningWorker.start();
-  await ensureEveAssistant({
+  await (opts.bootstrap?.ensureEveAssistant ?? ensureEveAssistant)({
     // The real API entrypoint starts the media watcher and talks to the live
     // gateway. In that mode @eve must also sync OpenClaw's default workspace;
     // route tests can still bootstrap the DB row without touching live gateway
@@ -930,7 +942,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       try {
         if (await legacyMediaIsPubliclyReachable(pg, path)) return;
       } catch (err) {
-        req.log.error({ err }, 'legacy media visibility check failed');
+        logSafeRequestError(req.log, err, {}, 'legacy media visibility check failed');
       }
       return reply.code(404).send(errorEnvelope(404, 'not_found', 'Media not found'));
     });

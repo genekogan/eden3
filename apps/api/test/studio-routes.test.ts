@@ -683,8 +683,9 @@ describe('POST /studio/generate', () => {
       costUsd: '0.00000000',
       manna: 0,
       errorCode: 'gateway_error',
-      errorMessage: expect.stringContaining('fal exploded'),
+      errorMessage: 'Studio generation failed',
     });
+    expect(JSON.stringify(usage)).not.toContain('fal exploded');
     expect(usage!.latencyMs).toBeGreaterThanOrEqual(0);
     invokeError = null;
   });
@@ -801,8 +802,9 @@ describe('POST /studio/generate', () => {
         status: 'error',
         manna: 0,
         errorCode: 'gateway_not_configured',
-        errorMessage: expect.stringContaining('OPENCLAW_GATEWAY_TOKEN is not set'),
+        errorMessage: 'Studio generation failed',
       });
+      expect(JSON.stringify(usage)).not.toContain('OPENCLAW_GATEWAY_TOKEN is not set');
     } finally {
       toolsFactoryError = null;
     }

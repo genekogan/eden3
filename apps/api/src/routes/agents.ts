@@ -25,7 +25,7 @@ import { eq, sql } from 'drizzle-orm';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, safeServerErrorLog, sendError } from '../errors';
+import { ApiError, logSafeRequestError, sendError } from '../errors';
 import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
   agentDtoFromEntities,
@@ -598,8 +598,10 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         runtimeSync: sync.status,
       });
     } catch (err) {
-      req.log.error(
-        { ...safeServerErrorLog(err), accountId: account.id },
+      logSafeRequestError(
+        req.log,
+        err,
+        { accountId: account.id },
         `repair failed for "${account.username}"`,
       );
       return sendError(
@@ -1089,7 +1091,12 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       await app.gatewayGlue.toolSync.syncAgentToolGroups({ openclawId: username, toolGroups });
     } catch (err) {
       provisionStatus = 'failed';
-      req.log.error({ err }, `import provisioning failed for agent "${username}"`);
+      logSafeRequestError(
+        req.log,
+        err,
+        { accountId: created.account.id },
+        `import provisioning failed for agent "${username}"`,
+      );
     }
 
     const [updatedAgent] = await db

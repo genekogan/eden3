@@ -26,7 +26,7 @@ import {
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
-import { ApiError, safeServerErrorLog, sendError } from '../errors';
+import { ApiError, logSafeRequestError, publicErrorCode, sendError } from '../errors';
 import { MediaPipeline, type AttachmentKind } from '../services/media-pipeline';
 import {
   admitStudioGeneration,
@@ -84,7 +84,10 @@ export async function recordStudioReversal<T>(
   _unsafeDetail: unknown,
   compensate: (failure: { errorCode: string; errorMessage: string }) => Promise<T>,
 ): Promise<T> {
-  return compensate({ errorCode, errorMessage: 'Studio generation failed' });
+  return compensate({
+    errorCode: publicErrorCode(500, errorCode),
+    errorMessage: 'Studio generation failed',
+  });
 }
 
 /** Attachment kinds a tool's output may claim (music/tts both land as audio). */
@@ -852,8 +855,10 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           if (fallbackErr instanceof ApiError) {
             return sendError(reply, fallbackErr.statusCode, fallbackErr.code, detail);
           }
-          req.log.error(
-            { ...safeServerErrorLog(fallbackErr), tool: body.tool },
+          logSafeRequestError(
+            req.log,
+            fallbackErr,
+            { tool: body.tool },
             'studio: tts fallback failed',
           );
           return sendError(reply, 502, 'provider_error', `tts failed: ${detail}`);
@@ -879,8 +884,10 @@ export const studioRoutes: FastifyPluginAsync<StudioRoutesOptions> = async (app,
           err instanceof GatewayHttpError || err instanceof GatewayToolError
             ? err.message
             : 'gateway invocation failed';
-        req.log.error(
-          { ...safeServerErrorLog(err), tool: body.tool },
+        logSafeRequestError(
+          req.log,
+          err,
+          { tool: body.tool },
           'studio: tool invocation failed',
         );
         await requireReversal('gateway_error', detail);

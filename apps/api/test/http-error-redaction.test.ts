@@ -1,4 +1,6 @@
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,19 +8,26 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
   errorEnvelope,
+  logSafeRequestError,
   safeServerErrorLog,
   sendError,
 } from '../src/errors';
-import { registerApiErrorHandler } from '../src/server';
+import { buildServer, registerApiErrorHandler } from '../src/server';
 import { recordStudioReversal } from '../src/routes/studio';
 
 const SENSITIVE = 'SENSITIVE_5XX_SENTINEL_do_not_expose';
+const SECRET_CODE = 'secret_token_value';
+const SECRET_ERRNO = 'ESECRET_TOKEN_VALUE';
+const SECRET_ERROR_NAME = 'SecretTokenError';
 
 describe('HTTP 5xx disclosure boundary', () => {
   const apps: FastifyInstance[] = [];
+  const tempDirs: string[] = [];
 
   afterEach(async () => {
     await Promise.all(apps.splice(0).map((app) => app.close()));
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
+    vi.unstubAllEnvs();
   });
 
   it.each([
@@ -29,10 +38,10 @@ describe('HTTP 5xx disclosure boundary', () => {
     [504, 'Request timed out'],
     [599, 'Service temporarily unavailable'],
   ] as const)('replaces untrusted %i text with one reviewed public message', (status, expected) => {
-    const envelope = errorEnvelope(status, 'specific_machine_code', SENSITIVE);
+    const envelope = errorEnvelope(status, 'agent_provision_failed', SENSITIVE);
 
     expect(envelope).toEqual({
-      error: { code: 'specific_machine_code', message: expected, statusCode: status },
+      error: { code: 'agent_provision_failed', message: expected, statusCode: status },
     });
     expect(JSON.stringify(envelope)).not.toContain(SENSITIVE);
   });
@@ -47,8 +56,8 @@ describe('HTTP 5xx disclosure boundary', () => {
     });
   });
 
-  it('rejects an injected 5xx machine code while preserving the status', () => {
-    const envelope = errorEnvelope(503, SENSITIVE, SENSITIVE);
+  it('rejects a grammar-valid injected 5xx machine code while preserving the status', () => {
+    const envelope = errorEnvelope(503, SECRET_CODE, SENSITIVE);
 
     expect(envelope).toEqual({
       error: {
@@ -58,6 +67,7 @@ describe('HTTP 5xx disclosure boundary', () => {
       },
     });
     expect(JSON.stringify(envelope)).not.toContain(SENSITIVE);
+    expect(JSON.stringify(envelope)).not.toContain(SECRET_CODE);
   });
 
   it.each([
@@ -85,7 +95,7 @@ describe('HTTP 5xx disclosure boundary', () => {
     },
   );
 
-  it('redacts an injected ApiError code from both response and logs', async () => {
+  it('redacts a grammar-valid injected ApiError code from both response and logs', async () => {
     const lines: string[] = [];
     const app = Fastify({
       logger: {
@@ -97,7 +107,7 @@ describe('HTTP 5xx disclosure boundary', () => {
     apps.push(app);
     registerApiErrorHandler(app, { bodyLimitBytes: 1_024 });
     app.get('/failure', async () => {
-      throw new ApiError(503, SENSITIVE, SENSITIVE);
+      throw new ApiError(503, SECRET_CODE, SENSITIVE);
     });
 
     const response = await app.inject({ method: 'GET', url: '/failure' });
@@ -111,6 +121,66 @@ describe('HTTP 5xx disclosure boundary', () => {
     });
     expect(response.body).not.toContain(SENSITIVE);
     expect(lines.join('\n')).not.toContain(SENSITIVE);
+    expect(lines.join('\n')).not.toContain(SECRET_CODE);
+  });
+
+  it('enforces redaction through the actual DB-free buildServer composition', async () => {
+    const mediaDir = await mkdtemp(path.join(tmpdir(), 'eden3-5xx-redaction-'));
+    tempDirs.push(mediaDir);
+    vi.stubEnv('MEDIA_DIR', mediaDir);
+    vi.stubEnv('CHANNEL_TOKEN_ENCRYPTION_KEY', '11'.repeat(32));
+    vi.stubEnv('OPENCLAW_GATEWAY_TOKEN', '');
+    const lines: string[] = [];
+    const app = await buildServer({
+      logger: {
+        level: 'error',
+        base: undefined,
+        stream: { write: (line: string) => lines.push(line) },
+      },
+      gateway: null,
+      bootstrap: {
+        ensureBuiltinSkills: async () => {},
+        ensureEveAssistant: async () => ({
+          accountId: '00000000-0000-4000-8000-000000000001',
+          username: 'eve',
+          openclawId: 'main',
+        }),
+      },
+    });
+    apps.push(app);
+    app.get('/__test_only_5xx_composition', async () => {
+      throw new ApiError(503, SECRET_CODE, SENSITIVE);
+    });
+    app.get('/__test_only_raw_5xx_composition', async (_request, reply) =>
+      reply.code(502).send({
+        error: { code: SECRET_CODE, message: SENSITIVE, statusCode: 502 },
+        providerDetail: SENSITIVE,
+      }));
+
+    const [response, rawResponse] = await Promise.all([
+      app.inject({ method: 'GET', url: '/__test_only_5xx_composition' }),
+      app.inject({ method: 'GET', url: '/__test_only_raw_5xx_composition' }),
+    ]);
+
+    expect(response.json()).toEqual({
+      error: {
+        code: 'internal_error',
+        message: 'Service temporarily unavailable',
+        statusCode: 503,
+      },
+    });
+    expect(response.body).not.toContain(SENSITIVE);
+    expect(rawResponse.json()).toEqual({
+      error: {
+        code: 'internal_error',
+        message: 'Upstream service unavailable',
+        statusCode: 502,
+      },
+    });
+    expect(rawResponse.body).not.toContain(SENSITIVE);
+    expect(rawResponse.body).not.toContain(SECRET_CODE);
+    expect(lines.join('\n')).not.toContain(SENSITIVE);
+    expect(lines.join('\n')).not.toContain(SECRET_CODE);
   });
 
   it.each([
@@ -156,45 +226,83 @@ describe('HTTP 5xx disclosure boundary', () => {
     },
   );
 
-  it('retains non-message exception telemetry without retaining unsafe text', () => {
-    const error = Object.assign(new Error(SENSITIVE), { code: 'EUPSTREAM' });
+  it.each([SECRET_ERRNO, 8_675_309])(
+    'retains only reviewed exception telemetry without retaining unsafe code %s',
+    (unsafeCode) => {
+      const error = Object.assign(new Error(SENSITIVE), { code: unsafeCode });
 
-    const context = safeServerErrorLog(error);
+      const context = safeServerErrorLog(error);
 
-    expect(context).toMatchObject({ errorName: 'Error', errorCode: 'EUPSTREAM' });
-    expect(JSON.stringify(context)).not.toContain(SENSITIVE);
-  });
+      expect(context).toEqual({ errorName: 'Error' });
+      expect(JSON.stringify(context)).not.toContain(SENSITIVE);
+      expect(JSON.stringify(context)).not.toContain(String(unsafeCode));
+    },
+  );
 
   it('rejects injected exception names and codes from safe log metadata', () => {
-    const error = Object.assign(new Error('ordinary'), { name: SENSITIVE, code: SENSITIVE });
+    const error = Object.assign(new Error('ordinary'), {
+      name: SECRET_ERROR_NAME,
+      code: SECRET_ERRNO,
+    });
 
     const context = safeServerErrorLog(error);
 
     expect(context).toEqual({ errorName: 'Error' });
-    expect(JSON.stringify(context)).not.toContain(SENSITIVE);
+    expect(JSON.stringify(context)).not.toContain(SECRET_ERROR_NAME);
+    expect(JSON.stringify(context)).not.toContain(SECRET_ERRNO);
+  });
+
+  it('captures request error logs without serializing the throwable', () => {
+    const calls: unknown[][] = [];
+    const logger = { error: (...args: unknown[]) => calls.push(args) };
+    const error = Object.assign(new Error(SENSITIVE), {
+      code: SECRET_ERRNO,
+      cause: new Error(SENSITIVE),
+    });
+
+    logSafeRequestError(logger, error, { accountId: 'safe-account-id' }, 'request failed');
+
+    expect(calls).toEqual([[
+      { accountId: 'safe-account-id', errorName: 'Error' },
+      'request failed',
+    ]]);
+    expect(JSON.stringify(calls)).not.toContain(SENSITIVE);
+    expect(JSON.stringify(calls)).not.toContain(SECRET_ERRNO);
   });
 
   it('stores a stable Studio reversal reason instead of provider detail', async () => {
     const compensate = vi.fn(async () => 'refunded' as const);
 
-    await expect(recordStudioReversal('provider_error', SENSITIVE, compensate))
+    await expect(recordStudioReversal(SECRET_CODE, SENSITIVE, compensate))
       .resolves.toBe('refunded');
     expect(compensate).toHaveBeenCalledWith({
-      errorCode: 'provider_error',
+      errorCode: 'internal_error',
       errorMessage: 'Studio generation failed',
     });
     expect(JSON.stringify(compensate.mock.calls)).not.toContain(SENSITIVE);
+    expect(JSON.stringify(compensate.mock.calls)).not.toContain(SECRET_CODE);
   });
 
   it('clamps an explicit route reply that bypasses errorEnvelope and sendError', async () => {
     const app = Fastify({ logger: false });
     apps.push(app);
     registerApiErrorHandler(app, { bodyLimitBytes: 1_024 });
-    app.get('/raw-provider-failure', async (_request, reply) =>
-      reply.code(502).send({
+    app.get('/raw-provider-failure', async (_request, reply) => {
+      reply.headers({
+        'accept-ranges': 'bytes',
+        'content-encoding': 'gzip',
+        'content-range': 'bytes 0-9/10',
+        digest: 'sha-256=stale',
+        etag: '"stale"',
+        'last-modified': 'Wed, 21 Oct 2015 07:28:00 GMT',
+        'retry-after': '30',
+        'x-content-type-options': 'nosniff',
+      });
+      return reply.code(502).send({
         error: { code: 'provider_error', message: SENSITIVE, statusCode: 502 },
         providerDetail: SENSITIVE,
-      }));
+      });
+    });
 
     const response = await app.inject({ method: 'GET', url: '/raw-provider-failure' });
 
@@ -207,6 +315,15 @@ describe('HTTP 5xx disclosure boundary', () => {
       },
     });
     expect(response.body).not.toContain(SENSITIVE);
+    expect(response.headers['accept-ranges']).toBeUndefined();
+    expect(response.headers['content-encoding']).toBeUndefined();
+    expect(response.headers['content-range']).toBeUndefined();
+    expect(response.headers.digest).toBeUndefined();
+    expect(response.headers.etag).toBeUndefined();
+    expect(response.headers['last-modified']).toBeUndefined();
+    expect(response.headers['retry-after']).toBe('30');
+    expect(response.headers['x-content-type-options']).toBe('nosniff');
+    expect(Number(response.headers['content-length'])).toBe(Buffer.byteLength(response.body));
   });
 
   it('does not reserialize a canonical 5xx envelope or disturb safe headers', async () => {
@@ -292,21 +409,30 @@ describe('HTTP 5xx disclosure boundary', () => {
   });
 
   it('keeps named provider and repair logs on the safe metadata seam', async () => {
-    const [studio, agents] = await Promise.all([
+    const [studio, agents, server] = await Promise.all([
       readFile(new URL('../src/routes/studio.ts', import.meta.url), 'utf8'),
       readFile(new URL('../src/routes/agents.ts', import.meta.url), 'utf8'),
+      readFile(new URL('../src/server.ts', import.meta.url), 'utf8'),
     ]);
 
     expect(studio).not.toMatch(/tts fallback failed:.*String\(fallbackErr\)/);
     expect(studio).not.toMatch(/tool invoke failed:.*String\(err\)/);
     expect(studio).toMatch(
-      /safeServerErrorLog\(fallbackErr\)[\s\S]{0,120}'studio: tts fallback failed'/,
+      /logSafeRequestError\([\s\S]{0,160}fallbackErr[\s\S]{0,160}'studio: tts fallback failed'/,
     );
     expect(studio).toMatch(
-      /safeServerErrorLog\(err\)[\s\S]{0,120}'studio: tool invocation failed'/,
+      /logSafeRequestError\([\s\S]{0,160}\berr,[\s\S]{0,160}'studio: tool invocation failed'/,
     );
     expect(agents).not.toMatch(/req\.log\.error\(\{ err \}, `repair failed/);
-    expect(agents).toContain('{ ...safeServerErrorLog(err), accountId: account.id }');
+    expect(agents).not.toMatch(/req\.log\.error\(\{ err \}, `import provisioning failed/);
+    expect(agents).toMatch(/logSafeRequestError\([\s\S]{0,120}\{ accountId: account\.id \}/);
+    expect(agents).toMatch(/logSafeRequestError\([\s\S]{0,160}created\.account\.id/);
+    expect(server).not.toMatch(
+      /req\.log\.error\(\{ err \}, 'legacy media visibility check failed'/,
+    );
+    expect(server).toMatch(
+      /logSafeRequestError\(req\.log, err, \{\}, 'legacy media visibility check failed'\)/,
+    );
   });
 
   it('keeps an actionable ApiError 4xx message through the production handler', async () => {
