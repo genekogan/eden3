@@ -49,6 +49,11 @@ import { HistorySync } from '../../src/services/history-sync';
 import { reconcileAgentRuntime } from '../../src/services/agent-runtime-sync';
 import { legacyMediaIsPubliclyReachable } from '../../src/services/legacy-media-visibility';
 import {
+  EdenMemoryDreamAgentRunner,
+  type MemoryDreamCheckpoint,
+  type MemoryDreamDurability,
+} from '../../src/services/memory-dreaming';
+import {
   admitStudioGeneration,
   compensateStudioGeneration,
   reserveStudioGeneration,
@@ -401,6 +406,197 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
     } finally {
       releaseWriter();
       await Promise.allSettled([...outstanding]);
+    }
+  }, 30_000);
+
+  it('serializes native deep-memory promotion with owner erasure in both lock orders', async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), 'eden3-dream-erasure-fence-'));
+    const writerOwner = randomUUID();
+    const writerAgent = randomUUID();
+    const deniedOwner = randomUUID();
+    const deniedAgent = randomUUID();
+    const writerUsername = `dream_writer_${writerOwner.slice(0, 8)}`;
+    const deniedUsername = `dream_denied_${deniedOwner.slice(0, 8)}`;
+    const writerOpenclawId = `dream-agent-${writerAgent.slice(0, 8)}`;
+    const deniedOpenclawId = `dream-denied-${deniedAgent.slice(0, 8)}`;
+    const writerWorkspace = join(workspaceRoot, `workspace-${writerOpenclawId}`);
+    const deniedWorkspace = join(workspaceRoot, `workspace-${deniedOpenclawId}`);
+    const outstanding = new Set<Promise<unknown>>();
+    let releasePromotion!: () => void;
+    let promotionEntered!: () => void;
+    const release = new Promise<void>((resolve) => { releasePromotion = resolve; });
+    const entered = new Promise<void>((resolve) => { promotionEntered = resolve; });
+    const promotion = {
+      agentId: writerOpenclawId,
+      candidates: 1,
+      promoted: 1,
+      policy: {
+        limit: 10 as const,
+        minScore: 0.55 as const,
+        minRecallCount: 1 as const,
+        minUniqueQueries: 1 as const,
+        apply: true as const,
+      },
+    };
+    const checkpointFor = (): MemoryDreamCheckpoint => ({
+      schema: 'eden-memory-dream-v1',
+      phase: 'seed_done',
+      date: '2026-08-09',
+      previousSha256: null,
+    });
+    const durabilityFor = (
+      runId: string,
+      saves: MemoryDreamCheckpoint[],
+    ): MemoryDreamDurability => ({
+      inspect: async (requestedRunId) => {
+        expect(requestedRunId).toBe(runId);
+        return {
+          checkpoint: checkpointFor(),
+          providerStatus: 'not_started',
+          usage: null,
+          debitKeys: [],
+        };
+      },
+      saveCheckpoint: async (_claim, checkpoint) => { saves.push(checkpoint); },
+    });
+    const runnerFor = (
+      runId: string,
+      openclawId: string,
+      workspacePath: string,
+      saves: MemoryDreamCheckpoint[],
+      promote: () => Promise<typeof promotion>,
+    ) => new EdenMemoryDreamAgentRunner({
+      compat: { async *chatTurn() {} },
+      bus: { publish: () => 0 } as never,
+      registry: { register() {}, touch() {} } as never,
+      historySync: { scheduleTrailingSync() {} } as never,
+      memoryRuntime: { promoteAgent: promote } as never,
+      modelRuntime: { getRuntime: async () => { throw new Error('stop after deep checkpoint'); } } as never,
+      durability: durabilityFor(runId, saves),
+      claimFence: async () => {},
+      recordRecoveryUsage: async () => {},
+      now: () => new Date('2026-08-09T12:00:00.000Z'),
+    });
+    try {
+      await mkdirSync(writerWorkspace, { recursive: true });
+      await mkdirSync(deniedWorkspace, { recursive: true });
+      await writeFile(join(writerWorkspace, 'MEMORY.md'), '# seeded writer memory\n', 'utf8');
+      await writeFile(join(deniedWorkspace, 'MEMORY.md'), '# seeded denied memory\n', 'utf8');
+      await pg`
+        insert into accounts(id,type,username) values
+          (${writerOwner},'user',${writerUsername}),
+          (${writerAgent},'agent',${`dream_writer_agent_${writerAgent.slice(0, 8)}`}),
+          (${deniedOwner},'user',${deniedUsername}),
+          (${deniedAgent},'agent',${`dream_denied_agent_${deniedAgent.slice(0, 8)}`})`;
+      await pg`
+        insert into agents(account_id,owner_id,name,openclaw_id,workspace_path,provision_status)
+        values
+          (${writerAgent},${writerOwner},'dream writer',${writerOpenclawId},${writerWorkspace},'ready'),
+          (${deniedAgent},${deniedOwner},'dream denied',${deniedOpenclawId},${deniedWorkspace},'ready')`;
+
+      const writerRunId = randomUUID();
+      const writerSaves: MemoryDreamCheckpoint[] = [];
+      const writerRunner = runnerFor(
+        writerRunId,
+        writerOpenclawId,
+        writerWorkspace,
+        writerSaves,
+        async () => {
+          promotionEntered();
+          await release;
+          await writeFile(join(writerWorkspace, 'MEMORY.md'), '# promoted writer memory\n', 'utf8');
+          return promotion;
+        },
+      );
+      const writer = writerRunner.run({
+        agentAccountId: writerAgent,
+        openclawId: writerOpenclawId,
+        username: `dream_writer_agent_${writerAgent.slice(0, 8)}`,
+        name: 'dream writer',
+        persona: null,
+        workspacePath: writerWorkspace,
+        provisionStatus: 'ready',
+        ownerAccountId: writerOwner,
+        ownerUsername: writerUsername,
+        lastActivityAt: new Date('2026-08-09T11:00:00.000Z'),
+        lastSuccessfulDreamActivityAt: null,
+        recoveryPending: false,
+      }, 'dream-sweep-writer', {
+        id: writerRunId,
+        sweepId: 'dream-sweep-writer',
+        claimToken: randomUUID(),
+        lastActivityAt: new Date('2026-08-09T11:00:00.000Z'),
+        isRecovery: false,
+      });
+      outstanding.add(writer);
+      await entered;
+      let intentSettled = false;
+      const store = erasureStore();
+      const intent = store.acceptIntent({
+        accountId: writerOwner,
+        confirmUsername: writerUsername,
+      }).finally(() => { intentSettled = true; });
+      outstanding.add(intent);
+      await waitForOperatorOwnerLockWait(writerOwner, () => intentSettled);
+      releasePromotion();
+      await expect(writer).rejects.toThrow('stop after deep checkpoint');
+      expect(writerSaves.map((saved) => saved.phase)).toEqual(['deep_started', 'deep_done']);
+      const accepted = await intent;
+      const manifestSink = recoverySink();
+      await expect(requestAccountErasure({
+        actorAccountId: writerOwner,
+        actorUsername: writerUsername,
+        actorIsAdmin: false,
+        confirmUsername: writerUsername,
+      }, store, ledger(), manifestSink)).resolves.toEqual({
+        jobId: accepted.jobId,
+        status: 'pending',
+      });
+      expect(vi.mocked(manifestSink.encryptWriteAndConfirm).mock.calls[0]![0].locators)
+        .toContainEqual(expect.objectContaining({ kind: 'agent_runtime', resourceId: writerAgent }));
+
+      await expect(erasureStore().acceptIntent({
+        accountId: deniedOwner,
+        confirmUsername: deniedUsername,
+      })).resolves.toMatchObject({ state: 'intent_pending' });
+      let deniedPromotions = 0;
+      const deniedRunId = randomUUID();
+      const deniedSaves: MemoryDreamCheckpoint[] = [];
+      const deniedRunner = runnerFor(
+        deniedRunId,
+        deniedOpenclawId,
+        deniedWorkspace,
+        deniedSaves,
+        async () => { deniedPromotions += 1; return { ...promotion, agentId: deniedOpenclawId }; },
+      );
+      await expect(deniedRunner.run({
+        agentAccountId: deniedAgent,
+        openclawId: deniedOpenclawId,
+        username: `dream_denied_agent_${deniedAgent.slice(0, 8)}`,
+        name: 'dream denied',
+        persona: null,
+        workspacePath: deniedWorkspace,
+        provisionStatus: 'ready',
+        ownerAccountId: deniedOwner,
+        ownerUsername: deniedUsername,
+        lastActivityAt: new Date('2026-08-09T11:00:00.000Z'),
+        lastSuccessfulDreamActivityAt: null,
+        recoveryPending: false,
+      }, 'dream-sweep-denied', {
+        id: deniedRunId,
+        sweepId: 'dream-sweep-denied',
+        claimToken: randomUUID(),
+        lastActivityAt: new Date('2026-08-09T11:00:00.000Z'),
+        isRecovery: false,
+      })).rejects.toMatchObject({ statusCode: 409, code: 'account_erasure_active' });
+      expect(deniedPromotions).toBe(0);
+      expect(deniedSaves.map((saved) => saved.phase)).toEqual(['deep_started']);
+      await expect(readFile(join(deniedWorkspace, 'memory', 'dreaming', 'deep', '2026-08-09.md')))
+        .rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      releasePromotion();
+      await Promise.allSettled([...outstanding]);
+      await rm(workspaceRoot, { recursive: true, force: true });
     }
   }, 30_000);
 

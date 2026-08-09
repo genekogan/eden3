@@ -24,6 +24,7 @@ import {
   distillAgentMemory,
   memorySha256,
   recordMemoryRevision,
+  withAgentMemoryPublicationFence,
 } from './memory-distillation';
 import type { HistorySync } from './history-sync';
 import type { TurnRegistry } from './turn-registry';
@@ -840,6 +841,7 @@ interface EdenMemoryDreamAgentRunnerOptions {
   durability?: MemoryDreamDurability;
   distillMemory?: typeof distillAgentMemory;
   memoryStatus?: typeof agentMemoryStatus;
+  memoryPublicationFence?: typeof withAgentMemoryPublicationFence;
   reverseAuthorization?: typeof reverseTurnAuthorization;
   claimFence?: (claim: MemoryDreamRunClaim, dbc?: DbHandle) => Promise<void>;
   recordRecoveryUsage?: (claim: MemoryDreamRunClaim, dbc?: DbHandle) => Promise<void>;
@@ -1324,6 +1326,7 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
   private readonly durability: MemoryDreamDurability;
   private readonly distillMemory: typeof distillAgentMemory;
   private readonly memoryStatus: typeof agentMemoryStatus;
+  private readonly memoryPublicationFence: typeof withAgentMemoryPublicationFence;
   private readonly reverseAuthorization: typeof reverseTurnAuthorization;
   private readonly claimFence: (
     claim: MemoryDreamRunClaim,
@@ -1343,6 +1346,8 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
     this.durability = options.durability ?? new PostgresMemoryDreamDurability();
     this.distillMemory = options.distillMemory ?? distillAgentMemory;
     this.memoryStatus = options.memoryStatus ?? agentMemoryStatus;
+    this.memoryPublicationFence =
+      options.memoryPublicationFence ?? withAgentMemoryPublicationFence;
     this.reverseAuthorization = options.reverseAuthorization ?? reverseTurnAuthorization;
     this.claimFence = options.claimFence ?? renewMemoryDreamRunClaim;
     this.recordRecoveryUsage = options.recordRecoveryUsage ?? recordMemoryDreamRecoveryUsage;
@@ -1429,47 +1434,61 @@ export class EdenMemoryDreamAgentRunner implements MemoryDreamAgentRunner {
     if (checkpoint.phase === 'seed_done') {
       checkpoint = { ...checkpoint, phase: 'deep_started' };
       await this.durability.saveCheckpoint(run, checkpoint, 'not_started');
-      const previousMemory = await readText(memoryPath);
-      const promotion = await this.options.memoryRuntime.promoteAgent(candidate.openclawId);
-      const promotedMemory = await readText(memoryPath);
-      if (
-        promotedMemory !== null &&
-        memorySha256(promotedMemory) !== memorySha256(previousMemory)
-      ) {
-        await recordMemoryRevision({
+      const deepStarted = checkpoint;
+      checkpoint = await this.memoryPublicationFence(
+        {
           agentAccountId: candidate.agentAccountId,
           openclawId: candidate.openclawId,
-          operation: 'dream-promotion',
-          previousContent: previousMemory,
-          content: promotedMemory,
-          metadata: { sweepId, runId, promotion, phase: 'deep' },
-        });
-      }
-      const deepDir = path.join(candidate.workspacePath, 'memory', 'dreaming', 'deep');
-      await fs.mkdir(deepDir, { recursive: true });
-      await fs.writeFile(
-        path.join(deepDir, `${checkpoint.date}.md`),
-        [
-          `# Deep memory promotion — ${checkpoint.date}`,
-          '',
-          `- Sweep: ${sweepId}`,
-          `- Run: ${runId}`,
-          `- Candidates: ${promotion.candidates}`,
-          `- Promoted: ${promotion.promoted}`,
-          `- MEMORY.md before: ${memorySha256(previousMemory) ?? 'absent'}`,
-          `- MEMORY.md after: ${memorySha256(promotedMemory) ?? 'absent'}`,
-          '',
-        ].join('\n'),
-        'utf8',
+          workspacePath: candidate.workspacePath,
+        },
+        async (tx) => {
+          const previousMemory = await readText(memoryPath);
+          const promotion = await this.options.memoryRuntime.promoteAgent(candidate.openclawId);
+          const promotedMemory = await readText(memoryPath);
+          if (
+            promotedMemory !== null &&
+            memorySha256(promotedMemory) !== memorySha256(previousMemory)
+          ) {
+            await recordMemoryRevision(
+              {
+                agentAccountId: candidate.agentAccountId,
+                openclawId: candidate.openclawId,
+                operation: 'dream-promotion',
+                previousContent: previousMemory,
+                content: promotedMemory,
+                metadata: { sweepId, runId, promotion, phase: 'deep' },
+              },
+              tx,
+            );
+          }
+          const deepDir = path.join(candidate.workspacePath, 'memory', 'dreaming', 'deep');
+          await fs.mkdir(deepDir, { recursive: true });
+          await fs.writeFile(
+            path.join(deepDir, `${deepStarted.date}.md`),
+            [
+              `# Deep memory promotion — ${deepStarted.date}`,
+              '',
+              `- Sweep: ${sweepId}`,
+              `- Run: ${runId}`,
+              `- Candidates: ${promotion.candidates}`,
+              `- Promoted: ${promotion.promoted}`,
+              `- MEMORY.md before: ${memorySha256(previousMemory) ?? 'absent'}`,
+              `- MEMORY.md after: ${memorySha256(promotedMemory) ?? 'absent'}`,
+              '',
+            ].join('\n'),
+            'utf8',
+          );
+          const deepDone: MemoryDreamCheckpoint = {
+            ...deepStarted,
+            phase: 'deep_done',
+            previousSha256: memorySha256(previousMemory),
+            promotedSha256: memorySha256(promotedMemory),
+            promotion,
+          };
+          await this.durability.saveCheckpoint(run, deepDone, 'not_started');
+          return deepDone;
+        },
       );
-      checkpoint = {
-        ...checkpoint,
-        phase: 'deep_done',
-        previousSha256: memorySha256(previousMemory),
-        promotedSha256: memorySha256(promotedMemory),
-        promotion,
-      };
-      await this.durability.saveCheckpoint(run, checkpoint, 'not_started');
     }
 
     if (!checkpoint.promotion) {

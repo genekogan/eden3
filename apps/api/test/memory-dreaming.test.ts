@@ -569,6 +569,8 @@ function makeRunner(
     } as never,
     modelRuntime: { getRuntime: async () => 'openclaw' } as never,
     durability,
+    memoryPublicationFence: async (_params, publish) =>
+      await publish((async () => []) as never),
     ...(overrides.distill ? { distillMemory: overrides.distill as never } : {}),
     ...(overrides.status ? { memoryStatus: overrides.status as never } : {}),
     reverseAuthorization:

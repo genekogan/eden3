@@ -45,8 +45,7 @@ function deepFenceErrors(input: string): string[] {
     ts.isIfStatement(node) && node.expression.getText(file) === "checkpoint.phase === 'seed_done'")[0];
   if (!deepBranch) return ['missing-deep-branch'];
   const fences = descendants(deepBranch, (node): node is ts.CallExpression =>
-    ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
-    node.expression.text === 'withAgentMemoryPublicationFence');
+    ts.isCallExpression(node) && callName(node) === 'memoryPublicationFence');
   if (fences.length !== 1) return [`fence-count=${fences.length}`];
   const callback = fences[0]!.arguments[1];
   if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) {
@@ -65,7 +64,7 @@ function deepFenceErrors(input: string): string[] {
   const deepDone = descendants(callback, (node): node is ts.CallExpression =>
     ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
     node.expression.name.text === 'saveCheckpoint' &&
-    node.arguments.some((argument) => /checkpoint/.test(argument.getText(file))));
+    node.arguments.some((argument) => argument.getText(file) === 'deepDone'));
   if (deepDone.length !== 1) errors.push(`deep-done=${deepDone.length}`);
   const revision = fencedCalls.find((call) => callName(call) === 'recordMemoryRevision');
   if (!revision || revision.arguments[1]?.getText(file) !== 'tx') errors.push('revision-tx');
@@ -75,8 +74,7 @@ function deepFenceErrors(input: string): string[] {
 function relocateCall(input: string, name: string): string {
   const file = ts.createSourceFile('memory-dreaming.ts', input, ts.ScriptTarget.Latest, true);
   const fence = descendants(file, (node): node is ts.CallExpression =>
-    ts.isCallExpression(node) && ts.isIdentifier(node.expression) &&
-    node.expression.text === 'withAgentMemoryPublicationFence')[0]!;
+    ts.isCallExpression(node) && callName(node) === 'memoryPublicationFence')[0]!;
   const callback = fence.arguments[1]!;
   const call = descendants(callback, (node): node is ts.CallExpression =>
     ts.isCallExpression(node) && callName(node) === name)[0]!;
@@ -92,6 +90,9 @@ function relocateCall(input: string, name: string): string {
 describe('memory dream deep-promotion erasure fence', () => {
   it('keeps native promotion, revision, report, and deep checkpoint in one owner fence', () => {
     expect(deepFenceErrors(source)).toEqual([]);
+    expect(source).toContain(
+      'options.memoryPublicationFence ?? withAgentMemoryPublicationFence',
+    );
     expect(source).toContain('agentAccountId: candidate.agentAccountId');
     expect(source).toContain('openclawId: candidate.openclawId');
     expect(source).toContain('workspacePath: candidate.workspacePath');
@@ -99,7 +100,7 @@ describe('memory dream deep-promotion erasure fence', () => {
       expect(deepFenceErrors(relocateCall(source, name))).not.toEqual([]);
     }
     expect(
-      deepFenceErrors(source.replace('recordMemoryRevision({', 'recordMemoryRevision({').replace('}, tx);', '});')),
+      deepFenceErrors(source.replace('              tx,\n            );', '            );')),
     ).not.toEqual([]);
   });
 });
