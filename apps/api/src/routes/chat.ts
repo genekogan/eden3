@@ -7,8 +7,18 @@ import {
   resolveAgentByUsername,
   resolveSession,
 } from '@eden3/core';
-import type { DbHandle } from '@eden3/core';
-import { accounts, agents, db, sessionAgents, sessionUsers, sessions, type Session } from '@eden3/db';
+import type { AuthSession, DbHandle } from '@eden3/core';
+import {
+  accounts,
+  agents,
+  db,
+  sessionAgents,
+  sessionUsers,
+  sessions,
+  type Account,
+  type Agent,
+  type Session,
+} from '@eden3/db';
 import {
   DEFAULT_AGENT_THINKING_LEVEL,
   DEFAULT_AGENT_TOOL_GROUPS,
@@ -75,6 +85,52 @@ interface ResolvedTarget {
   agent: TurnAgent;
 }
 
+type ChatViewer = Pick<AuthSession, 'accountId' | 'isAdmin'>;
+type ChatAgentAccount = Pick<Account, 'id' | 'username'>;
+type ChatAgentVisibility = Pick<Agent, 'ownerId' | 'public'>;
+
+/** Public agents are shared; private agents are invocable only by their managers. */
+export function isChatAgentVisible(
+  viewer: ChatViewer,
+  account: ChatAgentAccount,
+  agent: ChatAgentVisibility,
+): boolean {
+  return agent.public || viewer.isAdmin || viewer.accountId === agent.ownerId || viewer.accountId === account.id;
+}
+
+export function assertChatAgentVisible(
+  viewer: ChatViewer,
+  account: ChatAgentAccount,
+  agent: ChatAgentVisibility,
+): void {
+  if (!isChatAgentVisible(viewer, account, agent)) {
+    throw new ApiError(404, 'agent_not_found', `No agent named "${account.username}"`);
+  }
+}
+
+export interface ExistingChatAgentRow extends ChatAgentVisibility {
+  accountId: string;
+  username: string;
+  openclawId: string | null;
+  model: Agent['model'];
+  thinkingLevel: Agent['thinkingLevel'];
+}
+
+/** Select the same target as before, but revalidate current agent visibility first. */
+export function selectChatAgentForInvocation(
+  rows: readonly ExistingChatAgentRow[],
+  viewer: ChatViewer,
+): ExistingChatAgentRow | null {
+  const selected = rows.find((row) => row.openclawId !== null) ?? rows[0] ?? null;
+  if (!selected) return null;
+  assertChatAgentVisible(
+    viewer,
+    { id: selected.accountId, username: selected.username },
+    selected,
+  );
+  return selected;
+}
+
 /** A completed chat may make a previously-too-small seed eligible. */
 async function enqueueAutomaticMemoryRetryForAgent(
   agentAccountId: string,
@@ -111,12 +167,16 @@ async function enqueueAutomaticMemoryRetryForAgent(
   );
 }
 
-/** Create the session row + memberships for `new` in one transaction. */
-async function ensureChattableAgent(
+/** Resolve a ready runtime or provision one, only after current visibility passes. */
+export async function ensureChattableAgent(
+  viewer: ChatViewer,
   resolved: NonNullable<Awaited<ReturnType<typeof resolveAgentByUsername>>>,
   gatewayGlue: GatewayGlue,
 ): Promise<TurnAgent> {
   const { account, agent } = resolved;
+  // Defense in depth: every lazy-provision/runtime entry crosses this check,
+  // even if a caller omits its earlier friendly authorization pre-check.
+  assertChatAgentVisible(viewer, account, agent);
   if (agent.openclawId && agent.provisionStatus === 'ready') {
     return {
       accountId: account.id,
@@ -212,14 +272,12 @@ async function ensureChattableAgent(
 }
 
 async function createSession(
-  ownerAccountId: string,
-  agentUsername: string,
+  viewer: ChatViewer,
+  resolved: NonNullable<Awaited<ReturnType<typeof resolveAgentByUsername>>>,
   content: string,
   gatewayGlue: GatewayGlue,
 ): Promise<ResolvedTarget> {
-  const resolved = await resolveAgentByUsername(agentUsername);
-  if (!resolved) throw new ApiError(404, 'agent_not_found', `No agent named "${agentUsername}"`);
-  const chattable = await ensureChattableAgent(resolved, gatewayGlue);
+  const chattable = await ensureChattableAgent(viewer, resolved, gatewayGlue);
   const sessionId = randomUUID();
   const key = gatewaySessionKey(sessionId);
   const session = await db.transaction(async (tx) => {
@@ -227,7 +285,7 @@ async function createSession(
       .insert(sessions)
       .values({
         id: sessionId,
-        ownerId: ownerAccountId,
+        ownerId: viewer.accountId,
         title: titleFromContent(content),
         sessionType: 'chat',
         gatewaySessionKey: key,
@@ -237,7 +295,7 @@ async function createSession(
     await tx
       .insert(sessionAgents)
       .values({ sessionId, agentAccountId: chattable.accountId });
-    await tx.insert(sessionUsers).values({ sessionId, userAccountId: ownerAccountId });
+    await tx.insert(sessionUsers).values({ sessionId, userAccountId: viewer.accountId });
     return row;
   });
 
@@ -270,6 +328,7 @@ async function resolveExisting(
     .select({
       accountId: agents.accountId,
       ownerId: agents.ownerId,
+      public: agents.public,
       openclawId: agents.openclawId,
       model: agents.model,
       thinkingLevel: agents.thinkingLevel,
@@ -281,21 +340,25 @@ async function resolveExisting(
     .where(eq(sessionAgents.sessionId, session.id))
     .orderBy(agents.accountId)
     .limit(8);
-  let provisioned = rows.find((row) => row.openclawId !== null);
-  if (!provisioned && rows[0]) {
-    const resolved = await resolveAgentByUsername(rows[0].username);
-    if (!resolved) throw new ApiError(404, 'agent_not_found', `No agent named "${rows[0].username}"`);
-    const chattable = await ensureChattableAgent(resolved, gatewayGlue);
+  const selected = selectChatAgentForInvocation(rows, account);
+  if (!selected) {
+    throw new ApiError(409, 'agent_not_provisioned', 'No agent is attached to this session');
+  }
+  let provisioned = selected.openclawId !== null ? selected : null;
+  if (!provisioned) {
+    const resolved = await resolveAgentByUsername(selected.username);
+    if (!resolved) throw new ApiError(404, 'agent_not_found', `No agent named "${selected.username}"`);
+    const chattable = await ensureChattableAgent(account, resolved, gatewayGlue);
     provisioned = {
       accountId: chattable.accountId,
       ownerId: chattable.ownerId ?? resolved.agent.ownerId,
+      public: resolved.agent.public,
       username: chattable.username,
       openclawId: chattable.openclawId,
       model: chattable.model ?? DEFAULT_AGENT_MODEL,
       thinkingLevel: chattable.thinkingLevel ?? DEFAULT_AGENT_THINKING_LEVEL,
     };
   }
-  if (!provisioned) throw new ApiError(409, 'agent_not_provisioned', 'No agent is attached to this session');
 
   // Migrated sessions have no gateway key until first contact — backfill the
   // deterministic `eden3:s:<session uuid>` key now.
@@ -390,8 +453,9 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
         if (!preResolved) {
           throw new ApiError(404, 'agent_not_found', `No agent named "${body.agentUsername}"`);
         }
+        assertChatAgentVisible(account, preResolved.account, preResolved.agent);
         await assertTurnAdmissible(account.accountId, preResolved.agent.model ?? undefined);
-        target = await createSession(account.accountId, body.agentUsername, body.content, app.gatewayGlue);
+        target = await createSession(account, preResolved, body.content, app.gatewayGlue);
       } else {
         target = await resolveExisting(req.params.idOrNew, account, app.gatewayGlue);
         await assertTurnAdmissible(
