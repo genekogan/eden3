@@ -452,6 +452,67 @@ describe('hosted named channel accounts', () => {
     });
   });
 
+  it('replaces one hosted SecretRef when its durable capability epoch advances', async () => {
+    await seedConfig(hostedAgents(['agent-one']));
+    const first = await ensureHostedChannelAccount({
+      dataDir,
+      channel: 'discord',
+      runtimeAccountId: 'agent-one',
+      connectionId: connectionA,
+      accountId: accountA,
+      capabilityEpoch: 'c1',
+      label: 'Rotating bot',
+      bindAgentId: 'agent-one',
+      dmPolicy: 'pairing',
+      allowFrom: [],
+    });
+    const firstToken = (
+      (first.config.channels as Record<string, Record<string, unknown>>).discord!
+        .accounts as Record<string, { token: { id: string } }>
+    )['agent-one']!.token;
+
+    const rotated = await ensureHostedChannelAccount({
+      dataDir,
+      channel: 'discord',
+      runtimeAccountId: 'agent-one',
+      connectionId: connectionA,
+      accountId: accountA,
+      capabilityEpoch: 'c2',
+      label: 'Rotating bot',
+      bindAgentId: 'agent-one',
+      dmPolicy: 'pairing',
+      allowFrom: [],
+    });
+    const rotatedToken = (
+      (rotated.config.channels as Record<string, Record<string, unknown>>).discord!
+        .accounts as Record<string, { token: { id: string } }>
+    )['agent-one']!.token;
+
+    expect(rotated.changed).toBe(true);
+    expect(rotatedToken.id).not.toBe(firstToken.id);
+    expect(rotatedToken).toEqual(hostedChannelSecretRef({
+      connectionId: connectionA,
+      accountId: accountA,
+      channel: 'discord',
+      runtimeAccountId: 'agent-one',
+      epoch: 'c2',
+    }, TEST_CAP_KEY));
+
+    const replay = await ensureHostedChannelAccount({
+      dataDir,
+      channel: 'discord',
+      runtimeAccountId: 'agent-one',
+      connectionId: connectionA,
+      accountId: accountA,
+      capabilityEpoch: 'c2',
+      label: 'Rotating bot',
+      bindAgentId: 'agent-one',
+      dmPolicy: 'pairing',
+      allowFrom: [],
+    });
+    expect(replay.changed).toBe(false);
+  });
+
   it('pauses and deletes only the selected account while keeping the other bot routed', async () => {
     await seedConfig(hostedAgents(['agent-one', 'agent-two']));
     for (const [runtimeAccountId, connectionId, accountId] of [
