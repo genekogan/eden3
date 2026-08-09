@@ -13,9 +13,10 @@ import {
 } from './permalinks';
 
 /**
- * Live-postgres tests (localhost:5433, db eden3): throwaway rows created
- * below carry random hex24 external ids / usernames and are deleted in
- * afterAll (children before accounts, FK order).
+ * Disposable-Postgres tests: the dedicated integration config requires an
+ * exact leased `eden3_core_pg_<8hex>` database. Throwaway rows below carry
+ * random hex24 external ids / usernames and are deleted in afterAll (children
+ * before accounts, FK order).
  */
 
 const hex24 = () => randomBytes(12).toString('hex');

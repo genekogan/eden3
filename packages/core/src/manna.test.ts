@@ -25,8 +25,9 @@ import {
 } from './manna';
 
 /**
- * These tests hit the live local postgres (localhost:5433, db eden3). Every
- * row they create is a throwaway account made here and deleted in afterAll.
+ * These tests run only through the dedicated integration config against the
+ * exact disposable `eden3_core_pg_<8hex>` database supplied by its lease.
+ * Every row they create is a throwaway account deleted in afterAll.
  */
 
 const createdAccountIds: string[] = [];
