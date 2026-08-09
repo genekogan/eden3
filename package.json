@@ -10,7 +10,8 @@
   "scripts": {
     "dev": "concurrently -k -n api,web -c blue,magenta \"pnpm --filter @eden3/api dev\" \"pnpm --filter @eden3/web dev\"",
     "build": "pnpm -r build",
-    "test": "pnpm -r test && pnpm test:semantic-skips && pnpm test:credential-exposure",
+    "test": "pnpm -r test && pnpm test:standalone && node scripts/credential-exposure.mjs",
+    "test:standalone": "node scripts/standalone-test-manifest.mjs",
     "test:semantic-skips": "node --test scripts/semantic-test-controls.test.mjs",
     "test:credential-exposure": "node --test scripts/credential-exposure.test.mjs && node scripts/credential-exposure.mjs",
     "test:api-full": "pnpm --filter @eden3/api test:full",
