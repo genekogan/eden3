@@ -1,3 +1,4 @@
+import { getEnv } from '@eden3/core';
 import { pg } from '@eden3/db';
 import { readOpenClawConfig } from '@eden3/gateway';
 import { agentModelSchema, agentRuntimeSchema } from '@eden3/shared';
@@ -163,6 +164,77 @@ function signedDeltaPct(deltaUsd: number, invoiceCostUsd: number, computedCostUs
   return roundUsd(deltaUsd / basis);
 }
 
+export interface OperatorGatewayHealthProbeOptions {
+  baseUrl: string | undefined;
+  token: string | undefined;
+  fetchImpl?: typeof fetch;
+  now?: () => number;
+}
+
+function operatorGatewayModelsUrl(baseUrl: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1' || parsed.port === '' ||
+      parsed.username !== '' || parsed.password !== '' || parsed.pathname !== '/' ||
+      parsed.search !== '' || parsed.hash !== '') {
+    return null;
+  }
+  const port = Number(parsed.port);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return null;
+  return `${parsed.origin}/v1/models`;
+}
+
+/** Credential-bearing gateway health is restricted to the typed loopback origin. */
+export async function probeOperatorGatewayModels(
+  options: OperatorGatewayHealthProbeOptions,
+): Promise<
+  | { configured: false }
+  | {
+      configured: true;
+      reachable: boolean;
+      latencyMs?: number;
+      routableModels?: number;
+      error?: 'gateway_health_configuration_invalid' | 'gateway_health_unreachable';
+    }
+> {
+  if (!options.baseUrl || !options.token) return { configured: false };
+  const modelsUrl = operatorGatewayModelsUrl(options.baseUrl);
+  if (!modelsUrl) {
+    return {
+      configured: true,
+      reachable: false,
+      error: 'gateway_health_configuration_invalid',
+    };
+  }
+  const started = (options.now ?? Date.now)();
+  try {
+    const res = await (options.fetchImpl ?? fetch)(modelsUrl, {
+      headers: { authorization: `Bearer ${options.token}` },
+      redirect: 'error',
+      signal: AbortSignal.timeout(5_000),
+    });
+    const models = res.ok
+      ? (((await res.json()) as { data?: unknown[] }).data?.length ?? 0)
+      : 0;
+    return {
+      configured: true,
+      reachable: res.ok,
+      latencyMs: (options.now ?? Date.now)() - started,
+      routableModels: models,
+    };
+  } catch {
+    return {
+      configured: true,
+      reachable: false,
+      error: 'gateway_health_unreachable',
+    };
+  }
+}
+
 export const operatorRoutes: FastifyPluginAsync = async (app) => {
   // ---- Content report queue — closed-cohort operator minimum ------------
   app.get('/content-reports', { preHandler: app.requireAuth }, async (req) => {
@@ -284,31 +356,24 @@ export const operatorRoutes: FastifyPluginAsync = async (app) => {
     const gateway = await (async () => {
       if (!app.gatewayCompat) return { configured: false as const };
       try {
+        const probe = await probeOperatorGatewayModels({
+          baseUrl: getEnv().OPENCLAW_BASE_URL,
+          token: getEnv().OPENCLAW_GATEWAY_TOKEN,
+        });
+        if (!probe.configured) return probe;
         const dataDir = defaultOpenclawDataDir();
         const config = await readOpenClawConfig(dataDir);
         const agents = config.agents as { list?: unknown[] } | undefined;
         const registered = Array.isArray(agents?.list) ? agents.list.length : 0;
-        const base = process.env.OPENCLAW_GATEWAY_URL ?? 'http://127.0.0.1:18789';
-        const started = Date.now();
-        const res = await fetch(`${base}/v1/models`, {
-          headers: { authorization: `Bearer ${process.env.OPENCLAW_GATEWAY_TOKEN ?? ''}` },
-          signal: AbortSignal.timeout(5_000),
-        });
-        const models = res.ok
-          ? (((await res.json()) as { data?: unknown[] }).data?.length ?? 0)
-          : 0;
         return {
-          configured: true as const,
-          reachable: res.ok,
-          latencyMs: Date.now() - started,
+          ...probe,
           registeredAgents: registered,
-          routableModels: models,
         };
-      } catch (err) {
+      } catch {
         return {
           configured: true as const,
           reachable: false,
-          error: err instanceof Error ? err.message : String(err),
+          error: 'gateway_health_unreachable' as const,
         };
       }
     })();

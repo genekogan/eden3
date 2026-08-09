@@ -28,10 +28,11 @@ describe('operator gateway health credential boundary', () => {
   });
 
   it('sends the bearer only to the exact typed loopback models endpoint and refuses redirects', async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'model' }] }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    }));
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ data: [{ id: 'model' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
     const result = await probeOperatorGatewayModels({
       baseUrl: 'http://127.0.0.1:28789',
       token: 'fake-gateway-token',
