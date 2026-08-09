@@ -10,6 +10,7 @@ import {
   toAccountSummary,
   type AccountSummaryRow,
 } from '../route-helpers';
+import { passesPublicCreationModeration } from '../services/public-creation-moderation';
 
 /**
  * Creations API.
@@ -24,26 +25,12 @@ const reportBodySchema = z.object({
   reason: z.string().trim().max(1_000).optional(),
 });
 
-const PUBLIC_NSFW_THRESHOLD = 0.85;
-
-function nsfwScore(attributes: unknown): number | null {
-  if (typeof attributes !== 'object' || attributes === null) return null;
-  const value = (attributes as Record<string, unknown>).nsfw_score;
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
-  if (typeof value === 'string' && value.trim() !== '') {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-  return null;
-}
-
-function passesPublicModeration(creation: Creation): boolean {
-  const score = nsfwScore(creation.attributes);
-  return score === null || score < PUBLIC_NSFW_THRESHOLD;
-}
-
 function isPubliclyReachableCreation(creation: Creation): boolean {
-  return creation.public && !creation.deleted && passesPublicModeration(creation);
+  return (
+    creation.public &&
+    !creation.deleted &&
+    passesPublicCreationModeration(creation.attributes)
+  );
 }
 
 function canViewCreation(creation: Creation, viewer: AuthSession | null): boolean {
@@ -131,12 +118,11 @@ export const creationsRoutes: FastifyPluginAsync = async (app) => {
         where id = ${creation.id}
         for share
       `;
-      const currentNsfwScore = current ? nsfwScore(current.attributes) : null;
       if (
         !current ||
         !current.public ||
         current.deleted ||
-        (currentNsfwScore !== null && currentNsfwScore >= PUBLIC_NSFW_THRESHOLD)
+        !passesPublicCreationModeration(current.attributes)
       ) {
         throw new ApiError(404, 'creation_not_found', `No creation "${idOrExternal}"`);
       }

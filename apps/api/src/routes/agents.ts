@@ -55,6 +55,7 @@ import {
   saveAgentMemory,
   shouldRetryAutomaticMemoryDistillation,
 } from '../services/memory-distillation';
+import { publicCreationModerationSql } from '../services/public-creation-moderation';
 import { runMemoryRetrievalProbe } from '../services/memory-retrieval';
 import { publishNotificationChanged } from '../services/app-notifications';
 import { assertNativeAgentCreationAllowed } from '../services/native-agent-admission';
@@ -483,11 +484,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
         ${
           manager
             ? pg``
-            : pg`and (
-                c.attributes->>'nsfw_score' is null
-                or (c.attributes->>'nsfw_score') !~ '^[0-9]+(\\.[0-9]+)?$'
-                or (c.attributes->>'nsfw_score')::double precision < 0.85
-              )`
+            : pg`and ${publicCreationModerationSql(pg)}`
         }
       order by c.created_at desc nulls last, c.id desc
       limit 12

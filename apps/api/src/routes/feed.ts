@@ -20,6 +20,7 @@ import {
   type AgentRow,
   type CreationRow,
 } from '../route-helpers';
+import { publicCreationModerationSql } from '../services/public-creation-moderation';
 
 /**
  * Feed API (public, anonymous-friendly).
@@ -52,14 +53,6 @@ const feedCreationsQuerySchema = feedQuerySchema.extend({
 const feedAgentsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).default(12),
 });
-
-const safePublicCreationFilter = () => pg`
-  and (
-    c.attributes->>'nsfw_score' is null
-    or (c.attributes->>'nsfw_score') !~ '^[0-9]+(\\.[0-9]+)?$'
-    or (c.attributes->>'nsfw_score')::double precision < 0.85
-  )
-`;
 
 /** Resolve a filter reference to an accounts.id, or null when unknown. */
 async function resolveAccountRef(ref: string): Promise<string | null> {
@@ -126,7 +119,7 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
       left join accounts ag on ag.id = c.agent_id
       where c.deleted = false
         ${ownScope ? pg`` : pg`and c.public = true`}
-        ${ownScope ? pg`` : safePublicCreationFilter()}
+        ${ownScope ? pg`` : pg`and ${publicCreationModerationSql(pg)}`}
         ${agentId !== null ? pg`and c.agent_id = ${agentId}` : pg``}
         ${userId !== null ? pg`and c.user_id = ${userId}` : pg``}
         ${
@@ -175,15 +168,11 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
       with recent as (
         select sub.agent_id, max(sub.created_at) as last_creation_at
         from (
-          select agent_id, created_at
-          from creations
-          where public = true and deleted = false and agent_id is not null
-            and (
-              attributes->>'nsfw_score' is null
-              or (attributes->>'nsfw_score') !~ '^[0-9]+(\\.[0-9]+)?$'
-              or (attributes->>'nsfw_score')::double precision < 0.85
-            )
-          order by created_at desc nulls last
+          select c.agent_id, c.created_at
+          from creations c
+          where c.public = true and c.deleted = false and c.agent_id is not null
+            and ${publicCreationModerationSql(pg)}
+          order by c.created_at desc nulls last
           limit 1000
         ) sub
         group by sub.agent_id

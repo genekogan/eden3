@@ -244,8 +244,9 @@ describe('GET /media/:objectId lifecycle boundary', () => {
       'utf8',
     );
     expect(source).toContain('c.user_id = o.owner_account_id');
-    expect(source).toContain("c.attributes->>'nsfw_score'");
-    expect(source).toContain("::double precision < 0.85");
+    expect(source.match(/publicCreationModerationSql\(pg\)/g)).toHaveLength(1);
+    expect(source).not.toContain("attributes->>'nsfw_score'");
+    expect(source).not.toContain('!~');
     expect(source).toContain('s.deleted = false');
     expect(source).toContain('s.visible is distinct from false');
     expect(source).toContain('a.id = o.owner_account_id');

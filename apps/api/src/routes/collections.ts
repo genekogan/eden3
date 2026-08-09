@@ -15,6 +15,7 @@ import {
   type CollectionRow,
   type CreationRow,
 } from '../route-helpers';
+import { publicCreationModerationSql } from '../services/public-creation-moderation';
 
 /**
  * Collections API. Registered WITHOUT a prefix — it spans two path roots:
@@ -50,15 +51,6 @@ const membersQuerySchema = z.object({
 
 /** Cover thumbnails per collection on the list endpoint. */
 const COVER_LIMIT = 4;
-
-/** One canonical public-surface moderation predicate for collection members. */
-function publicCreationModeration() {
-  return pg`and (
-    c.attributes->>'nsfw_score' is null
-    or (c.attributes->>'nsfw_score') !~ '^[0-9]+(\\.[0-9]+)?$'
-    or (c.attributes->>'nsfw_score')::double precision < 0.85
-  )`;
-}
 
 interface MemberRow extends CreationRow {
   collection_id: string;
@@ -119,7 +111,7 @@ export const collectionsRoutes: FastifyPluginAsync = async (app) => {
     const memberVisibility = isOwner
       ? pg``
       : pg`and c.public = true
-           ${publicCreationModeration()}`;
+           and ${publicCreationModerationSql(pg)}`;
     const rows = await pg<CreationRow[]>`
       select c.id, c.external_id, c.user_id, c.agent_id, c.tool, c.filename,
              c.url, c.thumbnail_url, c.media_attributes, c.like_count, c.public,
@@ -257,7 +249,7 @@ export const collectionsRoutes: FastifyPluginAsync = async (app) => {
                where cc.collection_id = k.id
                  and c.deleted = false
                  and (c.public = true or ${isOwner})
-                 ${isOwner ? pg`` : publicCreationModeration()}) as creation_count
+                 ${isOwner ? pg`` : pg`and ${publicCreationModerationSql(pg)}`}) as creation_count
       from collections k
       where k.user_id = ${account.id}
         and k.deleted = false
@@ -311,7 +303,7 @@ async function coverCreationsFor(
       where cc.collection_id = any(${collectionIds}::uuid[])
         and c.deleted = false
         and c.public = true
-        ${options.includeModerated ? pg`` : publicCreationModeration()}
+        ${options.includeModerated ? pg`` : pg`and ${publicCreationModerationSql(pg)}`}
     ) ranked
     where ranked.rn <= ${COVER_LIMIT}
     order by ranked.collection_id, ranked.rn

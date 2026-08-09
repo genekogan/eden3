@@ -1,6 +1,7 @@
 import { pg } from '@eden3/db';
 
 import type { MediaObjectRecord, MediaObjectRepository } from './media-object-repository';
+import { publicCreationModerationSql } from './public-creation-moderation';
 
 interface Row {
   id: string;
@@ -39,11 +40,7 @@ export class PostgresMediaObjectRepository implements MediaObjectRepository {
                select c.user_id from creations c
                where c.public = true and c.deleted = false
                  and c.user_id = o.owner_account_id
-                 and (
-                   c.attributes->>'nsfw_score' is null
-                   or (c.attributes->>'nsfw_score') !~ '^[0-9]+(\.[0-9]+)?$'
-                   or (c.attributes->>'nsfw_score')::double precision < 0.85
-                 )
+                 and ${publicCreationModerationSql(pg)}
                  and (
                    c.url = ${durableUrl}
                    or c.thumbnail_url = ${durableUrl}
