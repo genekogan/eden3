@@ -9,6 +9,7 @@ export default defineConfig({
   test: {
     include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
     exclude: ['**/node_modules/**', '**/*.itest.ts'],
+    setupFiles: ['./test/setup-database-boundary.ts'],
     testTimeout: 30_000, // watcher tests poll real (tmp) filesystems
   },
 });
