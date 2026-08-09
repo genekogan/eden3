@@ -5,14 +5,16 @@ import { lintPersonaDoctrine } from '@eden3/shared';
 import { ZipArchive } from 'archiver';
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import path from 'node:path';
+import type { Readable } from 'node:stream';
 import { z } from 'zod';
 
 import { ApiError, errorEnvelope, logSafeRequestError } from '../errors';
 import {
   WORKSPACE_TEXT_MAX_BYTES,
+  WORKSPACE_EXPORT_MAX_BYTES,
   listWorkspaceTree,
   openWorkspaceDownload,
-  openWorkspaceExportStream,
+  openWorkspaceExportFile,
   readWorkspaceFile,
   resolveWorkspacePath,
   sha256Hex,
@@ -121,6 +123,54 @@ function attachmentFilename(name: string): string {
   return name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
 }
 
+async function appendOneArchiveEntry(
+  archive: ZipArchive,
+  source: Readable,
+  name: string,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      source.removeListener('error', onSourceError);
+      archive.removeListener('error', onArchiveError);
+      archive.removeListener('entry', onEntry);
+    };
+    const settle = (callback: () => void) => {
+      cleanup();
+      callback();
+    };
+    const onSourceError = (error: Error) => settle(() => reject(error));
+    const onArchiveError = (error: Error) => {
+      source.destroy();
+      settle(() => reject(error));
+    };
+    const onEntry = () => settle(resolve);
+    source.once('error', onSourceError);
+    archive.once('error', onArchiveError);
+    archive.once('entry', onEntry);
+    try {
+      archive.append(source, { name });
+    } catch (error) {
+      source.destroy();
+      settle(() => reject(error));
+    }
+  });
+}
+
+/** Serialize ZIP inputs so descriptor ownership and source errors stay bounded. */
+export async function appendWorkspaceArchiveFiles(
+  archive: ZipArchive,
+  root: string,
+  paths: string[],
+): Promise<void> {
+  let remainingBytes = WORKSPACE_EXPORT_MAX_BYTES;
+  for (const filePath of paths) {
+    const opened = await openWorkspaceExportFile(root, filePath, remainingBytes);
+    remainingBytes -= opened.sizeBytes;
+    await appendOneArchiveEntry(archive, opened.stream, filePath);
+  }
+  await archive.finalize();
+}
+
 export const workspaceRoutes: FastifyPluginAsync = async (app) => {
   // ---- GET /agents/:username/workspace — recursive tree --------------------
   app.get('/:username/workspace', { preHandler: app.requireAuth }, async (req) => {
@@ -154,7 +204,6 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
     const basename = path.posix.basename(download.rel);
     return reply
       .header('content-type', workspaceDownloadMime(basename))
-      .header('content-length', download.sizeBytes)
       .header('content-disposition', `attachment; filename="${attachmentFilename(basename)}"`)
       .send(download.stream);
   });
@@ -167,6 +216,19 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
     // the bytes) and a higher cap so big workspaces still export whole.
     const { entries } = await listWorkspaceTree(root, { withHashes: false, maxEntries: 10_000 });
 
+    const files = entries.filter((entry) => entry.kind === 'file');
+    let discoveredBytes = 0;
+    for (const entry of files) {
+      discoveredBytes += entry.sizeBytes;
+      if (discoveredBytes > WORKSPACE_EXPORT_MAX_BYTES) {
+        throw new ApiError(
+          413,
+          'workspace_export_too_large',
+          `Workspace export exceeds the ${WORKSPACE_EXPORT_MAX_BYTES / (1024 * 1024)}MB limit`,
+        );
+      }
+    }
+
     const archive = new ZipArchive({ zlib: { level: 6 } });
     archive.on('error', (err) => {
       logSafeRequestError(
@@ -177,14 +239,17 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
       );
       archive.destroy();
     });
-    for (const entry of entries) {
-      if (entry.kind === 'dir') continue;
-      // The tree is only discovery. Each lazy stream independently reopens and
-      // re-attests the file through a retained descriptor when archiver reads
-      // it, so a runtime path swap cannot redirect an export after listing.
-      archive.append(openWorkspaceExportStream(root, entry.path), { name: entry.path });
-    }
-    void archive.finalize();
+    void appendWorkspaceArchiveFiles(archive, root, files.map((entry) => entry.path)).catch(
+      (error: unknown) => {
+        logSafeRequestError(
+          req.log,
+          error,
+          { accountId: account.id },
+          'workspace export failed',
+        );
+        archive.destroy();
+      },
+    );
     return reply
       .header('content-type', 'application/zip')
       .header(

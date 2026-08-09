@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, createReadStream, type Stats } from 'node:fs';
+import { constants, createReadStream, type BigIntStats, type Stats } from 'node:fs';
 import { promises as fs } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
@@ -38,6 +38,8 @@ export const WORKSPACE_HASH_MAX_BYTES = 1024 * 1024;
 /** Text read/write ceiling — larger files are reported as binary. */
 export const WORKSPACE_TEXT_MAX_BYTES = 512 * 1024;
 export const WORKSPACE_DOWNLOAD_MAX_BYTES = 100 * 1024 * 1024;
+/** Whole ZIP exports are bounded across all files to protect the API worker. */
+export const WORKSPACE_EXPORT_MAX_BYTES = 1024 * 1024 * 1024;
 
 const HIDDEN_NAMES = new Set([
   'openclaw-workspace-state.json',
@@ -289,13 +291,41 @@ function isPathRaceError(error: unknown): boolean {
   return code === 'ENOENT' || code === 'ENOTDIR' || code === 'ELOOP';
 }
 
+async function descriptorRealpath(
+  handle: FileHandle,
+  openedPath: string,
+  descriptorIdentity: BigIntStats,
+): Promise<string> {
+  if (process.platform === 'linux') {
+    const descriptorPath = await realpathIfExists(`/proc/self/fd/${handle.fd}`);
+    if (descriptorPath === null) throw notFound();
+    return descriptorPath;
+  }
+
+  // macOS has no procfs and Node does not expose F_GETPATH. This fallback
+  // keeps local development fail-closed against ordinary swaps. Production is
+  // Linux and uses the descriptor-authoritative procfs branch above.
+  const reboundReal = await realpathIfExists(openedPath);
+  if (reboundReal === null) throw notFound();
+  const reboundStat = await fs.stat(reboundReal, { bigint: true });
+  if (
+    !reboundStat.isFile()
+    || reboundStat.dev !== descriptorIdentity.dev
+    || reboundStat.ino !== descriptorIdentity.ino
+  ) {
+    throw notFound();
+  }
+  return reboundReal;
+}
+
 /**
  * Resolve, open, and then re-attest a regular workspace file. The returned
  * descriptor is the authority: callers must read only through it and close it.
  *
- * O_NOFOLLOW rejects a final-component swap. Re-resolving after open catches
- * ancestor swaps, and the device/inode comparison binds the post-open pathname
- * back to the exact descriptor rather than trusting two independent checks.
+ * O_NOFOLLOW rejects a final-component swap. Linux production resolves the
+ * opened descriptor through procfs, so containment is bound to the kernel-held
+ * file rather than another attacker-controlled pathname lookup. The local
+ * macOS fallback additionally binds its post-open path by exact device/inode.
  */
 async function openPinnedWorkspaceFile(
   root: string,
@@ -310,22 +340,16 @@ async function openPinnedWorkspaceFile(
 
   let handle: FileHandle | null = null;
   try {
-    handle = await fs.open(targetReal, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await fs.open(
+      targetReal,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
     const descriptorStat = await handle.stat();
     const descriptorIdentity = await handle.stat({ bigint: true });
     if (!descriptorStat.isFile()) throw notFound();
 
-    const reboundReal = await realpathIfExists(targetReal);
-    if (reboundReal === null) throw notFound();
-    assertContainedRealPath(rootReal, reboundReal, false);
-    const reboundStat = await fs.stat(reboundReal, { bigint: true });
-    if (
-      !reboundStat.isFile()
-      || reboundStat.dev !== descriptorIdentity.dev
-      || reboundStat.ino !== descriptorIdentity.ino
-    ) {
-      throw notFound();
-    }
+    const descriptorReal = await descriptorRealpath(handle, targetReal, descriptorIdentity);
+    assertContainedRealPath(rootReal, descriptorReal, false);
 
     return { handle, rel, stat: descriptorStat };
   } catch (error) {
@@ -335,9 +359,33 @@ async function openPinnedWorkspaceFile(
   }
 }
 
-/** A descriptor-backed stream that closes its handle on EOF, error, or destroy. */
-function retainedHandleStream(handle: PinnedWorkspaceFile['handle']): Readable {
-  return handle.createReadStream({ autoClose: true });
+async function readPinnedAtMost(handle: FileHandle, maxBytes: number): Promise<Buffer> {
+  const result = Buffer.allocUnsafe(maxBytes + 1);
+  let offset = 0;
+  while (offset < result.byteLength) {
+    const { bytesRead } = await handle.read(
+      result,
+      offset,
+      result.byteLength - offset,
+      offset,
+    );
+    if (bytesRead === 0) break;
+    offset += bytesRead;
+  }
+  return result.subarray(0, offset);
+}
+
+/** A descriptor-backed, snapshot-bounded stream. */
+async function retainedHandleStream(handle: FileHandle, sizeBytes: number): Promise<Readable> {
+  if (sizeBytes === 0) {
+    await handle.close();
+    return Readable.from([]);
+  }
+  return handle.createReadStream({
+    autoClose: true,
+    start: 0,
+    end: sizeBytes - 1,
+  });
 }
 
 export async function readWorkspaceFile(root: string, rawPath: unknown): Promise<WorkspaceFileContent> {
@@ -347,7 +395,7 @@ export async function readWorkspaceFile(root: string, rawPath: unknown): Promise
     if (stat.size > WORKSPACE_TEXT_MAX_BYTES) {
       return { path: rel, kind: 'binary', sizeBytes: stat.size, mtime };
     }
-    const buf = await handle.readFile();
+    const buf = await readPinnedAtMost(handle, WORKSPACE_TEXT_MAX_BYTES);
     if (buf.byteLength > WORKSPACE_TEXT_MAX_BYTES) {
       return { path: rel, kind: 'binary', sizeBytes: buf.byteLength, mtime };
     }
@@ -387,16 +435,29 @@ export async function openWorkspaceDownload(
     rel,
     sizeBytes: stat.size,
     mtime: stat.mtime.toISOString(),
-    stream: retainedHandleStream(handle),
+    stream: await retainedHandleStream(handle, stat.size),
   };
 }
 
-/** Lazy descriptor-pinned stream for each entry in a workspace ZIP export. */
-export function openWorkspaceExportStream(root: string, rawPath: unknown): Readable {
-  return Readable.from((async function* () {
-    const { handle } = await openPinnedWorkspaceFile(root, rawPath);
-    for await (const chunk of retainedHandleStream(handle)) yield chunk;
-  })());
+/** Open one ZIP entry through a retained descriptor and exact snapshot bound. */
+export async function openWorkspaceExportFile(
+  root: string,
+  rawPath: unknown,
+  remainingBytes = WORKSPACE_EXPORT_MAX_BYTES,
+): Promise<{ sizeBytes: number; stream: Readable }> {
+  const { handle, stat } = await openPinnedWorkspaceFile(root, rawPath);
+  if (stat.size > remainingBytes) {
+    await handle.close();
+    throw new ApiError(
+      413,
+      'workspace_export_too_large',
+      `Workspace export exceeds the ${WORKSPACE_EXPORT_MAX_BYTES / (1024 * 1024)}MB limit`,
+    );
+  }
+  return {
+    sizeBytes: stat.size,
+    stream: await retainedHandleStream(handle, stat.size),
+  };
 }
 
 // ---------------------------------------------------------------------------
