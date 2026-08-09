@@ -33,7 +33,7 @@ describe('chat agent visibility boundary', () => {
     );
   });
 
-  it('fails before a private lazy/ready agent can touch gateway provisioning or model runtime', async () => {
+  it('fails before a private agent can touch gateway provisioning or model runtime', async () => {
     let poisonReads = 0;
     const poisonGateway = new Proxy({}, {
       get() {
@@ -109,21 +109,35 @@ describe('chat agent visibility boundary', () => {
     };
 
     assertBoundary(source);
+    const newCheck = 'assertChatAgentVisible(account, preResolved.account, preResolved.agent);';
+    const createCall = 'target = await createSession(account, preResolved, body.content, app.gatewayGlue);';
+    const movedNewCheck = source
+      .replace(newCheck, '// new-session visibility moved')
+      .replace(createCall, `${createCall}\n        ${newCheck}`);
+    const provisioningCheck = 'assertChatAgentVisible(viewer, account, agent);';
+    const provisioningBranch = "if (agent.openclawId && agent.provisionStatus === 'ready') {";
+    const movedProvisioningCheck = source
+      .replace(provisioningCheck, '// provisioning visibility moved')
+      .replace(provisioningBranch, `${provisioningBranch}\n    ${provisioningCheck}`);
+
     for (const mutant of [
       source.replace(
-        'assertChatAgentVisible(account, preResolved.account, preResolved.agent);',
+        newCheck,
         '// new-session visibility removed',
       ),
       source.replace(
-        'assertChatAgentVisible(viewer, account, agent);',
+        provisioningCheck,
         '// provisioning visibility removed',
       ),
+      movedNewCheck,
+      movedProvisioningCheck,
       source.replace(
         'selectChatAgentForInvocation(rows, account)',
         'rows.find((row) => row.openclawId !== null) ?? rows[0] ?? null',
       ),
       source.replace('public: agents.public,', 'public: true,'),
       source.replace('viewer.accountId === agent.ownerId', 'false'),
+      source.replace('viewer.accountId === account.id', 'false'),
     ]) {
       expect(mutant).not.toBe(source);
       expect(() => assertBoundary(mutant)).toThrow();
