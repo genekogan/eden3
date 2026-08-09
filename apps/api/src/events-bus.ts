@@ -1,4 +1,4 @@
-import { resolveSession } from '@eden3/core';
+import { resolveSession, type AuthSession } from '@eden3/core';
 import { encodeSseComment, encodeSseEvent, type SessionEvent } from '@eden3/shared';
 import type { FastifyPluginAsync } from 'fastify';
 
@@ -78,6 +78,72 @@ declare module 'fastify' {
 
 export const KEEPALIVE_INTERVAL_MS = 15_000;
 
+interface SessionEventAccessCheck<TSession extends { id: string }> {
+  expectedAccountId: string;
+  expectedSessionId: string;
+  getSession(): Promise<AuthSession | null>;
+  resolveSession(): Promise<TSession | null>;
+  canAccess(session: TSession, account: AuthSession): Promise<boolean>;
+}
+
+/** Revalidate every authority that admitted one long-lived event stream. */
+export async function sessionEventAccessStillValid<TSession extends { id: string }>(
+  check: SessionEventAccessCheck<TSession>,
+): Promise<boolean> {
+  const account = await check.getSession();
+  if (!account || account.accountId !== check.expectedAccountId) return false;
+  const session = await check.resolveSession();
+  if (!session || session.id !== check.expectedSessionId) return false;
+  return check.canAccess(session, account);
+}
+
+/** Single-flight authorization lease for a long-lived session event stream. */
+export class SessionEventAuthorizationLease {
+  private active = true;
+  private checking = false;
+
+  constructor(
+    private readonly check: () => Promise<boolean>,
+    private readonly onAuthorized: () => void,
+    private readonly onDenied: () => void,
+  ) {}
+
+  async reauthorize(): Promise<void> {
+    if (!this.active || this.checking) return;
+    this.checking = true;
+    try {
+      if (!(await this.check())) {
+        this.deny();
+        return;
+      }
+      if (this.active) this.onAuthorized();
+    } catch {
+      this.deny();
+    } finally {
+      this.checking = false;
+    }
+  }
+
+  stop(): void {
+    this.active = false;
+  }
+
+  private deny(): void {
+    if (!this.active) return;
+    this.active = false;
+    try {
+      this.onDenied();
+    } catch {
+      // Denial is already durable in this lease; never revive a failed stream.
+    }
+  }
+}
+
+export interface SessionEventsRoutesOptions {
+  /** Test-only cadence override; production retains the fixed 15-second lease. */
+  keepaliveIntervalMs?: number;
+}
+
 /**
  * `GET /sessions/:id/events` — the per-session SSE channel.
  *
@@ -94,7 +160,18 @@ export const KEEPALIVE_INTERVAL_MS = 15_000;
  * EventSource works cross-origin from the web app. A comment ping goes out
  * every 15s to keep proxies and idle sockets alive.
  */
-export const sessionEventsRoutes: FastifyPluginAsync = async (app) => {
+export const sessionEventsRoutes: FastifyPluginAsync<SessionEventsRoutesOptions> = async (
+  app,
+  options,
+) => {
+  const keepaliveIntervalMs = options.keepaliveIntervalMs ?? KEEPALIVE_INTERVAL_MS;
+  if (
+    !Number.isSafeInteger(keepaliveIntervalMs) ||
+    keepaliveIntervalMs < 10 ||
+    keepaliveIntervalMs > KEEPALIVE_INTERVAL_MS
+  ) {
+    throw new Error('session event keepalive interval must be an integer from 10ms to 15000ms');
+  }
   app.get<{ Params: { id: string } }>(
     '/sessions/:id/events',
     { preHandler: app.requireAuth },
@@ -135,15 +212,47 @@ export const sessionEventsRoutes: FastifyPluginAsync = async (app) => {
       });
       reply.raw.write(encodeSseComment('connected'));
 
+      let closed = false;
+      let keepalive: NodeJS.Timeout | null = null;
       const unsubscribe = bus.subscribe(sessionId, reply.raw);
-      const keepalive = setInterval(() => {
-        if (writable()) reply.raw.write(encodeSseComment('ping'));
-      }, KEEPALIVE_INTERVAL_MS);
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        if (keepalive) clearInterval(keepalive);
+        unsubscribe();
+      };
+      const terminate = () => {
+        cleanup();
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) reply.raw.end();
+      };
+      const authorizationLease = new SessionEventAuthorizationLease(
+        async () => {
+          if (!writable()) return false;
+          return sessionEventAccessStillValid({
+            expectedAccountId: account.accountId,
+            expectedSessionId: sessionId,
+            getSession: () => app.authProvider.getSession(req),
+            resolveSession: () => resolveSession(sessionId),
+            canAccess: canAccessSession,
+          });
+        },
+        () => {
+          if (!writable()) {
+            terminate();
+            return;
+          }
+          reply.raw.write(encodeSseComment('ping'));
+        },
+        terminate,
+      );
+      keepalive = setInterval(() => {
+        void authorizationLease.reauthorize();
+      }, keepaliveIntervalMs);
       keepalive.unref();
 
       reply.raw.on('close', () => {
-        clearInterval(keepalive);
-        unsubscribe();
+        authorizationLease.stop();
+        cleanup();
       });
     },
   );

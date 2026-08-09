@@ -24,6 +24,7 @@ let app: FastifyInstance;
 let baseUrl = '';
 let ownerId = '';
 let strangerId = '';
+let memberId = '';
 let sessionId = '';
 
 function cookieFor(accountId: string): string {
@@ -82,18 +83,21 @@ beforeAll(async () => {
   const accounts = await pg<{ id: string }[]>`
     insert into accounts (type, username) values
       ('user', ${`${marker}_owner`}),
-      ('user', ${`${marker}_stranger`})
+      ('user', ${`${marker}_stranger`}),
+      ('user', ${`${marker}_member`})
     returning id
   `;
   ownerId = accounts[0]!.id;
   strangerId = accounts[1]!.id;
+  memberId = accounts[2]!.id;
 
   const [session] = await pg<{ id: string }[]>`
     insert into sessions (owner_id, title) values (${ownerId}, ${`${marker} session`})
     returning id
   `;
   sessionId = session!.id;
-  await pg`insert into session_users (session_id, user_account_id) values (${sessionId}, ${ownerId})`;
+  await pg`insert into session_users (session_id, user_account_id) values
+    (${sessionId}, ${ownerId}), (${sessionId}, ${memberId})`;
 
   app = Fastify({ logger: false, forceCloseConnections: true });
   // The route sends 401/403/404 via sendError (return, not throw), so no
@@ -108,7 +112,7 @@ beforeAll(async () => {
     }),
   });
   app.decorate('eventsBus', new EventsBus());
-  await app.register(sessionEventsRoutes);
+  await app.register(sessionEventsRoutes, { keepaliveIntervalMs: 25 });
   await app.listen({ port: 0, host: '127.0.0.1' });
   const address = app.server.address();
   if (address === null || typeof address === 'string') throw new Error('no listen address');
@@ -151,5 +155,43 @@ describe('GET /sessions/:id/events — authorization (SSE IDOR guard)', () => {
     expect(res.contentType).toContain('text/event-stream');
     expect(res.event).toEqual(event);
     expect(encodeSseEvent(event)).toBe(`data: ${JSON.stringify(event)}\n\n`);
+  });
+
+  it('ends and unsubscribes after durable membership is revoked', async () => {
+    const controller = new AbortController();
+    const res = await fetch(`${baseUrl}/sessions/${sessionId}/events`, {
+      headers: { accept: 'text/event-stream', cookie: cookieFor(memberId) },
+      signal: controller.signal,
+    });
+    expect(res.status).toBe(200);
+    expect(res.body).not.toBeNull();
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let received = decoder.decode((await reader.read()).value);
+    expect(received).toContain(': connected');
+    expect(app.eventsBus.subscriberCount(sessionId)).toBe(1);
+
+    await pg`delete from session_users
+      where session_id = ${sessionId} and user_account_id = ${memberId}`;
+    const deadline = Date.now() + 2_000;
+    while (app.eventsBus.subscriberCount(sessionId) !== 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(app.eventsBus.subscriberCount(sessionId)).toBe(0);
+    expect(
+      app.eventsBus.publish(sessionId, {
+        type: 'manna.updated',
+        accountId: memberId,
+        balance: 777,
+      }),
+    ).toBe(0);
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += decoder.decode(value, { stream: true });
+    }
+    expect(received).not.toContain('manna.updated');
+    controller.abort();
   });
 });
