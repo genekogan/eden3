@@ -435,10 +435,47 @@ export const conceptsRoutes: FastifyPluginAsync<ConceptsRoutesOptions> = async (
         );
       }
 
-      await pg.begin(async (tx) => {
+      const ownerAccountId = resolved.agent.ownerId ?? resolved.account.id;
+      const admittedConcept = await pg.begin(async (tx) => {
+        // Account-erasure admission is the outermost lock. Holding this row
+        // through the media-store write and concept_images insert gives the
+        // erasure inventory an exact either/or boundary:
+        //   * upload first  -> the committed image row is inventoried
+        //   * erasure first -> reject before publishing any media bytes
+        const owners = await tx<{ id: string }[]>`
+          select id from accounts
+          where id = ${ownerAccountId} and deleted = false
+          for key share
+        `;
+        if (owners.length !== 1) {
+          throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+        }
+        const activeErasure = await tx`
+          select 1 from account_erasure_jobs
+          where account_id = ${ownerAccountId} and state <> 'succeeded'
+          limit 1
+        `;
+        if (activeErasure.length > 0) {
+          throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+        }
+
         await tx`select pg_advisory_xact_lock(hashtextextended(${`${CONCEPT_IMAGE_QUOTA_LOCK_PREFIX}${concept.id}`}, ${CONCEPT_QUOTA_LOCK_SEED}))`;
+        const [currentConcept] = await tx<ConceptRow[]>`
+          select c.id, c.agent_id, c.name, c.slug, c.description, c.instructions,
+                 c.created_at, c.updated_at
+          from concepts c
+          join agents a on a.account_id = c.agent_id
+          where c.id = ${concept.id}
+            and c.agent_id = ${resolved.account.id}
+            and c.deleted = false
+            and coalesce(a.owner_id, a.account_id) = ${ownerAccountId}
+          for update of c, a
+        `;
+        if (!currentConcept) {
+          throw new ApiError(404, 'concept_not_found', `No concept "${slug}"`);
+        }
         const [count] = await tx<{ count: number }[]>`
-          select count(*)::int as count from concept_images where concept_id = ${concept.id}
+          select count(*)::int as count from concept_images where concept_id = ${currentConcept.id}
         `;
         if ((count?.count ?? 0) >= MAX_IMAGES_PER_CONCEPT) {
           throw new ApiError(
@@ -452,16 +489,17 @@ export const conceptsRoutes: FastifyPluginAsync<ConceptsRoutesOptions> = async (
         await tx`
           insert into concept_images (concept_id, url, local_path, sha256, mime,
                                       width, height, size_bytes, filename, position)
-          values (${concept.id}, ${stored.url}, ${stored.localPath}, ${stored.sha256},
+          values (${currentConcept.id}, ${stored.url}, ${stored.localPath}, ${stored.sha256},
                   ${stored.mime}, ${dims.width}, ${dims.height}, ${stored.sizeBytes},
                   ${body.filename ?? null},
                   (select coalesce(max(position), -1) + 1
-                   from concept_images where concept_id = ${concept.id}))
+                   from concept_images where concept_id = ${currentConcept.id}))
         `;
+        return currentConcept;
       });
 
       await reproject(req, resolved.account.id);
-      return reply.code(201).send(await conceptResponse(concept));
+      return reply.code(201).send(await conceptResponse(admittedConcept));
     },
   );
 

@@ -31,7 +31,22 @@ describe('concept owner quota admission', () => {
       "const CONCEPT_IMAGE_QUOTA_LOCK_PREFIX = 'concept-image-quota:';",
     );
     expect(imageCreate).toContain('await pg.begin(async (tx) =>');
+    expect(imageCreate).toContain('const ownerAccountId = resolved.agent.ownerId ?? resolved.account.id');
+    expect(imageCreate).toContain('from accounts');
+    expect(imageCreate).toContain('for key share');
+    expect(imageCreate).toContain('from account_erasure_jobs');
+    expect(imageCreate).toContain("state <> 'succeeded'");
+    expect(imageCreate).toContain("'account_erasure_active'");
+    expect(imageCreate.indexOf('for key share')).toBeLessThan(
+      imageCreate.indexOf('from account_erasure_jobs'),
+    );
+    expect(imageCreate.indexOf('from account_erasure_jobs')).toBeLessThan(
+      imageCreate.indexOf('pg_advisory_xact_lock'),
+    );
     expect(imageCreate.indexOf('pg_advisory_xact_lock')).toBeLessThan(
+      imageCreate.indexOf('for update of c, a'),
+    );
+    expect(imageCreate.indexOf('for update of c, a')).toBeLessThan(
       imageCreate.indexOf('count(*)::int as count'),
     );
     expect(imageCreate.indexOf('count(*)::int as count')).toBeLessThan(
@@ -40,5 +55,17 @@ describe('concept owner quota admission', () => {
     expect(imageCreate.indexOf('getStore().put')).toBeLessThan(
       imageCreate.indexOf('insert into concept_images'),
     );
+
+    for (const mutation of [
+      imageCreate.replace('for key share', ''),
+      imageCreate.replace("state <> 'succeeded'", "state = 'succeeded'"),
+      imageCreate.replace('for update of c, a', ''),
+    ]) {
+      expect(mutation).not.toBe(imageCreate);
+      const ownerLock = mutation.indexOf('for key share');
+      const activeJob = mutation.indexOf("state <> 'succeeded'");
+      const conceptLock = mutation.indexOf('for update of c, a');
+      expect(ownerLock >= 0 && activeJob > ownerLock && conceptLock > activeJob).toBe(false);
+    }
   });
 });
