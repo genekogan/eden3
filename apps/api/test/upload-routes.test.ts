@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { Readable } from 'node:stream';
 
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -185,6 +186,25 @@ describe('uploadsRoutes tenant boundary', () => {
       await put(`/uploads/${reservation.uploadId}/parts/1`, capability, { 'content-type': 'text/plain' }),
       await put(`/uploads/${reservation.uploadId}/parts/1`, capability, { 'content-length': '8' }),
       await put(`/uploads/${reservation.uploadId}/parts/1`, capability, { 'content-length': '07' }),
+      await put(`/uploads/${reservation.uploadId}/parts/1`, capability, {
+        'content-length': String(UploadService.MAX_OBJECT_BYTES),
+      }),
+      await put(`/uploads/${reservation.uploadId}/parts/1`, capability, {
+        'content-length': String(UploadService.MAX_OBJECT_BYTES + 1),
+      }),
+      await put(`/uploads/${reservation.uploadId}/parts/1`, capability, {
+        'content-length': String(Number.MAX_SAFE_INTEGER + 1),
+      }),
+      await app.inject({
+        method: 'PUT',
+        url: `/uploads/${reservation.uploadId}/parts/1`,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'transfer-encoding': 'chunked',
+          'x-eden-upload-capability': capability,
+        },
+        payload: Readable.from(bytes),
+      }),
     ];
     expect(responses.map((response) => response.statusCode)).toEqual([
       401,
@@ -193,6 +213,10 @@ describe('uploadsRoutes tenant boundary', () => {
       401,
       415,
       400,
+      411,
+      400,
+      413,
+      413,
       411,
     ]);
     expect(parserCalls).toBe(0);

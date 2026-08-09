@@ -521,6 +521,54 @@ describe('upload.resumable@v1 security boundary', () => {
     expect(writes).toBe(1);
   });
 
+  it.each([
+    ['lifecycle state', 'upload_not_active'],
+    ['durable authorization', 'invalid_upload_capability'],
+  ] as const)('revalidates %s behind the process fence before backend mutation', async (mutation, code) => {
+    const repository = new InMemoryUploadRepository();
+    const backend = new MemoryMultipartBackend();
+    const uploadService = new UploadService({
+      repository,
+      backend,
+      capabilityKey: CAPABILITY_KEY,
+      backingStore: 'local',
+      securityMode: 'test',
+    });
+    const bytes = Buffer.from('race-bound');
+    const reservation = await uploadService.initiate(OWNER_A, {
+      displayName: 'race-bound.txt',
+      purpose: 'chat',
+      declaredSizeBytes: bytes.length,
+      declaredMime: 'text/plain',
+      declaredSha256: sha256(bytes),
+      partSizeBytes: bytes.length,
+    });
+    const signed = await uploadService.signPart(OWNER_A, reservation.uploadId, 1, {
+      checksumSha256: sha256(bytes),
+    });
+    const capability = signed.requiredHeaders['x-eden-upload-capability']!;
+
+    if (mutation === 'lifecycle state') {
+      const originalFindById = repository.findById.bind(repository);
+      let reads = 0;
+      repository.findById = async (uploadId) => {
+        reads += 1;
+        if (reads === 2) await repository.abort(uploadId, OWNER_A);
+        return originalFindById(uploadId);
+      };
+    } else {
+      const originalFindAuthorization = repository.findPartAuthorization.bind(repository);
+      let reads = 0;
+      repository.findPartAuthorization = async (...args) => {
+        reads += 1;
+        return reads === 2 ? null : originalFindAuthorization(...args);
+      };
+    }
+
+    await expect(uploadService.putLocalPart(capability, bytes)).rejects.toMatchObject({ code });
+    expect([...backend.parts.values()].every((parts) => parts.size === 0)).toBe(true);
+  });
+
   it('durably chooses one checksum across service instances before local bytes reach the backend', async () => {
     const repository = new InMemoryUploadRepository();
     const backend = new MemoryMultipartBackend();
