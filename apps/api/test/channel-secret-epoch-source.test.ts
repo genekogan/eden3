@@ -66,5 +66,7 @@ describe('channel SecretRef durable epoch wiring', () => {
     expect(interfaces).not.toContain('Capability epoch is still `c1`');
     expect(ledger).toContain('2026-08-09 retained-M3 amendment');
     expect(ledger).toContain('D-005 shared-gateway requester isolation remains open');
+    expect(ledger).toContain('KMS/key rotation + mass revocation');
+    expect(ledger).not.toContain('off-box copies; rotation + mass-revocation');
   });
 });
