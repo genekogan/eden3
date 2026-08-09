@@ -90,7 +90,7 @@ describe('0040 account erasure lifecycle schema', () => {
       entries: Array<{ idx: number; tag: string }>;
     };
     journal.entries.forEach((entry, index) => expect(entry.idx).toBe(index));
-    expect(journal.entries.at(-1)).toEqual(expect.objectContaining({
+    expect(journal.entries.find((entry) => entry.idx === 40)).toEqual(expect.objectContaining({
       idx: 40,
       tag: '0040_account_erasure_lifecycle',
     }));
@@ -107,6 +107,7 @@ describe('0040 account erasure lifecycle schema', () => {
     expect(targets.columns.find((column) => column.name === 'kind')?.enumValues).toEqual([
       'storage_object',
       'legacy_media_asset',
+      'legacy_concept_asset',
       'agent_runtime',
       'channel_runtime',
       'clerk_identity',

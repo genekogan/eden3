@@ -738,6 +738,31 @@ export const billingSubscriptions = pgTable(
   ],
 );
 
+export const stripeCheckoutIntents = pgTable(
+  'stripe_checkout_intents',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id').notNull().references(() => accounts.id),
+    kind: text('kind').$type<'manna_topup' | 'subscription'>().notNull(),
+    state: text('state').$type<'preparing' | 'provider_started' | 'created' | 'failed'>()
+      .notNull().default('preparing'),
+    requestKeySha256: text('request_key_sha256').notNull().unique(),
+    stripeSessionId: text('stripe_session_id').unique(),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('stripe_checkout_intents_account_state_idx').on(t.accountId, t.state),
+    check('stripe_checkout_intents_kind_chk', sql`${t.kind} in ('manna_topup','subscription')`),
+    check('stripe_checkout_intents_state_chk', sql`${t.state} in ('preparing','provider_started','created','failed')`),
+    check('stripe_checkout_intents_request_hash_chk', sql`${t.requestKeySha256} ~ '^[0-9a-f]{64}$'`),
+    check('stripe_checkout_intents_session_chk', sql`${t.stripeSessionId} is null or ${t.stripeSessionId} ~ '^cs_[A-Za-z0-9_]{3,252}$'`),
+    check('stripe_checkout_intents_error_chk', sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z0-9_]{1,100}$'`),
+    check('stripe_checkout_intents_shape_chk', sql`(${t.state} in ('preparing','provider_started') and ${t.stripeSessionId} is null and ${t.lastErrorCode} is null) or (${t.state}='created' and ${t.stripeSessionId} is not null and ${t.lastErrorCode} is null) or (${t.state}='failed' and ${t.stripeSessionId} is null and ${t.lastErrorCode} is not null)`) ,
+  ],
+);
+
 export const mannaVouchers = pgTable(
   'manna_vouchers',
   {
@@ -1019,6 +1044,29 @@ export const channelTurns = pgTable(
     uniqueIndex('channel_turns_external_message_uq')
       .on(t.connectionId, t.externalMessageId)
       .where(sql`${t.connectionId} is not null and ${t.externalMessageId} is not null`),
+  ],
+);
+
+export const channelOutboundPostIntents = pgTable(
+  'channel_outbound_post_intents',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    accountId: uuid('account_id').notNull().references(() => accounts.id),
+    connectionId: uuid('connection_id').notNull().references(() => channelConnections.id),
+    state: text('state').$type<'preparing' | 'provider_started' | 'succeeded' | 'failed'>()
+      .notNull().default('preparing'),
+    providerPostId: text('provider_post_id'),
+    lastErrorCode: text('last_error_code'),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    index('channel_outbound_post_intents_account_state_idx').on(t.accountId, t.state),
+    index('channel_outbound_post_intents_connection_idx').on(t.connectionId),
+    check('channel_outbound_post_intents_state_chk', sql`${t.state} in ('preparing','provider_started','succeeded','failed')`),
+    check('channel_outbound_post_intents_post_id_chk', sql`${t.providerPostId} is null or ${t.providerPostId} ~ '^[A-Za-z0-9_:-]{1,255}$'`),
+    check('channel_outbound_post_intents_error_chk', sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z0-9_]{1,100}$'`),
+    check('channel_outbound_post_intents_shape_chk', sql`(${t.state} in ('preparing','provider_started') and ${t.providerPostId} is null and ${t.lastErrorCode} is null) or (${t.state}='succeeded' and ${t.providerPostId} is not null and ${t.lastErrorCode} is null) or (${t.state}='failed' and ${t.providerPostId} is null and ${t.lastErrorCode} is not null)`),
   ],
 );
 
@@ -1838,6 +1886,7 @@ export const accountErasureJobs = pgTable(
     inventoriedAt: timestamptz('inventoried_at'),
     inventorySha256: text('inventory_sha256'),
     recoveryManifestConfirmedAt: timestamptz('recovery_manifest_confirmed_at'),
+    recoveryManifestSha256: text('recovery_manifest_sha256'),
     recoveryCiphertextSha256: text('recovery_ciphertext_sha256'),
     recoveryMacSha256: text('recovery_mac_sha256'),
     recoveryKeyVersion: integer('recovery_key_version'),
@@ -1867,7 +1916,7 @@ export const accountErasureJobs = pgTable(
     check('account_erasure_jobs_attempt_check', sql`${t.attemptCount} >= 0`),
     check(
       'account_erasure_jobs_hash_check',
-      sql`(${t.ledgerSha256} is null or ${t.ledgerSha256} ~ '^[0-9a-f]{64}$') and (${t.ledgerMacSha256} is null or ${t.ledgerMacSha256} ~ '^[0-9a-f]{64}$') and (${t.inventorySha256} is null or ${t.inventorySha256} ~ '^[0-9a-f]{64}$') and (${t.recoveryCiphertextSha256} is null or ${t.recoveryCiphertextSha256} ~ '^[0-9a-f]{64}$') and (${t.recoveryMacSha256} is null or ${t.recoveryMacSha256} ~ '^[0-9a-f]{64}$')`,
+      sql`(${t.ledgerSha256} is null or ${t.ledgerSha256} ~ '^[0-9a-f]{64}$') and (${t.ledgerMacSha256} is null or ${t.ledgerMacSha256} ~ '^[0-9a-f]{64}$') and (${t.inventorySha256} is null or ${t.inventorySha256} ~ '^[0-9a-f]{64}$') and (${t.recoveryManifestSha256} is null or ${t.recoveryManifestSha256} ~ '^[0-9a-f]{64}$') and (${t.recoveryCiphertextSha256} is null or ${t.recoveryCiphertextSha256} ~ '^[0-9a-f]{64}$') and (${t.recoveryMacSha256} is null or ${t.recoveryMacSha256} ~ '^[0-9a-f]{64}$')`,
     ),
     check(
       'account_erasure_jobs_error_check',
@@ -1875,7 +1924,7 @@ export const accountErasureJobs = pgTable(
     ),
     check(
       'account_erasure_jobs_evidence_group_check',
-      sql`((${t.ledgerConfirmedAt} is null and ${t.ledgerSha256} is null and ${t.ledgerMacSha256} is null) or (${t.ledgerConfirmedAt} is not null and ${t.ledgerSha256} is not null and ${t.ledgerMacSha256} is not null)) and ((${t.inventoriedAt} is null and ${t.inventorySha256} is null) or (${t.inventoriedAt} is not null and ${t.inventorySha256} is not null)) and ((${t.recoveryManifestConfirmedAt} is null and ${t.recoveryCiphertextSha256} is null and ${t.recoveryMacSha256} is null and ${t.recoveryKeyVersion} is null) or (${t.recoveryManifestConfirmedAt} is not null and ${t.recoveryCiphertextSha256} is not null and ${t.recoveryMacSha256} is not null and ${t.recoveryKeyVersion} >= 1))`,
+      sql`((${t.ledgerConfirmedAt} is null and ${t.ledgerSha256} is null and ${t.ledgerMacSha256} is null) or (${t.ledgerConfirmedAt} is not null and ${t.ledgerSha256} is not null and ${t.ledgerMacSha256} is not null)) and ((${t.inventoriedAt} is null and ${t.inventorySha256} is null) or (${t.inventoriedAt} is not null and ${t.inventorySha256} is not null)) and ((${t.recoveryManifestConfirmedAt} is null and ${t.recoveryManifestSha256} is null and ${t.recoveryCiphertextSha256} is null and ${t.recoveryMacSha256} is null and ${t.recoveryKeyVersion} is null) or (${t.recoveryManifestConfirmedAt} is not null and ${t.recoveryManifestSha256} is not null and ${t.recoveryCiphertextSha256} is not null and ${t.recoveryMacSha256} is not null and ${t.recoveryKeyVersion} >= 1))`,
     ),
     check(
       'account_erasure_jobs_shape_check',
@@ -1890,7 +1939,7 @@ export const accountErasureTargets = pgTable(
     id: uuid('id').primaryKey().defaultRandom(),
     jobId: uuid('job_id').notNull().references(() => accountErasureJobs.id, { onDelete: 'restrict' }),
     kind: text('kind', {
-      enum: ['storage_object', 'legacy_media_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone'],
+      enum: ['storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone'],
     }).notNull(),
     resourceId: uuid('resource_id').notNull(),
     state: text('state', { enum: ['pending', 'claimed', 'attention', 'succeeded'] })
@@ -1908,7 +1957,7 @@ export const accountErasureTargets = pgTable(
     uniqueIndex('account_erasure_targets_job_kind_resource_uq').on(t.jobId, t.kind, t.resourceId),
     index('account_erasure_targets_due_idx').on(t.nextAttemptAt, t.id).where(sql`${t.state} = 'pending'`),
     index('account_erasure_targets_claim_expiry_idx').on(t.claimExpiresAt, t.id).where(sql`${t.state} = 'claimed'`),
-    check('account_erasure_targets_kind_check', sql`${t.kind} in ('storage_object', 'legacy_media_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone')`),
+    check('account_erasure_targets_kind_check', sql`${t.kind} in ('storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'agent_runtime', 'channel_runtime', 'clerk_identity', 'stripe_customer', 'backup_tombstone')`),
     check('account_erasure_targets_state_check', sql`${t.state} in ('pending', 'claimed', 'attention', 'succeeded')`),
     check('account_erasure_targets_attempt_check', sql`${t.attemptCount} >= 0`),
     check('account_erasure_targets_error_check', sql`${t.lastErrorCode} is null or ${t.lastErrorCode} ~ '^[a-z][a-z0-9_]{0,99}$'`),
