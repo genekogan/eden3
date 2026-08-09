@@ -93,9 +93,11 @@ let ownerId = '';
 let strangerId = '';
 let agentId = ''; // public, provisioned (workspace_path = workspaceDir)
 let capAgentId = ''; // public, used only for the 20-concept cap test
+let quotaRaceAgentId = ''; // public, used only for concurrent quota admission
 let pendingAgentId = ''; // public, never provisioned (workspace_path null)
 const agentName = `${marker}_muse`;
 const capAgentName = `${marker}_full`;
+const quotaRaceAgentName = `${marker}_quota_race`;
 const privateAgentName = `${marker}_ghost`;
 const pendingAgentName = `${marker}_dormant`;
 
@@ -154,6 +156,12 @@ beforeAll(async () => {
     openclawId: capAgentName,
     workspacePath: capWorkspaceDir,
     provisionStatus: 'ready',
+  });
+  quotaRaceAgentId = await insertAgentAccount(quotaRaceAgentName, {
+    ownerId,
+    name: 'Quota Race Agent',
+    public: true,
+    provisionStatus: 'pending',
   });
   await insertAgentAccount(privateAgentName, {
     ownerId,
@@ -289,6 +297,52 @@ describe('POST /agents/:username/concepts', () => {
     });
     expect(res.statusCode).toBe(429);
     expect((res.json() as { error: { code: string } }).error.code).toBe('concept_quota_exceeded');
+  });
+
+  it('admits exactly one concurrent create at the per-agent quota boundary', async () => {
+    for (let i = 0; i < 19; i += 1) {
+      await pg`
+        insert into concepts (agent_id, name, slug)
+        values (${quotaRaceAgentId}, ${`Quota filler ${i}`}, ${`quota-filler-${i}`})
+      `;
+    }
+    const lockKey = `concept-quota:${quotaRaceAgentId}`;
+    const lock = await pg.reserve();
+    await lock`select pg_advisory_lock(hashtextextended(${lockKey}, 0))`;
+    let settled = 0;
+    let attempts: Array<Promise<unknown>> = [];
+    try {
+      attempts = ['first', 'second'].map((suffix) =>
+        app
+          .inject({
+            method: 'POST',
+            url: `/agents/${quotaRaceAgentName}/concepts`,
+            headers: { cookie: devCookie(ownerId) },
+            payload: { name: `Quota contender ${suffix}` },
+          })
+          .finally(() => {
+            settled += 1;
+          }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(0);
+      await lock`select pg_advisory_unlock(hashtextextended(${lockKey}, 0))`;
+
+      const responses = await Promise.all(attempts);
+      expect(
+        responses.map((response) => (response as { statusCode: number }).statusCode).sort(),
+      ).toEqual([201, 429]);
+      const [after] = await pg<{ count: number }[]>`
+        select count(*)::int as count
+        from concepts
+        where agent_id = ${quotaRaceAgentId} and deleted = false
+      `;
+      expect(after?.count).toBe(20);
+    } finally {
+      await lock`select pg_advisory_unlock(hashtextextended(${lockKey}, 0))`;
+      await Promise.allSettled(attempts);
+      lock.release();
+    }
   });
 
   it('creates (without projecting) for an unprovisioned agent', async () => {
