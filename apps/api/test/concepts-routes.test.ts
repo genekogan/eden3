@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -473,6 +474,64 @@ describe('PATCH + DELETE /agents/:username/concepts/:slug', () => {
 // ---------------------------------------------------------------------------
 
 describe('concept images', () => {
+  it('admits exactly one concurrent upload at the per-concept image boundary', async () => {
+    const [concept] = await pg<{ id: string }[]>`
+      select id from concepts
+      where agent_id = ${pendingAgentId} and slug = 'waiting-room' and deleted = false
+    `;
+    expect(concept?.id).toBeTruthy();
+    for (let i = 0; i < 7; i += 1) {
+      await pg`
+        insert into concept_images (
+          concept_id, url, sha256, mime, filename, position
+        ) values (
+          ${concept!.id}, ${`/media/${createHash('sha256').update(`quota-image-${i}`).digest('hex')}.png`},
+          ${createHash('sha256').update(`quota-image-${i}`).digest('hex')},
+          'image/png', ${`quota-image-${i}.png`}, ${i}
+        )
+      `;
+    }
+    const lockKey = `concept-image-quota:${concept!.id}`;
+    const lock = await pg.reserve();
+    await lock`select pg_advisory_lock(hashtextextended(${lockKey}, 0))`;
+    let settled = 0;
+    let attempts: Array<Promise<unknown>> = [];
+    try {
+      attempts = [0xa1, 0xa2].map((suffix) =>
+        app
+          .inject({
+            method: 'POST',
+            url: `/agents/${pendingAgentName}/concepts/waiting-room/images`,
+            headers: { cookie: devCookie(ownerId) },
+            payload: uploadBody(
+              Buffer.concat([PNG_1PX, Buffer.from([suffix])]),
+              'image/png',
+              `quota-contender-${suffix}.png`,
+            ),
+          })
+          .finally(() => {
+            settled += 1;
+          }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(0);
+      await lock`select pg_advisory_unlock(hashtextextended(${lockKey}, 0))`;
+
+      const responses = await Promise.all(attempts);
+      expect(
+        responses.map((response) => (response as { statusCode: number }).statusCode).sort(),
+      ).toEqual([201, 429]);
+      const [after] = await pg<{ count: number }[]>`
+        select count(*)::int as count from concept_images where concept_id = ${concept!.id}
+      `;
+      expect(after?.count).toBe(8);
+    } finally {
+      await lock`select pg_advisory_unlock(hashtextextended(${lockKey}, 0))`;
+      await Promise.allSettled(attempts);
+      lock.release();
+    }
+  });
+
   it('uploads a png through the media store and copies it into the workspace', async () => {
     const res = await app.inject({
       method: 'POST',

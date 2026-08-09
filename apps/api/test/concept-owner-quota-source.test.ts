@@ -23,5 +23,22 @@ describe('concept owner quota admission', () => {
     expect(create.indexOf('availableSlug(tx')).toBeLessThan(
       create.indexOf('insert into concepts'),
     );
+
+    const imageStart = source.indexOf("'/:username/concepts/:slug/images'");
+    const imageEnd = source.indexOf('// ---- PATCH', imageStart);
+    const imageCreate = source.slice(imageStart, imageEnd);
+    expect(source).toContain(
+      "const CONCEPT_IMAGE_QUOTA_LOCK_PREFIX = 'concept-image-quota:';",
+    );
+    expect(imageCreate).toContain('await pg.begin(async (tx) =>');
+    expect(imageCreate.indexOf('pg_advisory_xact_lock')).toBeLessThan(
+      imageCreate.indexOf('count(*)::int as count'),
+    );
+    expect(imageCreate.indexOf('count(*)::int as count')).toBeLessThan(
+      imageCreate.indexOf('getStore().put'),
+    );
+    expect(imageCreate.indexOf('getStore().put')).toBeLessThan(
+      imageCreate.indexOf('insert into concept_images'),
+    );
   });
 });

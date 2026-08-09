@@ -9,7 +9,7 @@ import { pg, type Account, type Agent } from '@eden3/db';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 
-import { logSafeRequestWarning, sendError } from '../errors';
+import { ApiError, logSafeRequestWarning, sendError } from '../errors';
 import { isUniqueViolation, pgToIso } from '../route-helpers';
 import {
   activeConceptRows,
@@ -49,7 +49,10 @@ import { canManage } from './agents';
  */
 
 const MAX_CONCEPTS_PER_AGENT = 20;
+const CONCEPT_QUOTA_LOCK_PREFIX = 'concept-quota:';
+const CONCEPT_QUOTA_LOCK_SEED = 0;
 const MAX_IMAGES_PER_CONCEPT = 8;
+const CONCEPT_IMAGE_QUOTA_LOCK_PREFIX = 'concept-image-quota:';
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 /** base64 inflates ~4/3; 12MB leaves room for the JSON envelope around 8MB. */
 const UPLOAD_BODY_LIMIT_BYTES = 12 * 1024 * 1024;
@@ -209,11 +212,17 @@ function slugify(name: string): string {
 }
 
 /** First free kebab slug for the agent: base, base-2, base-3, … */
-async function availableSlug(agentId: string, name: string): Promise<string | null> {
+type PgTransaction = Parameters<Parameters<typeof pg.begin>[1]>[0];
+
+async function availableSlug(
+  tx: PgTransaction,
+  agentId: string,
+  name: string,
+): Promise<string | null> {
   const base = slugify(name);
   const taken = new Set(
     (
-      await pg<{ slug: string }[]>`
+      await tx<{ slug: string }[]>`
         select slug from concepts where agent_id = ${agentId} and deleted = false
       `
     ).map((row) => row.slug),
@@ -294,33 +303,36 @@ export const conceptsRoutes: FastifyPluginAsync<ConceptsRoutesOptions> = async (
     const resolved = await resolveConceptAgent(req, reply, username, { write: true });
     if (!resolved) return reply;
 
-    const [quota] = await pg<{ count: number }[]>`
-      select count(*)::int as count
-      from concepts
-      where agent_id = ${resolved.account.id} and deleted = false
-    `;
-    if ((quota?.count ?? 0) >= MAX_CONCEPTS_PER_AGENT) {
-      return sendError(
-        reply,
-        429,
-        'concept_quota_exceeded',
-        `Concept limit reached (${MAX_CONCEPTS_PER_AGENT} per agent)`,
-      );
-    }
-
-    const slug = await availableSlug(resolved.account.id, body.name);
-    if (!slug) {
-      return sendError(reply, 409, 'concept_slug_taken', 'No free slug for that name');
-    }
-
     let row: ConceptRow | undefined;
+    let slug = '';
     try {
-      [row] = await pg<ConceptRow[]>`
-        insert into concepts (agent_id, name, slug, description, instructions)
-        values (${resolved.account.id}, ${body.name}, ${slug},
-                ${body.description || null}, ${body.instructions || null})
-        returning id, agent_id, name, slug, description, instructions, created_at, updated_at
-      `;
+      row = await pg.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`${CONCEPT_QUOTA_LOCK_PREFIX}${resolved.account.id}`}, ${CONCEPT_QUOTA_LOCK_SEED}))`;
+        const [quota] = await tx<{ count: number }[]>`
+          select count(*)::int as count
+          from concepts
+          where agent_id = ${resolved.account.id} and deleted = false
+        `;
+        if ((quota?.count ?? 0) >= MAX_CONCEPTS_PER_AGENT) {
+          throw new ApiError(
+            429,
+            'concept_quota_exceeded',
+            `Concept limit reached (${MAX_CONCEPTS_PER_AGENT} per agent)`,
+          );
+        }
+
+        slug = (await availableSlug(tx, resolved.account.id, body.name)) ?? '';
+        if (!slug) {
+          throw new ApiError(409, 'concept_slug_taken', 'No free slug for that name');
+        }
+        const [inserted] = await tx<ConceptRow[]>`
+          insert into concepts (agent_id, name, slug, description, instructions)
+          values (${resolved.account.id}, ${body.name}, ${slug},
+                  ${body.description || null}, ${body.instructions || null})
+          returning id, agent_id, name, slug, description, instructions, created_at, updated_at
+        `;
+        return inserted;
+      });
     } catch (err) {
       // The partial unique index is the real slug guard under concurrency.
       if (isUniqueViolation(err)) {
@@ -423,28 +435,30 @@ export const conceptsRoutes: FastifyPluginAsync<ConceptsRoutesOptions> = async (
         );
       }
 
-      const [count] = await pg<{ count: number }[]>`
-        select count(*)::int as count from concept_images where concept_id = ${concept.id}
-      `;
-      if ((count?.count ?? 0) >= MAX_IMAGES_PER_CONCEPT) {
-        return sendError(
-          reply,
-          429,
-          'concept_image_limit',
-          `Reference-image limit reached (${MAX_IMAGES_PER_CONCEPT} per concept)`,
-        );
-      }
+      await pg.begin(async (tx) => {
+        await tx`select pg_advisory_xact_lock(hashtextextended(${`${CONCEPT_IMAGE_QUOTA_LOCK_PREFIX}${concept.id}`}, ${CONCEPT_QUOTA_LOCK_SEED}))`;
+        const [count] = await tx<{ count: number }[]>`
+          select count(*)::int as count from concept_images where concept_id = ${concept.id}
+        `;
+        if ((count?.count ?? 0) >= MAX_IMAGES_PER_CONCEPT) {
+          throw new ApiError(
+            429,
+            'concept_image_limit',
+            `Reference-image limit reached (${MAX_IMAGES_PER_CONCEPT} per concept)`,
+          );
+        }
 
-      const stored = await getStore().put(buffer, { mime });
-      await pg`
-        insert into concept_images (concept_id, url, local_path, sha256, mime,
-                                    width, height, size_bytes, filename, position)
-        values (${concept.id}, ${stored.url}, ${stored.localPath}, ${stored.sha256},
-                ${stored.mime}, ${dims.width}, ${dims.height}, ${stored.sizeBytes},
-                ${body.filename ?? null},
-                (select coalesce(max(position), -1) + 1
-                 from concept_images where concept_id = ${concept.id}))
-      `;
+        const stored = await getStore().put(buffer, { mime });
+        await tx`
+          insert into concept_images (concept_id, url, local_path, sha256, mime,
+                                      width, height, size_bytes, filename, position)
+          values (${concept.id}, ${stored.url}, ${stored.localPath}, ${stored.sha256},
+                  ${stored.mime}, ${dims.width}, ${dims.height}, ${stored.sizeBytes},
+                  ${body.filename ?? null},
+                  (select coalesce(max(position), -1) + 1
+                   from concept_images where concept_id = ${concept.id}))
+        `;
+      });
 
       await reproject(req, resolved.account.id);
       return reply.code(201).send(await conceptResponse(concept));
