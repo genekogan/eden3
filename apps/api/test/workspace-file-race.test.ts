@@ -46,13 +46,17 @@ async function expectSafeOrRejected(streamFactory: () => Promise<NodeJS.Readable
   if (body !== null) expect(body).not.toContain('NEIGHBOR SECRET');
 }
 
+function isSafeFileCandidate(candidate: Parameters<typeof fs.open>[0]): boolean {
+  return path.basename(String(candidate)) === 'safe.txt';
+}
+
 async function swapFinalComponentAfterFirstResolution(root: string, neighbor: string) {
   const target = path.join(root, 'notes', 'safe.txt');
   const outside = path.join(neighbor, 'notes', 'safe.txt');
   const originalOpen = fs.open.bind(fs);
   let swapped = false;
   vi.spyOn(fs, 'open').mockImplementation(async (candidate, flags, mode) => {
-    if (!swapped && String(candidate).endsWith('/notes/safe.txt')) {
+    if (!swapped && isSafeFileCandidate(candidate)) {
       swapped = true;
       await fs.unlink(target);
       await fs.symlink(outside, target);
@@ -205,7 +209,7 @@ describe('workspace file descriptor pinning', () => {
     let instrumented = false;
     vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
       const handle = await originalOpen(...args);
-      if (!instrumented && String(args[0]).endsWith('/notes/safe.txt')) {
+      if (!instrumented && isSafeFileCandidate(args[0])) {
         instrumented = true;
         const originalStat = handle.stat.bind(handle);
         let statCalls = 0;
@@ -410,22 +414,27 @@ describe('workspace file descriptor pinning', () => {
     const fixture = await freshFixture();
     try {
       const target = path.join(fixture.root, 'notes', 'safe.txt');
-      const targetReal = await fs.realpath(target);
-      const originalStat = fs.stat.bind(fs);
+      const originalOpen = fs.open.bind(fs);
       let grownDuringRead = false;
-      vi.spyOn(fs, 'stat').mockImplementation(async (...args) => {
-        const result = await originalStat(...args);
-        if (
-          !grownDuringRead
-          && path.resolve(String(args[0])) === path.resolve(targetReal)
-          && typeof result.size === 'bigint'
-        ) {
-          grownDuringRead = true;
-          await fs.truncate(target, WORKSPACE_TEXT_MAX_BYTES + 4_096);
+      vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await originalOpen(...args);
+        if (!grownDuringRead && isSafeFileCandidate(args[0])) {
+          const originalStat = handle.stat.bind(handle);
+          let statCalls = 0;
+          vi.spyOn(handle, 'stat').mockImplementation(async (options) => {
+            const result = await originalStat(options as never);
+            statCalls += 1;
+            if (statCalls === 2) {
+              grownDuringRead = true;
+              await fs.truncate(target, WORKSPACE_TEXT_MAX_BYTES + 4_096);
+            }
+            return result as never;
+          });
         }
-        return result;
+        return handle;
       });
       const read = await readWorkspaceFile(fixture.root, 'notes/safe.txt');
+      expect(grownDuringRead).toBe(true);
       expect(read).toMatchObject({
         kind: 'binary',
         sizeBytes: WORKSPACE_TEXT_MAX_BYTES + 1,
@@ -485,7 +494,7 @@ describe('workspace file descriptor pinning', () => {
       vi.mocked(fs.open).mockImplementation(async (...args) => {
         const handle = await originalOpen(...args);
         opened.push(handle);
-        if (!replaced && String(args[0]).endsWith('/notes/safe.txt')) {
+        if (!replaced && isSafeFileCandidate(args[0])) {
           replaced = true;
           await fs.rename(replacement, target);
         }
