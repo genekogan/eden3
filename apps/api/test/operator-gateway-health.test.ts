@@ -6,6 +6,32 @@ import { probeOperatorGatewayModels } from '../src/routes/operator';
 
 const source = readFileSync(new URL('../src/routes/operator.ts', import.meta.url), 'utf8');
 
+function gatewayHandlerWiringErrors(input: string): string[] {
+  const start = input.indexOf("app.get('/health'");
+  const end = input.indexOf('const egressProxy', start);
+  if (start < 0 || end < 0) return ['missing-gateway-handler-slice'];
+  const gateway = input.slice(start, end);
+  const errors: string[] = [];
+  const calls = gateway.match(/probeOperatorGatewayModels\(\{/g) ?? [];
+  if (calls.length !== 1) errors.push(`probe-call-count=${calls.length}`);
+  for (const exact of [
+    'baseUrl: getEnv().OPENCLAW_BASE_URL',
+    'token: getEnv().OPENCLAW_GATEWAY_TOKEN',
+  ]) {
+    if (!gateway.includes(exact)) errors.push(`missing:${exact}`);
+  }
+  const guard = gateway.indexOf('if (!app.gatewayCompat)');
+  const probe = gateway.indexOf('probeOperatorGatewayModels({');
+  const configRead = gateway.indexOf('readOpenClawConfig(dataDir)');
+  if (guard < 0 || probe < 0 || configRead < 0 || !(guard < probe && probe < configRead)) {
+    errors.push('gateway-guard-probe-config-order');
+  }
+  for (const forbidden of ['fetch(', 'authorization', 'process.env.OPENCLAW']) {
+    if (gateway.includes(forbidden)) errors.push(`forbidden:${forbidden}`);
+  }
+  return errors;
+}
+
 describe('operator gateway health credential boundary', () => {
   it.each([
     'https://attacker.invalid',
@@ -73,5 +99,19 @@ describe('operator gateway health credential boundary', () => {
     expect(source).toContain("redirect: 'error'");
     expect(source).not.toContain('OPENCLAW_GATEWAY_URL');
     expect(source).not.toContain("OPENCLAW_GATEWAY_TOKEN ?? ''");
+    expect(gatewayHandlerWiringErrors(source)).toEqual([]);
+
+    const bypassMutant = source.replace(
+      /const probe = await probeOperatorGatewayModels\(\{[\s\S]*?\n\s*\}\);/,
+      `const probe = await fetch(getEnv().OPENCLAW_BASE_URL + '/v1/models', {
+          headers: { authorization: 'Bearer ' + getEnv().OPENCLAW_GATEWAY_TOKEN },
+        });`,
+    );
+    expect(gatewayHandlerWiringErrors(bypassMutant)).not.toEqual([]);
+    const guardRemovalMutant = source.replace(
+      "if (!app.gatewayCompat) return { configured: false as const };",
+      '',
+    );
+    expect(gatewayHandlerWiringErrors(guardRemovalMutant)).not.toEqual([]);
   });
 });
