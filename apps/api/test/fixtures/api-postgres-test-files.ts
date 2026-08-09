@@ -60,21 +60,42 @@ export const API_ALL_POSTGRES_TEST_FILES = [
 ].sort();
 
 const COMMAND_WORDS = new Set(['run', 'watch', 'related', 'vitest']);
+const API_ROOT = fileURLToPath(new URL('../../', import.meta.url));
+const REPOSITORY_ROOT = path.resolve(API_ROOT, '../..');
+
+function normalizedAbsoluteCandidates(selector: string): string[] {
+  if (path.isAbsolute(selector)) return [path.normalize(selector)];
+  return [
+    path.resolve(process.cwd(), selector),
+    path.resolve(API_ROOT, selector),
+    path.resolve(REPOSITORY_ROOT, selector),
+  ];
+}
+
+export function unitSelectorMatchesPostgresFile(
+  rawSelector: string,
+  file: string,
+): boolean {
+  const selector = rawSelector.replaceAll('\\', '/');
+  const absoluteFile = path.resolve(API_ROOT, file);
+  if (
+    file.includes(selector) ||
+    selector.endsWith(`/${file}`) ||
+    selector.endsWith(`/${file.slice('test/'.length)}`)
+  ) {
+    return true;
+  }
+  return normalizedAbsoluteCandidates(selector).some((candidate) =>
+    absoluteFile === candidate || absoluteFile.startsWith(`${candidate}${path.sep}`));
+}
 
 export function postgresFileMatchingUnitSelector(
   argv: readonly string[],
 ): string | undefined {
   for (const raw of argv) {
     if (raw.startsWith('-') || COMMAND_WORDS.has(raw)) continue;
-    const selector = raw.replaceAll('\\', '/');
     for (const file of API_ALL_POSTGRES_TEST_FILES) {
-      if (
-        file.includes(selector) ||
-        selector.endsWith(`/${file}`) ||
-        selector.endsWith(`/${file.slice('test/'.length)}`)
-      ) {
-        return file;
-      }
+      if (unitSelectorMatchesPostgresFile(raw, file)) return file;
     }
   }
   return undefined;
@@ -87,3 +108,5 @@ export function assertApiUnitTestSelectors(argv: readonly string[]): void {
     );
   }
 }
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';

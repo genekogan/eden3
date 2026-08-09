@@ -8,6 +8,7 @@ import {
   API_POSTGRES_TEST_FILES,
   assertApiUnitTestSelectors,
   postgresFileMatchingUnitSelector,
+  unitSelectorMatchesPostgresFile,
 } from './fixtures/api-postgres-test-files';
 
 describe('API Postgres test manifest', () => {
@@ -35,18 +36,28 @@ describe('API Postgres test manifest', () => {
     }
   });
 
-  it('refuses exact, abbreviated, broad, and absolute selectors for excluded Postgres files', () => {
-    for (const selector of [
-      'test/channels-routes.test.ts',
-      'channels-routes.test.ts',
-      'channels-routes',
-      'test',
-      '/tmp/work/apps/api/test/channels-routes.test.ts',
-      'agent-provisioning-notification-pg',
-    ]) {
-      expect(postgresFileMatchingUnitSelector(['run', selector]), selector).toBeDefined();
-      expect(() => assertApiUnitTestSelectors(['run', selector]), selector)
-        .toThrow(/test:postgres.*test:full/i);
+  it('refuses file and containing-directory selectors for every excluded Postgres file', () => {
+    const apiRoot = new URL('../', import.meta.url);
+    const repositoryRoot = new URL('../../../', import.meta.url);
+    for (const file of API_ALL_POSTGRES_TEST_FILES) {
+      const basename = file.slice('test/'.length);
+      const abbreviation = basename.slice(0, -'.test.ts'.length);
+      for (const selector of [
+        file,
+        basename,
+        abbreviation,
+        new URL(file, apiRoot).pathname,
+        './test',
+        'apps/api/test',
+        new URL('test', apiRoot).pathname,
+        new URL('apps/api/test', repositoryRoot).pathname,
+      ]) {
+        expect(unitSelectorMatchesPostgresFile(selector, file), `${file}: ${selector}`).toBe(true);
+        expect(postgresFileMatchingUnitSelector(['run', selector]), selector).toBeDefined();
+        expect(() => assertApiUnitTestSelectors(['run', selector]), selector)
+          .toThrow(/test:postgres.*test:full/i);
+      }
+      expect(unitSelectorMatchesPostgresFile('src', file), file).toBe(false);
     }
     expect(() => assertApiUnitTestSelectors(['run', 'src', '--reporter', 'dot'])).not.toThrow();
   });
