@@ -9,6 +9,7 @@ import {
   WORKSPACE_DOWNLOAD_MAX_BYTES,
   WORKSPACE_EXPORT_MAX_BYTES,
   WORKSPACE_TEXT_MAX_BYTES,
+  WORKSPACE_TREE_MAX_DEPTH,
   listWorkspaceTree,
   openWorkspaceDownload,
   openWorkspaceExportFile,
@@ -284,10 +285,12 @@ describe('workspace file descriptor pinning', () => {
     const originalOpen = fs.open.bind(fs);
     let activeDirectories = 0;
     let peakDirectories = 0;
+    let directoryOpenCount = 0;
     vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
       const handle = await originalOpen(...args);
       const flags = args[1];
       if (typeof flags === 'number' && (flags & constants.O_DIRECTORY) !== 0) {
+        directoryOpenCount += 1;
         activeDirectories += 1;
         peakDirectories = Math.max(peakDirectories, activeDirectories);
         const originalClose = handle.close.bind(handle);
@@ -308,9 +311,14 @@ describe('workspace file descriptor pinning', () => {
 
     try {
       const tree = await listWorkspaceTree(fixture.root, { maxEntries: 100, withHashes: false });
-      expect(tree.entries.filter((entry) => entry.kind === 'dir').length).toBeGreaterThanOrEqual(80);
+      expect(tree.truncated).toBe(true);
+      expect(tree.entries.filter((entry) => entry.kind === 'dir').length)
+        .toBeLessThanOrEqual(WORKSPACE_TREE_MAX_DEPTH + 1);
       expect(peakDirectories).toBeLessThanOrEqual(2);
       expect(activeDirectories).toBe(0);
+      // Reopening a bounded chain remains tightly finite instead of scaling to
+      // millions of opens at the public 2,000/10,000 entry caps.
+      expect(directoryOpenCount).toBeLessThan(2_300);
     } finally {
       await fs.rm(fixture.parent, { recursive: true, force: true });
     }

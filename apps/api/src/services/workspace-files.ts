@@ -33,6 +33,9 @@ import { ApiError } from '../errors';
  */
 
 export const WORKSPACE_TREE_MAX_ENTRIES = 2_000;
+/** Bound ancestor reopen work and path-string growth during descriptor walks. */
+export const WORKSPACE_TREE_MAX_DEPTH = 64;
+export const WORKSPACE_TREE_MAX_PATH_BYTES = 1_024;
 /** sha256 is computed for tree files at or below this size (conflict detection). */
 export const WORKSPACE_HASH_MAX_BYTES = 1024 * 1024;
 /** Text read/write ceiling — larger files are reported as binary. */
@@ -241,6 +244,14 @@ export async function listWorkspaceTree(
           break;
         }
         const rel = relPrefix === '' ? candidate.name : `${relPrefix}/${candidate.name}`;
+        const depth = relPrefix === '' ? 1 : relPrefix.split('/').length + 1;
+        if (
+          depth > WORKSPACE_TREE_MAX_DEPTH
+          || Buffer.byteLength(rel, 'utf8') > WORKSPACE_TREE_MAX_PATH_BYTES
+        ) {
+          truncated = true;
+          break;
+        }
         if (candidate.directoryHint) {
           let child: PinnedWorkspaceDirectory | null = null;
           try {
