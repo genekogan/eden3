@@ -282,6 +282,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       mediaDir: mediaRoot,
       baseUrl: '/media',
     }));
+    const outstanding = new Set<Promise<unknown>>();
     const app = Fastify();
     app.decorateRequest('account', null);
     app.decorate('requireAuth', requireAuth);
@@ -321,6 +322,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
           dataBase64: PNG_1PX.toString('base64'),
         },
       });
+      outstanding.add(uploadRequest);
       const stored = await pausingStore.published;
       let intentSettled = false;
       const intentStore = erasureStore();
@@ -330,7 +332,46 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       }).finally(() => {
         intentSettled = true;
       });
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      outstanding.add(intentRequest);
+      const lockWaitDeadline = Date.now() + 5_000;
+      let operatorOwnerLockWaitObserved = false;
+      while (Date.now() < lockWaitDeadline) {
+        if (intentSettled) {
+          throw new Error('erasure intent settled before reaching the owner-account lock wait');
+        }
+        const [operatorActivity] = await pg<{
+          state: string;
+          wait_event_type: string | null;
+          query: string;
+          active_job: boolean;
+        }[]>`
+          select activity.state,activity.wait_event_type,activity.query,
+            exists (
+              select 1 from account_erasure_jobs
+              where account_id=${uploadOwner} and state <> 'succeeded'
+            ) active_job
+          from pg_stat_activity activity
+          where activity.usename=${OPERATOR_LOGIN}
+            and activity.datname=${databaseName}
+          order by activity.backend_start desc
+          limit 1
+        `;
+        if (operatorActivity?.active_job) {
+          throw new Error('erasure intent committed before the paused media write');
+        }
+        if (
+          operatorActivity?.state === 'active' &&
+          operatorActivity.wait_event_type === 'Lock' &&
+          /from\s+accounts\s+where\s+id\s*=\s*\$\d+\s+for\s+update/i.test(
+            operatorActivity.query,
+          )
+        ) {
+          operatorOwnerLockWaitObserved = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(operatorOwnerLockWaitObserved).toBe(true);
       expect(intentSettled).toBe(false);
 
       pausingStore.resume();
@@ -390,6 +431,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       });
     } finally {
       pausingStore.resume();
+      await Promise.allSettled([...outstanding]);
       await app.close();
       await rm(mediaRoot, { recursive: true, force: true });
     }
