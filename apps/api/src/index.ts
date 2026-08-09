@@ -14,9 +14,9 @@ import { runtimeAttestationFromEnvironment } from './services/runtime-attestatio
 loadRootEnv();
 const env = getEnv();
 assertProductionBoundary(env);
+const runtimeAttestation = runtimeAttestationFromEnvironment();
 await ensureBaseline({ dataDir: defaultOpenclawDataDir() });
 await refreshActiveConceptInventories();
-const runtimeAttestation = runtimeAttestationFromEnvironment();
 
 const app = await buildServer({
   logger: { level: 'info', base: undefined }, // compact: no pid/hostname
