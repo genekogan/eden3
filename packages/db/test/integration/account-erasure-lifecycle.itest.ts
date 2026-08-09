@@ -311,6 +311,7 @@ describe('0040 account-erasure lifecycle against disposable PostgreSQL', () => {
         await tx`
           update account_erasure_jobs set state = 'pending', next_attempt_at = null,
             recovery_manifest_confirmed_at = statement_timestamp(),
+            recovery_manifest_sha256 = ${digest('manifest')},
             recovery_ciphertext_sha256 = ${digest('ciphertext')},
             recovery_mac_sha256 = ${digest('recovery-mac')}, recovery_key_version = 1,
             updated_at = statement_timestamp()
@@ -504,11 +505,13 @@ describe('0040 account-erasure lifecycle against disposable PostgreSQL', () => {
             insert into account_erasure_jobs (id, account_id, state, next_attempt_at,
               completed_at, ledger_confirmed_at, ledger_sha256, ledger_mac_sha256,
               inventoried_at, inventory_sha256, recovery_manifest_confirmed_at,
-              recovery_ciphertext_sha256, recovery_mac_sha256, recovery_key_version)
+              recovery_manifest_sha256, recovery_ciphertext_sha256,
+              recovery_mac_sha256, recovery_key_version)
             values (${randomUUID()}, ${randomUUID()}, 'succeeded', null, statement_timestamp(),
               statement_timestamp(), ${digest('restore-ledger')}, ${digest('restore-ledger-mac')},
               statement_timestamp(), ${digest('restore-inventory')}, statement_timestamp(),
-              ${digest('restore-ciphertext')}, ${digest('restore-mac')}, 1)`;
+              ${digest('restore-manifest')}, ${digest('restore-ciphertext')},
+              ${digest('restore-mac')}, 1)`;
         }),
         /new erasure job must start intent_pending/i,
       );
