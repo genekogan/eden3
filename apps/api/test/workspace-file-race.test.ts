@@ -131,17 +131,33 @@ describe('workspace file descriptor pinning', () => {
       return originalOpen(candidate, flags, mode);
     });
     try {
-      await expect(writeWorkspaceFile({
+      const outcome = await writeWorkspaceFile({
         root: fixture.root,
         path: 'notes/new.txt',
         content: 'OWNER NEW CONTENT',
         baseSha256: 'new',
-      })).rejects.toBeTruthy();
+      }).catch((error: unknown) => error);
+      if (process.platform === 'linux') {
+        expect(outcome).toMatchObject({ ok: true });
+        expect(await fs.readFile(path.join(parkedNotes, 'new.txt'), 'utf8')).toBe('OWNER NEW CONTENT');
+      } else {
+        expect(outcome).toMatchObject({ code: 'workspace_secure_write_unavailable' });
+        expect(swapped).toBe(false);
+      }
       await expect(fs.readFile(path.join(neighborNotes, 'new.txt'))).rejects.toMatchObject({
         code: 'ENOENT',
       });
       expect(await fs.readFile(path.join(neighborNotes, 'safe.txt'), 'utf8')).toBe('NEIGHBOR SECRET');
       expect((await fs.readdir(neighborNotes)).some((name) => name.startsWith('.eden3-write-'))).toBe(false);
+      const source = await fs.readFile(
+        path.join(import.meta.dirname, '../src/services/workspace-files.ts'),
+        'utf8',
+      );
+      const writeBody = source.slice(source.indexOf('export async function writeWorkspaceFile'));
+      expect(writeBody.indexOf("process.platform !== 'linux'")).toBeGreaterThanOrEqual(0);
+      expect(writeBody.indexOf("process.platform !== 'linux'")).toBeLessThan(
+        writeBody.indexOf('openPinnedParent(params.root, rel, true)'),
+      );
     } finally {
       await fs.rm(fixture.parent, { recursive: true, force: true });
     }
@@ -150,6 +166,15 @@ describe('workspace file descriptor pinning', () => {
   it('retains normal conflict-checked create and update behavior through pinned parents', async () => {
     const fixture = await freshFixture();
     try {
+      if (process.platform !== 'linux') {
+        await expect(writeWorkspaceFile({
+          root: fixture.root,
+          path: 'drafts/new.txt',
+          content: 'first',
+          baseSha256: 'new',
+        })).rejects.toMatchObject({ code: 'workspace_secure_write_unavailable' });
+        return;
+      }
       const created = await writeWorkspaceFile({
         root: fixture.root,
         path: 'drafts/new.txt',
@@ -195,6 +220,16 @@ describe('workspace file descriptor pinning', () => {
       return handle;
     });
     try {
+      if (process.platform !== 'linux') {
+        await expect(writeWorkspaceFile({
+          root: fixture.root,
+          path: 'notes/safe.txt',
+          content: 'replacement',
+          baseSha256: sha256Hex('OWNER BYTES'),
+        })).rejects.toMatchObject({ code: 'workspace_secure_write_unavailable' });
+        expect((await fs.stat(target)).size).toBe(Buffer.byteLength('OWNER BYTES'));
+        return;
+      }
       await expect(writeWorkspaceFile({
         root: fixture.root,
         path: 'notes/safe.txt',
@@ -233,6 +268,49 @@ describe('workspace file descriptor pinning', () => {
       );
       expect(source).toContain('fs.opendir(');
       expect(source).not.toContain('fs.readdir(dirAbs');
+    } finally {
+      await fs.rm(fixture.parent, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps directory descriptor usage constant across a deeply nested tree', async () => {
+    const fixture = await freshFixture();
+    let cursor = fixture.root;
+    for (let depth = 0; depth < 80; depth += 1) {
+      cursor = path.join(cursor, `d${depth}`);
+      await fs.mkdir(cursor);
+    }
+
+    const originalOpen = fs.open.bind(fs);
+    let activeDirectories = 0;
+    let peakDirectories = 0;
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args);
+      const flags = args[1];
+      if (typeof flags === 'number' && (flags & constants.O_DIRECTORY) !== 0) {
+        activeDirectories += 1;
+        peakDirectories = Math.max(peakDirectories, activeDirectories);
+        const originalClose = handle.close.bind(handle);
+        let counted = true;
+        vi.spyOn(handle, 'close').mockImplementation(async () => {
+          try {
+            return await originalClose();
+          } finally {
+            if (counted) {
+              counted = false;
+              activeDirectories -= 1;
+            }
+          }
+        });
+      }
+      return handle;
+    });
+
+    try {
+      const tree = await listWorkspaceTree(fixture.root, { maxEntries: 100, withHashes: false });
+      expect(tree.entries.filter((entry) => entry.kind === 'dir').length).toBeGreaterThanOrEqual(80);
+      expect(peakDirectories).toBeLessThanOrEqual(2);
+      expect(activeDirectories).toBe(0);
     } finally {
       await fs.rm(fixture.parent, { recursive: true, force: true });
     }

@@ -195,94 +195,98 @@ export async function listWorkspaceTree(
   const maxScannedEntries = Math.max(maxEntries * 4, maxEntries + 1_024);
   let scannedEntries = 0;
 
-  let rootDirectory: PinnedWorkspaceDirectory;
-  try {
-    rootDirectory = await openPinnedWorkspaceRoot(root);
-  } catch (error) {
-    // A never-provisioned or concurrently wiped workspace is just empty.
-    if (isNotFoundError(error)) return { entries: [], truncated: false };
-    throw error;
-  }
-
-  async function walk(directory: PinnedWorkspaceDirectory, relPrefix: string): Promise<void> {
-    const candidates: Array<{ name: string; directoryHint: boolean }> = [];
-    const dir = await fs.opendir(directoryAccessPath(directory));
+  const pendingDirectories = [''];
+  while (pendingDirectories.length > 0 && !truncated) {
+    const relPrefix = pendingDirectories.pop()!;
+    let directory: PinnedWorkspaceDirectory;
     try {
-      for await (const dirent of dir) {
-        scannedEntries += 1;
-        if (scannedEntries > maxScannedEntries) {
-          truncated = true;
-          break;
-        }
-        if (isHiddenName(dirent.name) || dirent.isSymbolicLink()) continue;
-        if (candidates.length >= Math.max(0, maxEntries - entries.length)) {
-          truncated = true;
-          break;
-        }
-        candidates.push({ name: dirent.name, directoryHint: dirent.isDirectory() });
-      }
-    } finally {
-      await dir.close().catch(() => {});
+      directory = await openPinnedDirectoryPath(root, relPrefix, false);
+    } catch (error) {
+      // A never-provisioned, concurrently moved, or wiped directory simply
+      // disappears from this point-in-time listing.
+      if (isNotFoundError(error) || isPathRaceOrTypeError(error)) continue;
+      throw error;
     }
 
-    candidates.sort((a, b) => {
-      if (a.directoryHint !== b.directoryHint) return a.directoryHint ? -1 : 1;
-      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
-    });
-
-    for (const candidate of candidates) {
-      if (entries.length >= maxEntries) {
-        truncated = true;
-        return;
+    const candidates: Array<{ name: string; directoryHint: boolean }> = [];
+    try {
+      const dir = await fs.opendir(directoryAccessPath(directory));
+      try {
+        for await (const dirent of dir) {
+          scannedEntries += 1;
+          if (scannedEntries > maxScannedEntries) {
+            truncated = true;
+            break;
+          }
+          if (isHiddenName(dirent.name) || dirent.isSymbolicLink()) continue;
+          if (candidates.length >= Math.max(0, maxEntries - entries.length)) {
+            truncated = true;
+            break;
+          }
+          candidates.push({ name: dirent.name, directoryHint: dirent.isDirectory() });
+        }
+      } finally {
+        await dir.close().catch(() => {});
       }
-      const rel = relPrefix === '' ? candidate.name : `${relPrefix}/${candidate.name}`;
-      if (candidate.directoryHint) {
-        let child: PinnedWorkspaceDirectory | null = null;
+
+      candidates.sort((a, b) => {
+        if (a.directoryHint !== b.directoryHint) return a.directoryHint ? -1 : 1;
+        return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+      });
+
+      const childDirectories: string[] = [];
+      for (const candidate of candidates) {
+        if (entries.length >= maxEntries) {
+          truncated = true;
+          break;
+        }
+        const rel = relPrefix === '' ? candidate.name : `${relPrefix}/${candidate.name}`;
+        if (candidate.directoryHint) {
+          let child: PinnedWorkspaceDirectory | null = null;
+          try {
+            child = await openPinnedChildDirectory(directory, candidate.name, false);
+            entries.push({
+              path: rel,
+              kind: 'dir',
+              sizeBytes: 0,
+              mtime: child.stat.mtime.toISOString(),
+            });
+            childDirectories.push(rel);
+          } catch (error) {
+            if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
+          } finally {
+            await child?.handle.close().catch(() => {});
+          }
+          continue;
+        }
+
+        let file: PinnedWorkspaceFile | null = null;
         try {
-          child = await openPinnedChildDirectory(directory, candidate.name, false);
-          entries.push({
+          file = await openPinnedRegularAt(directory, candidate.name, rel, false);
+          const entry: WorkspaceTreeEntry = {
             path: rel,
-            kind: 'dir',
-            sizeBytes: 0,
-            mtime: child.stat.mtime.toISOString(),
-          });
-          await walk(child, rel);
-          if (truncated) return;
+            kind: 'file',
+            sizeBytes: file.stat.size,
+            mtime: file.stat.mtime.toISOString(),
+          };
+          if (withHashes && file.stat.size <= WORKSPACE_HASH_MAX_BYTES) {
+            entry.sha256 = sha256Hex(await readPinnedSnapshot(file.handle, file.stat.size));
+          }
+          entries.push(entry);
         } catch (error) {
           if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
         } finally {
-          await child?.handle.close().catch(() => {});
+          await file?.handle.close().catch(() => {});
         }
-        continue;
       }
-
-      let file: PinnedWorkspaceFile | null = null;
-      try {
-        file = await openPinnedRegularAt(directory, candidate.name, rel, false);
-        const entry: WorkspaceTreeEntry = {
-          path: rel,
-          kind: 'file',
-          sizeBytes: file.stat.size,
-          mtime: file.stat.mtime.toISOString(),
-        };
-        if (withHashes && file.stat.size <= WORKSPACE_HASH_MAX_BYTES) {
-          entry.sha256 = sha256Hex(await readPinnedSnapshot(file.handle, file.stat.size));
-        }
-        entries.push(entry);
-      } catch (error) {
-        if (!isPathRaceOrTypeError(error) && !isNotFoundError(error)) throw error;
-      } finally {
-        await file?.handle.close().catch(() => {});
-      }
+      // Stack in reverse so the visible traversal remains alphabetic while no
+      // ancestor descriptor is retained across a child walk.
+      pendingDirectories.push(...childDirectories.reverse());
+    } finally {
+      await directory.handle.close().catch(() => {});
     }
   }
-
-  try {
-    await walk(rootDirectory, '');
-    return { entries, truncated };
-  } finally {
-    await rootDirectory.handle.close().catch(() => {});
-  }
+  return { entries, truncated };
 }
 
 // ---------------------------------------------------------------------------
@@ -428,6 +432,18 @@ async function openPinnedParent(
   const segments = rel.split('/');
   const name = segments.pop();
   if (!name) throw invalidPath();
+  return {
+    directory: await openPinnedDirectoryPath(root, segments.join('/'), create),
+    name,
+  };
+}
+
+async function openPinnedDirectoryPath(
+  root: string,
+  rel: string,
+  create: boolean,
+): Promise<PinnedWorkspaceDirectory> {
+  const segments = rel === '' ? [] : rel.split('/');
   let directory = await openPinnedWorkspaceRoot(root);
   try {
     for (const segment of segments) {
@@ -435,7 +451,7 @@ async function openPinnedParent(
       await directory.handle.close();
       directory = child;
     }
-    return { directory, name };
+    return directory;
   } catch (error) {
     await directory.handle.close().catch(() => {});
     throw error;
@@ -625,6 +641,18 @@ export async function writeWorkspaceFile(params: {
   const content = Buffer.from(params.content, 'utf8');
   if (content.byteLength > WORKSPACE_TEXT_MAX_BYTES) {
     throw new ApiError(413, 'workspace_file_too_large', 'Workspace text file is too large');
+  }
+  // Production is Linux, where /proc/self/fd gives this module genuine
+  // descriptor-relative open/rename semantics. Node exposes no equivalent
+  // openat/renameat primitive on macOS or Windows; a pathname fallback would
+  // reintroduce an ancestor-swap write window. Refuse before any filesystem
+  // mutation instead of offering a weaker local write boundary.
+  if (process.platform !== 'linux') {
+    throw new ApiError(
+      503,
+      'workspace_secure_write_unavailable',
+      'Workspace editing requires descriptor-relative filesystem support',
+    );
   }
 
   const { directory, name } = await openPinnedParent(params.root, rel, true);
