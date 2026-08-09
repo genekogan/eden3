@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 
 import { credit, getBalance, getEnv, type DbHandle } from '@eden3/core';
 import {
@@ -9,6 +9,7 @@ import {
   mannaTransactions,
   mannaVouchers,
   pg,
+  stripeCheckoutIntents,
 } from '@eden3/db';
 import { and, eq, isNull, or, sql } from 'drizzle-orm';
 import type { FastifyPluginAsync } from 'fastify';
@@ -28,7 +29,11 @@ interface StripeCheckoutLineItem {
 }
 
 export interface StripeCheckoutClient {
-  createCheckoutSession(params: URLSearchParams, secretKey: string): Promise<StripeCheckoutSession>;
+  createCheckoutSession(
+    params: URLSearchParams,
+    secretKey: string,
+    idempotencyKey?: string,
+  ): Promise<StripeCheckoutSession>;
   retrieveCheckoutSessionLineItems(
     sessionId: string,
     secretKey: string,
@@ -40,12 +45,13 @@ export interface BillingRoutesOptions {
 }
 
 const defaultStripeClient: StripeCheckoutClient = {
-  async createCheckoutSession(params, secretKey) {
+  async createCheckoutSession(params, secretKey, idempotencyKey) {
     const res = await fetch('https://api.stripe.com/v1/checkout/sessions', {
       method: 'POST',
       headers: {
         authorization: `Bearer ${secretKey}`,
         'content-type': 'application/x-www-form-urlencoded',
+        ...(idempotencyKey ? { 'idempotency-key': idempotencyKey } : {}),
       },
       body: params,
     });
@@ -592,10 +598,26 @@ async function handleCheckoutCompleted(
   if (!accountId) throw new ApiError(400, 'missing_account', 'Checkout session missing account metadata');
   const sessionId = asString(session.id);
   if (!sessionId) throw new ApiError(400, 'bad_event', 'Checkout session is missing its id');
+  const checkoutIntentId = metadataValue(session, 'checkoutIntentId');
+  if (!checkoutIntentId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(checkoutIntentId)) {
+    throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe Checkout intent binding is invalid');
+  }
   const mode = asString(session.mode);
   if (mode === 'subscription') {
     // Checkout completion metadata is user-writable and cannot establish an
     // entitlement. Authoritative subscription/invoice webhooks own state.
+    const [intent] = await db
+      .select({ id: stripeCheckoutIntents.id })
+      .from(stripeCheckoutIntents)
+      .where(and(
+        eq(stripeCheckoutIntents.id, checkoutIntentId),
+        eq(stripeCheckoutIntents.accountId, accountId),
+        eq(stripeCheckoutIntents.kind, 'subscription'),
+        eq(stripeCheckoutIntents.state, 'created'),
+        eq(stripeCheckoutIntents.stripeSessionId, sessionId),
+      ))
+      .limit(1);
+    if (!intent) throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe Checkout intent binding is invalid');
     return { action: 'subscription_checkout_awaiting_provider' };
   }
 
@@ -637,6 +659,18 @@ async function handleCheckoutCompleted(
       stripeCustomerId: customerId,
       stripeSubscriptionId: null,
     });
+    const [intent] = await tx
+      .select({ id: stripeCheckoutIntents.id })
+      .from(stripeCheckoutIntents)
+      .where(and(
+        eq(stripeCheckoutIntents.id, checkoutIntentId),
+        eq(stripeCheckoutIntents.accountId, accountId),
+        eq(stripeCheckoutIntents.kind, 'manna_topup'),
+        eq(stripeCheckoutIntents.state, 'created'),
+        eq(stripeCheckoutIntents.stripeSessionId, sessionId),
+      ))
+      .limit(1);
+    if (!intent) throw new ApiError(409, 'stripe_binding_mismatch', 'Stripe Checkout intent binding is invalid');
     if (await assertCreditBinding(tx, idempotencyKey, accountId, evidence)) {
       return { action: 'manna_credited', alreadyApplied: true };
     }
@@ -835,6 +869,8 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
     }
     const body = checkoutBodySchema.parse(req.body);
     const account = req.account!;
+    const checkoutIntentId = randomUUID();
+    const checkoutRequestKey = `eden3-checkout-${checkoutIntentId}`;
     const params = new URLSearchParams();
     params.set('success_url', env.BILLING_SUCCESS_URL ?? `http://localhost:${env.WEB_PORT}/manna?checkout=success`);
     params.set('cancel_url', env.BILLING_CANCEL_URL ?? `http://localhost:${env.WEB_PORT}/manna?checkout=cancel`);
@@ -842,6 +878,7 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
     params.set('line_items[0][quantity]', '1');
     params.set('metadata[accountId]', account.accountId);
     params.set('metadata[username]', account.username);
+    params.set('metadata[checkoutIntentId]', checkoutIntentId);
 
     if (body.kind === 'manna_topup') {
       if (!env.STRIPE_MANNA_TOPUP_PRICE_ID) {
@@ -866,8 +903,58 @@ export const billingRoutes: FastifyPluginAsync<BillingRoutesOptions> = async (ap
       params.set('subscription_data[metadata][monthlyManna]', String(plan.manna));
     }
 
-    const session = await stripeClient.createCheckoutSession(params, env.STRIPE_SECRET_KEY);
-    return { session };
+    const admitted = await pg.begin(async (tx) => {
+      const owners = await tx`select id from accounts where id=${account.accountId}
+        and deleted=false for update`;
+      if (owners.length !== 1) return false;
+      const active = await tx`select 1 from account_erasure_jobs
+        where account_id=${account.accountId} and state<>'succeeded' limit 1`;
+      if (active.length > 0) return false;
+      await tx`insert into stripe_checkout_intents(
+        id,account_id,kind,request_key_sha256
+      ) values (
+        ${checkoutIntentId},${account.accountId},${body.kind},
+        ${createHash('sha256').update(checkoutRequestKey,'utf8').digest('hex')}
+      )`;
+      return true;
+    });
+    if (!admitted) throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+
+    const outcome = await pg.begin(async (tx) => {
+      const owners = await tx`select id from accounts where id=${account.accountId}
+        and deleted=false for key share`;
+      if (owners.length !== 1) return { kind: 'fenced' as const };
+      const active = await tx`select 1 from account_erasure_jobs
+        where account_id=${account.accountId} and state<>'succeeded' limit 1`;
+      if (active.length > 0) return { kind: 'fenced' as const };
+      const [started] = await tx<{ id: string }[]>`
+        update stripe_checkout_intents set state='provider_started',updated_at=statement_timestamp()
+        where id=${checkoutIntentId} and account_id=${account.accountId} and state='preparing'
+        returning id`;
+      if (!started) return { kind: 'fenced' as const };
+      try {
+        const session = await stripeClient.createCheckoutSession(
+          params,
+          env.STRIPE_SECRET_KEY!,
+          checkoutRequestKey,
+        );
+        await tx`update stripe_checkout_intents set state='created',stripe_session_id=${session.id},
+          updated_at=statement_timestamp() where id=${checkoutIntentId} and state='provider_started'`;
+        return { kind: 'created' as const, session };
+      } catch {
+        // The provider call may have committed remotely before the transport
+        // failed. Keep the durable intent in-flight so erasure cannot seal or
+        // discard the idempotency identity without operator/provider proof.
+        return { kind: 'failed' as const };
+      }
+    });
+    if (outcome.kind === 'fenced') {
+      throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+    }
+    if (outcome.kind === 'failed') {
+      throw new ApiError(502, 'stripe_checkout_failed', 'Stripe Checkout is unavailable');
+    }
+    return { session: outcome.session };
   });
 
   await app.register(async (webhook) => {

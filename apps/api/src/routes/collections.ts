@@ -62,6 +62,21 @@ function canManageCollection(
   return viewer !== null && (viewer.isAdmin || viewer.accountId === userId);
 }
 
+async function resolveLiveCollection(idOrExternal: string) {
+  const collection = await resolveCollection(idOrExternal);
+  if (!collection || collection.userId === null) return collection;
+  const [owner] = await pg<{ live: boolean }[]>`
+    select exists (
+      select 1 from accounts a
+      where a.id=${collection.userId} and a.deleted=false
+        and not exists (
+          select 1 from account_erasure_jobs j
+          where j.account_id=a.id and j.state <> 'succeeded'
+        )
+    ) as live`;
+  return owner?.live ? collection : null;
+}
+
 export const collectionsRoutes: FastifyPluginAsync = async (app) => {
   // ---- POST /collections ---------------------------------------------------
   app.post('/collections', { preHandler: app.requireAuth }, async (req, reply) => {
@@ -81,7 +96,7 @@ export const collectionsRoutes: FastifyPluginAsync = async (app) => {
     const { cursor, limit } = membersQuerySchema.parse(req.query);
     const offset = parseOffsetCursorParam(cursor);
 
-    const collection = await resolveCollection(idOrExternal);
+    const collection = await resolveLiveCollection(idOrExternal);
     if (!collection) {
       return sendError(reply, 404, 'collection_not_found', `No collection "${idOrExternal}"`);
     }
@@ -145,7 +160,7 @@ export const collectionsRoutes: FastifyPluginAsync = async (app) => {
   app.post('/collections/:idOrExternal/creations', { preHandler: app.requireAuth }, async (req, reply) => {
     const { idOrExternal } = detailParamsSchema.parse(req.params);
     const body = addCreationBodySchema.parse(req.body);
-    const collection = await resolveCollection(idOrExternal);
+    const collection = await resolveLiveCollection(idOrExternal);
     if (!collection) {
       return sendError(reply, 404, 'collection_not_found', `No collection "${idOrExternal}"`);
     }
@@ -189,7 +204,7 @@ export const collectionsRoutes: FastifyPluginAsync = async (app) => {
   // ---- DELETE /collections/:id/creations/:creationId -----------------------
   app.delete('/collections/:idOrExternal/creations/:creationIdOrExternal', { preHandler: app.requireAuth }, async (req, reply) => {
     const { idOrExternal, creationIdOrExternal } = creationParamsSchema.parse(req.params);
-    const collection = await resolveCollection(idOrExternal);
+    const collection = await resolveLiveCollection(idOrExternal);
     if (!collection) {
       return sendError(reply, 404, 'collection_not_found', `No collection "${idOrExternal}"`);
     }
@@ -215,6 +230,14 @@ export const collectionsRoutes: FastifyPluginAsync = async (app) => {
 
     const account = await resolveAccountByUsername(username);
     if (!account) {
+      return sendError(reply, 404, 'user_not_found', `No account named "${username}"`);
+    }
+    const [activeErasure] = await pg<{ active: boolean }[]>`
+      select exists (
+        select 1 from account_erasure_jobs
+        where account_id=${account.id} and state <> 'succeeded'
+      ) as active`;
+    if (activeErasure?.active) {
       return sendError(reply, 404, 'user_not_found', `No account named "${username}"`);
     }
     const viewer = req.account;

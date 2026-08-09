@@ -357,6 +357,7 @@ describe('memory dream canonical recovery authorization (DEBT-003)', () => {
     const fixture = await seedReservation({ durable: 61, subscription: 0 });
     expect(
       await claimTurnProviderStart(fixture.claim.id, {
+        eventType: 'memory_dream',
         fence: (tx) => renewMemoryDreamRunClaim(fixture.claim, tx),
       }),
     ).toBe(true);

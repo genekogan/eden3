@@ -197,6 +197,7 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
          select id from channel_connections
          where account_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[]))
   `;
+  await pg`delete from channel_outbound_post_intents where account_id = any(${ids}::uuid[])`;
   await pg`delete from channel_connections where account_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
   await pg`
     delete from messages
@@ -225,6 +226,7 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
   await pg`delete from collections where user_id = any(${ids}::uuid[])`;
   await pg`delete from creations where user_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
   await pg`delete from triggers where user_id = any(${ids}::uuid[]) or agent_id = any(${ids}::uuid[])`;
+  await pg`delete from stripe_checkout_intents where account_id = any(${ids}::uuid[])`;
   await pg`delete from billing_subscriptions where account_id = any(${ids}::uuid[])`;
   await pg`delete from distill_state where agent_account_id = any(${ids}::uuid[])`;
   // Authorization rows FK-reference the ledger (reservation_tx_id) — remove

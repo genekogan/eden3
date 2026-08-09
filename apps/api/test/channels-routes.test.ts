@@ -182,7 +182,7 @@ const turnMetering = {
   markDelivered: vi.fn(async () => {}),
 };
 
-let xPostMode: 'ok' | 'revoked' | 'rate_limited' = 'ok';
+let xPostMode: 'ok' | 'revoked' | 'rate_limited' | 'provider_unavailable' = 'ok';
 const xPostCalls: string[] = [];
 const xClient: XUserClientLike = {
   async validate() {
@@ -200,6 +200,14 @@ const xClient: XUserClientLike = {
         code: 'revoked',
         message: 'X rejected the saved access token. Replace or revoke it.',
         retryable: false,
+      };
+    }
+    if (xPostMode === 'provider_unavailable') {
+      return {
+        ok: false,
+        code: 'provider_unavailable',
+        message: 'X could not complete this request right now.',
+        retryable: true,
       };
     }
     return {
@@ -631,7 +639,7 @@ describe('X BYO-app custody and posting', () => {
     expect(deniedAfterRevoke.statusCode).toBe(404);
   });
 
-  it('surfaces revoked and rate-limited posting states without exposing credentials', async () => {
+  it('surfaces revoked and preserves unknown post outcomes without exposing credentials', async () => {
     const connect = async (suffix: string) => {
       const response = await app.inject({
         method: 'POST',
@@ -662,16 +670,19 @@ describe('X BYO-app custody and posting', () => {
     expect(revoked.json()).toMatchObject({ error: { code: 'revoked' } });
     expect(revoked.body).not.toContain(marker);
 
-    const limitedId = await connect('limited');
-    xPostMode = 'rate_limited';
-    const limited = await app.inject({
+    const unknownId = await connect('unknown');
+    xPostMode = 'provider_unavailable';
+    const unknown = await app.inject({
       method: 'POST',
-      url: `/channels/x/connections/${limitedId}/posts`,
+      url: `/channels/x/connections/${unknownId}/posts`,
       headers: { cookie: devCookie(ownerId) },
-      payload: { text: 'limited case' },
+      payload: { text: 'unknown outcome case' },
     });
-    expect(limited.statusCode).toBe(429);
-    expect(limited.json()).toMatchObject({ error: { code: 'rate_limited' } });
+    expect(unknown.statusCode).toBe(503);
+    const [unknownIntent] = await pg<{ state: string; provider_post_id: string | null }[]>`
+      select state,provider_post_id from channel_outbound_post_intents
+      where connection_id=${unknownId} order by created_at desc limit 1`;
+    expect(unknownIntent).toEqual({ state: 'provider_started', provider_post_id: null });
   });
 });
 

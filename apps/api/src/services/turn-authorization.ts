@@ -41,6 +41,85 @@ export interface ReserveAuthorizationRow {
 
 export const PARTIAL_OUTPUT_SETTLEMENT_RULE = 'full-reserve-v1' as const;
 
+export type TurnProviderUsageEventType = 'chat_turn' | 'memory_dream' | 'channel_chat';
+
+/** Same-transaction provider lease + content-free usage anchor. */
+export async function claimTurnProviderAdmissionInTransaction(
+  tx: DbHandle,
+  turnId: string,
+  eventType: TurnProviderUsageEventType,
+  fence?: (tx: DbHandle) => Promise<void>,
+): Promise<boolean> {
+  const candidates = (await tx.execute(sql`
+    select a.account_id,a.agent_account_id,a.session_id,a.provider,a.model,
+      a.pricing_basis,a.ceiling_table_version
+    from turn_authorizations a where a.turn_id=${turnId}
+  `)) as unknown as Array<{
+    account_id: string;
+    agent_account_id: string | null;
+    session_id: string | null;
+    provider: string;
+    model: string;
+    pricing_basis: string;
+    ceiling_table_version: string;
+  }>;
+  const candidate = candidates[0];
+  if (!candidate) return false;
+  const payer = (await tx.execute(sql`
+    select id from accounts where id=${candidate.account_id} and deleted=false for key share
+  `)) as unknown as Array<{ id: string }>;
+  if (!payer[0]) return false;
+  await tx.execute(sql`
+    select a.id from accounts a join agents ag on ag.account_id=a.id
+    where ag.owner_id=${candidate.account_id} order by a.id for key share of a
+  `);
+  const activeErasure = (await tx.execute(sql`
+    select 1 from account_erasure_jobs
+    where account_id=${candidate.account_id} and state<>'succeeded' limit 1
+  `)) as unknown as unknown[];
+  if (activeErasure.length > 0) return false;
+  await fence?.(tx);
+  const parents = (await tx.execute(sql`
+    select account_id,agent_account_id,session_id,provider,model,pricing_basis,ceiling_table_version
+    from turn_authorizations where turn_id=${turnId} and state='reserved' for update
+  `)) as unknown as typeof candidates;
+  const parent = parents[0];
+  if (!parent || parent.account_id !== candidate.account_id ||
+      parent.agent_account_id !== candidate.agent_account_id ||
+      parent.session_id !== candidate.session_id || parent.provider !== candidate.provider ||
+      parent.model !== candidate.model || parent.pricing_basis !== candidate.pricing_basis ||
+      parent.ceiling_table_version !== candidate.ceiling_table_version) return false;
+  if (eventType === 'channel_chat') {
+    const channel = (await tx.execute(sql`
+      select 1 from channel_turns where turn_id=${turnId} and status='reserved'
+    `)) as unknown as unknown[];
+    if (channel.length !== 1) return false;
+  }
+  const insertedRun = (await tx.execute(sql`
+    insert into turn_provider_runs (turn_id) values (${turnId})
+    on conflict (turn_id) do nothing returning turn_id
+  `)) as unknown as Array<{ turn_id: string }>;
+  if (insertedRun.length !== 1) return false;
+  const skeleton = (await tx.execute(sql`
+    insert into usage_events (
+      event_type,status,user_id,agent_id,session_id,turn_id,provider,model,
+      pricing_basis,table_version,message_id,prompt_tokens,completion_tokens,
+      cached_tokens,cache_write_tokens,total_tokens,cost_usd,manna,latency_ms,
+      error_code,error_message,metadata
+    ) values (
+      ${eventType},'provider_admitted',${parent.account_id},${parent.agent_account_id},
+      ${parent.session_id},${turnId},${parent.provider},${parent.model},
+      ${parent.pricing_basis},${parent.ceiling_table_version},null,null,null,null,
+      null,null,null,null,null,null,null,null
+    ) on conflict (event_type,turn_id) where turn_id is not null do nothing
+    returning id
+  `)) as unknown as Array<{ id: string }>;
+  if (skeleton.length !== 1) {
+    throw new Error(`turn-authorization: turn ${turnId} has conflicting provider usage evidence`);
+  }
+  return true;
+}
+
 /**
  * Atomically consume the authorization's one provider-start ticket. The
  * insertion is durable and cross-process exclusive; false means another
@@ -49,25 +128,15 @@ export const PARTIAL_OUTPUT_SETTLEMENT_RULE = 'full-reserve-v1' as const;
  */
 export async function claimTurnProviderStart(
   turnId: string,
-  options: { db?: DbHandle; fence?: (tx: DbHandle) => Promise<void> } = {},
+  options: {
+    eventType: TurnProviderUsageEventType;
+    db?: DbHandle;
+    fence?: (tx: DbHandle) => Promise<void>;
+  },
 ): Promise<boolean> {
   const dbc = options.db ?? db;
-  return await dbc.transaction(async (tx) => {
-    await options.fence?.(tx);
-    // Lock the parent first so a terminal transition racing this claim yields
-    // a clean false, not a trigger error after a stale state read.
-    const parent = (await tx.execute(sql`
-      select state from turn_authorizations where turn_id = ${turnId} for update
-    `)) as unknown as { state: string }[];
-    if (parent[0]?.state !== 'reserved') return false;
-    const inserted = (await tx.execute(sql`
-      insert into turn_provider_runs (turn_id)
-      values (${turnId})
-      on conflict (turn_id) do nothing
-      returning turn_id
-    `)) as unknown as { turn_id: string }[];
-    return inserted.length === 1;
-  });
+  return await dbc.transaction((tx) =>
+    claimTurnProviderAdmissionInTransaction(tx, turnId, options.eventType, options.fence));
 }
 
 /**
@@ -111,6 +180,33 @@ export async function markTurnUsableOutput(
     }
     return false;
   });
+}
+
+/**
+ * When Tx1 freezes ordinary money transitions while a provider is in flight,
+ * persist only the canonical terminal/no-output fact. This operation never
+ * moves manna; the erasure recovery transaction remains the sole refund owner.
+ */
+export async function recordErasureProviderTerminalNoOutput(
+  turnId: string,
+  options: { db?: DbHandle } = {},
+): Promise<boolean> {
+  const dbc = options.db ?? db;
+  const rows = (await dbc.execute(sql`
+    select account_erasure_record_provider_terminal_no_output(${turnId}) recorded
+  `)) as unknown as { recorded: boolean }[];
+  return rows[0]?.recorded === true;
+}
+
+export async function recordErasureGenerationTerminalNoOutput(
+  turnId: string,
+  eventType: 'studio_generation' | 'chat_media',
+  options: { db?: DbHandle } = {},
+): Promise<boolean> {
+  const rows = (await (options.db ?? db).execute(sql`
+    select account_erasure_record_generation_terminal_no_output(${turnId},${eventType}) recorded
+  `)) as unknown as { recorded: boolean }[];
+  return rows[0]?.recorded === true;
 }
 
 export interface PartialOutputSettlementResult {
@@ -215,15 +311,10 @@ export async function settlePartialOutputAuthorization(options: {
     const eventType =
       row.reservation_type === 'spend:memory-dream' ? 'memory_dream' : 'chat_turn';
     const [usage] = await tx
-      .insert(usageEvents)
-      .values({
-        eventType,
+      .update(usageEvents)
+      .set({
         status: 'error',
-        userId: row.account_id,
-        agentId: row.agent_account_id,
-        sessionId: row.session_id,
         messageId: null,
-        turnId: row.turn_id,
         provider: row.provider,
         model: row.model,
         pricingBasis: row.pricing_basis,
@@ -241,7 +332,18 @@ export async function settlePartialOutputAuthorization(options: {
           },
         },
       })
-      .onConflictDoNothing()
+      .where(and(
+        eq(usageEvents.eventType, eventType),
+        eq(usageEvents.turnId, row.turn_id),
+        eq(usageEvents.status, 'provider_admitted'),
+        eq(usageEvents.userId, row.account_id),
+        row.agent_account_id === null
+          ? sql`${usageEvents.agentId} is null`
+          : eq(usageEvents.agentId, row.agent_account_id),
+        row.session_id === null
+          ? sql`${usageEvents.sessionId} is null`
+          : eq(usageEvents.sessionId, row.session_id),
+      ))
       .returning({ id: usageEvents.id });
     if (!usage) {
       const survivor = (await tx.execute(sql`

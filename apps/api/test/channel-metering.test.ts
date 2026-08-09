@@ -58,6 +58,7 @@ function store(overrides: Partial<ChannelTurnStoreLike> = {}): ChannelTurnStoreL
     claimRefund: vi.fn(),
     claimStale: vi.fn(async () => []),
     markDelivered: vi.fn(),
+    markUsableOutput: vi.fn(),
     markError: vi.fn(),
     authorize: vi.fn(async () => ({ balance: 39, replayed: false })),
     settleAuthorized: vi.fn(),
@@ -189,6 +190,7 @@ describe('ChannelTurnMeteringService economic authorization', () => {
   it('FG-ECON-CHANNEL-02 never charges above authorized-max and records the clamped settlement', async () => {
     const record = turn('settling');
     const persistence = store({
+      getTurn: vi.fn(async () => turn('reserved', record)),
       claimSettlement: vi.fn(async () => ({ turn: record, claimed: true })),
     });
     const result = await new ChannelTurnMeteringService(persistence).settle(
@@ -210,6 +212,7 @@ describe('ChannelTurnMeteringService economic authorization', () => {
   it('charges the full authorized reserve when trusted usage is missing', async () => {
     const record = turn('settling');
     const persistence = store({
+      getTurn: vi.fn(async () => turn('reserved', record)),
       claimSettlement: vi.fn(async () => ({ turn: record, claimed: true })),
     });
     await expect(
@@ -235,6 +238,7 @@ describe('ChannelTurnMeteringService economic authorization', () => {
   it('FG-ECON-CHANNEL-04 reverses split-exact authorization after a terminal-write failure', async () => {
     const record = turn('settling');
     const persistence = store({
+      getTurn: vi.fn(async () => turn('reserved', record)),
       claimSettlement: vi.fn(async () => ({ turn: record, claimed: true })),
       settleAuthorized: vi.fn(async () => {
         throw new Error('database unavailable');

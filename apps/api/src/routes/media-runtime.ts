@@ -1,4 +1,4 @@
-import { getEnv } from '@eden3/core';
+import { getEnv, type DbHandle } from '@eden3/core';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
@@ -31,7 +31,11 @@ const failureSchema = z
   })
   .strict();
 
-export const mediaRuntimeRoutes: FastifyPluginAsync = async (app) => {
+export interface MediaRuntimeRoutesOptions {
+  providerEvidenceDb?: DbHandle;
+}
+
+export const mediaRuntimeRoutes: FastifyPluginAsync<MediaRuntimeRoutesOptions> = async (app, opts) => {
   const expectedToken = getEnv().OPENCLAW_GATEWAY_TOKEN;
   const requireRuntime = async (req: { headers: { authorization?: string | string[] } }) => {
     if (!isValidChannelRuntimeAuthorization(req.headers.authorization, expectedToken)) {
@@ -52,7 +56,10 @@ export const mediaRuntimeRoutes: FastifyPluginAsync = async (app) => {
       try {
         const request = { ...body, tool: body.tool };
         const providerArgs = canonicalChatMediaProviderArgs(body.tool, body.args);
-        const studio = await verifyPendingStudioMedia({ request });
+        const studio = await verifyPendingStudioMedia({
+          request,
+          ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
+        });
         if (studio) {
           return {
             ok: true,
@@ -70,6 +77,7 @@ export const mediaRuntimeRoutes: FastifyPluginAsync = async (app) => {
         const authorization = await reserveChatMedia({
           request,
           dailyCap: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER,
+          ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
         });
         return {
           ok: true,
@@ -102,6 +110,7 @@ export const mediaRuntimeRoutes: FastifyPluginAsync = async (app) => {
         authorizationId,
         errorCode: body.errorCode,
         errorMessage: 'Media tool failed before producing an attributable artifact',
+        ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
       });
       if (outcome === 'refund_pending') {
         throw new ApiError(503, 'media_refund_pending', 'Media refund is pending');

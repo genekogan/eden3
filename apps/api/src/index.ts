@@ -9,16 +9,23 @@ import { defaultOpenclawDataDir } from './gateway-glue';
 import { assertProductionBoundary } from './production-boundary';
 import { buildServer } from './server';
 import { refreshActiveConceptInventories } from './services/concepts';
+import { runtimeAttestationFromEnvironment } from './services/runtime-attestation';
 
 loadRootEnv();
 const env = getEnv();
 assertProductionBoundary(env);
 await ensureBaseline({ dataDir: defaultOpenclawDataDir() });
 await refreshActiveConceptInventories();
+const runtimeAttestation = runtimeAttestationFromEnvironment();
 
 const app = await buildServer({
   logger: { level: 'info', base: undefined }, // compact: no pid/hostname
-  health: { schemaReadiness: checkSchemaReadiness },
+  health: {
+    schemaReadiness: checkSchemaReadiness,
+    ...(runtimeAttestation
+      ? { runtimeAttestation }
+      : {}),
+  },
   media: { autoStartWatcher: true },
   storage: { enabled: true, autoStartPolicyWorker: true },
   scheduler: { autoStart: true }, // eden3-side scheduled-task firing

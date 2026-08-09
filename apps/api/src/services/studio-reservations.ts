@@ -8,6 +8,8 @@ import {
 import { db, mannaAccounts, mannaTransactions, usageEvents } from '@eden3/db';
 import { and, asc, eq, inArray, isNotNull, lt, or, sql } from 'drizzle-orm';
 
+import { recordErasureGenerationTerminalNoOutput } from './turn-authorization';
+
 export const STUDIO_RESERVATION_EVENT_TYPE = 'studio_generation';
 export const STUDIO_RESERVATION_TTL_MS = 60 * 60 * 1000;
 export const STUDIO_RESERVATION_REAPER_INTERVAL_MS = 5 * 60 * 1000;
@@ -305,7 +307,7 @@ export async function compensateStudioGeneration(options: {
   const dbc = options.db ?? db;
   const reverse = options.reverse ?? reverseReservation;
 
-  const marked = await dbc.transaction(async (tx) => {
+  const markCompensation = () => dbc.transaction(async (tx) => {
     const rows = (await tx.execute(sql`
       select status, error_message, metadata from usage_events
       where event_type = ${STUDIO_RESERVATION_EVENT_TYPE}
@@ -367,6 +369,17 @@ export async function compensateStudioGeneration(options: {
       );
     return effective;
   });
+  let marked: Awaited<ReturnType<typeof markCompensation>>;
+  try {
+    marked = await markCompensation();
+  } catch (error) {
+    if (await recordErasureGenerationTerminalNoOutput(
+      options.turnId,
+      'studio_generation',
+      { db: dbc },
+    )) return 'refund_pending';
+    throw error;
+  }
   if (!marked) return 'terminal';
 
   try {

@@ -478,7 +478,7 @@ describe('economic authorization kernel (T08-U02, FG-ECON core)', () => {
     expect(authz).toMatchObject({ state: 'settled' });
   });
 
-  it('A6b: a stream that drops without a terminal event fully reverses the reservation', async () => {
+  it('A6b: a stream that drops after usable output settles the frozen full reserve', async () => {
     const fixture = await makeFixture(200);
     const compat: CompatClientLike = {
       async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
@@ -495,8 +495,11 @@ describe('economic authorization kernel (T08-U02, FG-ECON core)', () => {
       beginStream: sink,
     });
     expect(outcome.errorCode).toBe('gateway_stream_error');
-    expect((await getBalance(fixture.user.accountId)).total).toBe(200);
-    expect(await authzRow(outcome.turnId)).toMatchObject({ state: 'reversed' });
+    expect((await getBalance(fixture.user.accountId)).total).toBe(200 - HAIKU_AUTHORIZED_MAX);
+    expect(await authzRow(outcome.turnId)).toMatchObject({
+      state: 'settled',
+      charged_manna: HAIKU_AUTHORIZED_MAX.toFixed(4),
+    });
   });
 
   it('A3b: mixed subscription/durable pots settle and restore split-exactly through the full pipeline', async () => {

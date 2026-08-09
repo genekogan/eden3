@@ -7,14 +7,21 @@ import {
   reverseReservation,
   settleReservation,
   turnAuthorizedMax,
+  type DbHandle,
 } from '@eden3/core';
-import { db, pg } from '@eden3/db';
+import { db, pg, type PgClient } from '@eden3/db';
 import { getModelAgentRuntime, type GatewayUsage } from '@eden3/gateway';
 import type { AgentRuntime } from '@eden3/shared';
 import { sql } from 'drizzle-orm';
 
 import { meterChatUsage, type ChatTurnMetering } from './turns';
-import { insertTurnAuthorization, markTurnSettled } from './turn-authorization';
+import {
+  claimTurnProviderAdmissionInTransaction,
+  insertTurnAuthorization,
+  markTurnSettled,
+  markTurnUsableOutput,
+  recordErasureProviderTerminalNoOutput,
+} from './turn-authorization';
 import { channelRuntimeBindingMatches } from './channel-runtime-binding';
 
 export interface ChannelTurnUsage extends GatewayUsage {
@@ -125,6 +132,7 @@ export interface ChannelTurnStoreLike {
   ): Promise<ChannelRefundClaim | null>;
   claimStale(cutoff: Date, limit: number): Promise<string[]>;
   markDelivered(turnId: string): Promise<void>;
+  markUsableOutput(turnId: string): Promise<void>;
   markError(turnId: string, errorCode: string): Promise<void>;
   authorize(
     turn: ChannelTurnRecord,
@@ -225,6 +233,8 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   constructor(
     private readonly runtimeForModel: (model: string) => Promise<AgentRuntime> = (model) =>
       getModelAgentRuntime(model),
+    private readonly applicationDb: DbHandle = db,
+    private readonly applicationClient: PgClient = pg,
   ) {}
 
   async getBillableConnection(
@@ -232,7 +242,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     sessionId?: string | null,
     runtimeBinding?: { agentId?: string; bindingId?: string },
   ): Promise<BillableChannelConnection | null> {
-    const rows = await pg<BillableRow[]>`
+    const rows = await this.applicationClient<BillableRow[]>`
       select c.id as connection_id, c.runtime_account_id, c.account_id,
              c.agent_id, c.channel, a.model, a.openclaw_id as agent_openclaw_id,
              c.metadata
@@ -303,7 +313,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     if (currentRuntime !== connection.agentRuntime) {
       throw new Error('channel connection unavailable');
     }
-    return pg.begin(async (tx) => {
+    return this.applicationClient.begin(async (tx) => {
       const currentRows = await tx<BillableRow[]>`
         select c.id as connection_id, c.runtime_account_id, c.account_id,
                c.agent_id, c.channel, a.model, a.openclaw_id as agent_openclaw_id,
@@ -409,7 +419,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   }
 
   async getTurn(turnId: string): Promise<ChannelTurnRecord | null> {
-    const rows = await pg<TurnRow[]>`
+    const rows = await this.applicationClient<TurnRow[]>`
       select ${TURN_COLUMNS}
       from channel_turns
       where turn_id = ${turnId}
@@ -419,7 +429,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   }
 
   async claimSettlement(turnId: string): Promise<ChannelTurnClaim | null> {
-    return pg.begin(async (tx) => {
+    return this.applicationClient.begin(async (tx) => {
       const rows = await tx<TurnRow[]>`
         select ${TURN_COLUMNS}
         from channel_turns
@@ -445,7 +455,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     allowSettling = false,
     allowSettled = false,
   ): Promise<ChannelRefundClaim | null> {
-    return pg.begin(async (tx) => {
+    return this.applicationClient.begin(async (tx) => {
       const rows = await tx<{ turn_id: string; status: ChannelTurnStatus; error_code: string | null }[]>`
         select turn_id, status, error_code
         from channel_turns
@@ -494,7 +504,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
 
   async claimStale(cutoff: Date, limit: number): Promise<string[]> {
     const boundedLimit = Math.max(1, Math.min(500, Math.trunc(limit)));
-    return pg.begin(async (tx) => {
+    return this.applicationClient.begin(async (tx) => {
       const rows = await tx<{ turn_id: string }[]>`
         with stale as (
           select turn_id
@@ -528,7 +538,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     runtimeBinding?: { agentId?: string; bindingId?: string },
   ): Promise<ChannelAuthorizationResult> {
     const route = modelIdentity(turn.model);
-    return db.transaction(async (tx) => {
+    return this.applicationDb.transaction(async (tx) => {
       const liveRows = (await tx.execute(sql`
         select c.id as connection_id, c.runtime_account_id, c.account_id,
                c.agent_id, c.channel, a.model, a.openclaw_id as agent_openclaw_id,
@@ -673,12 +683,15 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
         returning turn_id
       `)) as unknown as { turn_id: string }[];
       if (!updated[0]) throw new Error('channel turn reservation state changed');
+      if (!await claimTurnProviderAdmissionInTransaction(tx, turn.turnId, 'channel_chat')) {
+        throw new Error('channel turn provider admission was not durably recorded');
+      }
       return { balance: debited.balance.total, replayed: debited.alreadyApplied };
     });
   }
 
   async markDelivered(turnId: string): Promise<void> {
-    await db.transaction(async (tx) => {
+    await this.applicationDb.transaction(async (tx) => {
       const rows = (await tx.execute(sql`
         select status, error_code
         from channel_turns
@@ -730,8 +743,12 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     });
   }
 
+  async markUsableOutput(turnId: string): Promise<void> {
+    await markTurnUsableOutput(turnId, { db: this.applicationDb });
+  }
+
   async markError(turnId: string, errorCode: string): Promise<void> {
-    await pg`
+    await this.applicationClient`
       update channel_turns
       set status = 'error', error_code = ${errorCode}, updated_at = now(), completed_at = now()
       where turn_id = ${turnId} and status = 'reserving'
@@ -745,7 +762,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
     chargedManna: number,
   ): Promise<void> {
     const costUsd = metering.costUsd === null ? null : metering.costUsd.toFixed(8);
-    await db.transaction(async (tx) => {
+    await this.applicationDb.transaction(async (tx) => {
       const authRows = (await tx.execute(sql`
         select state, authorized_max_manna, reserved_subscription_manna
         from turn_authorizations
@@ -776,21 +793,16 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
         type: 'refund:chat:channel:settle',
         db: tx,
       });
-      await tx.execute(sql`
-        insert into usage_events (
-          event_type, status, user_id, agent_id, session_id, turn_id,
-          provider, model, pricing_basis, table_version, prompt_tokens,
-          completion_tokens, cached_tokens, cache_write_tokens, total_tokens,
-          cost_usd, manna, metadata
-        ) values (
-          'channel_chat', ${metering.status === 'metered' ? 'completed' : metering.status},
-          ${turn.accountId}, ${turn.agentId}, ${turn.sessionId}, ${turn.turnId},
-          ${metering.provider}, ${metering.model}, ${turn.pricingBasis},
-          ${metering.status === 'metered' ? metering.tableVersion : null},
-          ${usage?.promptTokens ?? null}, ${usage?.completionTokens ?? null},
-          ${usage?.cachedTokens ?? null}, ${usage?.cacheWriteTokens ?? null},
-          ${usage?.totalTokens ?? null}, ${costUsd}, ${chargedManna},
-          ${JSON.stringify({
+      const usageUpdated = (await tx.execute(sql`
+        update usage_events set
+          status=${metering.status === 'metered' ? 'completed' : metering.status},
+          table_version=${metering.status === 'metered' ? metering.tableVersion : null},
+          prompt_tokens=${usage?.promptTokens ?? null},
+          completion_tokens=${usage?.completionTokens ?? null},
+          cached_tokens=${usage?.cachedTokens ?? null},
+          cache_write_tokens=${usage?.cacheWriteTokens ?? null},
+          total_tokens=${usage?.totalTokens ?? null},cost_usd=${costUsd},manna=${chargedManna},
+          metadata=${JSON.stringify({
             channel: turn.channel,
             connectionId: turn.connectionId,
             runtimeAccountId: turn.runtimeAccountId,
@@ -803,9 +815,14 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
               overrun: metering.status === 'metered' && metering.manna > turn.reservedManna,
             },
           })}::jsonb
-        )
-        on conflict (event_type, turn_id) where turn_id is not null do nothing
-      `);
+        where event_type='channel_chat' and turn_id=${turn.turnId}
+          and status='provider_admitted' and user_id=${turn.accountId}
+          and agent_id=${turn.agentId} and session_id is not distinct from ${turn.sessionId}::uuid
+          and provider=${metering.provider} and model=${metering.model}
+          and pricing_basis=${turn.pricingBasis}
+        returning id
+      `)) as unknown as Array<{ id: string }>;
+      if (usageUpdated.length !== 1) throw new Error('channel provider usage skeleton changed');
       const updated = (await tx.execute(sql`
         update channel_turns
         set status = 'delivery_pending', metered_manna = ${chargedManna},
@@ -818,7 +835,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   }
 
   async reverseAuthorized(turnId: string, errorCode: string): Promise<void> {
-    await db.transaction(async (tx) => {
+    await this.applicationDb.transaction(async (tx) => {
       let terminalErrorCode = errorCode;
       const authRows = (await tx.execute(sql`
         select a.state, a.reserved_subscription_manna,
@@ -902,7 +919,7 @@ export class PostgresChannelTurnStore implements ChannelTurnStoreLike {
   }
 
   async markRefundFailed(turnId: string, errorCode: string): Promise<void> {
-    await pg`
+    await this.applicationClient`
       update channel_turns
       set status = case
             when error_code = 'channel_delivery_compensation_pending' then 'refunding'
@@ -1052,6 +1069,7 @@ export function meterChannelUsage(
 export class ChannelTurnMeteringService {
   constructor(
     private readonly store: ChannelTurnStoreLike = new PostgresChannelTurnStore(),
+    private readonly providerEvidenceDb: DbHandle = db,
   ) {}
 
   async reserve(input: ReserveChannelTurnInput): Promise<{
@@ -1142,6 +1160,17 @@ export class ChannelTurnMeteringService {
     usage: ChannelTurnUsage | undefined,
     execution: ChannelExecutionReport,
   ): Promise<{ chargedManna: number; metering: ChatTurnMetering }> {
+    const observed = await this.store.getTurn(turnId);
+    if (!observed) throw new Error('channel turn unavailable');
+    try {
+      assertChannelExecutionMatches(observed, execution);
+    } catch (error) {
+      await this.refund(turnId);
+      throw error;
+    }
+    // Trusted usable output is durable before any settlement-state mutation.
+    // If Tx1 has frozen that later mutation, recovery still charges exactly.
+    await this.store.markUsableOutput(turnId);
     const claim = await this.store.claimSettlement(turnId);
     if (!claim) throw new Error('channel turn unavailable');
     const turn = claim.turn;
@@ -1151,18 +1180,11 @@ export class ChannelTurnMeteringService {
         turn.status === 'delivery_pending' ||
         turn.status === 'delivered')
     ) {
-      assertChannelExecutionMatches(turn, execution);
       const metering = meterChannelUsage(usage, turn.model);
       return { chargedManna: turn.meteredManna ?? turn.reservedManna, metering };
     }
     if (!claim.claimed || turn.status !== 'settling') {
       throw new Error('channel turn is not settleable');
-    }
-
-    try {
-      assertChannelExecutionMatches(turn, execution);
-    } catch (error) {
-      return this.failSettlement(turn, 'execution_mismatch', error);
     }
 
     const metering = meterChannelUsage(usage, turn.model);
@@ -1179,7 +1201,13 @@ export class ChannelTurnMeteringService {
   }
 
   async refund(turnId: string): Promise<void> {
-    const claim = await this.store.claimRefund(turnId);
+    let claim: Awaited<ReturnType<ChannelTurnStoreLike['claimRefund']>>;
+    try {
+      claim = await this.store.claimRefund(turnId);
+    } catch (error) {
+      if (await recordErasureProviderTerminalNoOutput(turnId, { db: this.providerEvidenceDb })) return;
+      throw error;
+    }
     if (!claim) throw new Error('channel turn unavailable');
     if (claim.status === 'settled') throw new Error('settled channel turn cannot be refunded');
     if (claim.status === 'refunded') return;

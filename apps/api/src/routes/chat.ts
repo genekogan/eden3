@@ -7,6 +7,7 @@ import {
   resolveAgentByUsername,
   resolveSession,
 } from '@eden3/core';
+import type { DbHandle } from '@eden3/core';
 import { accounts, agents, db, sessionAgents, sessionUsers, sessions, type Session } from '@eden3/db';
 import {
   DEFAULT_AGENT_THINKING_LEVEL,
@@ -357,7 +358,11 @@ function openSseSink(reply: FastifyReply, sessionId: string): TurnSink {
   };
 }
 
-export const chatRoutes: FastifyPluginAsync = async (app) => {
+export interface ChatRoutesOptions {
+  providerEvidenceDb?: DbHandle;
+}
+
+export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opts) => {
   app.post<{ Params: { idOrNew: string } }>(
     '/:idOrNew/messages',
     { preHandler: app.requireAuth },
@@ -412,6 +417,7 @@ export const chatRoutes: FastifyPluginAsync = async (app) => {
             bus: app.eventsBus,
             registry: app.turnRegistry,
             historySync: app.historySync,
+            ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
             onError: (err, context) => req.log.error({ err, context }, 'chat turn side-error'),
           },
           {

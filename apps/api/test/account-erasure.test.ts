@@ -5,6 +5,10 @@ import {
   ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
   ACCOUNT_ERASURE_RECOVERY_MANIFEST_SCHEMA_VERSION,
   AccountErasureRecoveryWorker,
+  accountErasureLedgerSha256,
+  canonicalAccountErasureLedger,
+  canonicalAccountErasureManifest,
+  accountErasureManifestSha256,
   accountErasureRequestSchema,
   requestAccountErasure,
   type AccountErasureIntentStore,
@@ -21,7 +25,12 @@ const ACCEPTED_AT = '2026-08-08T20:00:00.000Z';
 const CONFIRMED_AT = '2026-08-08T20:00:01.000Z';
 const CLAIM_EXPIRES_AT = '2026-08-08T20:01:00.000Z';
 const CLAIM_TOKEN = '44444444-4444-4444-8444-444444444444';
-const HASH = 'a'.repeat(64);
+const HASH = accountErasureLedgerSha256({
+  schemaVersion: ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
+  jobId: JOB_ID,
+  accountId: ACTOR_ID,
+  acceptedAt: ACCEPTED_AT,
+});
 const MAC = 'b'.repeat(64);
 const INVENTORY_HASH = 'c'.repeat(64);
 const CIPHERTEXT_HASH = 'd'.repeat(64);
@@ -66,6 +75,7 @@ function manifestSink(): AccountErasureRecoveryManifestSink {
       jobId: manifest.jobId,
       accountId: manifest.accountId,
       inventorySha256: manifest.inventorySha256,
+      manifestSha256: accountErasureManifestSha256(manifest),
       confirmedAt: CONFIRMED_AT,
       ciphertextSha256: CIPHERTEXT_HASH,
       macSha256: MAC,
@@ -140,6 +150,7 @@ describe('account erasure admission and ledger ordering', () => {
         jobId: manifest.jobId,
         accountId: manifest.accountId,
         inventorySha256: manifest.inventorySha256,
+        manifestSha256: accountErasureManifestSha256(manifest),
         confirmedAt: CONFIRMED_AT,
         ciphertextSha256: CIPHERTEXT_HASH,
         macSha256: MAC,
@@ -171,7 +182,7 @@ describe('account erasure admission and ledger ordering', () => {
       jobId: JOB_ID,
       accountId: ACTOR_ID,
       acceptedAt: ACCEPTED_AT,
-    });
+    }, expect.any(AbortSignal));
     expect(repository.sealUnclaimedAfterLedgerConfirmation).toHaveBeenCalledWith({
       jobId: JOB_ID,
       accountId: ACTOR_ID,
@@ -180,7 +191,10 @@ describe('account erasure admission and ledger ordering', () => {
       ledgerSha256: HASH,
       ledgerMacSha256: MAC,
     });
-    expect(recovery.encryptWriteAndConfirm).toHaveBeenCalledWith(recoveryManifest());
+    expect(recovery.encryptWriteAndConfirm).toHaveBeenCalledWith(
+      recoveryManifest(),
+      expect.any(AbortSignal),
+    );
     expect(repository.confirmRecoveryManifestUnclaimed).toHaveBeenCalledWith({
       jobId: JOB_ID,
       accountId: ACTOR_ID,
@@ -195,10 +209,10 @@ describe('account erasure admission and ledger ordering', () => {
     const repository = store();
     const ledger = sink();
     const recovery = manifestSink();
-    vi.mocked(ledger.writeAndConfirm).mockRejectedValue(new Error('ledger unavailable'));
-    await expect(requestAccountErasure(request(), repository, ledger, recovery)).rejects.toThrow(
-      'ledger unavailable',
-    );
+    vi.mocked(ledger.writeAndConfirm).mockRejectedValue(new Error(`ledger unavailable ${SECRET_LOCATOR}`));
+    const failure = requestAccountErasure(request(), repository, ledger, recovery);
+    await expect(failure).rejects.toMatchObject({ code: 'erasure_ledger_unavailable' });
+    await expect(failure).rejects.not.toThrow(SECRET_LOCATOR);
     expect(repository.sealUnclaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
   });
 
@@ -207,12 +221,12 @@ describe('account erasure admission and ledger ordering', () => {
     const ledger = sink();
     const recovery = manifestSink();
     vi.mocked(recovery.encryptWriteAndConfirm).mockRejectedValue(
-      new Error('dedicated recovery sink unavailable'),
+      new Error(`dedicated recovery sink unavailable ${SECRET_LOCATOR}`),
     );
 
     await expect(
       requestAccountErasure(request(), repository, ledger, recovery),
-    ).rejects.toThrow('dedicated recovery sink unavailable');
+    ).rejects.toMatchObject({ code: 'erasure_recovery_manifest_unavailable' });
     expect(repository.sealUnclaimedAfterLedgerConfirmation).toHaveBeenCalledTimes(1);
     expect(repository.confirmRecoveryManifestUnclaimed).not.toHaveBeenCalled();
     expect(JSON.stringify(vi.mocked(repository.sealUnclaimedAfterLedgerConfirmation).mock.calls)).not.toContain(
@@ -228,6 +242,7 @@ describe('account erasure admission and ledger ordering', () => {
       jobId: manifest.jobId,
       accountId: OTHER_ID,
       inventorySha256: manifest.inventorySha256,
+      manifestSha256: accountErasureManifestSha256(manifest),
       confirmedAt: CONFIRMED_AT,
       ciphertextSha256: CIPHERTEXT_HASH,
       macSha256: MAC,
@@ -239,6 +254,28 @@ describe('account erasure admission and ledger ordering', () => {
       statusCode: 503,
       code: 'erasure_recovery_manifest_mismatch',
     } satisfies Partial<ApiError>);
+    expect(repository.confirmRecoveryManifestUnclaimed).not.toHaveBeenCalled();
+  });
+
+  it('rejects a locator-drop mutant even when target inventory identity is unchanged', async () => {
+    const repository = store();
+    const recovery = manifestSink();
+    vi.mocked(recovery.encryptWriteAndConfirm).mockImplementation(async (manifest) => {
+      const dropped = { ...manifest, locators: [] };
+      return {
+        schemaVersion: manifest.schemaVersion,
+        jobId: manifest.jobId,
+        accountId: manifest.accountId,
+        inventorySha256: manifest.inventorySha256,
+        manifestSha256: accountErasureManifestSha256(dropped),
+        confirmedAt: CONFIRMED_AT,
+        ciphertextSha256: CIPHERTEXT_HASH,
+        macSha256: MAC,
+        keyVersion: 1,
+      };
+    });
+    await expect(requestAccountErasure(request(), repository, sink(), recovery))
+      .rejects.toMatchObject({ code: 'erasure_recovery_manifest_mismatch' });
     expect(repository.confirmRecoveryManifestUnclaimed).not.toHaveBeenCalled();
   });
 
@@ -257,6 +294,57 @@ describe('account erasure admission and ledger ordering', () => {
       code: 'erasure_ledger_mismatch',
     } satisfies Partial<ApiError>);
     expect(repository.sealUnclaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('rejects a syntactically valid ledger digest that is not bound to canonical readback bytes', async () => {
+    const repository = store();
+    const ledger = sink();
+    vi.mocked(ledger.writeAndConfirm).mockImplementation(async (record) => ({
+      record,
+      confirmedAt: CONFIRMED_AT,
+      sha256: 'f'.repeat(64),
+      macSha256: MAC,
+    }));
+    await expect(requestAccountErasure(request(), repository, ledger, manifestSink()))
+      .rejects.toMatchObject({ code: 'erasure_ledger_mismatch' });
+    expect(repository.sealUnclaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
+  });
+
+  it('uses fixed ledger property order and raw UTF-8 manifest locator ordering', () => {
+    const ledger = {
+      acceptedAt: ACCEPTED_AT,
+      accountId: ACTOR_ID,
+      jobId: JOB_ID,
+      schemaVersion: ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
+    } as const;
+    expect(canonicalAccountErasureLedger(ledger)).toBe(JSON.stringify({
+      schemaVersion: ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
+      jobId: JOB_ID,
+      accountId: ACTOR_ID,
+      acceptedAt: ACCEPTED_AT,
+    }));
+
+    const nfc = '/media/é.png';
+    const nfd = '/media/e\u0301.png';
+    const base = recoveryManifest();
+    const locators = [
+      { kind: 'agent_runtime' as const, resourceId: OTHER_ID, locator: nfc },
+      { kind: 'agent_runtime' as const, resourceId: ACTOR_ID, locator: nfd },
+    ];
+    const first = { ...base, locators };
+    const second = { ...base, locators: [...locators].reverse() };
+    const canonical = canonicalAccountErasureManifest(first);
+    expect(canonical).toBe(canonicalAccountErasureManifest(second));
+    expect(canonical).toContain(nfc);
+    expect(canonical).toContain(nfd);
+    expect(accountErasureManifestSha256(first)).toBe(accountErasureManifestSha256(second));
+    expect(accountErasureManifestSha256({
+      ...base,
+      locators: [{ ...locators[0]!, locator: nfd }],
+    })).not.toBe(accountErasureManifestSha256({
+      ...base,
+      locators: [{ ...locators[0]!, locator: nfc }],
+    }));
   });
 
   it('converges after a crash between confirmed ledger and transaction 2', async () => {
@@ -384,6 +472,8 @@ describe('account erasure autonomous recovery', () => {
       retried: 0,
       attention: 0,
       stale: 0,
+      wormOverdue: 0,
+      targetOverdue: 0,
     });
     expect(ledger.writeAndConfirm).toHaveBeenCalledTimes(1);
     expect(repository.sealClaimedAfterLedgerConfirmation).toHaveBeenCalledWith(
@@ -461,6 +551,8 @@ describe('account erasure autonomous recovery', () => {
       retried: 1,
       attention: 0,
       stale: 0,
+      wormOverdue: 0,
+      targetOverdue: 0,
     });
     expect(repository.recordRecoveryFailure).toHaveBeenCalledWith({
       jobId: JOB_ID,
@@ -492,10 +584,15 @@ describe('account erasure autonomous recovery', () => {
       retried: 0,
       attention: 0,
       stale: 0,
+      wormOverdue: 0,
+      targetOverdue: 0,
     });
     expect(ledger.writeAndConfirm).not.toHaveBeenCalled();
     expect(repository.sealClaimedAfterLedgerConfirmation).not.toHaveBeenCalled();
-    expect(recovery.encryptWriteAndConfirm).toHaveBeenCalledWith(recoveryManifest());
+    expect(recovery.encryptWriteAndConfirm).toHaveBeenCalledWith(
+      recoveryManifest(),
+      expect.any(AbortSignal),
+    );
     expect(repository.confirmClaimedRecoveryManifest).toHaveBeenCalledWith(
       expect.objectContaining({
         claimToken: CLAIM_TOKEN,
@@ -526,6 +623,8 @@ describe('account erasure autonomous recovery', () => {
       retried: 0,
       attention: 0,
       stale: 0,
+      wormOverdue: 0,
+      targetOverdue: 0,
     });
     await expect(second).resolves.toEqual({
       claimed: 0,
@@ -533,7 +632,73 @@ describe('account erasure autonomous recovery', () => {
       retried: 0,
       attention: 0,
       stale: 0,
+      wormOverdue: 0,
+      targetOverdue: 0,
     });
+  });
+
+  it('bounds a stuck custody sink and releases the exact recovery claim', async () => {
+    vi.useFakeTimers();
+    const repository = recoveryStore();
+    const ledger = sink();
+    vi.mocked(ledger.writeAndConfirm).mockImplementation(
+      (_record, signal) => new Promise((_resolve, reject) => {
+        signal!.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      }),
+    );
+    const worker = new AccountErasureRecoveryWorker(
+      repository,
+      ledger,
+      manifestSink(),
+      1,
+      1_000,
+    );
+    const tick = worker.tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    await expect(tick).resolves.toMatchObject({ claimed: 1, retried: 1 });
+    expect(repository.recordRecoveryFailure).toHaveBeenCalledWith({
+      jobId: JOB_ID,
+      claimToken: CLAIM_TOKEN,
+      claimExpiresAt: CLAIM_EXPIRES_AT,
+      errorCode: 'erasure_recovery_failed',
+    });
+    vi.useRealTimers();
+  });
+
+  it('surfaces an expired final recovery claim and durable age warnings', async () => {
+    const repository = recoveryStore();
+    vi.mocked(repository.claimIntentForRecovery).mockResolvedValueOnce({
+      jobId: JOB_ID,
+      status: 'attention',
+    });
+    repository.recoveryMetrics = vi.fn(async () => ({ wormOverdue: 2, targetOverdue: 1 }));
+    const ledger = sink();
+    const recovery = manifestSink();
+    const worker = new AccountErasureRecoveryWorker(repository, ledger, recovery, 1);
+
+    await expect(worker.tick()).resolves.toEqual({
+      claimed: 1,
+      sealed: 0,
+      retried: 0,
+      attention: 1,
+      stale: 0,
+      wormOverdue: 2,
+      targetOverdue: 1,
+    });
+    expect(ledger.writeAndConfirm).not.toHaveBeenCalled();
+    expect(recovery.encryptWriteAndConfirm).not.toHaveBeenCalled();
+  });
+
+  it('rejects a claim lease that cannot outlive both custody deadlines', () => {
+    const repository = Object.assign(recoveryStore(), { claimLeaseMs: 35_000 });
+    expect(() => new AccountErasureRecoveryWorker(
+      repository,
+      sink(),
+      manifestSink(),
+      1,
+      15_000,
+    )).toThrow('claim lease');
   });
 
   it('makes both late success and late failure stale after another worker reclaims', async () => {

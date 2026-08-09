@@ -2,7 +2,7 @@ import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
 import { getEnv } from '@eden3/core';
-import type { SchemaReadiness } from '@eden3/db';
+import { db, pg, type SchemaReadiness } from '@eden3/db';
 import { OpenClawCompatClient, OpenClawToolsClient } from '@eden3/gateway';
 import fastifyCors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
@@ -34,7 +34,16 @@ import { HistorySync, type AttachmentCallback, type ToolsClientLike } from './se
 import { AgentProvisioningWorker } from './services/agent-provisioning';
 import { AgentRuntimeSyncScheduler } from './services/agent-runtime-sync';
 import { startBackgroundWorkerLoop } from './services/background-worker-loop';
+import {
+  accountErasureIntervalMs,
+  assertAccountErasureRuntimeComposition,
+  assertAccountErasureRuntimeDatabaseIdentity,
+  registerAccountErasureBackgroundLifecycle,
+  type AccountErasureRuntimeBundle,
+} from './services/account-erasure-runtime';
 import { MediaPipeline, type AttachmentKind } from './services/media-pipeline';
+import { legacyMediaIsPubliclyReachable } from './services/legacy-media-visibility';
+import type { RuntimeAttestation } from './services/runtime-attestation';
 import {
   EdenMemoryDreamAgentRunner,
   MemoryDreamOrchestrator,
@@ -143,6 +152,8 @@ export interface BuildServerOptions {
   health?: {
     /** Production schema gate; tests may inject deterministic readiness. */
     schemaReadiness?: () => Promise<SchemaReadiness>;
+    /** Closed E2E process-identity proof; absent from ordinary responses. */
+    runtimeAttestation?: RuntimeAttestation;
   };
   storage?: {
     /** Construct the production object/upload runtime. Tests leave this false. */
@@ -162,6 +173,7 @@ export interface BuildServerOptions {
   };
   shares?: { repository: SessionShareRepository };
   notifications?: NotificationsRoutesOptions;
+  accountErasure?: AccountErasureRuntimeBundle;
 }
 
 declare module 'fastify' {
@@ -195,6 +207,8 @@ declare module 'fastify' {
  * populated process.env first (loadRootEnv).
  */
 export async function buildServer(opts: BuildServerOptions = {}): Promise<FastifyInstance> {
+  assertAccountErasureRuntimeComposition(opts.accountErasure);
+  assertAccountErasureRuntimeDatabaseIdentity(opts.accountErasure, { db, pg });
   const env = getEnv();
 
   const app = Fastify({
@@ -373,6 +387,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       versions: { api: pkg.version, node: process.version, fastify: app.version },
       database: databaseName,
       schema,
+      ...(opts.health?.runtimeAttestation
+        ? { runtimeAttestation: opts.health.runtimeAttestation }
+        : {}),
     });
   });
 
@@ -614,13 +631,30 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   });
 
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
-  await app.register(chatRoutes, { prefix: '/sessions' }); // POST /sessions/:idOrNew/messages
+  await app.register(chatRoutes, {
+    prefix: '/sessions',
+    ...(opts.accountErasure
+      ? { providerEvidenceDb: opts.accountErasure.providerEvidenceDb }
+      : {}),
+  }); // POST /sessions/:idOrNew/messages
   await app.register(authRoutes, { prefix: '/auth' });
   await app.register(notificationsRoutes, {
     prefix: '/notifications',
     ...(opts.notifications ?? {}),
   });
-  await app.register(accountRoutes, { prefix: '/account' });
+  await app.register(accountRoutes, {
+    prefix: '/account',
+    erasure: opts.accountErasure,
+  });
+  if (opts.accountErasure?.autoStart === true) {
+    registerAccountErasureBackgroundLifecycle(app, {
+      autoStart: true,
+      recoveryWorker: opts.accountErasure.recoveryWorker,
+      targetWorker: opts.accountErasure.targetWorker,
+      intervalMs: opts.accountErasure.intervalMs ?? accountErasureIntervalMs(),
+      logger: app.log,
+    });
+  }
   await app.register(sessionsRoutes, { prefix: '/sessions' });
   await app.register(agentsRoutes, { prefix: '/agents' });
   // Concepts share the /agents path root (/agents/:username/concepts/*).
@@ -633,10 +667,21 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // No prefix: collections spans /collections/* AND /users/:username/collections.
   await app.register(collectionsRoutes);
   await app.register(billingRoutes, { prefix: '/billing', ...(opts.billing ?? {}) });
-  await app.register(channelsRoutes, { prefix: '/channels', ...(opts.channels ?? {}) });
+  await app.register(channelsRoutes, {
+    prefix: '/channels',
+    ...(opts.channels ?? {}),
+    ...(opts.accountErasure
+      ? { providerEvidenceDb: opts.accountErasure.providerEvidenceDb }
+      : {}),
+  });
   // Gateway-only fail-closed media authorization callbacks. These exact POST
   // routes authenticate the gateway bearer before any allowlist bypass.
-  await app.register(mediaRuntimeRoutes, { prefix: '/media' });
+  await app.register(mediaRuntimeRoutes, {
+    prefix: '/media',
+    ...(opts.accountErasure
+      ? { providerEvidenceDb: opts.accountErasure.providerEvidenceDb }
+      : {}),
+  });
   await app.register(mannaRoutes, { prefix: '/manna' });
   // /usage — the tenant view of consumption (own balance/spend/activity).
   // Distinct from /operator (admin platform view); never exposes cost_usd.
@@ -734,11 +779,22 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // wildcard is deliberately registered after `/media/:objectId`; it serves
   // only MEDIA_DIR and cannot see pending/quarantined object-backend bytes.
   mkdirSync(env.MEDIA_DIR, { recursive: true });
-  await app.register(fastifyStatic, {
-    root: env.MEDIA_DIR,
-    prefix: '/media/',
-    index: false,
-    list: false,
+  await app.register(async (legacyMedia) => {
+    legacyMedia.addHook('onRequest', async (req, reply) => {
+      const path = req.url.split('?', 1)[0]!;
+      try {
+        if (await legacyMediaIsPubliclyReachable(pg, path)) return;
+      } catch (err) {
+        req.log.error({ err }, 'legacy media visibility check failed');
+      }
+      return reply.code(404).send(errorEnvelope(404, 'not_found', 'Media not found'));
+    });
+    await legacyMedia.register(fastifyStatic, {
+      root: env.MEDIA_DIR,
+      prefix: '/media/',
+      index: false,
+      list: false,
+    });
   });
   // Trigger routes live at /tasks on the wire (web contract).
   await app.register(triggersRoutes, { prefix: '/tasks' });

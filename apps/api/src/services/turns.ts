@@ -32,7 +32,7 @@ import {
   type GatewayTurnEvent,
   type GatewayUsage,
 } from '@eden3/gateway';
-import { desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 
 import type { EventsBus } from '../events-bus';
 import { ApiError } from '../errors';
@@ -65,6 +65,7 @@ import {
   insertTurnAuthorization,
   markTurnUsableOutput,
   markTurnSettled,
+  recordErasureProviderTerminalNoOutput,
   reverseTurnAuthorization,
   settlePartialOutputAuthorization,
 } from './turn-authorization';
@@ -161,6 +162,12 @@ export interface RunTurnDeps {
   subscriptionTurnClaims?: SubscriptionTurnClaimsLike;
   /** Optional deterministic Eve-memory seam for isolated tests. */
   evePeerMemoryReader?: EvePeerMemoryReader;
+  /**
+   * Exact ordinary-application database handle for reservation, provider
+   * admission/evidence, and terminal persistence. Production erasure runtime
+   * supplies the handle whose login/database identity was attested at boot.
+   */
+  db?: DbHandle;
   /** Error sink for non-fatal background failures (default: swallow). */
   onError?: (err: unknown, context: string) => void;
 }
@@ -657,6 +664,7 @@ async function runClaimedTurn(
   params: RunTurnParams,
   turnId: string,
 ): Promise<TurnOutcome> {
+  const turnDb = deps.db ?? db;
   const { session, agent, user, content } = params;
   const onError = deps.onError ?? (() => {});
   const sessionKey = session.gatewaySessionKey;
@@ -667,7 +675,7 @@ async function runClaimedTurn(
   // operator toggle during this turn affects the next turn, never settlement
   // of the one already in flight.
   const agentRuntime = agent.agentRuntime;
-  const pricingBasis =
+  const pricingBasis: 'provider-api' | 'notional-subscription' =
     agentRuntime === 'claude-cli' ? 'notional-subscription' : 'provider-api';
   const isMemoryDream = params.source?.kind === 'memory_dream';
   const isAutomation =
@@ -694,7 +702,7 @@ async function runClaimedTurn(
     operation: (dbc?: DbHandle) => Promise<T>,
   ): Promise<T> => {
     if (!params.fundingFence) return await operation();
-    return await db.transaction(async (tx) => {
+    return await turnDb.transaction(async (tx) => {
       await params.fundingFence!(tx);
       return await operation(tx);
     });
@@ -711,7 +719,7 @@ async function runClaimedTurn(
   // release the unused headroom at settlement); a 402/429 must precede
   // streaming.
   await params.beforeDebit?.();
-  const reserveAuthorization = async () => db.transaction(async (tx) => {
+  const reserveAuthorization = async () => turnDb.transaction(async (tx) => {
     if (params.fundingFence) await params.fundingFence(tx);
     const debited = await debit({
       accountId: user.accountId,
@@ -790,7 +798,7 @@ async function runClaimedTurn(
       (err instanceof DailyCapExceededError || err instanceof RollingSpendCapExceededError)
     ) {
       try {
-        await db.insert(usageEvents).values({
+        await turnDb.insert(usageEvents).values({
           eventType: usageEventType,
           status: 'error',
           userId: user.accountId,
@@ -834,6 +842,8 @@ async function runClaimedTurn(
   let providerStartAcquired: boolean;
   try {
     providerStartAcquired = await claimTurnProviderStart(turnId, {
+      eventType: usageEventType,
+      db: turnDb,
       ...(params.fundingFence ? { fence: params.fundingFence } : {}),
     });
   } catch (err) {
@@ -841,6 +851,7 @@ async function runClaimedTurn(
       await reverseTurnAuthorization({
         turnId,
         refundType,
+        db: turnDb,
         ...(params.fundingFence ? { fence: params.fundingFence } : {}),
       });
     } catch (reverseErr) {
@@ -866,6 +877,7 @@ async function runClaimedTurn(
       await reverseTurnAuthorization({
         turnId,
         refundType,
+        db: turnDb,
         ...(params.fundingFence ? { fence: params.fundingFence } : {}),
       });
     } catch (reverseErr) {
@@ -964,6 +976,7 @@ async function runClaimedTurn(
     try {
       const partial = await settlePartialOutputAuthorization({
         turnId,
+        db: turnDb,
         errorCode: outcome.errorCode ?? 'provider_stream_interrupted_after_output',
         errorMessage:
           outcome.errorMessage ?? 'Provider stream ended after emitting usable output',
@@ -992,6 +1005,7 @@ async function runClaimedTurn(
       const result = await reverseTurnAuthorization({
         turnId,
         refundType,
+        db: turnDb,
         ...(params.fundingFence ? { fence: params.fundingFence } : {}),
       });
       if (result.partialOutputRequired) return await settleMarkedPartialOutput();
@@ -1005,6 +1019,19 @@ async function runClaimedTurn(
       return true;
     } catch (err) {
       onError(err, 'turn reservation reversal');
+      if (!usableOutputMarked) {
+        try {
+          if (await recordErasureProviderTerminalNoOutput(turnId, { db: turnDb })) {
+            // Recovery now owns the still-reserved money transition. Suppress
+            // the generic metadata-bearing error row; the canonical evidence
+            // is intentionally zero-manna and locator-free.
+            usageEventRecorded = true;
+            return true;
+          }
+        } catch (evidenceError) {
+          onError(evidenceError, 'account-erasure provider terminal evidence');
+        }
+      }
       return false;
     }
   };
@@ -1031,16 +1058,10 @@ async function runClaimedTurn(
     if (usageEventRecorded || partialSettlementPending) return;
     try {
       const metering = record.metering ?? meterChatUsage(record.usage, meteringModel);
-      // Paired with the usage_events_turn_unique partial index: a retried or
-      // crashed-and-replayed pipeline cannot double-record this turn.
-      const inserted = await (options.dbc ?? db).insert(usageEvents).values({
-        eventType: usageEventType,
+      const dbc = options.dbc ?? turnDb;
+      const terminalValues = {
         status: record.status,
-        userId: user.accountId,
-        agentId: agent.accountId,
-        sessionId: session.id,
         messageId: record.messageId ?? null,
-        turnId,
         provider: metering.provider,
         model: metering.model,
         pricingBasis,
@@ -1081,13 +1102,32 @@ async function runClaimedTurn(
           userMessageId: userMessage.id,
           source: params.source ?? null,
         },
+      };
+      // Provider admission created the content-free durable anchor. Consume
+      // that exact row instead of inserting terminal truth after the provider
+      // has already run (which an active erasure correctly fences).
+      const updated = await dbc.update(usageEvents).set(terminalValues).where(and(
+        eq(usageEvents.eventType, usageEventType),
+        eq(usageEvents.turnId, turnId),
+        eq(usageEvents.status, 'provider_admitted'),
+        eq(usageEvents.userId, user.accountId),
+        eq(usageEvents.agentId, agent.accountId),
+        eq(usageEvents.sessionId, session.id),
+      )).returning({ id: usageEvents.id });
+      const inserted = updated.length > 0 ? updated : await dbc.insert(usageEvents).values({
+        eventType: usageEventType,
+        userId: user.accountId,
+        agentId: agent.accountId,
+        sessionId: session.id,
+        turnId,
+        ...terminalValues,
       }).onConflictDoNothing().returning({ id: usageEvents.id });
       if (options.strict === true && inserted.length === 0) {
         // A conflicting usage row already exists for this turn. In strict
         // (terminal-transaction) mode a silent no-op could commit settlement
         // against a stale error row — verify the survivor is an equivalent
         // terminal row, else abort the transaction (checkpoint-#2).
-        const survivor = (await (options.dbc ?? db).execute(sql`
+        const survivor = (await (options.dbc ?? turnDb).execute(sql`
           select status, manna from usage_events
           where event_type = ${usageEventType} and turn_id = ${turnId}
         `)) as unknown as { status: string; manna: number | null }[];
@@ -1143,7 +1183,7 @@ async function runClaimedTurn(
           if (!primedMarked) {
             primedMarked = true;
             try {
-              await db
+              await turnDb
                 .update(sessions)
                 .set({ gatewayPrimedAt: new Date(), updatedAt: new Date() })
                 .where(eq(sessions.id, session.id));
@@ -1166,6 +1206,7 @@ async function runClaimedTurn(
             // explicit error or crash follows full-reserve-v1 instead of
             // returning a useful prefix for free. One DB roundtrip per turn.
             await markTurnUsableOutput(turnId, {
+              db: turnDb,
               ...(params.fundingFence ? { fence: params.fundingFence } : {}),
             });
             usableOutputMarked = true;
@@ -1353,7 +1394,7 @@ async function runClaimedTurn(
             balanceTotal: number;
           };
           try {
-            terminal = await db.transaction(async (tx) => {
+            terminal = await turnDb.transaction(async (tx) => {
               if (params.fundingFence) await params.fundingFence(tx);
               // Authorization row FIRST, ledger second — the same lock order
               // as reverseTurnAuthorization, so settle and reap/reverse can

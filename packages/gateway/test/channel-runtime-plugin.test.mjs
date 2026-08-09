@@ -207,6 +207,7 @@ function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) 
         );
         return {
           ok: true,
+          providerAdmitted: true,
           turnId: body.turnId,
           model: mapping.model,
           agentRuntime: mapping.agentRuntime,
@@ -1072,6 +1073,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     const drifted = mockBridge(hostedConfig(), {
       '/channels/runtime/turns/reserve': async (body) => ({
         ok: true,
+        providerAdmitted: true,
         turnId: body.turnId,
         model: 'openai/gpt-5.5',
         agentRuntime: 'openclaw',

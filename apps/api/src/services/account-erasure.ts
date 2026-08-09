@@ -1,10 +1,12 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 
 import { ApiError } from '../errors';
 
 export const ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION = 'eden3.account-erasure@v1' as const;
 export const ACCOUNT_ERASURE_RECOVERY_MANIFEST_SCHEMA_VERSION =
   'eden3.account-erasure-recovery@v1' as const;
+export const ACCOUNT_ERASURE_SINK_TIMEOUT_MS = 15_000;
 
 export const accountErasureRequestSchema = z
   .object({
@@ -31,6 +33,7 @@ export interface AccountErasureLedgerConfirmation {
   record: AccountErasureLedgerRecord;
   confirmedAt: string;
   sha256: string;
+  /** Sink-keyed MAC over the same canonical bytes; app validates shape while sink readback verifies it. */
   macSha256: string;
 }
 
@@ -40,7 +43,14 @@ export interface AccountErasureRequestResult {
 }
 
 export interface AccountErasureRecoveryLocator {
-  kind: 'clerk_identity' | 'stripe_customer' | 'channel_runtime' | 'agent_runtime';
+  kind:
+    | 'clerk_identity'
+    | 'stripe_customer'
+    | 'channel_runtime'
+    | 'agent_runtime'
+    | 'storage_object'
+    | 'legacy_media_asset'
+    | 'legacy_concept_asset';
   resourceId: string;
   /** Ephemeral plaintext passed only to the dedicated encrypting sink. */
   locator: string;
@@ -68,10 +78,54 @@ export interface AccountErasureRecoveryManifestConfirmation {
   jobId: string;
   accountId: string;
   inventorySha256: string;
+  /** SHA-256 of the exact canonical plaintext manifest authenticated as AAD. */
+  manifestSha256: string;
   confirmedAt: string;
   ciphertextSha256: string;
   macSha256: string;
   keyVersion: number;
+}
+
+/** Versioned, property-order-independent WORM ledger bytes. */
+export function canonicalAccountErasureLedger(record: AccountErasureLedgerRecord): string {
+  return JSON.stringify({
+    schemaVersion: record.schemaVersion,
+    jobId: record.jobId,
+    accountId: record.accountId,
+    acceptedAt: record.acceptedAt,
+  });
+}
+
+export function accountErasureLedgerSha256(record: AccountErasureLedgerRecord): string {
+  return createHash('sha256').update(canonicalAccountErasureLedger(record)).digest('hex');
+}
+
+export function canonicalAccountErasureManifest(
+  manifest: AccountErasureRecoveryManifest,
+): string {
+  const utf8Order = (left: string, right: string): number =>
+    Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+  return JSON.stringify({
+    schemaVersion: manifest.schemaVersion,
+    jobId: manifest.jobId,
+    accountId: manifest.accountId,
+    inventoriedAt: manifest.inventoriedAt,
+    inventorySha256: manifest.inventorySha256,
+    locators: [...manifest.locators]
+      .map((entry) => ({
+        kind: entry.kind,
+        resourceId: entry.resourceId,
+        locator: entry.locator,
+      }))
+      .sort((a, b) => utf8Order(
+        `${a.kind}\u0000${a.resourceId}\u0000${a.locator}`,
+        `${b.kind}\u0000${b.resourceId}\u0000${b.locator}`,
+      )),
+  });
+}
+
+export function accountErasureManifestSha256(manifest: AccountErasureRecoveryManifest): string {
+  return createHash('sha256').update(canonicalAccountErasureManifest(manifest)).digest('hex');
 }
 
 export interface AccountErasureManifestPendingIntent {
@@ -121,8 +175,18 @@ export interface AccountErasureIntentStore {
 }
 
 export interface AccountErasureRecoveryStore extends AccountErasureIntentStore {
+  readonly databaseBoundary?: object;
+  /** Optional composition proof that a claimed lease outlives both sink deadlines. */
+  readonly claimLeaseMs?: number;
   /** Claim one due intent/backup target with a fenced lease, or null when idle. */
-  claimIntentForRecovery(): Promise<ClaimedAccountErasureIntent | null>;
+  claimIntentForRecovery(): Promise<
+    ClaimedAccountErasureIntent | { jobId: string; status: 'attention' } | null
+  >;
+  /** Durable operator-truth counts, evaluated against PostgreSQL time. */
+  recoveryMetrics?(): Promise<{
+    wormOverdue: number;
+    targetOverdue: number;
+  }>;
   /** Transaction 2 for a worker; token/expiry CAS makes a late lease stale. */
   sealClaimedAfterLedgerConfirmation(input: {
     jobId: string;
@@ -155,6 +219,7 @@ export interface AccountErasureLedgerSink {
   /** Canonically encode, MAC, WORM-write, then HEAD/read back the exact record. */
   writeAndConfirm(
     record: AccountErasureLedgerRecord,
+    signal?: AbortSignal,
   ): Promise<AccountErasureLedgerConfirmation>;
 }
 
@@ -165,6 +230,7 @@ export interface AccountErasureRecoveryManifestSink {
    */
   encryptWriteAndConfirm(
     manifest: AccountErasureRecoveryManifest,
+    signal?: AbortSignal,
   ): Promise<AccountErasureRecoveryManifestConfirmation>;
 }
 
@@ -183,12 +249,14 @@ function exactLedgerConfirmation(
 ): boolean {
   const actual = confirmation.record;
   return (
+    Object.keys(actual).sort().join(',') === 'acceptedAt,accountId,jobId,schemaVersion' &&
     actual.schemaVersion === expected.schemaVersion &&
     actual.jobId === expected.jobId &&
     actual.accountId === expected.accountId &&
     actual.acceptedAt === expected.acceptedAt &&
     Number.isFinite(Date.parse(confirmation.confirmedAt)) &&
-    lowercaseSha256.test(confirmation.sha256) &&
+    Date.parse(confirmation.confirmedAt) >= Date.parse(expected.acceptedAt) &&
+    confirmation.sha256 === accountErasureLedgerSha256(expected) &&
     lowercaseSha256.test(confirmation.macSha256)
   );
 }
@@ -196,6 +264,7 @@ function exactLedgerConfirmation(
 async function confirmedLedgerInput(
   intent: AccountErasureIntent,
   ledger: AccountErasureLedgerSink,
+  timeoutMs = ACCOUNT_ERASURE_SINK_TIMEOUT_MS,
 ): Promise<{
   jobId: string;
   accountId: string;
@@ -210,7 +279,12 @@ async function confirmedLedgerInput(
     accountId: intent.accountId,
     acceptedAt: intent.acceptedAt,
   };
-  const evidence = await ledger.writeAndConfirm(record);
+  let evidence: AccountErasureLedgerConfirmation;
+  try {
+    evidence = await withSinkTimeout(timeoutMs, (signal) => ledger.writeAndConfirm(record, signal));
+  } catch {
+    throw new ApiError(503, 'erasure_ledger_unavailable', 'Account erasure ledger is unavailable');
+  }
   if (!exactLedgerConfirmation(record, evidence)) {
     throw new ApiError(503, 'erasure_ledger_mismatch', 'Account erasure ledger confirmation failed');
   }
@@ -233,7 +307,9 @@ function exactRecoveryManifestConfirmation(
     actual.jobId === expected.jobId &&
     actual.accountId === expected.accountId &&
     actual.inventorySha256 === expected.inventorySha256 &&
+    actual.manifestSha256 === accountErasureManifestSha256(expected) &&
     Number.isFinite(Date.parse(actual.confirmedAt)) &&
+    Date.parse(actual.confirmedAt) >= Date.parse(expected.inventoriedAt) &&
     lowercaseSha256.test(actual.ciphertextSha256) &&
     lowercaseSha256.test(actual.macSha256) &&
     Number.isSafeInteger(actual.keyVersion) &&
@@ -244,8 +320,21 @@ function exactRecoveryManifestConfirmation(
 async function confirmedRecoveryManifest(
   manifest: AccountErasureRecoveryManifest,
   sink: AccountErasureRecoveryManifestSink,
+  timeoutMs = ACCOUNT_ERASURE_SINK_TIMEOUT_MS,
 ): Promise<AccountErasureRecoveryManifestConfirmation> {
-  const confirmation = await sink.encryptWriteAndConfirm(manifest);
+  let confirmation: AccountErasureRecoveryManifestConfirmation;
+  try {
+    confirmation = await withSinkTimeout(
+      timeoutMs,
+      (signal) => sink.encryptWriteAndConfirm(manifest, signal),
+    );
+  } catch {
+    throw new ApiError(
+      503,
+      'erasure_recovery_manifest_unavailable',
+      'Account erasure recovery custody is unavailable',
+    );
+  }
   if (!exactRecoveryManifestConfirmation(manifest, confirmation)) {
     throw new ApiError(
       503,
@@ -254,6 +343,28 @@ async function confirmedRecoveryManifest(
     );
   }
   return confirmation;
+}
+
+async function withSinkTimeout<T>(
+  timeoutMs: number,
+  operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 120_000) {
+    throw new Error('Account erasure sink timeout must be between 1 second and 2 minutes');
+  }
+  const controller = new AbortController();
+  let rejectTimeout!: (error: Error) => void;
+  const timeout = new Promise<never>((_resolve, reject) => { rejectTimeout = reject; });
+  const timer = setTimeout(() => {
+    controller.abort();
+    rejectTimeout(new Error('account erasure sink timed out'));
+  }, timeoutMs);
+  timer.unref();
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -281,9 +392,20 @@ export async function requestAccountErasure(
   if (intent.accountId !== input.actorAccountId) {
     throw new ApiError(503, 'erasure_intent_mismatch', 'Account erasure intent did not match');
   }
-  const inventory = await store.sealUnclaimedAfterLedgerConfirmation(
-    await confirmedLedgerInput(intent, ledger),
-  );
+  let inventory: AccountErasureClaimResult;
+  try {
+    inventory = await store.sealUnclaimedAfterLedgerConfirmation(
+      await confirmedLedgerInput(intent, ledger),
+    );
+  } catch (error) {
+    // Tx1 is already durable and freezes new work. Canonical terminalizers may
+    // still need to converge provider/money state; the recovery loop owns that
+    // restart-safe continuation and the caller never has to resubmit deletion.
+    if (error instanceof ApiError && error.code === 'erasure_work_in_flight') {
+      return { jobId: intent.jobId, status: 'pending' };
+    }
+    throw error;
+  }
   if (inventory.status === 'stale') {
     throw new ApiError(409, 'erasure_recovery_claimed', 'Account erasure recovery is in progress');
   }
@@ -308,6 +430,8 @@ export interface AccountErasureRecoveryTickResult {
   retried: number;
   attention: number;
   stale: number;
+  wormOverdue: number;
+  targetOverdue: number;
 }
 
 /** Provider-free recovery for intents stranded before transaction 2. */
@@ -319,14 +443,27 @@ export class AccountErasureRecoveryWorker {
     private readonly ledger: AccountErasureLedgerSink,
     private readonly recoveryManifestSink: AccountErasureRecoveryManifestSink,
     private readonly batchSize = 25,
+    private readonly sinkTimeoutMs = ACCOUNT_ERASURE_SINK_TIMEOUT_MS,
   ) {
     if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 100) {
       throw new Error('Account erasure recovery batch size must be between 1 and 100');
     }
+    if (!Number.isSafeInteger(sinkTimeoutMs) || sinkTimeoutMs < 1_000 || sinkTimeoutMs > 120_000) {
+      throw new Error('Account erasure sink timeout must be between 1 second and 2 minutes');
+    }
+    if (
+      store.claimLeaseMs !== undefined &&
+      store.claimLeaseMs <= sinkTimeoutMs * 2 + 5_000
+    ) {
+      throw new Error('Account erasure claim lease must outlive both sink deadlines');
+    }
   }
 
   async tick(): Promise<AccountErasureRecoveryTickResult> {
-    if (this.running) return { claimed: 0, sealed: 0, retried: 0, attention: 0, stale: 0 };
+    if (this.running) return {
+      claimed: 0, sealed: 0, retried: 0, attention: 0, stale: 0,
+      wormOverdue: 0, targetOverdue: 0,
+    };
     this.running = true;
     const result: AccountErasureRecoveryTickResult = {
       claimed: 0,
@@ -334,12 +471,23 @@ export class AccountErasureRecoveryWorker {
       retried: 0,
       attention: 0,
       stale: 0,
+      wormOverdue: 0,
+      targetOverdue: 0,
     };
     try {
+      if (this.store.recoveryMetrics) {
+        const metrics = await this.store.recoveryMetrics();
+        result.wormOverdue = metrics.wormOverdue;
+        result.targetOverdue = metrics.targetOverdue;
+      }
       for (let index = 0; index < this.batchSize; index += 1) {
         const claim = await this.store.claimIntentForRecovery();
         if (!claim) break;
         result.claimed += 1;
+        if ('status' in claim) {
+          result.attention += 1;
+          continue;
+        }
         try {
           let inventory: AccountErasureSealedInventory | { jobId: string; status: 'stale' };
           if (claim.intent.state === 'manifest_pending') {
@@ -350,7 +498,7 @@ export class AccountErasureRecoveryWorker {
               recoveryManifest: claim.intent.recoveryManifest,
             };
           } else {
-            const confirmed = await confirmedLedgerInput(claim.intent, this.ledger);
+            const confirmed = await confirmedLedgerInput(claim.intent, this.ledger, this.sinkTimeoutMs);
             inventory = await this.store.sealClaimedAfterLedgerConfirmation({
               ...confirmed,
               claimToken: claim.claimToken,
@@ -364,6 +512,7 @@ export class AccountErasureRecoveryWorker {
           const manifestConfirmation = await confirmedRecoveryManifest(
             inventory.recoveryManifest,
             this.recoveryManifestSink,
+            this.sinkTimeoutMs,
           );
           const completed = await this.store.confirmClaimedRecoveryManifest({
             jobId: inventory.jobId,

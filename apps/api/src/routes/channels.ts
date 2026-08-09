@@ -6,6 +6,7 @@ import {
   InsufficientMannaError,
   resolveAgentByUsername,
   TurnCeilingError,
+  type DbHandle,
 } from '@eden3/core';
 import { channelConnections, db, pg, secretAccessAuditEvents } from '@eden3/db';
 import {
@@ -26,6 +27,7 @@ import {
   ChannelTurnMeteringService,
   ChannelDeliveryTerminalCompensatedError,
   ChannelExecutionMismatchError,
+  PostgresChannelTurnStore,
   type ChannelTurnUsage,
 } from '../services/channel-metering';
 import {
@@ -97,6 +99,7 @@ export interface ChannelsRoutesOptions {
   > &
     Partial<Pick<ChannelTurnMeteringService, 'refundStale'>>;
   runtimeToken?: string;
+  providerEvidenceDb?: DbHandle;
   xConnector?: Pick<XByoConnectorService, 'connect' | 'post' | 'revoke'>;
   telegramManager?: {
     username: string;
@@ -829,7 +832,10 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
   };
   const sessionSync =
     opts.sessionSync ?? new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault);
-  const turnMetering = opts.turnMetering ?? new ChannelTurnMeteringService();
+  const turnMetering = opts.turnMetering ?? new ChannelTurnMeteringService(
+    new PostgresChannelTurnStore(undefined, opts.providerEvidenceDb),
+    opts.providerEvidenceDb,
+  );
   const xConnector =
     opts.xConnector ??
     new XByoConnectorService(
@@ -953,17 +959,65 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const account = req.account!;
     const { id } = paramsSchema.parse(req.params);
     const body = xPostBodySchema.parse(req.body);
-    const rows = await pg<XConnectionRow[]>`
-      select ${X_CONNECTION_COLUMNS}
-      from channel_connections
-      where id = ${id} and channel = 'x'
-        and desired_state = 'active'
-        and account_id = ${account.accountId}
-      limit 1
-    `;
-    const row = rows[0];
+    const admitted = await pg.begin(async (tx) => {
+      await tx`select id from accounts where id=${account.accountId} and deleted=false for update`;
+      const active = await tx`select 1 from account_erasure_jobs
+        where account_id=${account.accountId} and state<>'succeeded' limit 1`;
+      if (active.length > 0) return null;
+      const rows = await tx<XConnectionRow[]>`
+        select ${X_CONNECTION_COLUMNS}
+        from channel_connections
+        where id = ${id} and channel = 'x'
+          and desired_state = 'active'
+          and account_id = ${account.accountId}
+        for update
+      `;
+      const row = rows[0];
+      if (!row) return { row: null, intentId: null };
+      const [intent] = await tx<{ id: string }[]>`
+        insert into channel_outbound_post_intents(account_id,connection_id)
+        values (${account.accountId},${row.id}) returning id`;
+      return { row, intentId: intent!.id };
+    });
+    if (admitted === null) {
+      return sendError(reply, 409, 'account_erasure_active', 'Account deletion is in progress');
+    }
+    const row = admitted.row;
     if (!row) return sendError(reply, 404, 'x_connection_not_found', 'X connection not found');
-    const result = await xConnector.post(xChannelSecretHandle(row), body.text);
+    const result = await pg.begin(async (tx) => {
+      const owners = await tx`select id from accounts where id=${account.accountId} and deleted=false for key share`;
+      if (owners.length !== 1) return null;
+      const active = await tx`select 1 from account_erasure_jobs
+        where account_id=${account.accountId} and state<>'succeeded' limit 1`;
+      if (active.length > 0) return null;
+      const live = await tx<XConnectionRow[]>`
+        select ${X_CONNECTION_COLUMNS} from channel_connections
+        where id=${row.id} and account_id=${account.accountId} and channel='x'
+          and desired_state='active' for update`;
+      if (!live[0]) return null;
+      const [started] = await tx<{ id: string }[]>`
+        update channel_outbound_post_intents set state='provider_started',updated_at=statement_timestamp()
+        where id=${admitted.intentId} and account_id=${account.accountId}
+          and connection_id=${row.id} and state='preparing' returning id`;
+      if (!started) return null;
+      const outcome = await xConnector.post(xChannelSecretHandle(live[0]), body.text);
+      if (outcome.ok) {
+        await tx`update channel_outbound_post_intents set state='succeeded',
+          provider_post_id=${outcome.value.id},updated_at=statement_timestamp()
+          where id=${admitted.intentId} and state='provider_started'`;
+      } else if (outcome.code !== 'provider_unavailable') {
+        await tx`update channel_outbound_post_intents set state='failed',
+          last_error_code=${outcome.code},updated_at=statement_timestamp()
+          where id=${admitted.intentId} and state='provider_started'`;
+      }
+      // A transport/provider-unavailable result has unknown external outcome.
+      // Keep the durable provider_started intent open so erasure cannot seal
+      // until an operator/provider reconciliation supplies exact post truth.
+      return outcome;
+    });
+    if (result === null) {
+      return sendError(reply, 409, 'account_erasure_active', 'Account deletion is in progress');
+    }
     if (!result.ok) {
       if (result.code === 'revoked') {
         await xConnector.revoke(xChannelSecretHandle(row));
@@ -2864,6 +2918,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
       const result = await turnMetering.reserve(body);
       return {
         ok: true,
+        providerAdmitted: true,
         turnId: result.turn.turnId,
         reservedManna: result.turn.reservedManna,
         balance: result.balance,

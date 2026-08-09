@@ -6,6 +6,13 @@ import { ZipArchive } from 'archiver';
 import type { FastifyPluginAsync } from 'fastify';
 
 import { ApiError } from '../errors';
+import {
+  accountErasureRequestSchema,
+  requestAccountErasure,
+  type AccountErasureIntentStore,
+  type AccountErasureLedgerSink,
+  type AccountErasureRecoveryManifestSink,
+} from '../services/account-erasure';
 
 /**
  * A complete, owner-scoped account export.
@@ -462,7 +469,36 @@ async function streamAccountArchive(archive: ZipArchive, accountId: string): Pro
   await archive.finalize();
 }
 
-export const accountRoutes: FastifyPluginAsync = async (app) => {
+export interface AccountRoutesOptions {
+  /** Omitted in production until both dedicated WORM custody boundaries exist. */
+  erasure?: {
+    store: AccountErasureIntentStore;
+    ledger: AccountErasureLedgerSink;
+    recoveryManifestSink: AccountErasureRecoveryManifestSink;
+  };
+}
+
+export const accountRoutes: FastifyPluginAsync<AccountRoutesOptions> = async (app, options) => {
+  app.delete('/', { preHandler: app.requireAuth, bodyLimit: 1_024 }, async (req, reply) => {
+    if (!options.erasure) {
+      throw new ApiError(503, 'account_erasure_unavailable', 'Account erasure is not configured');
+    }
+    const body = accountErasureRequestSchema.parse(req.body);
+    const account = req.account!;
+    const result = await requestAccountErasure(
+      {
+        actorAccountId: account.accountId,
+        actorUsername: account.username,
+        actorIsAdmin: account.isAdmin,
+        confirmUsername: body.confirmUsername,
+      },
+      options.erasure.store,
+      options.erasure.ledger,
+      options.erasure.recoveryManifestSink,
+    );
+    return reply.code(202).send(result);
+  });
+
   app.get('/export', { preHandler: app.requireAuth }, async (req, reply) => {
     const accountId = req.account!.accountId;
     const [account] = await pg<{ username: string }[]>`

@@ -46,6 +46,21 @@ describe('GET /health', () => {
     expect(body.versions.node).toBe(process.version);
     expect(body.versions.fastify).toMatch(/^5\./);
     expect(body.versions.api).toBeTruthy();
+    expect(res.json()).not.toHaveProperty('runtimeAttestation');
+  });
+
+  it('echoes a closed runtime attestation only when explicitly injected', async () => {
+    const runtimeAttestation = {
+      integrationHead: 'a'.repeat(40),
+      nonce: 'nonce_for_closed_e2e_1234',
+    };
+    const probe = await buildServer({ health: { runtimeAttestation } });
+    try {
+      expect((await probe.inject({ method: 'GET', url: '/health' })).json())
+        .toMatchObject({ runtimeAttestation });
+    } finally {
+      await probe.close();
+    }
   });
 
   it('fails closed when production requires a stale or unavailable schema', async () => {
@@ -168,10 +183,11 @@ describe('http hardening', () => {
   it('allows public media to render across the API and web origins', async () => {
     const mediaDir = await mkdtemp(path.join(tmpdir(), 'eden3-media-corp-'));
     const restoreMediaDir = withEnv('MEDIA_DIR', mediaDir);
-    await writeFile(path.join(mediaDir, 'fixture.txt'), 'fixture', 'utf8');
+    const canonicalFixture = `${'a'.repeat(64)}.txt`;
+    await writeFile(path.join(mediaDir, canonicalFixture), 'fixture', 'utf8');
     const probe = await buildServer();
     try {
-      const res = await probe.inject({ method: 'GET', url: '/media/fixture.txt' });
+      const res = await probe.inject({ method: 'GET', url: `/media/${canonicalFixture}` });
       expect(res.statusCode).toBe(200);
       expect(res.headers['cross-origin-resource-policy']).toBe('cross-origin');
       expect(res.headers['x-content-type-options']).toBe('nosniff');

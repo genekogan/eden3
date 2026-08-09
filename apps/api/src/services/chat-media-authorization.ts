@@ -19,6 +19,7 @@ import {
 } from '../routes/studio';
 import { plainSessionKey } from './turn-registry';
 import { STUDIO_RESERVATION_EVENT_TYPE } from './studio-reservations';
+import { recordErasureGenerationTerminalNoOutput } from './turn-authorization';
 
 export const CHAT_MEDIA_EVENT_TYPE = 'chat_media';
 export const CHAT_MEDIA_RESERVATION_TTL_MS = 60 * 60 * 1_000;
@@ -608,7 +609,7 @@ export async function compensateChatMedia(options: {
   now?: Date;
 }): Promise<'refunded' | 'refund_pending' | 'terminal'> {
   const dbc = options.db ?? db;
-  const marked = await dbc.transaction(async (tx) => {
+  const markCompensation = () => dbc.transaction(async (tx) => {
     const rows = (await tx.execute(sql`
       select status, metadata from usage_events
       where event_type = ${CHAT_MEDIA_EVENT_TYPE} and turn_id = ${options.authorizationId}
@@ -647,6 +648,17 @@ export async function compensateChatMedia(options: {
       );
     return metadata;
   });
+  let marked: Awaited<ReturnType<typeof markCompensation>>;
+  try {
+    marked = await markCompensation();
+  } catch (error) {
+    if (await recordErasureGenerationTerminalNoOutput(
+      options.authorizationId,
+      CHAT_MEDIA_EVENT_TYPE,
+      { db: dbc },
+    )) return 'refund_pending';
+    throw error;
+  }
   if (!marked) return 'terminal';
   try {
     return await dbc.transaction(async (tx) => {

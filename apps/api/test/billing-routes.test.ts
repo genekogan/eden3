@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 
 import { getBalance, resetEnvCache } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
@@ -29,7 +29,10 @@ const checkoutLineItems = new Map<string, Array<{ priceId: string; quantity: num
 const fakeStripeClient: StripeCheckoutClient = {
   async createCheckoutSession(params, secretKey) {
     checkoutCalls.push({ params: new URLSearchParams(params), secretKey });
-    return { id: `cs_test_${checkoutCalls.length}`, url: `https://checkout.stripe.test/${checkoutCalls.length}` };
+    return {
+      id: `cs_${marker}_${checkoutCalls.length}`,
+      url: `https://checkout.stripe.test/${checkoutCalls.length}`,
+    };
   },
   async retrieveCheckoutSessionLineItems(sessionId) {
     return checkoutLineItems.get(sessionId) ?? [];
@@ -89,6 +92,25 @@ async function ledgerRows(accountId: string) {
   `;
 }
 
+async function checkoutMetadata(
+  accountId: string,
+  kind: 'manna_topup' | 'subscription',
+  sessionId: string,
+  metadata: Record<string, string>,
+): Promise<Record<string, string>> {
+  const checkoutIntentId = randomUUID();
+  const requestHash = checkoutIntentId.replaceAll('-', '').repeat(2);
+  await pg`
+    insert into stripe_checkout_intents
+      (id,account_id,kind,state,request_key_sha256)
+    values (${checkoutIntentId},${accountId},${kind},'preparing',${requestHash})`;
+  await pg`update stripe_checkout_intents set state='provider_started'
+    where id=${checkoutIntentId} and state='preparing'`;
+  await pg`update stripe_checkout_intents set state='created',stripe_session_id=${sessionId}
+    where id=${checkoutIntentId} and state='provider_started'`;
+  return { ...metadata, checkoutIntentId };
+}
+
 beforeAll(async () => {
   for (const key of envKeys) originalEnv.set(key, process.env[key]);
   process.env.STRIPE_MODE = 'test';
@@ -130,9 +152,9 @@ describe('POST /billing/checkout', () => {
       payload: { kind: 'manna_topup' },
     });
 
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode, res.body).toBe(200);
     expect((res.json() as { session: { id: string; url: string } }).session).toMatchObject({
-      id: 'cs_test_1',
+      id: `cs_${marker}_1`,
       url: 'https://checkout.stripe.test/1',
     });
     const call = checkoutCalls.at(-1)!;
@@ -152,7 +174,7 @@ describe('POST /billing/checkout', () => {
       payload: { kind: 'subscription', tier: 'basic' },
     });
 
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode, res.body).toBe(200);
     const call = checkoutCalls.at(-1)!;
     expect(call.params.get('mode')).toBe('subscription');
     expect(call.params.get('line_items[0][price]')).toBe('price_basic');
@@ -233,17 +255,20 @@ describe('GET /billing/subscription', () => {
 
 describe('POST /billing/webhook', () => {
   it('credits checkout manna exactly once on signed checkout.session.completed replay', async () => {
-    checkoutLineItems.set(`${marker}_cs`, [{ priceId: 'price_topup', quantity: 1 }]);
+    const sessionId = `cs_${marker}_checkout`;
+    checkoutLineItems.set(sessionId, [{ priceId: 'price_topup', quantity: 1 }]);
     const event = {
       id: `${marker}_evt_checkout`,
       type: 'checkout.session.completed',
       data: {
         object: {
-          id: `${marker}_cs`,
+          id: sessionId,
           mode: 'payment',
           payment_status: 'paid',
           client_reference_id: userId,
-          metadata: { accountId: userId, kind: 'manna_topup', mannaAmount: '1234' },
+          metadata: await checkoutMetadata(userId, 'manna_topup', sessionId, {
+            accountId: userId, kind: 'manna_topup', mannaAmount: '1234',
+          }),
         },
       },
     };
@@ -262,14 +287,17 @@ describe('POST /billing/webhook', () => {
   });
 
   it('credits one checkout object once across concurrent distinct event ids and ignores amount metadata', async () => {
-    checkoutLineItems.set(`${marker}_cs_semantic`, [{ priceId: 'price_topup', quantity: 1 }]);
+    const sessionId = `cs_${marker}_semantic`;
+    checkoutLineItems.set(sessionId, [{ priceId: 'price_topup', quantity: 1 }]);
     const before = await getBalance(userId);
     const object = {
-      id: `${marker}_cs_semantic`,
+      id: sessionId,
       mode: 'payment',
       payment_status: 'paid',
       client_reference_id: userId,
-      metadata: { accountId: userId, kind: 'manna_topup', mannaAmount: '999999' },
+      metadata: await checkoutMetadata(userId, 'manna_topup', sessionId, {
+        accountId: userId, kind: 'manna_topup', mannaAmount: '999999',
+      }),
     };
     const responses = await Promise.all([
       postWebhook({ id: `${marker}_evt_semantic_a`, type: 'checkout.session.completed', data: { object } }),
@@ -288,7 +316,7 @@ describe('POST /billing/webhook', () => {
 
   it('durably binds a payment-only Stripe customer to one account across sessions', async () => {
     const customerId = `${marker}_cus_payment_only`;
-    for (const sessionId of [`${marker}_cs_customer_owner`, `${marker}_cs_customer_rebind`]) {
+    for (const sessionId of [`cs_${marker}_customer_owner`, `cs_${marker}_customer_rebind`]) {
       checkoutLineItems.set(sessionId, [{ priceId: 'price_topup', quantity: 1 }]);
     }
     const first = await postWebhook({
@@ -296,12 +324,14 @@ describe('POST /billing/webhook', () => {
       type: 'checkout.session.completed',
       data: {
         object: {
-          id: `${marker}_cs_customer_owner`,
+          id: `cs_${marker}_customer_owner`,
           mode: 'payment',
           payment_status: 'paid',
           customer: customerId,
           client_reference_id: userId,
-          metadata: { accountId: userId, kind: 'manna_topup' },
+          metadata: await checkoutMetadata(userId, 'manna_topup', `cs_${marker}_customer_owner`, {
+            accountId: userId, kind: 'manna_topup',
+          }),
         },
       },
     });
@@ -312,12 +342,14 @@ describe('POST /billing/webhook', () => {
       type: 'checkout.session.completed',
       data: {
         object: {
-          id: `${marker}_cs_customer_rebind`,
+          id: `cs_${marker}_customer_rebind`,
           mode: 'payment',
           payment_status: 'paid',
           customer: customerId,
           client_reference_id: otherUserId,
-          metadata: { accountId: otherUserId, kind: 'manna_topup' },
+          metadata: await checkoutMetadata(otherUserId, 'manna_topup', `cs_${marker}_customer_rebind`, {
+            accountId: otherUserId, kind: 'manna_topup',
+          }),
         },
       },
     });
@@ -333,11 +365,13 @@ describe('POST /billing/webhook', () => {
       type: 'checkout.session.completed',
       data: {
         object: {
-          id: `${marker}_cs_conflict`,
+          id: `cs_${marker}_conflict`,
           mode: 'payment',
           payment_status: 'paid',
           client_reference_id: otherUserId,
-          metadata: { accountId: userId, kind: 'manna_topup' },
+          metadata: await checkoutMetadata(userId, 'manna_topup', `cs_${marker}_conflict`, {
+            accountId: userId, kind: 'manna_topup',
+          }),
         },
       },
     });
@@ -348,7 +382,7 @@ describe('POST /billing/webhook', () => {
   });
 
   it('rejects a paid checkout whose authoritative line item is not the configured top-up price', async () => {
-    const sessionId = `${marker}_cs_wrong_price`;
+    const sessionId = `cs_${marker}_wrong_price`;
     checkoutLineItems.set(sessionId, [{ priceId: 'price_unrelated', quantity: 1 }]);
     const before = await getBalance(userId);
     const res = await postWebhook({
@@ -360,7 +394,9 @@ describe('POST /billing/webhook', () => {
           mode: 'payment',
           payment_status: 'paid',
           client_reference_id: userId,
-          metadata: { accountId: userId, kind: 'manna_topup' },
+          metadata: await checkoutMetadata(userId, 'manna_topup', sessionId, {
+            accountId: userId, kind: 'manna_topup',
+          }),
         },
       },
     });
@@ -376,7 +412,7 @@ describe('POST /billing/webhook', () => {
       { priceId: 'price_unrelated', quantity: 1 },
     ], 'additional line'],
   ] as const)('rejects top-up checkout with %s', async (lineItems, suffix) => {
-    const sessionId = `${marker}_cs_${suffix.replaceAll(' ', '_')}`;
+    const sessionId = `cs_${marker}_${suffix.replaceAll(' ', '_')}`;
     checkoutLineItems.set(sessionId, [...lineItems]);
     const before = await getBalance(userId);
     const res = await postWebhook({
@@ -389,7 +425,9 @@ describe('POST /billing/webhook', () => {
           payment_status: 'paid',
           customer: `${marker}_cus_topup_shape`,
           client_reference_id: userId,
-          metadata: { accountId: userId, kind: 'manna_topup' },
+          metadata: await checkoutMetadata(userId, 'manna_topup', sessionId, {
+            accountId: userId, kind: 'manna_topup',
+          }),
         },
       },
     });
@@ -400,17 +438,20 @@ describe('POST /billing/webhook', () => {
 
   it('leaves subscription checkout completion side-effect-free until an authoritative webhook arrives', async () => {
     const subscriptionId = `${marker}_sub_checkout_untrusted`;
+    const sessionId = `cs_${marker}_subscription`;
     const res = await postWebhook({
       id: `${marker}_evt_checkout_subscription`,
       type: 'checkout.session.completed',
       data: {
         object: {
-          id: `${marker}_cs_subscription`,
+          id: sessionId,
           mode: 'subscription',
           customer: `${marker}_cus_checkout_untrusted`,
           subscription: subscriptionId,
           client_reference_id: userId,
-          metadata: { accountId: userId, kind: 'subscription', tier: 'pro' },
+          metadata: await checkoutMetadata(userId, 'subscription', sessionId, {
+            accountId: userId, kind: 'subscription', tier: 'pro',
+          }),
         },
       },
     });
