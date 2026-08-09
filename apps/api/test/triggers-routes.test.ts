@@ -436,6 +436,109 @@ describe('POST /tasks', () => {
     }
   });
 
+  it('serializes API and agent-bridge creates under the same owner lock coordinates', async () => {
+    const { createPostgresTaskStore } = (await import(
+      new URL('../../../infra/agent-cron-bridge/server.mjs', import.meta.url).href
+    )) as {
+      createPostgresTaskStore: (
+        sql: typeof pg,
+        options: { maxScheduledTasksPerUser: number },
+      ) => {
+        create(
+          identity: { ownerId: string; agentAccountId: string },
+          input: {
+            name: string;
+            prompt: string;
+            schedule: unknown;
+            nextScheduledRun: Date;
+          },
+        ): Promise<unknown>;
+      };
+    };
+    const [before] = await pg<{ count: number }[]>`
+      select count(*)::int as count
+      from triggers
+      where user_id = ${userId}
+        and deleted = false
+    `;
+    const limit = (before?.count ?? 0) + 1;
+    const restore = withEnv('MAX_SCHEDULED_TASKS_PER_USER', String(limit));
+    const agentLock = await pg.reserve();
+    await agentLock`select pg_advisory_lock(hashtextextended(${agentId}::text, 84))`;
+    const beforeCalls = fakeCron.removals.length;
+    let settled = 0;
+    try {
+      const store = createPostgresTaskStore(pg, { maxScheduledTasksPerUser: limit });
+      const apiAttempt = app
+        .inject({
+          method: 'POST',
+          url: '/tasks',
+          headers: { cookie: devCookie(userId) },
+          payload: {
+            agentUsername,
+            name: `${marker} API bridge quota race`,
+            prompt: 'API contender',
+            schedule,
+          },
+        })
+        .finally(() => {
+          settled += 1;
+        });
+      const bridgeAttempt = store
+        .create(
+          { ownerId: userId, agentAccountId: agentId },
+          {
+            name: `${marker} bridge quota race`,
+            prompt: 'bridge contender',
+            schedule,
+            nextScheduledRun: new Date(Date.now() + 60_000),
+          },
+        )
+        .then(
+          () => ({ ok: true as const, code: null }),
+          (error: unknown) => ({
+            ok: false as const,
+            code:
+              typeof error === 'object' && error !== null && 'code' in error
+                ? String(error.code)
+                : null,
+          }),
+        )
+        .finally(() => {
+          settled += 1;
+        });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(settled).toBe(0);
+      await agentLock`select pg_advisory_unlock(hashtextextended(${agentId}::text, 84))`;
+
+      const [apiResponse, bridgeResult] = await Promise.all([apiAttempt, bridgeAttempt]);
+      expect(Number(apiResponse.statusCode === 201) + Number(bridgeResult.ok)).toBe(1);
+      if (apiResponse.statusCode !== 201) {
+        expect(apiResponse.statusCode).toBe(429);
+        expect((apiResponse.json() as { error: { code: string } }).error.code).toBe(
+          'task_quota_exceeded',
+        );
+      }
+      if (!bridgeResult.ok) expect(bridgeResult.code).toBe('task_quota_exceeded');
+
+      const [after] = await pg<{ count: number }[]>`
+        select count(*)::int as count
+        from triggers
+        where user_id = ${userId}
+          and deleted = false
+      `;
+      expect(after?.count).toBe(limit);
+      expect(fakeCron.removals).toHaveLength(
+        beforeCalls + Number(apiResponse.statusCode === 201),
+      );
+    } finally {
+      await agentLock`select pg_advisory_unlock(hashtextextended(${agentId}::text, 84))`;
+      agentLock.release();
+      restore();
+    }
+  });
+
   it('enforces the hard ten-enabled-task limit per agent', async () => {
     for (let index = 0; index < 10; index += 1) {
       await pg`

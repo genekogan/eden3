@@ -106,6 +106,7 @@ const patchBodySchema = z
 
 const idParamsSchema = z.object({ id: z.string().trim().min(1).max(200) });
 const runBodySchema = z.object({ requestId: z.string().uuid() }).strict();
+const TASK_OWNER_LOCK_SEED = 84;
 
 /**
  * Next fire instant for a schedule, with TaskScheduleError mapped onto the
@@ -282,7 +283,7 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     const rowId = await pg.begin(async (tx) => {
       await tx`select pg_advisory_xact_lock(hashtextextended(${
         `task-owner:${viewer.accountId}`
-      }::text, 84))`;
+      }::text, ${TASK_OWNER_LOCK_SEED}))`;
       const [quota] = await tx<{ count: number }[]>`
         select count(*)::int as count
         from triggers

@@ -14,7 +14,9 @@ describe('scheduled-task owner quota admission', () => {
       api.indexOf('const rowId = await pg.begin'),
       api.indexOf('const [row] = await db.select()', api.indexOf('const rowId = await pg.begin')),
     );
+    expect(api).toContain('const TASK_OWNER_LOCK_SEED = 84;');
     expect(apiCreate).toMatch(/task-owner:[\s\S]*where user_id[\s\S]*task_quota_exceeded/);
+    expect(apiCreate).toContain('}::text, ${TASK_OWNER_LOCK_SEED}))`');
     expect(apiCreate.indexOf('task-owner:')).toBeLessThan(
       apiCreate.indexOf('agentAccount.id}::text'),
     );
@@ -23,6 +25,8 @@ describe('scheduled-task owner quota admission', () => {
       bridge.indexOf('async create(identity, input)'),
       bridge.indexOf('async update(identity, id', bridge.indexOf('async create(identity, input)')),
     );
+    expect(bridge).toContain('export const TASK_OWNER_LOCK_SEED = 84;');
+    expect(bridge).toContain('}::text, ${TASK_OWNER_LOCK_SEED}))`');
     expect(bridgeCreate).toMatch(
       /lockOwner\(tx, identity\)[\s\S]*assertOwnerLimitAvailable\(tx, identity\)[\s\S]*lockAgent\(tx, identity\)/,
     );
