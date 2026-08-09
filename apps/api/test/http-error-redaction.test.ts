@@ -24,19 +24,38 @@ const SECRET_CODE = 'secret_token_value';
 const SECRET_ERRNO = 'ESECRET_TOKEN_VALUE';
 const SECRET_ERROR_NAME = 'SecretTokenError';
 
-const REVIEWED_BACKGROUND_THROWABLE_LOGS = new Set([
-  'server.ts:history-sync failed',
-  'server.ts:scheduled task side-error',
-  'server.ts:scheduled task recovery side-error',
-  'server.ts:turn-reservation reaper side-error',
-  'server.ts:studio-reservation reaper side-error',
-  'server.ts:chat-media reaper side-error',
-  'server.ts:memory dream side-error',
-  'server.ts:memory dream scheduler tick failed',
-  'server.ts:upload policy event tick failed',
-  'server.ts:multipart cleanup tick failed',
-  'routes/channels.ts:channel turn stale-refund sweep failed',
-]);
+const REVIEWED_BACKGROUND_THROWABLE_LOG_ANCHORS: string[] = [
+  "routes/channels.ts|app.log|channel turn stale-refund sweep failed|app.log.error({ err: error }, 'channel turn stale-refund sweep failed')",
+  "server.ts|app.log|chat-media reaper side-error|app.log.error({ err, context }, 'chat-media reaper side-error')",
+  "server.ts|app.log|history-sync failed|app.log.error({ err, sessionId }, 'history-sync failed')",
+  "server.ts|app.log|memory dream scheduler tick failed|app.log.error({ err }, 'memory dream scheduler tick failed')",
+  "server.ts|app.log|memory dream side-error|app.log.error({ err, context }, 'memory dream side-error')",
+  "server.ts|app.log|multipart cleanup tick failed|app.log.error({ err }, 'multipart cleanup tick failed')",
+  "server.ts|app.log|scheduled task recovery side-error|app.log.error({ err, context }, 'scheduled task recovery side-error')",
+  "server.ts|app.log|scheduled task side-error|app.log.error({ err, context }, 'scheduled task side-error')",
+  "server.ts|app.log|studio-reservation reaper side-error|app.log.error({ err, context }, 'studio-reservation reaper side-error')",
+  "server.ts|app.log|turn-reservation reaper side-error|app.log.error({ err, context }, 'turn-reservation reaper side-error')",
+  "server.ts|app.log|upload policy event tick failed|app.log.error({ err }, 'upload policy event tick failed')",
+  "services/account-erasure-runtime.ts|options.logger|account erasure tick failed|options.logger.error({ err: error }, 'account erasure tick failed')",
+  "services/agent-provisioning.ts|this.options.logger|agent provisioning attempt failed|this.options.logger?.error( { err: error, agentAccountId: claim.agentAccountId }, 'agent provisioning attempt failed', )",
+  "services/agent-provisioning.ts|this.options.logger|agent provisioning heartbeat failed|this.options.logger?.warn( { err: error, agentAccountId: claim.agentAccountId }, 'agent provisioning heartbeat failed', )",
+  "services/agent-provisioning.ts|this.options.logger|agent provisioning tick failed|this.options.logger?.error({ err: error }, 'agent provisioning tick failed')",
+  "services/agent-runtime-sync.ts|this.deps.logger|agent runtime sync tick failed|this.deps.logger?.error({ err: error }, 'agent runtime sync tick failed')",
+  'services/media-pipeline.ts|this.log|(dynamic)|this.log.error( `media-pipeline: rehome event publish failed for ${put.sha256}: ${String(err)}`, )',
+  'services/media-pipeline.ts|this.log|(dynamic)|this.log.error(`media-pipeline: event publish failed for ${put.sha256}: ${String(err)}`)',
+  "services/storage-runtime.ts|options.logger|(dynamic)|options.logger.error( { err: error, ...context }, context.terminal ? 'multipart upload cleanup exhausted retries' : 'multipart upload cleanup attempt failed', )",
+  "services/task-scheduler.ts|this.log|task-scheduler: legacy gateway cron cleanup failed|this.log?.warn({ err }, 'task-scheduler: legacy gateway cron cleanup failed')",
+  "services/task-scheduler.ts|this.log|task-scheduler: recovery tick failed|this.log?.error({ err }, 'task-scheduler: recovery tick failed')",
+  "services/task-scheduler.ts|this.log|task-scheduler: scheduled run failed|this.log?.error({ err, triggerId: row.id }, 'task-scheduler: scheduled run failed')",
+  "services/task-scheduler.ts|this.log|task-scheduler: tick failed|this.log?.error({ err }, 'task-scheduler: tick failed')",
+  'workers/media-watcher.ts|log|(dynamic)|log.error(`media-sighting: failed for ${sighting.path}: ${String(err)}`)',
+  'workers/media-watcher.ts|log|(dynamic)|log.warn(`media-sighting: Studio quarantine check failed closed: ${String(err)}`)',
+  'workers/media-watcher.ts|this.log|(dynamic)|this.log.error(`media-watcher: failed to handle ${filePath}: ${String(err)}`)',
+  'workers/media-watcher.ts|this.log|(dynamic)|this.log.error(`media-watcher: ingest failed for ${file.path}: ${String(err)}`)',
+  'workers/media-watcher.ts|this.log|(dynamic)|this.log.error(`media-watcher: watch error: ${String(err)}`)',
+  'workers/media-watcher.ts|this.log|(dynamic)|this.log.warn(`media-watcher: Studio quarantine check failed closed: ${String(err)}`)',
+  'workers/media-watcher.ts|this.log|(dynamic)|this.log.warn(`media-watcher: history-sync failed for ${filePath}: ${String(err)}`)',
+];
 
 async function typescriptFiles(root: string): Promise<string[]> {
   const entries = await readdir(root, { withFileTypes: true });
@@ -50,6 +69,41 @@ async function typescriptFiles(root: string): Promise<string[]> {
 
 function rawThrowableLoggerFindings(filePath: string, sourceText: string): string[] {
   const source = ts.createSourceFile(filePath, sourceText, ts.ScriptTarget.Latest, true);
+  const loggerAliases = new Set(['log', 'logger']);
+  const throwableNames = new Set(['cause', 'err', 'error', 'failure']);
+  const compact = (value: string) => value.replace(/\s+/g, ' ').trim();
+  const loggerLike = (node: ts.Expression): boolean => {
+    if (ts.isIdentifier(node)) return loggerAliases.has(node.text);
+    if (ts.isPropertyAccessExpression(node)) {
+      return node.name.text === 'log' || node.name.text === 'logger';
+    }
+    return false;
+  };
+  const collectAliases = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer
+    ) {
+      const initializer = node.initializer;
+      const childSource = ts.isCallExpression(initializer) &&
+        ts.isPropertyAccessExpression(initializer.expression) &&
+        initializer.expression.name.text === 'child'
+        ? initializer.expression.expression
+        : initializer;
+      if (loggerLike(childSource)) loggerAliases.add(node.name.text);
+    }
+    if (ts.isCatchClause(node) && node.variableDeclaration &&
+        ts.isIdentifier(node.variableDeclaration.name)) {
+      throwableNames.add(node.variableDeclaration.name.text);
+    }
+    if (ts.isParameter(node) && ts.isIdentifier(node.name) &&
+        /^(?:cause|err|error|failure)$/i.test(node.name.text)) {
+      throwableNames.add(node.name.text);
+    }
+    ts.forEachChild(node, collectAliases);
+  };
+  collectAliases(source);
   const findings: string[] = [];
   const visit = (node: ts.Node): void => {
     if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
@@ -57,20 +111,18 @@ function rawThrowableLoggerFindings(filePath: string, sourceText: string): strin
       const logger = node.expression.expression;
       if (
         (method === 'error' || method === 'warn') &&
-        ts.isPropertyAccessExpression(logger) &&
-        logger.name.text === 'log' &&
-        ts.isIdentifier(logger.expression) &&
-        ['app', 'req', 'request'].includes(logger.expression.text)
+        loggerLike(logger)
       ) {
         const messageArg = node.arguments.at(-1);
         const message = messageArg && ts.isStringLiteral(messageArg) ? messageArg.text : '(dynamic)';
         let unsafe = false;
         for (const argument of node.arguments) {
           const inspect = (candidate: ts.Node): void => {
-            if (
-              ts.isIdentifier(candidate) &&
-              ['err', 'error'].includes(candidate.text)
-            ) {
+            if (ts.isIdentifier(candidate) && throwableNames.has(candidate.text)) {
+              unsafe = true;
+            }
+            if (ts.isNewExpression(candidate) &&
+                ts.isIdentifier(candidate.expression) && candidate.expression.text === 'Error') {
               unsafe = true;
             }
             ts.forEachChild(candidate, inspect);
@@ -78,8 +130,12 @@ function rawThrowableLoggerFindings(filePath: string, sourceText: string): strin
           inspect(argument);
         }
         if (unsafe) {
-          const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
-          findings.push(`${filePath}:${line}:${message}`);
+          findings.push([
+            filePath,
+            compact(logger.getText(source)),
+            message,
+            compact(node.getText(source)),
+          ].join('|'));
         }
       }
     }
@@ -375,25 +431,46 @@ describe('HTTP 5xx disclosure boundary', () => {
     expect(JSON.stringify(calls)).not.toContain(SECRET_ERRNO);
   });
 
-  it('recursively inventories raw throwable logs and allows only reviewed background sites', async () => {
+  it('recursively anchors every raw throwable log to a reviewed background call', async () => {
     const apiSrc = path.resolve(import.meta.dirname, '../src');
-    const files = [
-      path.join(apiSrc, 'server.ts'),
-      ...await typescriptFiles(path.join(apiSrc, 'routes')),
-    ];
-    const unsafe: string[] = [];
+    const files = await typescriptFiles(apiSrc);
+    const raw: string[] = [];
     for (const file of files) {
       const relative = path.relative(apiSrc, file);
-      const findings = rawThrowableLoggerFindings(relative, await readFile(file, 'utf8'));
-      for (const finding of findings) {
-        const [sourceFile, _line, message] = finding.split(':');
-        if (!REVIEWED_BACKGROUND_THROWABLE_LOGS.has(`${sourceFile}:${message}`)) {
-          unsafe.push(finding);
-        }
-      }
+      raw.push(...rawThrowableLoggerFindings(relative, await readFile(file, 'utf8')));
     }
 
-    expect(unsafe).toEqual([]);
+    expect(raw.sort()).toEqual([...REVIEWED_BACKGROUND_THROWABLE_LOG_ANCHORS].sort());
+  });
+
+  it.each([
+    [
+      'logger alias',
+      `async function run(log) { try { await work(); } catch (failure) {
+        log.error({ err: failure }, 'aliased failure');
+      } }`,
+    ],
+    [
+      'service receiving a request logger',
+      `async function reconcile(deps) { try { await work(); } catch (cause) {
+        deps.logger.warn({ err: cause }, 'service failure');
+      } }`,
+    ],
+    [
+      'renamed throwable',
+      `try { work(); } catch (failure) { app.log.error({ failure }, 'renamed failure'); }`,
+    ],
+    [
+      'child logger',
+      `const child = req.log.child({ route: 'x' });
+       try { work(); } catch (cause) { child.warn({ cause }, 'child failure'); }`,
+    ],
+    [
+      'request-owned background-message laundering',
+      `try { work(); } catch (err) { req.log.error({ err }, 'history-sync failed'); }`,
+    ],
+  ])('detects raw throwable logging through a %s mutant', (_name, source) => {
+    expect(rawThrowableLoggerFindings('mutant.ts', source)).toHaveLength(1);
   });
 
   it('stores a stable Studio reversal reason instead of provider detail', async () => {

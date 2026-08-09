@@ -8,6 +8,7 @@ import {
   DEFAULT_AGENT_TOOL_GROUPS,
 } from '@eden3/shared';
 
+import { logSafeRequestWarning } from '../errors';
 import {
   defaultOpenclawDataDir,
   type ProvisionerLike,
@@ -216,10 +217,14 @@ export async function reconcileAgentRuntime(
           where account_id = ${claim.account_id}
             and runtime_sync_claim_token = ${claim.claimToken}::uuid
         `.catch((error) => {
-          deps.logger?.warn(
-            { err: error, accountId: claim.account_id },
-            'agent runtime sync heartbeat failed',
-          );
+          if (deps.logger) {
+            logSafeRequestWarning(
+              deps.logger,
+              error,
+              { accountId: claim.account_id },
+              'agent runtime sync heartbeat failed',
+            );
+          }
         }).finally(() => {
           heartbeatInFlight = false;
         });
@@ -289,10 +294,14 @@ export async function reconcileAgentRuntime(
         return { status: 'synced', version: claim.runtime_sync_version };
       } catch (error) {
         await failRuntimeSync(claim);
-        deps.logger?.warn(
-          { err: error, accountId: claim.account_id, version: claim.runtime_sync_version },
-          'agent runtime synchronization deferred for retry',
-        );
+        if (deps.logger) {
+          logSafeRequestWarning(
+            deps.logger,
+            error,
+            { accountId: claim.account_id, version: claim.runtime_sync_version },
+            'agent runtime synchronization deferred for retry',
+          );
+        }
         return {
           status: 'pending',
           version: claim.runtime_sync_version,
