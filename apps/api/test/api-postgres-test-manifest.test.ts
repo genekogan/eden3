@@ -10,6 +10,7 @@ import {
   postgresFileMatchingUnitSelector,
   unitSelectorMatchesPostgresFile,
 } from './fixtures/api-postgres-test-files';
+import { assertApiPostgresEvidenceFlag } from './fixtures/api-test-database-boundary';
 
 describe('API Postgres test manifest', () => {
   it('is sorted, unique, and points only to existing test files', () => {
@@ -27,10 +28,27 @@ describe('API Postgres test manifest', () => {
     const unit = (await import('../vitest.config')).default;
     const postgres = (await import('../vitest.postgres.config')).default;
     expect(postgres.test?.include).toEqual(API_POSTGRES_TEST_FILES);
-    const notification = (await import('../vitest.agent-provision-notification-pg.config')).default;
-    const e2eFixture = (await import('../vitest.e2e-scratch-fixture-pg.config')).default;
-    expect(notification.test?.include).toEqual([API_GATED_POSTGRES_TEST_FILES[0]]);
-    expect(e2eFixture.test?.include).toEqual([API_GATED_POSTGRES_TEST_FILES[1]]);
+    const priorNotification = process.env.EDEN3_AGENT_PROVISION_NOTIFICATION_PG;
+    const priorFixture = process.env.EDEN3_E2E_FIXTURE_PG;
+    try {
+      process.env.EDEN3_AGENT_PROVISION_NOTIFICATION_PG = '1';
+      process.env.EDEN3_E2E_FIXTURE_PG = '1';
+      const notification = (await import('../vitest.agent-provision-notification-pg.config')).default;
+      const e2eFixture = (await import('../vitest.e2e-scratch-fixture-pg.config')).default;
+      expect(notification.test?.include).toEqual([API_GATED_POSTGRES_TEST_FILES[0]]);
+      expect(e2eFixture.test?.include).toEqual([API_GATED_POSTGRES_TEST_FILES[1]]);
+    } finally {
+      if (priorNotification === undefined) {
+        delete process.env.EDEN3_AGENT_PROVISION_NOTIFICATION_PG;
+      } else {
+        process.env.EDEN3_AGENT_PROVISION_NOTIFICATION_PG = priorNotification;
+      }
+      if (priorFixture === undefined) {
+        delete process.env.EDEN3_E2E_FIXTURE_PG;
+      } else {
+        process.env.EDEN3_E2E_FIXTURE_PG = priorFixture;
+      }
+    }
     for (const file of API_ALL_POSTGRES_TEST_FILES) {
       expect(unit.test?.exclude, file).toContain(file);
     }
@@ -77,5 +95,45 @@ describe('API Postgres test manifest', () => {
       readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
     ) as { scripts?: Record<string, string> };
     expect(root.scripts?.['test:api-full']).toBe('pnpm --filter @eden3/api test:full');
+  });
+
+  it('fails closed on missing gated-proof flags instead of skipping test bodies', () => {
+    for (const flag of [
+      'EDEN3_AGENT_PROVISION_NOTIFICATION_PG',
+      'EDEN3_E2E_FIXTURE_PG',
+    ] as const) {
+      expect(() => assertApiPostgresEvidenceFlag({}, flag)).toThrow(
+        /explicit evidence flag/i,
+      );
+      expect(() => assertApiPostgresEvidenceFlag({ [flag]: '0' }, flag)).toThrow(
+        /explicit evidence flag/i,
+      );
+      expect(() => assertApiPostgresEvidenceFlag({ [flag]: '1' }, flag)).not.toThrow();
+    }
+
+    const notificationConfig = readFileSync(
+      new URL('../vitest.agent-provision-notification-pg.config.ts', import.meta.url),
+      'utf8',
+    );
+    const fixtureConfig = readFileSync(
+      new URL('../vitest.e2e-scratch-fixture-pg.config.ts', import.meta.url),
+      'utf8',
+    );
+    const notificationProof = readFileSync(
+      new URL('./agent-provisioning-notification-pg.test.ts', import.meta.url),
+      'utf8',
+    );
+    const fixtureProof = readFileSync(
+      new URL('./e2e-scratch-fixture-pg.test.ts', import.meta.url),
+      'utf8',
+    );
+    expect(notificationConfig).toContain(
+      "assertApiPostgresEvidenceFlag(process.env, 'EDEN3_AGENT_PROVISION_NOTIFICATION_PG')",
+    );
+    expect(fixtureConfig).toContain(
+      "assertApiPostgresEvidenceFlag(process.env, 'EDEN3_E2E_FIXTURE_PG')",
+    );
+    expect(notificationProof).not.toMatch(/describe\.skip|enabled\s*\?\s*describe/);
+    expect(fixtureProof).not.toMatch(/describe\.skip|enabled\s*\?\s*describe/);
   });
 });

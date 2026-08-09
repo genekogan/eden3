@@ -10,10 +10,7 @@ import {
   type E2EScratchFixtureRepository,
 } from '../src/testing/e2e-scratch-fixture';
 
-const enabled = process.env.EDEN3_E2E_FIXTURE_PG === '1';
-const integration = enabled ? describe : describe.skip;
-
-integration('isolated E2E scratch fixture (disposable Postgres)', () => {
+describe('isolated E2E scratch fixture (disposable Postgres)', () => {
   let app: FastifyInstance;
   let databaseName: string;
   let fixtureId: string;

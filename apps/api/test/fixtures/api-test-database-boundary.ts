@@ -8,6 +8,19 @@ const REFUSAL = 'API tests require a local disposable database';
 export const API_TEST_DATABASE_SENTINEL =
   'postgres://127.0.0.1:1/eden3_api_unit_unreachable';
 
+export type ApiPostgresEvidenceFlag =
+  | 'EDEN3_AGENT_PROVISION_NOTIFICATION_PG'
+  | 'EDEN3_E2E_FIXTURE_PG';
+
+export function assertApiPostgresEvidenceFlag(
+  environment: Record<string, string | undefined>,
+  flag: ApiPostgresEvidenceFlag,
+): void {
+  if (environment[flag] !== '1') {
+    throw new Error('API PostgreSQL proof requires its explicit evidence flag');
+  }
+}
+
 export function isApiVitestConfigName(name: string): boolean {
   return name.startsWith('vitest') && name.endsWith('.config.ts');
 }

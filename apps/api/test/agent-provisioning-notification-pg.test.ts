@@ -3,8 +3,6 @@ import { randomUUID } from 'node:crypto';
 import type { PgClient } from '@eden3/db';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-const enabled = process.env.EDEN3_AGENT_PROVISION_NOTIFICATION_PG === '1';
-const integration = enabled ? describe : describe.skip;
 let pg: PgClient;
 let EventsBus: typeof import('../src/events-bus').EventsBus;
 let AgentProvisioningWorker: typeof import('../src/services/agent-provisioning').AgentProvisioningWorker;
@@ -89,7 +87,7 @@ async function state(agentId: string, kind: string) {
   return row;
 }
 
-integration('agent provisioning notifications (disposable Postgres)', () => {
+describe('agent provisioning notifications (disposable Postgres)', () => {
   beforeAll(async () => {
     [{ pg }, { EventsBus }, { AgentProvisioningWorker }] = await Promise.all([
       import('@eden3/db'),
