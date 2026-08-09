@@ -1,3 +1,8 @@
+import {
+  databaseNameFromUrl,
+  hasLiteralPostgresEndpoint,
+} from '@eden3/core/database-url';
+
 export interface RuntimeAttestation {
   integrationHead: string;
   nonce: string;
@@ -14,13 +19,13 @@ export function runtimeAttestationFromEnvironment(
       !/^[A-Za-z0-9_-]{16,128}$/.test(nonce)) {
     throw new Error('closed runtime attestation inputs are invalid or incomplete');
   }
-  let databaseName = '';
-  try {
-    databaseName = new URL(environment.DATABASE_URL ?? '').pathname.replace(/^\//, '');
-  } catch {
-    throw new Error('closed runtime attestation requires a disposable database');
-  }
-  if (environment.NODE_ENV === 'production' || databaseName === 'eden3' || databaseName === 'eden3_stg' || !databaseName) {
+  const databaseName = databaseNameFromUrl(environment.DATABASE_URL ?? '');
+  if (
+    environment.NODE_ENV === 'production' ||
+    databaseName === null ||
+    !/^eden3_channel_client_[a-z0-9_]{8,48}$/.test(databaseName) ||
+    !hasLiteralPostgresEndpoint(environment.DATABASE_URL ?? '', '127.0.0.1', 5433)
+  ) {
     throw new Error('closed runtime attestation is forbidden for production or canonical databases');
   }
   return { integrationHead, nonce };

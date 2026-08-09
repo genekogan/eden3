@@ -58,13 +58,15 @@ const originalEnvironment = Object.fromEntries(
 );
 
 function setAttestationEnvironment(input: {
+  databaseUrl?: string;
   database?: string;
   head?: string;
   nodeEnv?: string;
   nonce?: string;
 }): void {
   for (const name of managedEnvironment) delete process.env[name];
-  process.env.DATABASE_URL = `postgres://localhost/${input.database ?? 'eden3_entrypoint_order_test'}`;
+  process.env.DATABASE_URL = input.databaseUrl ??
+    `postgres://127.0.0.1:5433/${input.database ?? 'eden3_channel_client_entrypoint_order'}`;
   process.env.NODE_ENV = input.nodeEnv ?? 'test';
   if (input.head !== undefined) process.env.EDEN3_E2E_INTEGRATION_HEAD = input.head;
   if (input.nonce !== undefined) process.env.EDEN3_E2E_RUNTIME_NONCE = input.nonce;
@@ -102,6 +104,26 @@ describe('API entrypoint runtime-attestation ordering', () => {
     ['production', {
       head: 'a'.repeat(40),
       nodeEnv: 'production',
+      nonce: 'valid_nonce_123456',
+    }],
+    ['localhost endpoint', {
+      databaseUrl: 'postgres://localhost:5433/eden3_channel_client_entrypoint_order',
+      head: 'a'.repeat(40),
+      nonce: 'valid_nonce_123456',
+    }],
+    ['remote endpoint', {
+      databaseUrl: 'postgres://remote.example:5433/eden3_channel_client_entrypoint_order',
+      head: 'a'.repeat(40),
+      nonce: 'valid_nonce_123456',
+    }],
+    ['default endpoint port', {
+      databaseUrl: 'postgres://127.0.0.1/eden3_channel_client_entrypoint_order',
+      head: 'a'.repeat(40),
+      nonce: 'valid_nonce_123456',
+    }],
+    ['canonical Postgres port', {
+      databaseUrl: 'postgres://127.0.0.1:5432/eden3_channel_client_entrypoint_order',
+      head: 'a'.repeat(40),
       nonce: 'valid_nonce_123456',
     }],
   ] as const)('rejects %s inputs before any mutating boot work', async (_name, environment) => {

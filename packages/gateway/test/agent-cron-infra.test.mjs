@@ -92,5 +92,19 @@ describe('metered self-cron infrastructure contract', () => {
     expect(() => databaseNameFromApiUrl('postgres://api@localhost:5433/a/b')).toThrow(
       /one safe logical database name/,
     );
+    for (const url of [
+      'postgres://api@localhost:5433/scratch/../eden3',
+      'postgres://api@localhost:5433/scratch/%2e%2e/eden3',
+      'postgres://api@localhost:5433/./eden3',
+      'postgres://api@localhost:5433/%65den3',
+    ]) {
+      expect(() => databaseNameFromApiUrl(url), url).toThrow(/one safe logical database name/);
+    }
+    expect(() =>
+      assertMatchingDatabaseSelection(
+        'postgres://sidecar@postgres:5432/scratch/../eden3',
+        'postgres://api@localhost:5433/eden3',
+      ),
+    ).toThrow(/does not match the API/);
   });
 });

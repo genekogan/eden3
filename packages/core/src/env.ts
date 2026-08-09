@@ -2,6 +2,8 @@ import path from 'node:path';
 
 import { z } from 'zod';
 
+import { databaseNameFromUrl } from './database-url';
+
 /**
  * Typed environment loader for eden3.
  *
@@ -30,17 +32,6 @@ const authProviderSchema = z
 
 /** Active closed-cohort signup grant from MVP.md (1,000 manna = $1 peg). */
 export const DEFAULT_CLERK_NEW_USER_SEED_MANNA = 100;
-
-function databaseNameFromUrl(raw: string): string | null {
-  try {
-    const parsed = new URL(raw);
-    if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') return null;
-    const name = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
-    return /^[A-Za-z0-9_-]+$/.test(name) ? name : null;
-  } catch {
-    return null;
-  }
-}
 
 export const envSchema = z.object({
   /** Postgres (docker, localhost:5433). */

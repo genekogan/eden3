@@ -75,6 +75,18 @@ describe('channel resolver infrastructure contract', () => {
         'postgres://api@localhost:5433/eden3_stg',
       ),
     ).toThrow(/does not match the API/);
+    expect(() =>
+      assertMatchingDatabaseSelection(
+        'postgres://sidecar@postgres:5432/scratch/%2e%2e/eden3',
+        'postgres://api@localhost:5433/eden3',
+      ),
+    ).toThrow(/does not match the API/);
+    expect(() =>
+      assertMatchingDatabaseSelection(
+        'postgres://sidecar@postgres:5432/%65den3',
+        'postgres://api@localhost:5433/eden3',
+      ),
+    ).toThrow(/does not match the API/);
   });
 
   it('keeps cold-boot health and host Postgres routing compatible with the hardened socket', async () => {

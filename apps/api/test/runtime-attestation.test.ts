@@ -6,7 +6,7 @@ describe('closed runtime attestation inputs', () => {
   const valid = {
     EDEN3_E2E_INTEGRATION_HEAD: 'b'.repeat(40),
     EDEN3_E2E_RUNTIME_NONCE: 'closed_e2e_nonce_12345',
-    DATABASE_URL: 'postgres://localhost/eden3_runtime_attestation_test',
+    DATABASE_URL: 'postgres://127.0.0.1:5433/eden3_channel_client_attestation',
     NODE_ENV: 'test',
   };
 
@@ -27,5 +27,21 @@ describe('closed runtime attestation inputs', () => {
       ...valid,
       DATABASE_URL: 'postgres://localhost/eden3',
     })).toThrow();
+    for (const databaseUrl of [
+      'postgres://localhost/other_noncanonical_database',
+      'postgres://localhost/scratch/../eden3_channel_client_attestation',
+      'postgres://localhost/scratch/%2e%2e/eden3_channel_client_attestation',
+      'postgres://localhost/%65den3_channel_client_attestation',
+      'postgres://localhost:5433/eden3_channel_client_attestation',
+      'postgres://remote.example:5433/eden3_channel_client_attestation',
+      'postgres://127.0.0.1/eden3_channel_client_attestation',
+      'postgres://127.0.0.1:5432/eden3_channel_client_attestation',
+      'postgres://127.0.0.1:5433/eden3_channel_client_attestation?host=remote.example',
+    ]) {
+      expect(() => runtimeAttestationFromEnvironment({
+        ...valid,
+        DATABASE_URL: databaseUrl,
+      }), databaseUrl).toThrow();
+    }
   });
 });
