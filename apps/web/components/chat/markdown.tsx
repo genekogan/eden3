@@ -7,10 +7,12 @@
  * so streamed model output stays inert.
  */
 
-import { memo } from "react";
+import React, { memo } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import type { Components } from "react-markdown";
+
+import { isAllowedMarkdownImageSource } from "./markdown-media-policy";
 
 const REMARK_PLUGINS = [remarkGfm];
 
@@ -29,9 +31,12 @@ const COMPONENTS: Components = {
   },
   img({ src, alt }) {
     if (typeof src !== "string" || src.length === 0) return null;
+    if (!isAllowedMarkdownImageSource(src)) {
+      return alt ? <span className="text-muted">{alt}</span> : null;
+    }
     return (
       // eslint-disable-next-line @next/next/no-img-element -- markdown media
-      // URLs render verbatim (legacy CDN or local /media), no optimizer.
+      // Policy-approved legacy CDN or exact local media capability, no optimizer.
       <img
         src={src}
         alt={alt ?? ""}
