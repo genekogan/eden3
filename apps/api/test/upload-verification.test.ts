@@ -135,6 +135,76 @@ function pdfWithCompressedObjects(): Buffer {
   ]);
 }
 
+function pdfWithCompressedObjectPayloads(payloadSizes: number[]): Buffer {
+  const streamObjectNumbers = payloadSizes.map((_, index) => 10 + index);
+  const payloadObjectNumbers = payloadSizes.map((_, index) => 20 + index);
+  const chunks: Buffer[] = [Buffer.from('%PDF-1.7\n', 'latin1')];
+  const streamOffsets = new Map<number, number>();
+  let length = chunks[0]!.length;
+
+  payloadSizes.forEach((payloadSize, index) => {
+    const objectNumbers = index === 0
+      ? [1, 2, payloadObjectNumbers[index]!]
+      : [payloadObjectNumbers[index]!];
+    const bodies = index === 0
+      ? [
+          '<< /Type /Catalog /Pages 2 0 R >>',
+          '<< /Type /Pages /Count 0 /Kids [] >>',
+          `<< /Padding (${'.'.repeat(payloadSize)}) >>`,
+        ]
+      : [`<< /Padding (${'.'.repeat(payloadSize)}) >>`];
+    let bodyOffset = 0;
+    const header = objectNumbers.map((objectNumber, bodyIndex) => {
+      const entry = `${objectNumber} ${bodyOffset}`;
+      bodyOffset += Buffer.byteLength(bodies[bodyIndex]!, 'latin1');
+      return entry;
+    }).join(' ') + ' ';
+    const decoded = Buffer.from(`${header}${bodies.join('')}`, 'latin1');
+    const compressed = deflateSync(decoded);
+    const streamObjectNumber = streamObjectNumbers[index]!;
+    streamOffsets.set(streamObjectNumber, length);
+    const prefix = Buffer.from(
+      `${streamObjectNumber} 0 obj\n<< /Type /ObjStm /N ${objectNumbers.length} /First ${Buffer.byteLength(header, 'latin1')} /Filter /FlateDecode /Length ${compressed.length} >>\nstream\n`,
+      'latin1',
+    );
+    const suffix = Buffer.from('\nendstream\nendobj\n', 'latin1');
+    chunks.push(prefix, compressed, suffix);
+    length += prefix.length + compressed.length + suffix.length;
+  });
+
+  const xrefOffset = length;
+  const xrefObjectNumber = 30;
+  const declaredSize = xrefObjectNumber + 1;
+  const records = Buffer.alloc(declaredSize * 7);
+  const entry = (objectNumber: number, type: number, field: number, third: number) => {
+    records[objectNumber * 7] = type;
+    records.writeUInt32BE(field, objectNumber * 7 + 1);
+    records.writeUInt16BE(third, objectNumber * 7 + 5);
+  };
+  entry(0, 0, 0, 65_535);
+  streamObjectNumbers.forEach((streamObjectNumber, index) => {
+    entry(streamObjectNumber, 1, streamOffsets.get(streamObjectNumber)!, 0);
+    if (index === 0) {
+      entry(1, 2, streamObjectNumber, 0);
+      entry(2, 2, streamObjectNumber, 1);
+      entry(payloadObjectNumbers[index]!, 2, streamObjectNumber, 2);
+    } else {
+      entry(payloadObjectNumbers[index]!, 2, streamObjectNumber, 0);
+    }
+  });
+  entry(xrefObjectNumber, 1, xrefOffset, 0);
+  const compressedXref = deflateSync(records);
+  return Buffer.concat([
+    ...chunks,
+    Buffer.from(
+      `${xrefObjectNumber} 0 obj\n<< /Type /XRef /Size ${declaredSize} /Root 1 0 R /W [1 4 2] /Filter /FlateDecode /Length ${compressedXref.length} >>\nstream\n`,
+      'latin1',
+    ),
+    compressedXref,
+    Buffer.from(`\nendstream\nendobj\nstartxref\n${xrefOffset}\n%%EOF\n`, 'latin1'),
+  ]);
+}
+
 function mp4(brand = 'isom'): Buffer {
   const box = (type: string, data: Buffer): Buffer => {
     const output = Buffer.alloc(8 + data.length);
@@ -326,6 +396,22 @@ describe('generic browser MIME verification (DEBT-019)', () => {
     ['encrypted PDF', Buffer.from(pdf().toString('latin1').replace('/Root 1 0 R', '/Root 1 0 R /Encrypt 9 0 R'), 'latin1')],
     ['incremental PDF', Buffer.from(pdf().toString('latin1').replace('/Root 1 0 R', '/Root 1 0 R /Prev 12'), 'latin1')],
   ])('keeps unsupported %s fail-closed', (_name, bytes) => {
+    expect(verifyUploadHeader(bytes, 'application/pdf').quarantineReason).toBe(
+      'truncated_or_malformed_content',
+    );
+  });
+
+  it('quarantines a compressed PDF object stream whose decoded size exceeds the file budget', () => {
+    const bytes = pdfWithCompressedObjectPayloads([2 * 1024 * 1024]);
+    expect(bytes.length).toBeLessThan(32 * 1024);
+    expect(verifyUploadHeader(bytes, 'application/pdf').quarantineReason).toBe(
+      'truncated_or_malformed_content',
+    );
+  });
+
+  it('shares one cumulative decode budget across distinct compressed PDF object streams', () => {
+    const bytes = pdfWithCompressedObjectPayloads([700 * 1024, 700 * 1024]);
+    expect(bytes.length).toBeLessThan(32 * 1024);
     expect(verifyUploadHeader(bytes, 'application/pdf').quarantineReason).toBe(
       'truncated_or_malformed_content',
     );
