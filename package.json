@@ -27,12 +27,14 @@
     "load:gateway:test": "node --test scripts/load-gateway.test.mjs",
     "load:web-api": "node scripts/load-web-api.mjs",
     "load:web-api:test": "node --test scripts/load-web-api.test.mjs",
+    "load:postgres-metrics": "pnpm --filter @eden3/api load:postgres-metrics",
     "test:service-exposure": "node --test infra/service-exposure.test.mjs",
     "tunnel:api": "bash scripts/tunnel.sh --api",
     "tunnel:web": "bash scripts/tunnel.sh --web",
     "tunnel:stop": "bash scripts/tunnel-stop.sh",
     "db:generate": "pnpm --filter @eden3/db generate",
-    "db:migrate": "pnpm --filter @eden3/db migrate"
+    "db:migrate": "pnpm --filter @eden3/db migrate",
+    "db:managed-preflight": "pnpm --filter @eden3/db managed:preflight"
   },
   "devDependencies": {
     "@playwright/test": "^1.53.2",

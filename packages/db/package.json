@@ -12,6 +12,7 @@
   "scripts": {
     "generate": "drizzle-kit generate",
     "migrate": "tsx src/migrate.ts",
+    "managed:preflight": "tsx src/managed-preflight-cli.ts",
     "studio": "drizzle-kit studio",
     "ping": "tsx src/ping.ts",
     "ready": "tsx src/ready.ts",
