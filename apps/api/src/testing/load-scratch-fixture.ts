@@ -49,6 +49,30 @@ export function parseLoadScratchDatabaseUrl(raw: string): {
   return { databaseName, url };
 }
 
+export function loadScratchRuntimeAttestation(environment: NodeJS.ProcessEnv): {
+  databaseName: string;
+  integrationHead: string;
+  nonce: string;
+} {
+  if (environment.NODE_ENV === 'production') {
+    throw new Error('load scratch runtime is forbidden in production');
+  }
+  const rawDatabaseUrl = environment.DATABASE_URL;
+  if (!rawDatabaseUrl) throw new Error('DATABASE_URL is required');
+  const { databaseName } = parseLoadScratchDatabaseUrl(rawDatabaseUrl);
+  const integrationHead = environment.EDEN3_E2E_INTEGRATION_HEAD;
+  const nonce = environment.EDEN3_E2E_RUNTIME_NONCE;
+  if (
+    !integrationHead ||
+    !/^[0-9a-f]{40}$/.test(integrationHead) ||
+    !nonce ||
+    !/^[A-Za-z0-9_-]{16,128}$/.test(nonce)
+  ) {
+    throw new Error('load scratch runtime attestation is invalid or incomplete');
+  }
+  return { databaseName, integrationHead, nonce };
+}
+
 function deterministicUuid(databaseName: string, index: number): string {
   const digest = createHash('sha256')
     .update('eden3:load-scratch-user:v1\0')

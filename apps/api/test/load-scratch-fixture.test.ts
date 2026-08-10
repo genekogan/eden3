@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  loadScratchRuntimeAttestation,
   loadScratchUsers,
   parseLoadScratchDatabaseUrl,
   seedLoadScratchUsers,
@@ -59,6 +60,25 @@ describe('disposable population load fixture', () => {
     expect(new Set(users.map((user) => user.id)).size).toBe(50);
     expect(loadScratchUsers('eden3_runtime_load_20260810_abcd')).toEqual(users);
     expect(() => loadScratchUsers('eden3_runtime_load_20260810_abcd', 51)).toThrow(/between 1 and 50/);
+  });
+
+  it('attests only a non-production load database and exact source identity', () => {
+    expect(loadScratchRuntimeAttestation({
+      DATABASE_URL: 'postgres://eden3@127.0.0.1:55450/eden3_runtime_load_20260810_abcd',
+      EDEN3_E2E_INTEGRATION_HEAD: 'a'.repeat(40),
+      EDEN3_E2E_RUNTIME_NONCE: 'load_20260810_abcd',
+      NODE_ENV: 'development',
+    })).toEqual({
+      databaseName: 'eden3_runtime_load_20260810_abcd',
+      integrationHead: 'a'.repeat(40),
+      nonce: 'load_20260810_abcd',
+    });
+    expect(() => loadScratchRuntimeAttestation({
+      DATABASE_URL: 'postgres://eden3@127.0.0.1:55450/eden3_runtime_load_20260810_abcd',
+      EDEN3_E2E_INTEGRATION_HEAD: 'a'.repeat(40),
+      EDEN3_E2E_RUNTIME_NONCE: 'load_20260810_abcd',
+      NODE_ENV: 'production',
+    })).toThrow(/forbidden in production/);
   });
 
   it('seeds users and manna accounts together and converges idempotently', async () => {
