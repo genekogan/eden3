@@ -19,6 +19,8 @@
     "typecheck": "pnpm -r typecheck",
     "etl": "pnpm --filter @eden3/etl etl",
     "etl:verify": "pnpm --filter @eden3/etl etl:verify",
+    "etl:reconcile:manna-x10": "pnpm --filter @eden3/etl reconcile:manna-x10",
+    "etl:reconcile:permalinks": "pnpm --filter @eden3/etl reconcile:permalinks",
     "etl:snapshot": "node scripts/create-etl-mongo-snapshot.mjs",
     "etl:parity": "bash scripts/etl-parity-db.sh",
     "eve:reconcile": "pnpm --filter @eden3/api eve:reconcile",
