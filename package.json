@@ -25,6 +25,8 @@
     "autonomy:smoke": "node scripts/autonomy-smoke.mjs",
     "load:gateway": "node scripts/load-gateway.mjs",
     "load:gateway:test": "node --test scripts/load-gateway.test.mjs",
+    "load:web-api": "node scripts/load-web-api.mjs",
+    "load:web-api:test": "node --test scripts/load-web-api.test.mjs",
     "test:service-exposure": "node --test infra/service-exposure.test.mjs",
     "tunnel:api": "bash scripts/tunnel.sh --api",
     "tunnel:web": "bash scripts/tunnel.sh --web",
