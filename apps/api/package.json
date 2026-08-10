@@ -7,6 +7,7 @@
     "dev": "tsx watch src/index.ts",
     "eve:reconcile": "tsx src/eve-reconcile.ts",
     "start": "tsx src/index.ts",
+    "load:postgres-metrics": "tsx src/testing/load-postgres-metrics-cli.ts",
     "test": "vitest run --passWithNoTests",
     "test:postgres": "vitest run --config vitest.postgres.config.ts",
     "test:agent-provision-notification-pg": "EDEN3_AGENT_PROVISION_NOTIFICATION_PG=1 vitest run --config vitest.agent-provision-notification-pg.config.ts",
