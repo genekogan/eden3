@@ -8,6 +8,7 @@ import type {
 } from '@eden3/shared';
 
 import type { EventsBus } from '../events-bus';
+import { pgToIso } from '../route-helpers';
 
 export const notificationChannel = (accountId: string): string => `account:${accountId}`;
 
@@ -18,19 +19,19 @@ export interface AppNotificationStore {
   dismiss(accountId: string, id: string): Promise<boolean>;
 }
 
-interface NotificationRow {
+export interface NotificationRow {
   id: string;
   kind: AppNotificationKind;
   target_path: string | null;
-  read_at: Date | null;
-  created_at: Date;
+  read_at: string | Date | null;
+  created_at: string | Date;
   source_id: string;
   source_type: 'agent';
   source_username: string;
   source_image: string | null;
 }
 
-function toDto(row: NotificationRow): AppNotificationDto {
+export function notificationRowToDto(row: NotificationRow): AppNotificationDto {
   return {
     id: row.id,
     kind: row.kind,
@@ -41,8 +42,8 @@ function toDto(row: NotificationRow): AppNotificationDto {
       userImage: row.source_image,
     },
     targetPath: row.target_path,
-    readAt: row.read_at?.toISOString() ?? null,
-    createdAt: row.created_at.toISOString(),
+    readAt: row.read_at === null ? null : pgToIso(row.read_at),
+    createdAt: pgToIso(row.created_at),
   };
 }
 
@@ -68,7 +69,7 @@ export class PostgresAppNotificationStore implements AppNotificationStore {
           and dismissed_at is null
       `,
     ]);
-    return { items: rows.map(toDto), unreadCount: Number(counts[0]?.unread_count ?? 0) };
+    return { items: rows.map(notificationRowToDto), unreadCount: Number(counts[0]?.unread_count ?? 0) };
   }
 
   async markRead(accountId: string, id: string): Promise<boolean> {
