@@ -26,6 +26,7 @@ import {
   SANDBOX_MEMORY_LIMIT,
   SANDBOX_NO_PROXY,
   SANDBOX_PIDS_LIMIT,
+  SANDBOX_USER,
   SANDBOX_PRUNE_IDLE_HOURS,
   SANDBOX_PRUNE_MAX_AGE_DAYS,
   SANDBOX_SHARED_ASSETS_CONTAINER_DIR,
@@ -384,6 +385,7 @@ describe('ensureBaseline', () => {
               memory: SANDBOX_MEMORY_LIMIT,
               memorySwap: SANDBOX_MEMORY_LIMIT,
               pidsLimit: SANDBOX_PIDS_LIMIT,
+              user: SANDBOX_USER,
               dangerouslyAllowExternalBindSources: true,
               env: {
                 HTTP_PROXY: SANDBOX_EGRESS_PROXY_URL,
@@ -718,6 +720,7 @@ describe('ensureBaseline', () => {
       memory: SANDBOX_MEMORY_LIMIT,
       memorySwap: SANDBOX_MEMORY_LIMIT,
       pidsLimit: SANDBOX_PIDS_LIMIT,
+      user: SANDBOX_USER,
       dangerouslyAllowExternalBindSources: true,
       binds: [
         `${resolveSandboxAssetsDir(dataDir)}:${SANDBOX_SHARED_ASSETS_CONTAINER_DIR}:ro`,
