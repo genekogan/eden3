@@ -9,7 +9,6 @@ import {
   SESSION_TITLE_MODEL,
   generateSessionTitle,
   normalizeSessionTitle,
-  provisionalSessionTitle,
   sessionTitlePrompt,
 } from '../src/services/session-title';
 
@@ -89,22 +88,19 @@ describe('asynchronous session titles', () => {
     );
     expect(normalizeSessionTitle('***')).toBeNull();
     expect(normalizeSessionTitle('rocket', ['rocket'])).toBeNull();
-    expect(provisionalSessionTitle('make a picture of a dog eating cheese')).toBe(
-      'A dog eating cheese',
-    );
     expect(sessionTitlePrompt('x'.repeat(5_000)).length).toBeLessThan(1_500);
   });
 
-  it('wires an immediate compact title then compare-and-set, never first-message copy', () => {
+  it('wires a null pending title then compare-and-set, never agent or first-message copy', () => {
     const source = readFileSync(resolve(import.meta.dirname, '../src/routes/chat.ts'), 'utf8');
     const createStart = source.indexOf('export async function createSession');
     const createEnd = source.indexOf('/** Resolve an existing session', createStart);
     const createSlice = source.slice(createStart, createEnd);
-    expect(createSlice).toContain('title: provisionalTitle');
-    expect(createSlice).toContain('provisionalSessionTitle(content)');
+    expect(createSlice).toContain('title: null');
+    expect(createSlice).not.toContain('provisionalSessionTitle');
     expect(createSlice).not.toContain('titleFromContent');
     expect(source).toContain('void generateSessionTitle({');
-    expect(source).toContain('${sessions.title} = ${target.session.title}');
+    expect(source).toContain('${sessions.title} is null');
     expect(source).toContain('forbiddenTitles: [target.agent.username]');
   });
 });

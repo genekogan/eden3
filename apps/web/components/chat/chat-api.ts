@@ -120,7 +120,7 @@ export function sessionAgents(
 export function sessionTitle(session: SessionDto | null | undefined): string {
   const title = session?.title?.trim();
   if (title) return title;
-  return "New conversation";
+  return "New Chat";
 }
 
 /** Best displayable error text for a thrown value. */

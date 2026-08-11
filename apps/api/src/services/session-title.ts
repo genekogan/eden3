@@ -8,29 +8,6 @@ const SESSION_TITLE_INPUT_CHARS = 1_200;
 const SESSION_TITLE_MAX_CHARS = 72;
 const SESSION_TITLE_MAX_WORDS = 7;
 
-/**
- * Give a new conversation an immediate useful label while Haiku writes the
- * better title asynchronously. This is a compact extract, not the old
- * first-message-equals-title behavior.
- */
-export function provisionalSessionTitle(firstMessage: string): string {
-  let title = firstMessage.replace(/\s+/g, ' ').trim();
-  title = title
-    .replace(
-      /^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:make|create|generate|draw)\s+(?:me\s+)?(?:an?\s+)?(?:picture|image|photo|illustration)\s+(?:of\s+)?/i,
-      '',
-    )
-    .replace(
-      /^(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+)?(?:make|create|generate|draw)\s+(?:me\s+)?/i,
-      '',
-    )
-    .replace(/^[\s:;,.!?-]+|[\s:;,.!?-]+$/g, '')
-    .trim();
-  if (!title) title = 'New conversation';
-  title = title.split(' ').slice(0, 6).join(' ');
-  return title.charAt(0).toUpperCase() + title.slice(1);
-}
-
 export interface SessionTitleCompat {
   chatTurn(params: ChatTurnParams): AsyncGenerator<GatewayTurnEvent, void, void>;
 }
@@ -86,8 +63,8 @@ export function normalizeSessionTitle(
 
 /**
  * Run a best-effort title turn in an isolated gateway session. Persistence is
- * compare-and-set against the provisional title so a human rename always
- * wins the race.
+ * compare-and-set against the still-null title so a human rename always wins
+ * the race.
  */
 export async function generateSessionTitle(input: GenerateSessionTitleInput): Promise<boolean> {
   const abort = new AbortController();

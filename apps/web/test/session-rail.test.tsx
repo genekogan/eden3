@@ -60,7 +60,21 @@ describe("agent-scoped conversation rail", () => {
   });
 
   it("never presents the selected agent name as an untitled conversation", () => {
-    expect(sessionTitle({ ...session, title: null })).toBe("New conversation");
+    expect(sessionTitle({ ...session, title: null })).toBe("New Chat");
+  });
+
+  it("shows animated progress while the generated title is pending", () => {
+    const html = renderToStaticMarkup(
+      <SessionRailItem
+        session={{ ...session, title: null }}
+        href="/agents/rocket/chats/1"
+        active
+        titlePending
+      />,
+    );
+    expect(html).toContain('aria-label="Generating conversation title"');
+    expect(html).toContain("animate-pulse");
+    expect(html).not.toContain(">rocket<");
   });
 
   it("wires the real share, rename, pin, archive, and soft-delete actions", () => {

@@ -37,7 +37,7 @@ import { projectAgentConcepts } from '../services/concepts';
 import { assertTurnAdmissible, runTurn, type TurnAgent, type TurnSink } from '../services/turns';
 import { canAccessSession } from './sessions';
 import { enqueueLazyMemoryDistillation } from '../services/memory-distillation';
-import { generateSessionTitle, provisionalSessionTitle } from '../services/session-title';
+import { generateSessionTitle } from '../services/session-title';
 
 /**
  * POST /sessions/:idOrNew/messages — the chat turn endpoint.
@@ -282,16 +282,16 @@ export async function createSession(
   const chattable = await ensureChattableAgent(viewer, resolved, gatewayGlue);
   const sessionId = randomUUID();
   const key = gatewaySessionKey(sessionId);
-  const provisionalTitle = provisionalSessionTitle(content);
   const session = await db.transaction(async (tx) => {
     const [row] = await tx
       .insert(sessions)
       .values({
         id: sessionId,
         ownerId: viewer.accountId,
-        // Render a concise label immediately; a cheap isolated Haiku job
-        // compare-and-swaps it with a better title after the turn begins.
-        title: provisionalTitle,
+        // Null is an explicit short-lived "title pending" state. The web
+        // renders New Chat / animated dots until the isolated Haiku title
+        // compare-and-swap completes.
+        title: null,
         sessionType: 'chat',
         gatewaySessionKey: key,
       })
@@ -472,7 +472,7 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
             const [updated] = await db
               .update(sessions)
               .set({ title, updatedAt: new Date() })
-              .where(sql`${sessions.id} = ${target.session.id} and ${sessions.title} = ${target.session.title} and ${sessions.deleted} = false`)
+              .where(sql`${sessions.id} = ${target.session.id} and ${sessions.title} is null and ${sessions.deleted} = false`)
               .returning({ id: sessions.id });
             return updated !== undefined;
           },

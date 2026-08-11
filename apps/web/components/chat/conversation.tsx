@@ -469,7 +469,7 @@ export function SessionConversation({
 
   const title = session
     ? sessionTitle(session)
-    : (primaryAgent?.username ?? "Conversation");
+    : "New Chat";
 
   const noticeNode: ReactNode = notice ? (
     <ComposerNotice tone="warn">

@@ -46,6 +46,24 @@ function RailSkeleton() {
   );
 }
 
+function PendingTitleDots() {
+  return (
+    <span
+      aria-label="Generating conversation title"
+      className="inline-flex h-4 items-center gap-1"
+    >
+      {[0, 1, 2].map((index) => (
+        <span
+          key={index}
+          aria-hidden
+          className="size-1 animate-pulse rounded-full bg-muted"
+          style={{ animationDelay: `${index * 180}ms` }}
+        />
+      ))}
+    </span>
+  );
+}
+
 function isChannelSession(session: SessionDto): boolean {
   return session.sessionType === "channel" || session.channelConnectionId !== null;
 }
@@ -62,6 +80,7 @@ export function SessionRailItem({
   href,
   active,
   archivedView = false,
+  titlePending = false,
   onChanged,
   onRemoved,
 }: {
@@ -69,6 +88,7 @@ export function SessionRailItem({
   href: string;
   active: boolean;
   archivedView?: boolean;
+  titlePending?: boolean;
   onChanged?: (session: SessionDto) => void;
   onRemoved?: () => void;
 }) {
@@ -137,7 +157,7 @@ export function SessionRailItem({
         <span className="flex min-w-0 items-center gap-1.5">
           {session.pinned ? <span aria-label="Pinned conversation" title="Pinned">⌖</span> : null}
           <span className="block min-w-0 truncate text-[13px] leading-snug">
-            {sessionTitle(session)}
+            {titlePending ? <PendingTitleDots /> : sessionTitle(session)}
           </span>
         </span>
         <span className="mt-0.5 block truncate text-[11px] text-faint">
@@ -368,7 +388,7 @@ export function SessionRail({
 
   // A new conversation is inserted before its tiny title turn finishes.
   // Re-read a bounded number of times so the generated title appears without
-  // a manual reload; failures stop quietly and retain the normal agent fallback.
+  // a manual reload; failures stop quietly and settle on New Chat.
   useEffect(() => {
     if (phase !== "ready") return;
     const pending = sessions.filter((session) => {
@@ -559,6 +579,10 @@ export function SessionRail({
                     href={`${basePath}/${session.id}`}
                     active={active}
                     archivedView={archivedView}
+                    titlePending={
+                      !session.title?.trim() &&
+                      (titlePolls.current.get(session.id) ?? 0) < 6
+                    }
                     onChanged={replaceSession}
                     onRemoved={() => removeSession(session)}
                   />
