@@ -53,6 +53,8 @@ describe('API managed PostgreSQL rehearsal boundary', () => {
     }
     expect(include).toContain('test/channels-routes.test.ts');
     expect(include).toContain('test/fg-econ-chat-media.test.ts');
+    expect(managedConfig.test?.fileParallelism).toBe(false);
+    expect(managedConfig.test?.testTimeout).toBeGreaterThanOrEqual(180_000);
   });
 
   it.each([

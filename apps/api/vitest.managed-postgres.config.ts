@@ -16,7 +16,9 @@ export default defineConfig({
     include: managedPostgresFiles,
     setupFiles: ['./test/setup-required-managed-postgres-boundary.ts'],
     fileParallelism: false,
-    testTimeout: 60_000,
+    // Remote TLS round trips make the longest multi-boundary money/channel
+    // cases legitimately exceed the local-floor timeout without hanging.
+    testTimeout: 180_000,
     hookTimeout: 120_000,
   },
 });
