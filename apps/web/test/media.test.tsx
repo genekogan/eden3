@@ -2,7 +2,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { MediaFull, isAudioMedia, isVideoMedia } from "../components/media";
-import { MessageRow } from "../components/chat/message-bubble";
+import { AttachmentLightbox, MessageRow } from "../components/chat/message-bubble";
 import type { MessageDto } from "../lib/types";
 
 describe("media rendering", () => {
@@ -71,6 +71,29 @@ describe("media rendering", () => {
     );
     expect(html).toContain('src="/media/dog.png"');
     expect(html).toContain("aspect-ratio:1024 / 768");
-    expect(html).toContain('/creations/00000000-0000-4000-8000-000000000004');
+    expect(html).toContain('aria-label="View attachment larger"');
+    expect(html).toContain("View larger");
+    expect(html).toContain('download="eden3-00000000-0000-4000-8000-000000000004.png"');
+    expect(html).not.toContain('/creations/00000000-0000-4000-8000-000000000004');
+  });
+
+  it("renders a focused media viewer with an in-place image and download action", () => {
+    const html = renderToStaticMarkup(
+      <AttachmentLightbox
+        attachment={{
+          url: "/media/dog.png",
+          mime: "image/png",
+          creationId: "00000000-0000-4000-8000-000000000004",
+          width: 1024,
+          height: 768,
+        }}
+        onClose={() => {}}
+      />,
+    );
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain('aria-modal="true"');
+    expect(html).toContain('src="/media/dog.png"');
+    expect(html).toContain('aria-label="Close media viewer"');
+    expect(html).toContain('download="eden3-00000000-0000-4000-8000-000000000004.png"');
   });
 });

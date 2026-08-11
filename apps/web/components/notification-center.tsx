@@ -122,7 +122,7 @@ export function NotificationCenter({
       {open ? (
         <section
           aria-label="Notifications"
-          className="absolute bottom-full right-0 z-[60] mb-2 w-[min(21rem,calc(100vw-1rem))] overflow-hidden rounded-xl border border-edge bg-raised shadow-xl shadow-black/30"
+          className="fixed bottom-14 left-2 z-[60] flex max-h-[calc(100vh-4rem)] w-[min(21rem,calc(100vw-1rem))] flex-col overflow-hidden rounded-xl border border-edge bg-raised shadow-xl shadow-black/30 sm:absolute sm:bottom-full sm:left-0 sm:mb-2"
         >
           <header className="flex items-center justify-between border-b border-edge px-3 py-2.5">
             <h2 className="text-sm font-medium">Notifications</h2>
@@ -139,7 +139,7 @@ export function NotificationCenter({
           {state.items.length === 0 ? (
             <p className="px-3 py-6 text-center text-sm text-faint">You’re all caught up.</p>
           ) : (
-            <ul className="max-h-80 overflow-y-auto p-1.5">
+            <ul className="min-h-0 overflow-y-auto p-1.5">
               {state.items.map((item) => (
                 <li
                   key={item.id}

@@ -14,15 +14,15 @@
  *   <InlineError />         failure row with retry affordance
  *
  * The media is the hero: attachments render large through MediaFull with a
- * quiet caption link to the creation permalink.
+ * quiet, discoverable viewer and download controls.
  */
 
 import Link from "next/link";
 import React from "react";
 import type { ReactNode } from "react";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AgentAvatar } from "@/components/agent-avatar";
-import { MediaFull } from "@/components/media";
+import { isAudioMedia, isVideoMedia, MediaFull } from "@/components/media";
 import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import type { AccountSummary, MessageAttachment, MessageDto } from "@/lib/types";
 import { Markdown } from "./markdown";
@@ -39,32 +39,180 @@ import type {
 // Shared bits
 // ---------------------------------------------------------------------------
 
+function attachmentDownloadName(attachment: MessageAttachment): string {
+  const pathname = attachment.url.split(/[?#]/, 1)[0] ?? "";
+  const basename = pathname.slice(pathname.lastIndexOf("/") + 1);
+  const extension = /^[a-zA-Z0-9._-]+$/.test(basename) && basename.includes(".")
+    ? basename.slice(basename.lastIndexOf("."))
+    : "";
+  return `eden3-${attachment.creationId ?? "media"}${extension}`;
+}
+
+function ExpandIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} aria-hidden className="size-3.5">
+      <path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} aria-hidden className="size-3.5">
+      <path d="M12 3v12m0 0 4-4m-4 4-4-4M4 19h16" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+export function AttachmentLightbox({
+  attachment,
+  onClose,
+}: {
+  attachment: MessageAttachment;
+  onClose: () => void;
+}) {
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const video = isVideoMedia(attachment.url, attachment.mime ?? null);
+  const audio = isAudioMedia(attachment.url, attachment.mime ?? null);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    closeButton.current?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="attachment-lightbox-title"
+      className="fixed inset-0 z-[120] flex flex-col bg-black/80 backdrop-blur-sm"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <header className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-4 text-white">
+        <h2 id="attachment-lightbox-title" className="text-sm font-medium">Generated media</h2>
+        <div className="flex items-center gap-1.5">
+          <a
+            href={attachment.url}
+            download={attachmentDownloadName(attachment)}
+            className="inline-flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-white/80 transition-colors hover:bg-white/10 hover:text-white"
+          >
+            <DownloadIcon />
+            Download
+          </a>
+          <button
+            ref={closeButton}
+            type="button"
+            aria-label="Close media viewer"
+            onClick={onClose}
+            className="rounded-lg p-2 text-white/80 transition-colors hover:bg-white/10 hover:text-white"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} aria-hidden className="size-5">
+              <path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
+      </header>
+      <section
+        className="flex min-h-0 flex-1 items-center justify-center p-4"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) onClose();
+        }}
+      >
+        {audio ? (
+          <audio src={attachment.url} controls autoPlay className="w-full max-w-2xl" />
+        ) : video ? (
+          <video
+            src={attachment.url}
+            controls
+            autoPlay
+            playsInline
+            className="max-h-full max-w-full rounded-xl shadow-2xl"
+          />
+        ) : (
+          // eslint-disable-next-line @next/next/no-img-element -- exact media URL is already policy-reviewed.
+          <img
+            src={attachment.url}
+            alt="Generated media"
+            className="max-h-full max-w-full rounded-xl object-contain shadow-2xl"
+          />
+        )}
+      </section>
+    </div>
+  );
+}
+
 function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
+  const [expanded, setExpanded] = useState<MessageAttachment | null>(null);
   if (attachments.length === 0) return null;
   return (
-    <div className="mt-2 flex flex-col gap-3">
-      {attachments.map((attachment, index) => (
-        <figure key={`${attachment.url}:${index}`} className="max-w-md">
-          <MediaFull
-            url={attachment.url}
-            mime={attachment.mime ?? null}
-            alt="attachment"
-            width={attachment.width ?? null}
-            height={attachment.height ?? null}
-          />
-          {attachment.creationId ? (
-            <figcaption className="mt-1.5 text-right">
-              <Link
-                href={`/creations/${attachment.creationId}`}
-                className="text-[11px] text-faint transition-colors hover:text-accent-soft"
-              >
-                open creation →
-              </Link>
-            </figcaption>
-          ) : null}
-        </figure>
-      ))}
-    </div>
+    <>
+      <div className="mt-2 flex flex-col gap-3">
+        {attachments.map((attachment, index) => {
+          const image = !isVideoMedia(attachment.url, attachment.mime ?? null) &&
+            !isAudioMedia(attachment.url, attachment.mime ?? null);
+          return (
+            <figure key={`${attachment.url}:${index}`} className="max-w-md">
+              {image ? (
+                <button
+                  type="button"
+                  aria-label="View attachment larger"
+                  onClick={() => setExpanded(attachment)}
+                  className="block w-full cursor-zoom-in rounded-xl text-left outline-none ring-accent/50 focus-visible:ring-2"
+                >
+                  <MediaFull
+                    url={attachment.url}
+                    mime={attachment.mime ?? null}
+                    alt="attachment"
+                    width={attachment.width ?? null}
+                    height={attachment.height ?? null}
+                  />
+                </button>
+              ) : (
+                <MediaFull
+                  url={attachment.url}
+                  mime={attachment.mime ?? null}
+                  alt="attachment"
+                  width={attachment.width ?? null}
+                  height={attachment.height ?? null}
+                />
+              )}
+              <figcaption className="mt-1.5 flex items-center justify-end gap-1 text-[11px] text-faint">
+                <button
+                  type="button"
+                  onClick={() => setExpanded(attachment)}
+                  className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 transition-colors hover:bg-foreground/[0.05] hover:text-accent-soft"
+                >
+                  <ExpandIcon />
+                  View larger
+                </button>
+                <a
+                  href={attachment.url}
+                  download={attachmentDownloadName(attachment)}
+                  className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 transition-colors hover:bg-foreground/[0.05] hover:text-accent-soft"
+                >
+                  <DownloadIcon />
+                  Download
+                </a>
+              </figcaption>
+            </figure>
+          );
+        })}
+      </div>
+      {expanded ? (
+        <AttachmentLightbox attachment={expanded} onClose={() => setExpanded(null)} />
+      ) : null}
+    </>
   );
 }
 
