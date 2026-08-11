@@ -122,7 +122,7 @@ export function NotificationCenter({
       {open ? (
         <section
           aria-label="Notifications"
-          className="absolute bottom-full left-0 z-[60] mb-2 w-[min(21rem,calc(100vw-1rem))] overflow-hidden rounded-xl border border-edge bg-raised shadow-xl shadow-black/30"
+          className="absolute bottom-full right-0 z-[60] mb-2 w-[min(21rem,calc(100vw-1rem))] overflow-hidden rounded-xl border border-edge bg-raised shadow-xl shadow-black/30"
         >
           <header className="flex items-center justify-between border-b border-edge px-3 py-2.5">
             <h2 className="text-sm font-medium">Notifications</h2>
