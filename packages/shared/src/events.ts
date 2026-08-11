@@ -11,7 +11,8 @@
  *
  * Lifecycle of a chat turn:
  *   turn.started -> token* -> turn.completed
- *                -> media.pending -> media.attached   (async, may land later)
+ *                -> media.pending -> media.attached | media.failed
+ *                                                     (async, may land later)
  *                -> manna.updated                     (after debits/refunds)
  *   error may replace/interrupt any of the above.
  */
@@ -80,6 +81,17 @@ export const mediaAttachedEventSchema = z.object({
 });
 export type MediaAttachedEvent = z.infer<typeof mediaAttachedEventSchema>;
 
+/** An admitted media tool failed before it produced an attributable file. */
+export const mediaFailedEventSchema = z.object({
+  type: z.literal('media.failed'),
+  sessionId: uuid,
+  /** Tool name matching the pending placeholder that should be retired. */
+  tool: z.string().min(1),
+  code: z.string().min(1),
+  message: z.string(),
+});
+export type MediaFailedEvent = z.infer<typeof mediaFailedEventSchema>;
+
 /** Balance changed (debit, media charge, or refund). */
 export const mannaUpdatedEventSchema = z.object({
   type: z.literal('manna.updated'),
@@ -122,6 +134,7 @@ export const sessionEventSchema = z.discriminatedUnion('type', [
   turnCompletedEventSchema,
   mediaPendingEventSchema,
   mediaAttachedEventSchema,
+  mediaFailedEventSchema,
   mannaUpdatedEventSchema,
   notificationCreatedEventSchema,
   notificationChangedEventSchema,
@@ -136,6 +149,7 @@ export const SESSION_EVENT_TYPES = [
   'turn.completed',
   'media.pending',
   'media.attached',
+  'media.failed',
   'manna.updated',
   'notification.created',
   'notification.changed',

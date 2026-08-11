@@ -1,4 +1,5 @@
 import { getEnv, type DbHandle } from '@eden3/core';
+import type { SessionEvent } from '@eden3/shared';
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
@@ -7,6 +8,7 @@ import { ApiError, logSafeRequestWarning } from '../errors';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
 import {
   canonicalChatMediaProviderArgs,
+  chatMediaAuthorizationEventContext,
   compensateChatMedia,
   isChatMediaTool,
   reserveChatMedia,
@@ -33,6 +35,45 @@ const failureSchema = z
 
 export interface MediaRuntimeRoutesOptions {
   providerEvidenceDb?: DbHandle;
+}
+
+type MediaEventBus = {
+  publish(sessionId: string, event: SessionEvent): number;
+};
+
+export function publishChatMediaPending(
+  bus: MediaEventBus,
+  authorization: { sessionId: string; tool: string },
+): boolean {
+  try {
+    bus.publish(authorization.sessionId, {
+      type: 'media.pending',
+      sessionId: authorization.sessionId,
+      tool: authorization.tool,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function publishChatMediaFailed(
+  bus: MediaEventBus,
+  context: { sessionId: string; tool: string },
+  code: string,
+): boolean {
+  try {
+    bus.publish(context.sessionId, {
+      type: 'media.failed',
+      sessionId: context.sessionId,
+      tool: context.tool,
+      code,
+      message: 'Media generation failed before producing output.',
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export const mediaRuntimeRoutes: FastifyPluginAsync<MediaRuntimeRoutesOptions> = async (app, opts) => {
@@ -79,6 +120,12 @@ export const mediaRuntimeRoutes: FastifyPluginAsync<MediaRuntimeRoutesOptions> =
           dailyCap: getEnv().DAILY_MANNA_SPEND_CAP_PER_USER,
           ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
         });
+        if (!publishChatMediaPending(app.eventsBus, authorization)) {
+          req.log.warn(
+            { sessionId: authorization.sessionId },
+            'chat media pending UI event could not be published',
+          );
+        }
         return {
           ok: true,
           authorizationOwner: 'chat' as const,
@@ -106,12 +153,34 @@ export const mediaRuntimeRoutes: FastifyPluginAsync<MediaRuntimeRoutesOptions> =
     async (req) => {
       const { authorizationId } = paramsSchema.parse(req.params);
       const body = failureSchema.parse(req.body ?? {});
+      let context: Awaited<ReturnType<typeof chatMediaAuthorizationEventContext>> = null;
+      try {
+        context = await chatMediaAuthorizationEventContext({
+          authorizationId,
+          ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
+        });
+      } catch (err) {
+        logSafeRequestWarning(
+          req.log,
+          err,
+          { authorizationId },
+          'chat media failure context lookup failed',
+        );
+      }
       const outcome = await compensateChatMedia({
         authorizationId,
         errorCode: body.errorCode,
         errorMessage: 'Media tool failed before producing an attributable artifact',
         ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
       });
+      if (context && outcome !== 'terminal') {
+        if (!publishChatMediaFailed(app.eventsBus, context, body.errorCode)) {
+          req.log.warn(
+            { sessionId: context.sessionId },
+            'chat media failure UI event could not be published',
+          );
+        }
+      }
       if (outcome === 'refund_pending') {
         throw new ApiError(503, 'media_refund_pending', 'Media refund is pending');
       }

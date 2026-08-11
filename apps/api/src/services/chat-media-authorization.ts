@@ -659,6 +659,24 @@ export async function hasPendingChatMediaAuthorization(options: {
   return rows.length === 1;
 }
 
+/** Safe session/tool coordinates for the UI lifecycle of one authorization. */
+export async function chatMediaAuthorizationEventContext(options: {
+  authorizationId: string;
+  db?: DbHandle;
+}): Promise<{ sessionId: string; tool: StudioToolName } | null> {
+  const rows = (await (options.db ?? db).execute(sql`
+    select session_id, metadata
+    from usage_events
+    where event_type = ${CHAT_MEDIA_EVENT_TYPE}
+      and turn_id = ${options.authorizationId}
+    limit 1
+  `)) as unknown as Array<{ session_id: string | null; metadata: unknown }>;
+  const row = rows[0];
+  if (!row?.session_id) return null;
+  const metadata = readMetadata(row.metadata);
+  return { sessionId: row.session_id, tool: metadata.tool };
+}
+
 export async function compensateChatMedia(options: {
   authorizationId: string;
   errorCode: string;

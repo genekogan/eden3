@@ -450,6 +450,12 @@ function appendShimmer(
   tool: string,
   at: string,
 ): ConversationState {
+  const alreadyPending = state.local.some(
+    (item) =>
+      item.kind === "media-pending" &&
+      (item.tool === tool || item.tool === "unknown" || tool === "unknown"),
+  );
+  if (alreadyPending) return state;
   shimmerSeq += 1;
   const item: MediaPendingItem = {
     kind: "media-pending",
@@ -458,6 +464,35 @@ function appendShimmer(
     at,
   };
   return { ...state, local: [...state.local, item] };
+}
+
+function applyMediaFailed(
+  state: ConversationState,
+  event: Extract<SessionEvent, { type: "media.failed" }>,
+  at: string,
+): ConversationState {
+  let retired = false;
+  const local = state.local.filter((item) => {
+    if (
+      !retired &&
+      item.kind === "media-pending" &&
+      (item.tool === event.tool || item.tool === "unknown")
+    ) {
+      retired = true;
+      return false;
+    }
+    return true;
+  });
+  return appendError(
+    local.length === state.local.length ? state : { ...state, local },
+    {
+      clientId: `error:media:${event.sessionId}:${event.tool}:${event.code}`,
+      code: event.code,
+      message: event.message,
+      retryContent: null,
+      at,
+    },
+  );
 }
 
 function appendError(
@@ -562,6 +597,8 @@ export function conversationReducer(
           return appendShimmer(state, event.tool, action.at);
         case "media.attached":
           return applyMediaAttached(state, event, action.at);
+        case "media.failed":
+          return applyMediaFailed(state, event, action.at);
         case "manna.updated":
           return state; // broadcast handled globally (sidebar badge)
         case "error": {
@@ -688,11 +725,14 @@ export function conversationReducer(
           );
         }
         case "media.pending":
-          // While our POST stream is live it delivers its own media.pending.
-          if (state.activeStreamId !== null) return state;
+          // The runtime authorization callback is the earliest authoritative
+          // signal and arrives on this channel even while our POST turn is
+          // live. appendShimmer dedupes the terminal stream fallback.
           return appendShimmer(state, event.tool, action.at);
         case "media.attached":
           return applyMediaAttached(state, event, action.at);
+        case "media.failed":
+          return applyMediaFailed(state, event, action.at);
         case "manna.updated":
           return state;
         case "error": {

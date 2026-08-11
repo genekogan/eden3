@@ -34,6 +34,13 @@ const fixtures: SessionEvent[] = [
   { type: 'turn.completed', turnId: ids.turn, messageId: ids.message },
   { type: 'media.pending', sessionId: ids.session, tool: 'image_generate' },
   {
+    type: 'media.failed',
+    sessionId: ids.session,
+    tool: 'image_generate',
+    code: 'media_tool_failed',
+    message: 'Image generation failed',
+  },
+  {
     type: 'media.attached',
     sessionId: ids.session,
     messageId: ids.message,

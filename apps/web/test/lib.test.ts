@@ -31,6 +31,13 @@ describe("lib/sse decode", () => {
       { type: "turn.completed", turnId: TURN_ID, messageId: SESSION_ID },
       { type: "media.pending", sessionId: SESSION_ID, tool: "image_generate" },
       {
+        type: "media.failed",
+        sessionId: SESSION_ID,
+        tool: "image_generate",
+        code: "media_tool_failed",
+        message: "Image generation failed",
+      },
+      {
         type: "media.attached",
         sessionId: SESSION_ID,
         messageId: TURN_ID,

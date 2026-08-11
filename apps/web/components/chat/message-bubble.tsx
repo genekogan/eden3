@@ -18,6 +18,7 @@
  */
 
 import Link from "next/link";
+import React from "react";
 import type { ReactNode } from "react";
 import { useCallback, useState } from "react";
 import { AgentAvatar } from "@/components/agent-avatar";
@@ -424,16 +425,32 @@ export function MediaPendingBubble({
   item: MediaPendingItem;
   sender: AccountSummary | null;
 }) {
+  const label =
+    item.tool === "image_generate"
+      ? "Creating your image"
+      : item.tool === "video_generate"
+        ? "Creating your video"
+        : item.tool === "music_generate"
+          ? "Creating your audio"
+          : "Creating media";
   return (
     <AgentRow sender={sender} showAvatar={false}>
-      <div className="w-64 max-w-full">
-        <div className="relative aspect-square animate-pulse overflow-hidden rounded-xl border border-edge/70 bg-foreground/[0.04]" />
+      <div
+        className="w-64 max-w-full"
+        role="status"
+        aria-live="polite"
+        aria-label={`${label}…`}
+      >
+        <div className="relative aspect-square overflow-hidden rounded-xl border border-edge/70 bg-foreground/[0.04]">
+          <div className="absolute inset-0 animate-pulse bg-gradient-to-br from-foreground/[0.02] via-foreground/[0.08] to-accent/[0.08]" />
+          <div className="absolute inset-x-8 bottom-8 top-8 animate-pulse rounded-lg border border-edge/60 bg-background/20" />
+        </div>
         <p className="mt-1.5 flex items-center gap-1.5 text-[11px] text-faint">
           <span className="relative flex size-1.5">
             <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent/60" />
             <span className="relative inline-flex size-1.5 rounded-full bg-accent" />
           </span>
-          creating with <span className="font-mono">{item.tool}</span>…
+          {label}…
         </p>
       </div>
     </AgentRow>

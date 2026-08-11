@@ -331,16 +331,25 @@ describe("media lifecycle", () => {
     ]);
   });
 
-  it("suppresses channel media.pending while a POST stream is active", () => {
+  it("shows authoritative channel media.pending during a POST stream and dedupes fallback", () => {
     const active = run([
       { type: "send", clientId: "c1", content: "make art", at: AT },
       {
         type: "channel/event",
-        event: { type: "media.pending", sessionId: SESSION_ID, tool: "x" },
+        event: {
+          type: "media.pending",
+          sessionId: SESSION_ID,
+          tool: "image_generate",
+        },
         at: AT,
       },
+      streamEvent("c1", {
+        type: "media.pending",
+        sessionId: SESSION_ID,
+        tool: "unknown",
+      }),
     ]);
-    expect(active.local.some((i) => i.kind === "media-pending")).toBe(false);
+    expect(active.local.filter((i) => i.kind === "media-pending")).toHaveLength(1);
 
     const idle = run([
       {
@@ -350,6 +359,39 @@ describe("media lifecycle", () => {
       },
     ]);
     expect(idle.local.some((i) => i.kind === "media-pending")).toBe(true);
+  });
+
+  it("retires a failed media placeholder and renders a bounded error", () => {
+    const state = run([
+      {
+        type: "channel/event",
+        event: {
+          type: "media.pending",
+          sessionId: SESSION_ID,
+          tool: "image_generate",
+        },
+        at: AT,
+      },
+      {
+        type: "channel/event",
+        event: {
+          type: "media.failed",
+          sessionId: SESSION_ID,
+          tool: "image_generate",
+          code: "media_tool_failed",
+          message: "Media generation failed before producing output.",
+        },
+        at: AT,
+      },
+    ]);
+    expect(state.local.some((i) => i.kind === "media-pending")).toBe(false);
+    expect(state.local).toContainEqual(
+      expect.objectContaining({
+        kind: "error",
+        code: "media_tool_failed",
+        message: "Media generation failed before producing output.",
+      }),
+    );
   });
 
   it("merges media.attached into a fetched server row when present", () => {
