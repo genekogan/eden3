@@ -396,6 +396,7 @@ describe('AgentProvisioner.provisionAgent', () => {
       routableTimeoutMs: 2_000,
       routablePollIntervalMs: 10,
       now: () => new Date('2026-07-03T00:00:00.000Z'),
+      prepareMemoryIndexTarget: async () => {},
     });
     await expect(provisioner.provisionAgent(PARAMS)).rejects.toThrow(
       /bootstrap suppression failed.*blank-slate ritual/s,
@@ -423,6 +424,7 @@ describe('AgentProvisioner.provisionAgent', () => {
       routableTimeoutMs: 2_000,
       routablePollIntervalMs: 10,
       now: () => new Date('2026-07-03T00:00:00.000Z'),
+      prepareMemoryIndexTarget: async () => {},
     });
 
     await expect(provisioner.provisionAgent(PARAMS)).rejects.toThrow(
@@ -723,6 +725,7 @@ describe('AgentProvisioner.updateAgentPersona', () => {
       routableTimeoutMs: 2_000,
       routablePollIntervalMs: 10,
       now: () => new Date('2026-07-03T00:00:00.000Z'),
+      prepareMemoryIndexTarget: async () => {},
     });
     await provisioner.provisionAgent(PARAMS);
     const workspaceDir = path.join(dataDir, 'workspace-banny');
