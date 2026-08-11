@@ -47,6 +47,8 @@ const fixtures: SessionEvent[] = [
     url: '/media/ab12cd.png',
     mime: 'image/png',
     creationId: ids.creation,
+    width: 1024,
+    height: 768,
   },
   { type: 'manna.updated', accountId: ids.account, balance: 42.5 },
   {

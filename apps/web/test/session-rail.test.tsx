@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
 import { SessionRailItem } from "../components/chat/session-rail";
+import { sessionTitle } from "../components/chat/chat-api";
 import type { SessionDto } from "../lib/types";
 
 const session: SessionDto = {
@@ -56,6 +57,10 @@ describe("agent-scoped conversation rail", () => {
     expect(source).not.toContain('from "@/components/agent-avatar"');
     expect(source).not.toContain("<AgentAvatar");
     expect(source).toContain("<SessionRailItem");
+  });
+
+  it("never presents the selected agent name as an untitled conversation", () => {
+    expect(sessionTitle({ ...session, title: null })).toBe("New conversation");
   });
 
   it("wires the real share, rename, pin, archive, and soft-delete actions", () => {

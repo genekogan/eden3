@@ -78,6 +78,9 @@ export const mediaAttachedEventSchema = z.object({
   url: z.string().min(1),
   mime: z.string().min(1),
   creationId: uuid,
+  /** Intrinsic dimensions let the chat reserve the correct box immediately. */
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
 });
 export type MediaAttachedEvent = z.infer<typeof mediaAttachedEventSchema>;
 

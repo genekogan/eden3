@@ -9,6 +9,7 @@ import {
   SESSION_TITLE_MODEL,
   generateSessionTitle,
   normalizeSessionTitle,
+  provisionalSessionTitle,
   sessionTitlePrompt,
 } from '../src/services/session-title';
 
@@ -37,7 +38,7 @@ describe('asynchronous session titles', () => {
       agentId: 'rocket',
       sessionId: '00000000-0000-4000-8000-000000000001',
       firstMessage: 'Can you make me a dramatic image of a rocket?',
-      persistIfUntitled: persist,
+      persistIfCurrent: persist,
     });
 
     expect(saved).toBe(true);
@@ -64,7 +65,7 @@ describe('asynchronous session titles', () => {
         agentId: 'agent',
         sessionId: '00000000-0000-4000-8000-000000000001',
         firstMessage: 'hello',
-        persistIfUntitled: persist,
+        persistIfCurrent: persist,
       }),
     ).resolves.toBe(false);
     expect(persist).toHaveBeenCalledTimes(1);
@@ -76,7 +77,7 @@ describe('asynchronous session titles', () => {
         agentId: 'agent',
         sessionId: '00000000-0000-4000-8000-000000000002',
         firstMessage: 'hello',
-        persistIfUntitled: never,
+        persistIfCurrent: never,
       }),
     ).resolves.toBe(false);
     expect(never).not.toHaveBeenCalled();
@@ -87,17 +88,23 @@ describe('asynchronous session titles', () => {
       'One two three four five six seven',
     );
     expect(normalizeSessionTitle('***')).toBeNull();
+    expect(normalizeSessionTitle('rocket', ['rocket'])).toBeNull();
+    expect(provisionalSessionTitle('make a picture of a dog eating cheese')).toBe(
+      'A dog eating cheese',
+    );
     expect(sessionTitlePrompt('x'.repeat(5_000)).length).toBeLessThan(1_500);
   });
 
-  it('wires new-session persistence as null then compare-and-set, never first-message copy', () => {
+  it('wires an immediate compact title then compare-and-set, never first-message copy', () => {
     const source = readFileSync(resolve(import.meta.dirname, '../src/routes/chat.ts'), 'utf8');
     const createStart = source.indexOf('export async function createSession');
     const createEnd = source.indexOf('/** Resolve an existing session', createStart);
     const createSlice = source.slice(createStart, createEnd);
-    expect(createSlice).toContain('title: null');
+    expect(createSlice).toContain('title: provisionalTitle');
+    expect(createSlice).toContain('provisionalSessionTitle(content)');
     expect(createSlice).not.toContain('titleFromContent');
     expect(source).toContain('void generateSessionTitle({');
-    expect(source).toContain('${sessions.title} is null');
+    expect(source).toContain('${sessions.title} = ${target.session.title}');
+    expect(source).toContain('forbiddenTitles: [target.agent.username]');
   });
 });

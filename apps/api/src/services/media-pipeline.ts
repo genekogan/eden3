@@ -372,6 +372,8 @@ export class MediaPipeline {
                 url: put.url,
                 mime: put.mime,
                 creationId: rehomeCreation.id,
+                ...(put.width !== undefined ? { width: put.width } : {}),
+                ...(put.height !== undefined ? { height: put.height } : {}),
               });
             });
           }
@@ -634,6 +636,8 @@ export class MediaPipeline {
           url: put.url,
           mime: put.mime,
           creationId: creation.id,
+          ...(put.width !== undefined ? { width: put.width } : {}),
+          ...(put.height !== undefined ? { height: put.height } : {}),
         });
         if (mediaAuthorization && billedAccountId) {
           ingestBus.publish(sessionId, {

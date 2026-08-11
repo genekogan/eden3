@@ -49,6 +49,8 @@ function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
             url={attachment.url}
             mime={attachment.mime ?? null}
             alt="attachment"
+            width={attachment.width ?? null}
+            height={attachment.height ?? null}
           />
           {attachment.creationId ? (
             <figcaption className="mt-1.5 text-right">

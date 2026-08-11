@@ -116,15 +116,11 @@ export function sessionAgents(
   return session?.agents ?? [];
 }
 
-/** "Session with <agents>" fallback title chain. */
+/** Untitled legacy sessions never masquerade as the selected agent. */
 export function sessionTitle(session: SessionDto | null | undefined): string {
   const title = session?.title?.trim();
   if (title) return title;
-  const agents = sessionAgents(session);
-  if (agents.length > 0) {
-    return agents.map((agent) => agent.username).join(", ");
-  }
-  return "Conversation";
+  return "New conversation";
 }
 
 /** Best displayable error text for a thrown value. */

@@ -228,6 +228,8 @@ export function MediaFull({
   mime,
   alt,
   blurhash,
+  width,
+  height,
   className,
   autoPlay = false,
 }: {
@@ -236,6 +238,8 @@ export function MediaFull({
   mime?: string | null;
   alt?: string;
   blurhash?: string | null;
+  width?: number | null;
+  height?: number | null;
   className?: string;
   /** Autoplay (muted) — for freshly attached chat media. */
   autoPlay?: boolean;
@@ -245,6 +249,8 @@ export function MediaFull({
     ...(mime !== undefined ? { mime } : {}),
     ...(alt !== undefined ? { alt } : {}),
     ...(blurhash !== undefined ? { blurhash } : {}),
+    ...(width !== undefined ? { width } : {}),
+    ...(height !== undefined ? { height } : {}),
   });
   const display = source.url ?? source.thumbnailUrl;
   const directMime = display === source.url ? source.mime : null;

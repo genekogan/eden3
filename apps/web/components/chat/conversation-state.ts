@@ -373,6 +373,8 @@ function applyMediaAttached(
     url: event.url,
     mime: event.mime,
     creationId: event.creationId,
+    ...(event.width !== undefined ? { width: event.width } : {}),
+    ...(event.height !== undefined ? { height: event.height } : {}),
   };
 
   // Prefer merging into the fetched server row — by message id, or by an
