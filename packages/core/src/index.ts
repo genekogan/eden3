@@ -9,5 +9,6 @@ export * from './auth';
 export * from './manna';
 export * from './metering';
 export * from './media-store';
+export * from './object-lifecycle-rehearsal';
 export * from './permalinks';
 export * from './session-key';

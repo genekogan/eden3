@@ -30,6 +30,7 @@
     "load:web-api": "node scripts/load-web-api.mjs",
     "load:web-api:test": "node --test scripts/load-web-api.test.mjs",
     "load:postgres-metrics": "pnpm --filter @eden3/api load:postgres-metrics",
+    "r2:object-lifecycle": "pnpm exec tsx scripts/r2-object-lifecycle-rehearsal.ts",
     "test:service-exposure": "node --test infra/service-exposure.test.mjs",
     "tunnel:api": "bash scripts/tunnel.sh --api",
     "tunnel:web": "bash scripts/tunnel.sh --web",

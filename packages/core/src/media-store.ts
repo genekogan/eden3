@@ -398,6 +398,8 @@ export interface ObjectBackend {
   put(input: ObjectPutInput): Promise<ObjectHead>;
   get(key: string): Promise<ObjectGetResult>;
   head(key: string): Promise<ObjectHead | null>;
+  /** Idempotently remove one exact immutable key. */
+  delete(key: string, signal?: AbortSignal): Promise<void>;
   createMultipart(input: MultipartCreateInput): Promise<MultipartUpload>;
   uploadPart(input: MultipartPartInput): Promise<MultipartPart>;
   listParts(input: MultipartAbortInput): Promise<MultipartPart[]>;
@@ -513,6 +515,21 @@ export class LocalObjectBackend implements ObjectBackend {
       if (isNodeError(error, 'ENOENT')) return null;
       throw error;
     }
+  }
+
+  async delete(key: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const target = this.resolveKey(key);
+    try {
+      const info = await lstat(target);
+      if (!info.isFile() || info.isSymbolicLink()) {
+        throw new Error('Object key is not a regular file');
+      }
+      await rm(target);
+    } catch (error) {
+      if (!isNodeError(error, 'ENOENT')) throw error;
+    }
+    signal?.throwIfAborted();
   }
 
   async createMultipart(input: MultipartCreateInput): Promise<MultipartUpload> {
@@ -799,6 +816,7 @@ export class R2ObjectBackend implements ObjectBackend {
       headers,
       ...(body ? { body } : {}),
       ...(signal ? { signal } : {}),
+      redirect: 'error',
     });
     if (!expected.includes(response.status)) {
       throw new Error(`R2 ${method} failed with status ${response.status}`);
@@ -864,6 +882,10 @@ export class R2ObjectBackend implements ObjectBackend {
       ...(response.headers.get('x-amz-meta-sha256') ? { sha256: response.headers.get('x-amz-meta-sha256')! } : {}),
       ...(response.headers.get('content-type') ? { contentType: normalizeMime(response.headers.get('content-type')!) } : {}),
     };
+  }
+
+  async delete(key: string, signal?: AbortSignal): Promise<void> {
+    await this.request('DELETE', key, [], undefined, {}, [204, 404], signal);
   }
 
   async createMultipart(input: MultipartCreateInput): Promise<MultipartUpload> {
