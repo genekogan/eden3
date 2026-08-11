@@ -8,13 +8,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isEndpointMissing, onMannaUpdate } from "@/lib/api";
 import type { SessionDto } from "@/lib/types";
-import { AgentAvatar } from "@/components/agent-avatar";
 import { formatRelativeTime } from "@/lib/format";
 import { Skeleton } from "@/components/skeleton";
-import { sessionAgents, sessionTitle } from "./chat-api";
+import { sessionTitle } from "./chat-api";
 
 function NewChatIcon() {
   return (
@@ -37,12 +36,9 @@ function RailSkeleton() {
   return (
     <div className="space-y-1 px-2" aria-hidden>
       {Array.from({ length: 6 }, (_, i) => (
-        <div key={i} className="flex items-center gap-2.5 rounded-lg px-2.5 py-2">
-          <Skeleton className="size-8 rounded-full" />
-          <div className="flex-1 space-y-1.5">
-            <Skeleton className="h-3 w-2/3" />
-            <Skeleton className="h-2.5 w-1/3" />
-          </div>
+        <div key={i} className="space-y-1.5 rounded-lg px-2.5 py-2">
+          <Skeleton className="h-3 w-2/3" />
+          <Skeleton className="h-2.5 w-1/3" />
         </div>
       ))}
     </div>
@@ -54,6 +50,52 @@ function isChannelSession(session: SessionDto): boolean {
 }
 
 type ChannelFilter = "all" | "direct" | "channels";
+
+/**
+ * One conversation row. The surrounding rail is already scoped to the
+ * selected agent, so repeating that same agent avatar on every row adds no
+ * information and steals space from the conversation title.
+ */
+export function SessionRailItem({
+  session,
+  href,
+  active,
+}: {
+  session: SessionDto;
+  href: string;
+  active: boolean;
+}) {
+  const when = session.lastMessageAt ?? session.updatedAt;
+
+  return (
+    <Link
+      href={href}
+      aria-current={active ? "page" : undefined}
+      className={`relative block rounded-lg px-3 py-2 transition-colors ${
+        active
+          ? "bg-foreground/[0.06] text-foreground"
+          : "text-muted hover:bg-foreground/[0.03] hover:text-foreground"
+      }`}
+    >
+      {active ? (
+        <span
+          aria-hidden
+          className="absolute inset-y-2 left-0 w-0.5 rounded-full bg-accent"
+        />
+      ) : null}
+      <span className="block truncate text-[13px] leading-snug">
+        {sessionTitle(session)}
+      </span>
+      <span className="mt-0.5 block truncate text-[11px] text-faint">
+        {isChannelSession(session) && session.platform
+          ? `${session.platform} · `
+          : ""}
+        {formatRelativeTime(when)}
+        {session.messageCount > 0 ? ` · ${session.messageCount} messages` : ""}
+      </span>
+    </Link>
+  );
+}
 
 export function SessionRail({
   className,
@@ -248,45 +290,13 @@ export function SessionRail({
           <ul className="space-y-0.5">
             {visibleSessions.map((session) => {
               const active = isActive(session);
-              const agents = sessionAgents(session);
-              const when = session.lastMessageAt ?? session.updatedAt;
               return (
                 <li key={session.id}>
-                  <Link
+                  <SessionRailItem
+                    session={session}
                     href={`${basePath}/${session.id}`}
-                    aria-current={active ? "page" : undefined}
-                    className={`relative flex items-center gap-2.5 rounded-lg px-2.5 py-2 transition-colors ${
-                      active
-                        ? "bg-foreground/[0.06] text-foreground"
-                        : "text-muted hover:bg-foreground/[0.03] hover:text-foreground"
-                    }`}
-                  >
-                    {active ? (
-                      <span
-                        aria-hidden
-                        className="absolute inset-y-2 left-0 w-0.5 rounded-full bg-accent"
-                      />
-                    ) : null}
-                    <AgentAvatar
-                      account={agents[0]}
-                      name={agents[0]?.username ?? sessionTitle(session)}
-                      size={30}
-                    />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[13px] leading-snug">
-                        {sessionTitle(session)}
-                      </span>
-                      <span className="mt-0.5 block truncate text-[11px] text-faint">
-                        {isChannelSession(session) && session.platform
-                          ? `${session.platform} · `
-                          : ""}
-                        {formatRelativeTime(when)}
-                        {session.messageCount > 0
-                          ? ` · ${session.messageCount} messages`
-                          : ""}
-                      </span>
-                    </span>
-                  </Link>
+                    active={active}
+                  />
                 </li>
               );
             })}
