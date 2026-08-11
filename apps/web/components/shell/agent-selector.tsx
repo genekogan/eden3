@@ -43,7 +43,7 @@ export function AgentSelector({ collapsed = false }: { collapsed?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const { username, agent, phase } = useSelectedAgent();
-  const { agents } = useMyAgents();
+  const { agents, phase: myAgentsPhase } = useMyAgents();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -175,8 +175,10 @@ export function AgentSelector({ collapsed = false }: { collapsed?: boolean }) {
             ) : null}
           </button>
           <div className="my-1 border-t border-edge" />
-          {agents === null ? (
+          {myAgentsPhase === "loading" ? (
             <p className="px-2.5 py-2 text-xs text-faint">Loading your agents…</p>
+          ) : myAgentsPhase === "error" || agents === null ? (
+            <p className="px-2.5 py-2 text-xs text-faint">Couldn’t load your agents.</p>
           ) : agents.length === 0 ? (
             <p className="px-2.5 py-2 text-xs text-faint">No agents of your own yet.</p>
           ) : (

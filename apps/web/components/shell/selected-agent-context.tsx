@@ -20,7 +20,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, onDevUserChange } from "@/lib/api";
+import { api, onAgentInventoryChange, onDevUserChange } from "@/lib/api";
 import type { AgentDto, DevUser } from "@/lib/types";
 import { clearLastAgent, getLastAgent, setLastAgent } from "@/lib/last-agent";
 
@@ -108,6 +108,16 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     return onDevUserChange((user) => {
       setViewer(user);
+      setMyAgentsPhase("loading");
+      setMyAgentsNonce((nonce) => nonce + 1);
+    });
+  }, []);
+
+  // Agent creation/import/profile/avatar mutations happen in several screens.
+  // One app-wide invalidation keeps this long-lived shell inventory coherent
+  // without coupling every mutation form back to the provider.
+  useEffect(() => {
+    return onAgentInventoryChange(() => {
       setMyAgentsPhase("loading");
       setMyAgentsNonce((nonce) => nonce + 1);
     });

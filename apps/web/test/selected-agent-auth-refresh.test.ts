@@ -8,11 +8,56 @@ describe("selected-agent authentication refresh", () => {
       new URL("../components/shell/selected-agent-context.tsx", import.meta.url),
       "utf8",
     );
-    expect(source).toContain('import { api, onDevUserChange } from "@/lib/api"');
+    expect(source).toContain(
+      'import { api, onAgentInventoryChange, onDevUserChange } from "@/lib/api"',
+    );
     expect(source).toMatch(
       /onDevUserChange\(\(user\) => \{\s*setViewer\(user\);\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,
     );
 
     expect(source.match(/onDevUserChange\(/g)).toHaveLength(1);
+  });
+
+  it("refreshes the owned-agent inventory after successful agent mutations", async () => {
+    const contextSource = await readFile(
+      new URL("../components/shell/selected-agent-context.tsx", import.meta.url),
+      "utf8",
+    );
+    const apiSource = await readFile(new URL("../lib/api.ts", import.meta.url), "utf8");
+    const selectorSource = await readFile(
+      new URL("../components/shell/agent-selector.tsx", import.meta.url),
+      "utf8",
+    );
+
+    expect(contextSource).toContain(
+      'import { api, onAgentInventoryChange, onDevUserChange } from "@/lib/api"',
+    );
+    expect(contextSource).toMatch(
+      /onAgentInventoryChange\(\(\) => \{\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,
+    );
+    expect(contextSource.match(/onAgentInventoryChange\(/g)).toHaveLength(1);
+
+    const agentsClient = apiSource.slice(
+      apiSource.indexOf("  agents: {"),
+      apiSource.indexOf("\n  feed: {"),
+    );
+    expect(agentsClient.match(/emitAgentInventoryChange\(\);/g)).toHaveLength(5);
+    for (const operation of [
+      "async create",
+      "async importBundle",
+      "async update",
+      "async uploadAvatar",
+      "async removeAvatar",
+    ]) {
+      expect(agentsClient).toContain(operation);
+    }
+
+    expect(selectorSource).toContain(
+      "const { agents, phase: myAgentsPhase } = useMyAgents();",
+    );
+    expect(selectorSource.indexOf('myAgentsPhase === "loading"')).toBeLessThan(
+      selectorSource.indexOf("agents.length === 0"),
+    );
+    expect(selectorSource).toContain("Couldn’t load your agents.");
   });
 });

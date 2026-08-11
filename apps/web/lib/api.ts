@@ -346,6 +346,25 @@ export function onDevUserChange(
 }
 
 // ---------------------------------------------------------------------------
+// Agent-inventory broadcast (create/import/profile/avatar -> shell selector)
+// ---------------------------------------------------------------------------
+
+export const AGENT_INVENTORY_EVENT = "eden3:agent-inventory.changed";
+
+/** Invalidate the shell's owned-agent inventory after a successful mutation. */
+export function emitAgentInventoryChange(): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new Event(AGENT_INVENTORY_EVENT));
+}
+
+/** Listen for owned-agent mutations; returns an unsubscribe function. */
+export function onAgentInventoryChange(listener: () => void): () => void {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener(AGENT_INVENTORY_EVENT, listener);
+  return () => window.removeEventListener(AGENT_INVENTORY_EVENT, listener);
+}
+
+// ---------------------------------------------------------------------------
 // Streaming
 // ---------------------------------------------------------------------------
 
@@ -673,7 +692,9 @@ export const api = {
 
     /** POST /api/agents */
     async create(input: AgentCreateInput): Promise<AgentDto> {
-      return unwrap<AgentDto>(await post<unknown>("/agents", input), "agent");
+      const agent = unwrap<AgentDto>(await post<unknown>("/agents", input), "agent");
+      emitAgentInventoryChange();
+      return agent;
     },
 
     /** GET /api/agents/:username/export -> portable JSON bundle. */
@@ -717,16 +738,20 @@ export const api = {
     },
 
     /** POST /api/agents/import -> create/provision from portable bundle. */
-    importBundle(input: AgentImportInput): Promise<AgentImportResult> {
-      return post<AgentImportResult>("/agents/import", input);
+    async importBundle(input: AgentImportInput): Promise<AgentImportResult> {
+      const result = await post<AgentImportResult>("/agents/import", input);
+      emitAgentInventoryChange();
+      return result;
     },
 
     /** PATCH /api/agents/:username */
     async update(username: string, patchBody: AgentUpdateInput): Promise<AgentDto> {
-      return unwrap<AgentDto>(
+      const agent = unwrap<AgentDto>(
         await patch<unknown>(`/agents/${enc(username)}`, patchBody),
         "agent",
       );
+      emitAgentInventoryChange();
+      return agent;
     },
 
     /** GET /api/agents/:username/workspace — owner/admin recursive file tree. */
@@ -777,18 +802,22 @@ export const api = {
       username: string,
       input: AgentAvatarUploadInput,
     ): Promise<AgentDto> {
-      return unwrap<AgentDto>(
+      const agent = unwrap<AgentDto>(
         await post<unknown>(`/agents/${enc(username)}/avatar`, input),
         "agent",
       );
+      emitAgentInventoryChange();
+      return agent;
     },
 
     /** DELETE /api/agents/:username/avatar — clears the avatar. */
     async removeAvatar(username: string): Promise<AgentDto> {
-      return unwrap<AgentDto>(
+      const agent = unwrap<AgentDto>(
         await apiFetch<unknown>(`/agents/${enc(username)}/avatar`, { method: "DELETE" }),
         "agent",
       );
+      emitAgentInventoryChange();
+      return agent;
     },
 
   },
