@@ -706,6 +706,8 @@ export interface R2ObjectBackendOptions {
   bucket: string;
   accessKeyId: string;
   secretAccessKey: string;
+  /** Short-lived AWS-compatible session token, when using scoped R2 temporary credentials. */
+  sessionToken?: string;
   /** R2 bucket placement must have been created with the EU jurisdiction. */
   jurisdiction?: 'eu';
   endpoint?: string;
@@ -721,6 +723,7 @@ export class R2ObjectBackend implements ObjectBackend {
   readonly jurisdiction = 'eu';
   private readonly accessKeyId: string;
   private readonly secretAccessKey: string;
+  private readonly sessionToken: string | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
   private readonly completingKeys = new Set<string>();
@@ -733,6 +736,12 @@ export class R2ObjectBackend implements ObjectBackend {
     }
     if (!options.accessKeyId.trim()) throw new Error('R2 access key id is required');
     if (!options.secretAccessKey.trim()) throw new Error('R2 secret access key is required');
+    if (
+      options.sessionToken !== undefined
+      && (!options.sessionToken || options.sessionToken !== options.sessionToken.trim())
+    ) {
+      throw new Error('R2 session token must not contain surrounding whitespace and must be non-empty when supplied');
+    }
     const endpoint = new URL(
       options.endpoint ?? `https://${options.accountId}.eu.r2.cloudflarestorage.com`,
     );
@@ -747,6 +756,7 @@ export class R2ObjectBackend implements ObjectBackend {
     this.bucket = options.bucket;
     this.accessKeyId = options.accessKeyId;
     this.secretAccessKey = options.secretAccessKey;
+    this.sessionToken = options.sessionToken;
     this.fetchImpl = options.fetch ?? fetch;
     this.now = options.now ?? (() => new Date());
   }
@@ -787,6 +797,7 @@ export class R2ObjectBackend implements ObjectBackend {
       'x-amz-content-sha256': payloadHash,
       'x-amz-date': amzDate,
       ...Object.fromEntries(Object.entries(extraHeaders).map(([name, value]) => [name.toLowerCase(), value])),
+      ...(this.sessionToken ? { 'x-amz-security-token': this.sessionToken } : {}),
     };
     const signedNames = Object.keys(headers).sort();
     const canonicalHeaders = signedNames.map((name) => `${name}:${headers[name]!.trim()}\n`).join('');
@@ -981,6 +992,7 @@ export class R2ObjectBackend implements ObjectBackend {
       ['X-Amz-Date', amzDate],
       ['X-Amz-Expires', String(expires)],
       ['X-Amz-SignedHeaders', signedHeaders.join(';')],
+      ...(this.sessionToken ? [['X-Amz-Security-Token', this.sessionToken] as [string, string]] : []),
       ['partNumber', String(input.partNumber)],
       ['uploadId', input.uploadId],
     ];
