@@ -17,6 +17,7 @@ import { ButtonSpinner, primaryButtonClass, quietButtonClass } from "@/component
 import { Toast } from "@/components/agents/toast";
 import { Skeleton } from "@/components/skeleton";
 import { formatRelativeTime } from "@/lib/format";
+import { useSettingsUnsavedChanges } from "./unsaved-changes";
 
 const SOUL_PATH = "SOUL.md";
 
@@ -83,24 +84,25 @@ export function PersonaEditor({ username }: { username: string }) {
     void load();
   }, [load]);
 
-  const save = async () => {
-    if (state.kind !== "ready" || saving) return;
+  const save = async (): Promise<boolean> => {
+    if (state.kind !== "ready" || saving) return false;
+    const snapshot = state;
     setSaving(true);
     setDoctrineError(null);
     setActionError(null);
     try {
       const { file } = await api.agents.workspaceSave(username, {
         path: SOUL_PATH,
-        content: state.draft,
-        baseSha256: state.baseSha256,
-        baseRevision: state.doctrineRevision,
+        content: snapshot.draft,
+        baseSha256: snapshot.baseSha256,
+        baseRevision: snapshot.doctrineRevision,
       });
       if (file.doctrineRevision === undefined || file.doctrineSyncState === undefined) {
         throw new Error("SOUL.md saved but revision confirmation was unavailable; reload the page.");
       }
       setState({
-        ...state,
-        loadedContent: state.draft,
+        ...snapshot,
+        loadedContent: snapshot.draft,
         baseSha256: file.sha256,
         doctrineRevision: file.doctrineRevision,
         doctrineSyncState: file.doctrineSyncState,
@@ -108,6 +110,7 @@ export function PersonaEditor({ username }: { username: string }) {
       });
       setConflict(null);
       setToast("Saved — the soul shapes the very next message.");
+      return true;
     } catch (error) {
       if (error instanceof ApiError && error.status === 409) {
         const body = (error.body ?? {}) as Partial<WorkspaceWriteConflict> & {
@@ -127,10 +130,29 @@ export function PersonaEditor({ username }: { username: string }) {
       } else {
         setActionError(describeApiFailure(error));
       }
+      return false;
     } finally {
       setSaving(false);
     }
   };
+
+  const dirty = state.kind === "ready" && state.draft !== state.loadedContent;
+
+  const discardChanges = () => {
+    if (state.kind !== "ready") return;
+    setState({ ...state, draft: state.loadedContent });
+    setConflict(null);
+    setDoctrineError(null);
+    setActionError(null);
+  };
+
+  useSettingsUnsavedChanges({
+    label: "this agent’s persona",
+    dirty,
+    saving,
+    save,
+    discard: discardChanges,
+  });
 
   const keepEditing = () => {
     if (state.kind !== "ready" || conflict === null) return;
@@ -165,7 +187,6 @@ export function PersonaEditor({ username }: { username: string }) {
     );
   }
 
-  const dirty = state.draft !== state.loadedContent;
   const needsSync = state.doctrineSyncState === "conflict";
 
   return (
@@ -230,7 +251,7 @@ export function PersonaEditor({ username }: { username: string }) {
         </p>
       ) : null}
 
-      <div className="flex items-center justify-between gap-2.5 border-t border-edge pt-4">
+      <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-edge pt-4">
         <p role="status" className={conflict ? "text-xs text-warning-soft" : "text-xs text-faint"}>
           {conflict
             ? "Conflict — choose which version to keep"
@@ -242,15 +263,25 @@ export function PersonaEditor({ username }: { username: string }) {
                   ? "Conflict — file and Settings bytes differ"
                   : "Synced with Workspace"}
         </p>
-        <button
-          type="button"
-          onClick={() => void save()}
-          disabled={saving || (!dirty && !needsSync) || conflict !== null}
-          className={primaryButtonClass}
-        >
-          {saving ? <ButtonSpinner /> : null}
-          {saving ? "Saving…" : needsSync && !dirty ? "Use file in Settings" : "Save SOUL.md"}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={discardChanges}
+            disabled={saving || !dirty}
+            className={quietButtonClass}
+          >
+            Discard changes
+          </button>
+          <button
+            type="button"
+            onClick={() => void save()}
+            disabled={saving || (!dirty && !needsSync) || conflict !== null}
+            className={primaryButtonClass}
+          >
+            {saving ? <ButtonSpinner /> : null}
+            {saving ? "Saving…" : needsSync && !dirty ? "Use file in Settings" : "Save SOUL.md"}
+          </button>
+        </div>
       </div>
 
       <p className="text-xs leading-relaxed text-faint">

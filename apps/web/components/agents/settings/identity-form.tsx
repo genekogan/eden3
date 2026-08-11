@@ -24,6 +24,7 @@ import { Toast } from "@/components/agents/toast";
 import { Skeleton } from "@/components/skeleton";
 import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 import { useAgentPatch } from "./use-agent-patch";
+import { useSettingsUnsavedChanges } from "./unsaved-changes";
 
 type Fields = { name: string; description: string; greeting: string; voice: string };
 
@@ -53,6 +54,44 @@ export function IdentityForm({ username }: { username: string }) {
     setFields(initial);
   }, [agent]);
 
+  const setField = (key: keyof Fields) => (value: string) =>
+    setFields((prev) => (prev ? { ...prev, [key]: value } : prev));
+
+  const dirty =
+    fields !== null && baseline.current !== null &&
+    JSON.stringify(fields) !== JSON.stringify(baseline.current);
+
+  const saveChanges = async (): Promise<boolean> => {
+    if (saving || !fields || !baseline.current) return false;
+    const snapshot = { ...fields };
+    const patch: Record<string, string> = {};
+    for (const key of Object.keys(snapshot) as (keyof Fields)[]) {
+      if (snapshot[key] !== baseline.current[key]) patch[key] = snapshot[key];
+    }
+    if (await save(patch, "Saved — identity updates apply to the next message.")) {
+      baseline.current = snapshot;
+      return true;
+    }
+    return false;
+  };
+
+  const discardChanges = () => {
+    if (baseline.current) setFields({ ...baseline.current });
+  };
+
+  useSettingsUnsavedChanges({
+    label: "this agent’s identity",
+    dirty,
+    saving,
+    save: saveChanges,
+    discard: discardChanges,
+  });
+
+  const onSubmit = async (event: FormEvent) => {
+    event.preventDefault();
+    await saveChanges();
+  };
+
   if (!agent || !fields) {
     return (
       <div className="space-y-4" aria-busy>
@@ -62,25 +101,6 @@ export function IdentityForm({ username }: { username: string }) {
       </div>
     );
   }
-
-  const setField = (key: keyof Fields) => (value: string) =>
-    setFields((prev) => (prev ? { ...prev, [key]: value } : prev));
-
-  const dirty =
-    baseline.current !== null &&
-    JSON.stringify(fields) !== JSON.stringify(baseline.current);
-
-  const onSubmit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (saving || !baseline.current) return;
-    const patch: Record<string, string> = {};
-    for (const key of Object.keys(fields) as (keyof Fields)[]) {
-      if (fields[key] !== baseline.current[key]) patch[key] = fields[key];
-    }
-    if (await save(patch, "Saved — identity updates apply to the next message.")) {
-      baseline.current = fields;
-    }
-  };
 
   const onAvatarPicked = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0] ?? null;
@@ -200,12 +220,24 @@ export function IdentityForm({ username }: { username: string }) {
         </p>
       ) : null}
 
-      <div className="flex items-center justify-between gap-2.5 border-t border-edge pt-5">
-        <p className="text-xs text-faint">{dirty ? "Unsaved changes" : "All changes saved"}</p>
-        <button type="submit" disabled={saving || !dirty} className={primaryButtonClass}>
-          {saving ? <ButtonSpinner /> : null}
-          {saving ? "Saving…" : "Save changes"}
-        </button>
+      <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-edge pt-5">
+        <p role="status" className="text-xs text-faint">
+          {saving ? "Saving…" : dirty ? "Unsaved changes" : "All changes saved"}
+        </p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={discardChanges}
+            disabled={saving || !dirty}
+            className={quietButtonClass}
+          >
+            Discard changes
+          </button>
+          <button type="submit" disabled={saving || !dirty} className={primaryButtonClass}>
+            {saving ? <ButtonSpinner /> : null}
+            {saving ? "Saving…" : "Save changes"}
+          </button>
+        </div>
       </div>
 
       {toast ? <Toast message={toast} onDismiss={() => setToast(null)} /> : null}

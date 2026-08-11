@@ -11,7 +11,7 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, DragEvent, FormEvent } from "react";
+import type { ChangeEvent, DragEvent } from "react";
 import { api } from "@/lib/api";
 import type { ConceptDto, ConceptImageUploadInput } from "@/lib/types";
 import { EmptyState } from "@/components/empty-state";
@@ -21,6 +21,7 @@ import {
   primaryButtonClass,
   quietButtonClass,
 } from "@/components/agents/form-fields";
+import { useSettingsUnsavedChanges } from "@/components/agents/settings/unsaved-changes";
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGES = 8;
@@ -134,9 +135,13 @@ function ConceptDetail({
     setConfirmDelete(false);
   }, [concept.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const save = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (busy) return;
+  const dirty =
+    name !== concept.name ||
+    description !== (concept.description ?? "") ||
+    instructions !== (concept.instructions ?? "");
+
+  const save = async (): Promise<boolean> => {
+    if (busy) return false;
     setBusy("save");
     setNote(null);
     try {
@@ -146,13 +151,33 @@ function ConceptDetail({
         instructions: instructions.trim(),
       });
       onChanged(updated);
+      setName(updated.name);
+      setDescription(updated.description ?? "");
+      setInstructions(updated.instructions ?? "");
       setNote("Saved — the agent sees this on its next generation.");
+      return true;
     } catch (error) {
       setNote(describeApiFailure(error));
+      return false;
     } finally {
       setBusy(null);
     }
   };
+
+  const discardChanges = () => {
+    setName(concept.name);
+    setDescription(concept.description ?? "");
+    setInstructions(concept.instructions ?? "");
+    setNote(null);
+  };
+
+  useSettingsUnsavedChanges({
+    label: `the “${concept.name}” concept`,
+    dirty,
+    saving: busy === "save",
+    save,
+    discard: discardChanges,
+  });
 
   // Shared upload path fed by BOTH the file input and drag-and-drop.
   const uploadFiles = async (files: File[]) => {
@@ -353,7 +378,13 @@ function ConceptDetail({
 
       {/* Text fields */}
       {canManage ? (
-        <form onSubmit={(event) => void save(event)} className="mt-6 space-y-4">
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            void save();
+          }}
+          className="mt-6 space-y-4"
+        >
           <div>
             <label htmlFor={`concept-name-${concept.id}`} className={microLabelClass}>
               Name
@@ -398,30 +429,43 @@ function ConceptDetail({
               className={`mt-2 ${textareaClass}`}
             />
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="submit"
-              disabled={busy !== null || name.trim() === ""}
-              className={primaryButtonClass}
-            >
-              {busy === "save" ? "Saving…" : "Save concept"}
-            </button>
-            <button
-              type="button"
-              onClick={() => void deleteConcept()}
-              disabled={busy !== null}
-              className={`rounded-md border px-3.5 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                confirmDelete
-                  ? "border-danger/60 bg-danger/10 text-danger-soft"
-                  : "border-edge text-muted hover:border-danger/50 hover:text-danger-soft"
-              }`}
-            >
-              {busy === "delete"
-                ? "Deleting…"
-                : confirmDelete
-                  ? "Really delete?"
-                  : "Delete"}
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p role="status" className="text-xs text-faint">
+              {busy === "save" ? "Saving…" : dirty ? "Unsaved changes" : "All changes saved"}
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={discardChanges}
+                disabled={busy !== null || !dirty}
+                className={quietButtonClass}
+              >
+                Discard changes
+              </button>
+              <button
+                type="submit"
+                disabled={busy !== null || !dirty || name.trim() === ""}
+                className={primaryButtonClass}
+              >
+                {busy === "save" ? "Saving…" : "Save concept"}
+              </button>
+              <button
+                type="button"
+                onClick={() => void deleteConcept()}
+                disabled={busy !== null}
+                className={`rounded-md border px-3.5 py-2 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                  confirmDelete
+                    ? "border-danger/60 bg-danger/10 text-danger-soft"
+                    : "border-edge text-muted hover:border-danger/50 hover:text-danger-soft"
+                }`}
+              >
+                {busy === "delete"
+                  ? "Deleting…"
+                  : confirmDelete
+                    ? "Really delete?"
+                    : "Delete"}
+              </button>
+            </div>
           </div>
         </form>
       ) : (
@@ -505,10 +549,9 @@ export function AgentConceptsPanel({
     })();
   }, [username]);
 
-  const createConcept = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const createConcept = async (): Promise<boolean> => {
     const name = newName.trim();
-    if (!name || createBusy) return;
+    if (!name || createBusy) return false;
     setCreateBusy(true);
     setCreateError(null);
     try {
@@ -545,12 +588,26 @@ export function AgentConceptsPanel({
       setNewDescription("");
       setNewInstructions("");
       setNewImages([]);
+      return true;
     } catch (error) {
       setCreateError(describeApiFailure(error));
+      return false;
     } finally {
       setCreateBusy(false);
     }
   };
+
+  const createDirty =
+    showCreate &&
+    (newName !== "" || newDescription !== "" || newInstructions !== "" || newImages.length > 0);
+
+  useSettingsUnsavedChanges({
+    label: "a new concept draft",
+    dirty: createDirty,
+    saving: createBusy,
+    save: createConcept,
+    discard: resetCreateForm,
+  });
 
   const replaceConcept = (updated: ConceptDto) => {
     setConcepts((prev) =>
@@ -574,7 +631,10 @@ export function AgentConceptsPanel({
   const createForm =
     canManage && showCreate ? (
       <form
-        onSubmit={(event) => void createConcept(event)}
+        onSubmit={(event) => {
+          event.preventDefault();
+          void createConcept();
+        }}
         className="mt-4 space-y-3 rounded-xl border border-edge bg-surface p-4"
       >
         <input

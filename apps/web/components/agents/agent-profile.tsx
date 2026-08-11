@@ -56,6 +56,7 @@ import {
   primaryButtonClass,
   quietButtonClass,
 } from "@/components/agents/form-fields";
+import { useSettingsUnsavedChanges } from "@/components/agents/settings/unsaved-changes";
 import { formatDate } from "@/lib/format";
 
 // ---------------------------------------------------------------------------
@@ -297,6 +298,7 @@ export function AgentSkillsPanel({
   const [attached, setAttached] = useState<AgentSkillDto[]>([]);
   const [available, setAvailable] = useState<SkillDefinitionDto[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [savedSelection, setSavedSelection] = useState<Set<string>>(new Set());
   const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
   const [errorText, setErrorText] = useState("");
   const [saving, setSaving] = useState(false);
@@ -312,7 +314,9 @@ export function AgentSkillsPanel({
         if (seq.current !== id) return;
         setAttached(data.attached);
         setAvailable((data.available ?? []).filter((skill) => skill.status === "approved"));
-        setSelected(new Set(data.attached.filter((skill) => skill.enabled).map((skill) => skill.slug)));
+        const enabled = new Set(data.attached.filter((skill) => skill.enabled).map((skill) => skill.slug));
+        setSelected(enabled);
+        setSavedSelection(new Set(enabled));
         setPhase("ready");
       } catch (error) {
         if (seq.current !== id) return;
@@ -322,21 +326,40 @@ export function AgentSkillsPanel({
     })();
   }, [username]);
 
-  const save = async () => {
+  const save = async (): Promise<boolean> => {
     setSaving(true);
     setNote(null);
     try {
       const data = await api.skills.setAgent(username, [...selected].sort());
       setAttached(data.skills ?? data.attached);
       setAvailable((data.available ?? available).filter((skill) => skill.status === "approved"));
-      setSelected(new Set((data.skills ?? data.attached).filter((skill) => skill.enabled).map((skill) => skill.slug)));
+      const enabled = new Set(
+        (data.skills ?? data.attached).filter((skill) => skill.enabled).map((skill) => skill.slug),
+      );
+      setSelected(enabled);
+      setSavedSelection(new Set(enabled));
       setNote("Skills updated.");
+      return true;
     } catch (error) {
       setNote(describeApiFailure(error));
+      return false;
     } finally {
       setSaving(false);
     }
   };
+
+  const selectedKey = [...selected].sort().join("\n");
+  const savedKey = [...savedSelection].sort().join("\n");
+  const dirty = selectedKey !== savedKey;
+  const discardChanges = () => setSelected(new Set(savedSelection));
+
+  useSettingsUnsavedChanges({
+    label: "this agent’s skills",
+    dirty,
+    saving,
+    save,
+    discard: discardChanges,
+  });
 
   if (phase === "loading") return <SkeletonRows count={4} />;
   if (phase === "error") return <EmptyState title="Couldn't load skills" hint={errorText} />;
@@ -400,14 +423,29 @@ export function AgentSkillsPanel({
           );
         })}
       </div>
-      <button
-        type="button"
-        onClick={() => void save()}
-        disabled={saving}
-        className={primaryButtonClass}
-      >
-        {saving ? "Saving…" : "Save skills"}
-      </button>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p role="status" className="text-xs text-faint">
+          {saving ? "Saving…" : dirty ? "Unsaved changes" : "All changes saved"}
+        </p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={discardChanges}
+            disabled={saving || !dirty}
+            className={quietButtonClass}
+          >
+            Discard changes
+          </button>
+          <button
+            type="button"
+            onClick={() => void save()}
+            disabled={saving || !dirty}
+            className={primaryButtonClass}
+          >
+            {saving ? "Saving…" : "Save skills"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -455,7 +493,7 @@ export function AgentMemoryPanel({
     })();
   }, [canManage, username]);
 
-  const save = async () => {
+  const save = async (): Promise<boolean> => {
     setBusy("save");
     setNote(null);
     try {
@@ -463,12 +501,26 @@ export function AgentMemoryPanel({
       setSnapshot(data.memory);
       setDraft(data.memory.collective.content ?? "");
       setNote("Memory saved.");
+      return true;
     } catch (error) {
       setNote(describeApiFailure(error));
+      return false;
     } finally {
       setBusy(null);
     }
   };
+
+  const savedMemory = snapshot?.collective.content ?? "";
+  const dirty = phase === "ready" && draft !== savedMemory;
+  const discardChanges = () => setDraft(savedMemory);
+
+  useSettingsUnsavedChanges({
+    label: "this agent’s memory correction",
+    dirty,
+    saving: busy === "save",
+    save,
+    discard: discardChanges,
+  });
 
   const rebuild = async () => {
     if (
@@ -523,23 +575,36 @@ export function AgentMemoryPanel({
         spellCheck={false}
         className="min-h-[360px] w-full max-w-full resize-y rounded-lg border border-edge bg-black/20 p-4 font-mono text-[13px] leading-relaxed text-muted outline-none transition-colors focus:border-accent/60"
       />
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={() => void save()}
-          disabled={busy !== null || draft.trim() === ""}
-          className={primaryButtonClass}
-        >
-          {busy === "save" ? "Saving…" : "Save owner correction"}
-        </button>
-        <button
-          type="button"
-          onClick={() => void rebuild()}
-          disabled={busy !== null}
-          className={quietButtonClass}
-        >
-          {busy === "rebuild" ? "Reseeding…" : "Force reseed from history"}
-        </button>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p role="status" className="text-xs text-faint">
+          {busy === "save" ? "Saving…" : dirty ? "Unsaved changes" : "All changes saved"}
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={discardChanges}
+            disabled={busy !== null || !dirty}
+            className={quietButtonClass}
+          >
+            Discard changes
+          </button>
+          <button
+            type="button"
+            onClick={() => void save()}
+            disabled={busy !== null || !dirty || draft.trim() === ""}
+            className={primaryButtonClass}
+          >
+            {busy === "save" ? "Saving…" : "Save owner correction"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void rebuild()}
+            disabled={busy !== null}
+            className={quietButtonClass}
+          >
+            {busy === "rebuild" ? "Reseeding…" : "Force reseed from history"}
+          </button>
+        </div>
       </div>
       {snapshot?.latestRevision ? (
         <p className="rounded-lg border border-edge bg-surface px-3 py-2 text-xs leading-relaxed text-faint">

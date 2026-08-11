@@ -14,6 +14,7 @@ import {
   FieldShell,
   inputClass,
   primaryButtonClass,
+  quietButtonClass,
 } from "@/components/agents/form-fields";
 import {
   MODEL_TIER_OPTIONS,
@@ -27,6 +28,7 @@ import { Toast } from "@/components/agents/toast";
 import { Skeleton } from "@/components/skeleton";
 import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 import { useAgentPatch } from "./use-agent-patch";
+import { useSettingsUnsavedChanges } from "./unsaved-changes";
 
 type Fields = { model: string; thinkingLevel: string; toolGroups: string[] };
 
@@ -51,15 +53,6 @@ export function ToolsForm({ username }: { username: string }) {
     setFields(initial);
   }, [agent]);
 
-  if (!agent || !fields) {
-    return (
-      <div className="space-y-4" aria-busy>
-        <Skeleton className="h-32 w-full" />
-        <Skeleton className="h-24 w-full" />
-      </div>
-    );
-  }
-
   const setToolGroup = (value: string, enabled: boolean) => {
     setFields((prev) => {
       if (!prev) return prev;
@@ -74,24 +67,54 @@ export function ToolsForm({ username }: { username: string }) {
   };
 
   const dirty =
-    baseline.current !== null &&
+    fields !== null && baseline.current !== null &&
     JSON.stringify(fields) !== JSON.stringify(baseline.current);
+
+  const saveChanges = async (): Promise<boolean> => {
+    if (saving || !fields || !baseline.current) return false;
+    const snapshot: Fields = { ...fields, toolGroups: [...fields.toolGroups] };
+    const patch: AgentUpdateInput = {};
+    if (snapshot.model !== baseline.current.model) patch.model = snapshot.model;
+    if (snapshot.thinkingLevel !== baseline.current.thinkingLevel) {
+      patch.thinkingLevel = snapshot.thinkingLevel;
+    }
+    if (JSON.stringify(snapshot.toolGroups) !== JSON.stringify(baseline.current.toolGroups)) {
+      patch.toolGroups = snapshot.toolGroups;
+    }
+    if (await save(patch, "Saved — runtime updates apply to the next message.")) {
+      baseline.current = snapshot;
+      return true;
+    }
+    return false;
+  };
+
+  const discardChanges = () => {
+    if (baseline.current) {
+      setFields({ ...baseline.current, toolGroups: [...baseline.current.toolGroups] });
+    }
+  };
+
+  useSettingsUnsavedChanges({
+    label: "this agent’s tools and runtime",
+    dirty,
+    saving,
+    save: saveChanges,
+    discard: discardChanges,
+  });
 
   const onSubmit = async (event: FormEvent) => {
     event.preventDefault();
-    if (saving || !baseline.current) return;
-    const patch: AgentUpdateInput = {};
-    if (fields.model !== baseline.current.model) patch.model = fields.model;
-    if (fields.thinkingLevel !== baseline.current.thinkingLevel) {
-      patch.thinkingLevel = fields.thinkingLevel;
-    }
-    if (JSON.stringify(fields.toolGroups) !== JSON.stringify(baseline.current.toolGroups)) {
-      patch.toolGroups = fields.toolGroups;
-    }
-    if (await save(patch, "Saved — runtime updates apply to the next message.")) {
-      baseline.current = fields;
-    }
+    await saveChanges();
   };
+
+  if (!agent || !fields) {
+    return (
+      <div className="space-y-4" aria-busy>
+        <Skeleton className="h-32 w-full" />
+        <Skeleton className="h-24 w-full" />
+      </div>
+    );
+  }
 
   return (
     <form onSubmit={(e) => void onSubmit(e)} className="space-y-6">
@@ -181,12 +204,24 @@ export function ToolsForm({ username }: { username: string }) {
         </p>
       ) : null}
 
-      <div className="flex items-center justify-between gap-2.5 border-t border-edge pt-5">
-        <p className="text-xs text-faint">{dirty ? "Unsaved changes" : "All changes saved"}</p>
-        <button type="submit" disabled={saving || !dirty} className={primaryButtonClass}>
-          {saving ? <ButtonSpinner /> : null}
-          {saving ? "Saving…" : "Save changes"}
-        </button>
+      <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-edge pt-5">
+        <p role="status" className="text-xs text-faint">
+          {saving ? "Saving…" : dirty ? "Unsaved changes" : "All changes saved"}
+        </p>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={discardChanges}
+            disabled={saving || !dirty}
+            className={quietButtonClass}
+          >
+            Discard changes
+          </button>
+          <button type="submit" disabled={saving || !dirty} className={primaryButtonClass}>
+            {saving ? <ButtonSpinner /> : null}
+            {saving ? "Saving…" : "Save changes"}
+          </button>
+        </div>
       </div>
 
       {toast ? <Toast message={toast} onDismiss={() => setToast(null)} /> : null}
