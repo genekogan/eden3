@@ -143,10 +143,14 @@ export function NotificationCenter({
               {state.items.map((item) => (
                 <li
                   key={item.id}
-                  className={`group flex items-start gap-2 rounded-lg px-2 py-2 ${
-                    item.readAt === null ? "bg-accent/[0.08]" : ""
-                  }`}
+                  className="group flex items-start gap-2 rounded-lg px-2 py-2 transition-colors hover:bg-foreground/[0.035]"
                 >
+                  {item.readAt === null ? (
+                    <span
+                      aria-label="Unread"
+                      className="mt-1.5 size-1.5 shrink-0 rounded-full bg-accent"
+                    />
+                  ) : null}
                   <Link
                     href={item.targetPath ?? "/agents"}
                     onClick={() => {
@@ -181,7 +185,7 @@ export function NotificationCenter({
         onClick={() => setOpen((value) => !value)}
         aria-label={`Notifications${state.unreadCount ? `, ${state.unreadCount} unread` : ""}`}
         aria-expanded={open}
-        className={`relative flex size-10 items-center justify-center text-muted transition-colors hover:text-foreground ${
+        className={`relative flex size-10 items-center justify-center rounded-lg text-muted outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent/50 ${
           collapsed ? "mx-auto" : ""
         }`}
       >

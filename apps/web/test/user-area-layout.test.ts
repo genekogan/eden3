@@ -31,4 +31,11 @@ describe("sidebar account footer layout", () => {
     expect(notificationCenterSource).toContain("sm:absolute sm:bottom-full sm:left-0");
     expect(notificationCenterSource).not.toContain("bottom-full right-0");
   });
+
+  it("uses a compact unread dot without tinting whole notification rows", () => {
+    expect(notificationCenterSource).toContain('aria-label="Unread"');
+    expect(notificationCenterSource).toContain("rounded-full bg-accent");
+    expect(notificationCenterSource).not.toContain('item.readAt === null ? "bg-accent');
+    expect(notificationCenterSource).toContain("focus-visible:ring-accent/50");
+  });
 });
