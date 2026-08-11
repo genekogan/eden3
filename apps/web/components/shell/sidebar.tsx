@@ -27,10 +27,9 @@ import {
   type StudioCategory,
 } from "@/components/studio/catalog";
 import { AgentSelector } from "./agent-selector";
-import { EveSidebarEntry } from "@/components/eve/eve-empty-state";
 import { EnvChip } from "./env-chip";
 import { UserArea } from "./user-area";
-import { useMyAgents, useSelectedAgent } from "./selected-agent-context";
+import { useSelectedAgent } from "./selected-agent-context";
 
 /** Minimal 24px stroke icons (multi-subpath `d` strings, lucide-derived). */
 export const ICONS = {
@@ -174,29 +173,6 @@ function AgentNav({
 }) {
   const pathname = usePathname();
   const { username } = useSelectedAgent();
-  const { agents, phase } = useMyAgents();
-
-  if (isEveUsername(username)) {
-    return (
-      <EveSidebarEntry
-        onNavigate={onNavigate}
-        labelsAlways={labels === "always"}
-      />
-    );
-  }
-
-  if (
-    phase === "ready" &&
-    agents !== null &&
-    agents.length === 0
-  ) {
-    return (
-      <EveSidebarEntry
-        onNavigate={onNavigate}
-        labelsAlways={labels === "always"}
-      />
-    );
-  }
 
   if (!username) {
     return (

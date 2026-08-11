@@ -6,7 +6,6 @@ import { NextRequest } from "next/server";
 import { describe, expect, it } from "vitest";
 import {
   EveEmptyState,
-  EveSidebarEntry,
 } from "../components/eve/eve-empty-state";
 import {
   agentSectionHref,
@@ -31,15 +30,7 @@ describe("eve empty-state entry", () => {
     expect(html).not.toContain("/settings");
   });
 
-  it("keeps the pinned eve and builder links in the selector sidebar state", () => {
-    const html = renderToStaticMarkup(<EveSidebarEntry labelsAlways />);
-    expect(html).toContain('data-testid="eve-sidebar-entry"');
-    expect(html).toContain('href="/agents/eve/chats/new"');
-    expect(html).toContain('href="/agents/builder"');
-    expect(html).toContain("Make me my own agent");
-  });
-
-  it("wires the pinned entry into both zero-agent surfaces", () => {
+  it("keeps the Eve invitation in the directory without duplicating it in the sidebar", () => {
     const directory = readFileSync(
       resolve(WEB_ROOT, "components/agents/agents-directory.tsx"),
       "utf8",
@@ -54,8 +45,9 @@ describe("eve empty-state entry", () => {
     );
 
     expect(directory).toContain("<EveEmptyState />");
-    expect(sidebar).toContain("<EveSidebarEntry");
-    expect(sidebar).toContain("if (isEveUsername(username))");
+    expect(sidebar).not.toContain("EveSidebarEntry");
+    expect(sidebar).not.toContain('data-testid="eve-sidebar-entry"');
+    expect(sidebar).toContain("!isEveUsername(username) || !isEveConcealedSubpath(item.sub)");
     expect(selector).toContain("@eve · Eden guide");
   });
 });

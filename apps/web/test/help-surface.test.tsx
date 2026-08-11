@@ -160,8 +160,19 @@ describe("authenticated help surface", () => {
     const contextual = renderToStaticMarkup(
       <ContextualHelpLink topic="safe-errors">Recover safely</ContextualHelpLink>,
     );
-    expect(contextual).toContain('href="/help#safe-errors"');
+    expect(contextual).toContain('aria-haspopup="dialog"');
+    expect(contextual).toContain('aria-expanded="false"');
+    expect(contextual).not.toContain('href="/help#safe-errors"');
     expect(contextual).toContain("Recover safely");
+
+    const source = readFileSync(
+      resolve(REPO_ROOT, "apps/web/components/help/contextual-help-link.tsx"),
+      "utf8",
+    );
+    expect(source).toContain('role="dialog"');
+    expect(source).toContain('aria-modal="true"');
+    expect(source).toContain('event.key === "Escape"');
+    expect(source).toContain("article.steps.map");
   });
 
   it("keeps contextual links on the four first-use empty states", () => {
