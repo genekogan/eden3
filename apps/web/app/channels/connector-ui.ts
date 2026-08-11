@@ -90,9 +90,15 @@ export function xClientDeepLink(connection: XConnectionDto): string | null {
 }
 
 export function connectionHealthLabel(
-  connection: Pick<ChannelConnectionDto, 'observedState' | 'lastError'>,
+  connection: Pick<ChannelConnectionDto, 'observedState' | 'lastError' | 'desiredState' | 'status'>,
 ): string {
   if (connection.lastError) return `Needs attention: ${connection.lastError.message}`;
+  if (
+    connection.desiredState === 'active'
+    && (connection.status === 'reconnecting' || connection.observedState === 'stopped')
+  ) {
+    return 'Reconnecting — messages will resume automatically';
+  }
   switch (connection.observedState) {
     case 'live':
       return 'Healthy — receiving messages';
@@ -109,6 +115,15 @@ export function connectionHealthLabel(
     default:
       return 'Status not reported yet';
   }
+}
+
+export function connectionStatusLabel(
+  connection: Pick<ChannelConnectionDto, 'observedState' | 'desiredState' | 'status'>,
+): string {
+  return connection.desiredState === 'active'
+    && (connection.status === 'reconnecting' || connection.observedState === 'stopped')
+    ? 'reconnecting'
+    : connection.observedState;
 }
 
 export function xFailureAction(code: string | null): string | null {

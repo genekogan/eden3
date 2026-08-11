@@ -7,6 +7,7 @@ import {
   CHANNEL_STATUS_POLL_MS,
   channelClientDeepLink,
   connectionHealthLabel,
+  connectionStatusLabel,
   discordInviteUrl,
   parseDiscordGroupCoordinates,
   parseTelegramGroupCoordinates,
@@ -108,6 +109,12 @@ describe('connector health copy', () => {
       ),
     ).toBe('Needs attention: Replace this token.');
     expect(connectionHealthLabel(connection({ observedState: 'verified' }))).toContain('activate');
+    const reconnecting = connection({ observedState: 'stopped', desiredState: 'active', status: 'reconnecting' });
+    expect(connectionStatusLabel(reconnecting)).toBe('reconnecting');
+    expect(connectionHealthLabel(reconnecting)).toContain('resume automatically');
+    const paused = connection({ observedState: 'stopped', desiredState: 'inactive', status: 'paused' });
+    expect(connectionStatusLabel(paused)).toBe('stopped');
+    expect(connectionHealthLabel(paused)).toBe('Inactive');
   });
 
   it.each(['invalid_credentials', 'revoked', 'rate_limited', 'provider_unavailable'])(

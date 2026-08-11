@@ -22,6 +22,7 @@ import {
   X_DEVELOPER_PORTAL,
   channelClientDeepLink,
   connectionHealthLabel,
+  connectionStatusLabel,
   discordInviteUrl,
   parseDiscordGroupCoordinates,
   parseTelegramGroupCoordinates,
@@ -65,7 +66,7 @@ function statusTone(connection: ChannelConnectionDto): string {
   if (connection.observedState === "error") {
     return "border-danger/25 bg-danger/10 text-danger-soft";
   }
-  if (connection.observedState === "starting") {
+  if (connection.observedState === "starting" || connectionStatusLabel(connection) === "reconnecting") {
     return "border-warning/25 bg-warning/10 text-warning-soft";
   }
   return "border-edge bg-foreground/[0.04] text-muted";
@@ -711,7 +712,7 @@ export function ChannelsClient({
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="text-sm font-medium">{connection.label || connection.bot?.username || LABELS[connection.channel]}</h3>
               <span className={`rounded-full border px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider ${statusTone(connection)}`}>
-                {connection.observedState}
+                {connectionStatusLabel(connection)}
               </span>
             </div>
             <p className="mt-1 text-xs text-muted">
