@@ -114,7 +114,7 @@ describe('object lifecycle rehearsal', () => {
       body: Buffer.from('expected'),
       cacheRoot,
       sandboxRoot,
-    })).rejects.toThrow(/checksum/i);
+    })).rejects.toEqual(new ObjectLifecycleRehearsalError('r2_object_hydration_failed'));
 
     expect(calls.puts).toBe(1);
     expect(calls.deletes).toBe(1);
@@ -136,5 +136,26 @@ describe('object lifecycle rehearsal', () => {
       cacheRoot: await root('object-cache'),
       sandboxRoot: await root('object-sandbox'),
     })).rejects.toEqual(new ObjectLifecycleRehearsalError('r2_object_cleanup_failed'));
+  });
+
+  it('reports a fixed lifecycle phase without serializing provider details', async () => {
+    const objectRoot = await root('object-root');
+    const backend = new LocalObjectBackend({ root: objectRoot });
+    const { writer, reader } = splitAuthorities(backend);
+    let heads = 0;
+    reader.head = async (key: string) => {
+      heads += 1;
+      if (heads === 1) throw new Error('synthetic provider account and path detail');
+      return backend.head(key);
+    };
+
+    await expect(runObjectLifecycleRehearsal({
+      writer,
+      reader,
+      objectId,
+      cacheRoot: await root('object-cache'),
+      sandboxRoot: await root('object-sandbox'),
+    })).rejects.toEqual(new ObjectLifecycleRehearsalError('r2_object_reader_identity_failed'));
+    await expect(backend.head(objectKey(objectId))).resolves.toBeNull();
   });
 });

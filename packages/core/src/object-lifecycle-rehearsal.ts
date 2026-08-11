@@ -45,6 +45,22 @@ export class ObjectLifecycleRehearsalError extends Error {
   }
 }
 
+type ObjectLifecyclePhase =
+  | 'upload'
+  | 'reader_identity'
+  | 'hydration'
+  | 'hydration_identity'
+  | 'deletion'
+  | 'remote_absence';
+
+function safeLifecycleError(error: unknown, phase: ObjectLifecyclePhase): unknown {
+  if (error instanceof ObjectLifecycleRehearsalError) return error;
+  if (error instanceof Error && /^R2 (PUT|GET|HEAD|DELETE) failed with status [1-5][0-9]{2}$/.test(error.message)) {
+    return error;
+  }
+  return new ObjectLifecycleRehearsalError(`r2_object_${phase}_failed`);
+}
+
 function sha256(bytes: Buffer | string): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
@@ -97,6 +113,7 @@ export async function runObjectLifecycleRehearsal(
   let uploadMs = 0;
   let hydrationMs = 0;
   let deletionMs = 0;
+  let phase: ObjectLifecyclePhase = 'upload';
 
   try {
     const uploadStarted = now();
@@ -112,17 +129,20 @@ export async function runObjectLifecycleRehearsal(
       throw new ObjectLifecycleRehearsalError('r2_object_upload_identity_mismatch');
     }
 
+    phase = 'reader_identity';
     const observed = await options.reader.head(key);
     if (!observed || observed.sha256 !== contentSha256 || observed.sizeBytes !== body.length) {
       throw new ObjectLifecycleRehearsalError('r2_object_reader_identity_mismatch');
     }
 
+    phase = 'hydration';
     const hydrationStarted = now();
     hydrated = await service.hydrate(descriptor, { displayName: 'rehearsal.bin' });
     hydrationMs = now() - hydrationStarted;
     if (!hydrated.sandboxPath) {
       throw new ObjectLifecycleRehearsalError('r2_object_sandbox_projection_missing');
     }
+    phase = 'hydration_identity';
     const [cached, sandboxed] = await Promise.all([
       readFile(hydrated.localPath),
       readFile(hydrated.sandboxPath),
@@ -133,15 +153,17 @@ export async function runObjectLifecycleRehearsal(
     await hydrated.release();
     hydrated = undefined;
 
+    phase = 'deletion';
     const deletionStarted = now();
     await options.writer.delete(key);
+    phase = 'remote_absence';
     if (await options.reader.head(key)) {
       throw new ObjectLifecycleRehearsalError('r2_object_remote_absence_unproven');
     }
     objectMayExist = false;
     deletionMs = now() - deletionStarted;
   } catch (error) {
-    primaryError = error;
+    primaryError = safeLifecycleError(error, phase);
   } finally {
     await hydrated?.release().catch(() => {});
     await Promise.all([
