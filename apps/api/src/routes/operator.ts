@@ -413,6 +413,7 @@ export const operatorRoutes: FastifyPluginAsync = async (app) => {
       memoryDreamScheduler: app.memoryDreamScheduler
         ? { running: app.memoryDreamScheduler.running }
         : { running: false },
+      turnAdmission: app.turnLimiter.snapshot(),
     };
   });
 

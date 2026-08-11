@@ -228,6 +228,22 @@ describe('HTTP 5xx disclosure boundary', () => {
     expect(JSON.stringify(envelope)).not.toContain(SECRET_CODE);
   });
 
+  it.each(['turn_capacity_exceeded', 'turn_queue_timeout'] as const)(
+    'preserves reviewed overload code %s while redacting internal text',
+    (code) => {
+      const envelope = errorEnvelope(503, code, SENSITIVE);
+
+      expect(envelope).toEqual({
+        error: {
+          code,
+          message: 'Service temporarily unavailable',
+          statusCode: 503,
+        },
+      });
+      expect(JSON.stringify(envelope)).not.toContain(SENSITIVE);
+    },
+  );
+
   it.each([
     [502, 'provider_error', 'Upstream service unavailable'],
     [502, 'repair_failed', 'Upstream service unavailable'],

@@ -61,6 +61,8 @@ const PUBLIC_SERVER_ERROR_CODES = new Set([
   'telegram_manager_not_configured',
   'telegram_response_invalid',
   'telegram_unavailable',
+  'turn_capacity_exceeded',
+  'turn_queue_timeout',
   'tts_not_configured',
 ]);
 

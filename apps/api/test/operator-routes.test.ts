@@ -192,6 +192,12 @@ describe('GET /operator/health', () => {
       gateway: { configured: boolean } & Record<string, unknown>;
       egressProxy: unknown;
       scheduler: { running: boolean };
+      turnAdmission: {
+        active: number;
+        queued: number;
+        globalLimit: number;
+        queueLimit: number;
+      };
       database: string | null;
     };
     expect(body.ok).toBe(true);
@@ -202,6 +208,12 @@ describe('GET /operator/health', () => {
     expect(body).toHaveProperty('egressProxy');
     expect(body).toHaveProperty('scheduler');
     expect(typeof body.scheduler.running).toBe('boolean');
+    expect(body.turnAdmission).toMatchObject({
+      active: 0,
+      queued: 0,
+      globalLimit: 10,
+      queueLimit: 50,
+    });
   });
 });
 

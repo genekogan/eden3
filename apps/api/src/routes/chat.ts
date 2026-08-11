@@ -476,14 +476,31 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
       }
 
       const turnLimit = await concurrentTurnLimit(account.accountId);
-      const releaseTurn = app.turnLimiter.acquire(account.accountId, turnLimit.limit);
-      if (!releaseTurn) {
+      const queueAbort = new AbortController();
+      const abortQueuedTurn = () => queueAbort.abort();
+      reply.raw.once('close', abortQueuedTurn);
+      const admission = await app.turnLimiter.admit(account.accountId, turnLimit.limit, {
+        signal: queueAbort.signal,
+      });
+      reply.raw.off('close', abortQueuedTurn);
+      if (!admission.admitted && admission.reason === 'per_account_limit') {
         throw new ApiError(
           429,
           'turn_concurrency_exceeded',
           `Too many active chat turns: limit is ${turnLimit.limit}${turnLimit.tier ? ` for ${turnLimit.tier}` : ''}`,
         );
       }
+      if (!admission.admitted) {
+        reply.header('retry-after', '1');
+        throw new ApiError(
+          503,
+          admission.reason === 'queue_timeout' ? 'turn_queue_timeout' : 'turn_capacity_exceeded',
+          admission.reason === 'queue_timeout'
+            ? 'The agent-turn queue timed out before provider admission; retry shortly'
+            : 'Agent-turn capacity is temporarily unavailable; retry shortly',
+        );
+      }
+      reply.header('x-eden3-turn-queue-ms', String(admission.queueWaitMs));
 
       try {
         await runTurn(
@@ -539,7 +556,7 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
         }
         throw err;
       } finally {
-        releaseTurn();
+        admission.release();
       }
 
       return reply; // hijacked — the SSE sink owns the socket from here

@@ -589,11 +589,16 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       })
     : null;
   app.decorate('turnRegistry', new TurnRegistry());
-  app.decorate('turnLimiter', new TurnConcurrencyLimiter());
+  app.decorate('turnLimiter', new TurnConcurrencyLimiter({
+    globalLimit: env.MAX_CONCURRENT_TURNS_GLOBAL,
+    queueLimit: env.MAX_QUEUED_TURNS_GLOBAL,
+    queueTimeoutMs: env.TURN_QUEUE_TIMEOUT_MS,
+  }));
   app.decorate('historySync', historySync);
   app.decorate('gatewayCompat', gatewayClients?.compat ?? null);
   app.addHook('onClose', async () => {
     historySync?.stop();
+    app.turnLimiter.close();
   });
 
   // One process-wide media pipeline/watcher shared by chat and Studio.

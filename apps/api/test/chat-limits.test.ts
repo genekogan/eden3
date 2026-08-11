@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir, rm } from 'node:fs/promises';
 
 import { credit, debit, gatewaySessionKey, resetEnvCache } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
@@ -102,6 +103,8 @@ describe('chat rate limits', () => {
   it('lazy-provisions a pending public agent on first chat access', async () => {
     const suffix = randomUUID().slice(0, 8);
     const username = `${marker}_lazy_${suffix}`.replace(/_/g, '-');
+    const workspaceDir = `/tmp/fake-workspaces/workspace-${username}`;
+    await mkdir(workspaceDir, { recursive: true });
     const userId = await insertUserAccount(`${marker}_lazy_user_${suffix}`);
     await insertAgentAccount(username, {
       ownerId: userId,
@@ -152,7 +155,7 @@ describe('chat rate limits', () => {
         headers: { cookie: devCookie(userId) },
         payload: { content: 'wake up', agentUsername: username },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode, res.body).toBe(200);
       expect(provisioner.provisions[0]).toMatchObject({
         openclawId: username,
         name: 'Lazy Agent',
@@ -204,6 +207,7 @@ describe('chat rate limits', () => {
       expect(assistant?.content).toBe('awake');
     } finally {
       await app.close();
+      await rm(workspaceDir, { force: true, recursive: true });
     }
   });
 
@@ -269,6 +273,173 @@ describe('chat rate limits', () => {
       unblock?.();
       await app?.close();
       restore();
+    }
+  });
+
+  it('queues distinct users fairly behind the global ceiling and refuses queue overflow before debit', async () => {
+    const restores = [
+      withEnv('MAX_CONCURRENT_TURNS_PER_USER', '1'),
+      withEnv('MAX_CONCURRENT_TURNS_GLOBAL', '1'),
+      withEnv('MAX_QUEUED_TURNS_GLOBAL', '1'),
+      withEnv('TURN_QUEUE_TIMEOUT_MS', '5000'),
+    ];
+    const [firstFixture, secondFixture, overflowFixture] = await Promise.all([
+      makeFixture(),
+      makeFixture(),
+      makeFixture(),
+    ]);
+    let app: FastifyInstance | null = null;
+    let releaseFirst!: () => void;
+    let firstEntered!: () => void;
+    let secondEntered!: () => void;
+    const firstEnteredGateway = new Promise<void>((resolve) => { firstEntered = resolve; });
+    const secondEnteredGateway = new Promise<void>((resolve) => { secondEntered = resolve; });
+    const holdFirst = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let calls = 0;
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        calls += 1;
+        if (calls === 1) {
+          firstEntered();
+          yield { type: 'turn.started' };
+          await holdFirst;
+        } else {
+          secondEntered();
+          yield { type: 'turn.started' };
+        }
+        yield {
+          type: 'turn.completed',
+          text: 'ok',
+          emptyTurn: false,
+          finishReason: 'stop',
+        };
+      },
+    };
+
+    try {
+      app = await buildServer({ gateway: { compat, tools: emptyTools } });
+      await app.ready();
+      const first = app.inject({
+        method: 'POST',
+        url: `/sessions/${firstFixture.sessionId}/messages`,
+        headers: { cookie: devCookie(firstFixture.userId) },
+        payload: { content: 'first' },
+      });
+      await firstEnteredGateway;
+      const second = app.inject({
+        method: 'POST',
+        url: `/sessions/${secondFixture.sessionId}/messages`,
+        headers: { cookie: devCookie(secondFixture.userId) },
+        payload: { content: 'second' },
+      });
+      for (let attempt = 0; attempt < 100 && app.turnLimiter.snapshot().queued !== 1; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(app.turnLimiter.snapshot()).toMatchObject({ active: 1, queued: 1 });
+
+      const overflow = await app.inject({
+        method: 'POST',
+        url: `/sessions/${overflowFixture.sessionId}/messages`,
+        headers: { cookie: devCookie(overflowFixture.userId) },
+        payload: { content: 'overflow' },
+      });
+      expect(overflow.statusCode).toBe(503);
+      expect(overflow.headers['retry-after']).toBe('1');
+      expect((overflow.json() as { error: { code: string } }).error.code).toBe(
+        'turn_capacity_exceeded',
+      );
+      expect(await spendCount(overflowFixture.userId)).toBe(0);
+      expect(calls).toBe(1);
+
+      releaseFirst();
+      await secondEnteredGateway;
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+      expect(firstResult.statusCode).toBe(200);
+      expect(secondResult.statusCode).toBe(200);
+      expect(Number(secondResult.headers['x-eden3-turn-queue-ms'])).toBeGreaterThanOrEqual(0);
+      expect(calls).toBe(2);
+      expect(await spendCount(firstFixture.userId)).toBe(1);
+      expect(await spendCount(secondFixture.userId)).toBe(1);
+      expect(app.turnLimiter.snapshot()).toMatchObject({
+        active: 0,
+        queued: 0,
+        queuedGranted: 1,
+        rejectedQueueFull: 1,
+      });
+    } finally {
+      releaseFirst?.();
+      await app?.close();
+      for (const restore of restores.reverse()) restore();
+    }
+  });
+
+  it('times out a queued turn before provider admission or debit and releases capacity cleanly', async () => {
+    const restores = [
+      withEnv('MAX_CONCURRENT_TURNS_PER_USER', '1'),
+      withEnv('MAX_CONCURRENT_TURNS_GLOBAL', '1'),
+      withEnv('MAX_QUEUED_TURNS_GLOBAL', '1'),
+      withEnv('TURN_QUEUE_TIMEOUT_MS', '1000'),
+    ];
+    const [activeFixture, timedOutFixture] = await Promise.all([makeFixture(), makeFixture()]);
+    let app: FastifyInstance | null = null;
+    let releaseActive!: () => void;
+    let activeEntered!: () => void;
+    const activeEnteredGateway = new Promise<void>((resolve) => { activeEntered = resolve; });
+    const holdActive = new Promise<void>((resolve) => { releaseActive = resolve; });
+    let calls = 0;
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        calls += 1;
+        activeEntered();
+        yield { type: 'turn.started' };
+        await holdActive;
+        yield {
+          type: 'turn.completed',
+          text: 'ok',
+          emptyTurn: false,
+          finishReason: 'stop',
+        };
+      },
+    };
+
+    try {
+      app = await buildServer({ gateway: { compat, tools: emptyTools } });
+      await app.ready();
+      const active = app.inject({
+        method: 'POST',
+        url: `/sessions/${activeFixture.sessionId}/messages`,
+        headers: { cookie: devCookie(activeFixture.userId) },
+        payload: { content: 'active' },
+      });
+      await activeEnteredGateway;
+
+      const timedOut = await app.inject({
+        method: 'POST',
+        url: `/sessions/${timedOutFixture.sessionId}/messages`,
+        headers: { cookie: devCookie(timedOutFixture.userId) },
+        payload: { content: 'times out' },
+      });
+
+      expect(timedOut.statusCode).toBe(503);
+      expect(timedOut.headers['retry-after']).toBe('1');
+      expect((timedOut.json() as { error: { code: string } }).error.code).toBe(
+        'turn_queue_timeout',
+      );
+      expect(calls).toBe(1);
+      expect(await spendCount(timedOutFixture.userId)).toBe(0);
+      expect(app.turnLimiter.snapshot()).toMatchObject({
+        active: 1,
+        queued: 0,
+        timedOut: 1,
+      });
+
+      releaseActive();
+      expect((await active).statusCode).toBe(200);
+      expect(app.turnLimiter.snapshot()).toMatchObject({ active: 0, queued: 0 });
+    } finally {
+      releaseActive?.();
+      await app?.close();
+      for (const restore of restores.reverse()) restore();
     }
   });
 

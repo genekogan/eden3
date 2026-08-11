@@ -15,6 +15,7 @@ import { databaseNameFromUrl } from './database-url';
 const portSchema = z.coerce.number().int().min(1).max(65535);
 const positiveIntSchema = z.coerce.number().int().min(1);
 const nonnegativeIntSchema = z.coerce.number().int().min(0);
+const turnQueueTimeoutSchema = z.coerce.number().int().min(1_000).max(120_000);
 const utcHourSchema = z.coerce.number().int().min(0).max(23);
 const csvSchema = z.preprocess(
   (value) =>
@@ -107,6 +108,12 @@ export const envSchema = z.object({
   MAX_CHANNEL_CONNECTIONS_PER_USER: nonnegativeIntSchema.default(20),
   /** Chat turns a user may have in flight at once for the current local tier. */
   MAX_CONCURRENT_TURNS_PER_USER: nonnegativeIntSchema.default(2),
+  /** Process-wide provider-turn ceiling; excess interactive turns enter the bounded fair queue. */
+  MAX_CONCURRENT_TURNS_GLOBAL: positiveIntSchema.default(10),
+  /** Maximum interactive turns waiting for a process-wide provider slot. */
+  MAX_QUEUED_TURNS_GLOBAL: nonnegativeIntSchema.default(50),
+  /** Maximum pre-provider queue wait before a safe retryable refusal. */
+  TURN_QUEUE_TIMEOUT_MS: turnQueueTimeoutSchema.default(30_000),
   /** Tier-specific chat turn concurrency ceilings. Fall back to the local default when unset. */
   MAX_CONCURRENT_TURNS_BASIC: nonnegativeIntSchema.optional(),
   MAX_CONCURRENT_TURNS_PRO: nonnegativeIntSchema.optional(),
