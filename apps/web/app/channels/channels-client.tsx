@@ -18,6 +18,7 @@ import { SkeletonRows } from "@/components/skeleton";
 import { formatRelativeTime } from "@/lib/format";
 import {
   CHANNEL_STATUS_POLL_MS,
+  TELEGRAM_ONBOARDING_POLL_MS,
   DISCORD_DEVELOPER_PORTAL,
   X_DEVELOPER_PORTAL,
   channelClientDeepLink,
@@ -295,7 +296,11 @@ export function ChannelsClient({
     let disposed = false;
     let inFlight = false;
     const poll = () => {
-      if (inFlight || activeTelegramIntent.current !== intentId) return;
+      if (
+        inFlight
+        || document.visibilityState !== "visible"
+        || activeTelegramIntent.current !== intentId
+      ) return;
       inFlight = true;
       void api.channels.managedTelegramStatus(intentId).then(
         (status) => {
@@ -315,10 +320,16 @@ export function ChannelsClient({
         inFlight = false;
       });
     };
-    const timer = window.setInterval(poll, 2_000);
+    void poll();
+    const timer = window.setInterval(() => void poll(), TELEGRAM_ONBOARDING_POLL_MS);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void poll();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       disposed = true;
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [mergeConnection, telegramOnboarding?.intent.id, telegramOnboarding?.intent.state, telegramStep]);
 

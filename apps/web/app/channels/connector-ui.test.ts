@@ -5,6 +5,7 @@ import type { ChannelConnectionDto, XConnectionDto } from '@/lib/types';
 import {
   DISCORD_BOT_PERMISSIONS,
   CHANNEL_STATUS_POLL_MS,
+  TELEGRAM_ONBOARDING_POLL_MS,
   channelClientDeepLink,
   connectionHealthLabel,
   connectionStatusLabel,
@@ -142,6 +143,20 @@ describe('channel operation polling', () => {
     expect(block).toContain('api.channels.list()');
     expect(block).toContain('api.channels.pairing(connectionId)');
     expect(block).toContain('window.setInterval(() => void poll(), CHANNEL_STATUS_POLL_MS)');
+    expect(block).toContain('document.removeEventListener("visibilitychange", onVisibilityChange)');
+  });
+
+  it('advances Telegram onboarding immediately and only while the cockpit is visible', async () => {
+    expect(TELEGRAM_ONBOARDING_POLL_MS).toBe(2_000);
+    const source = await readFile(new URL('./channels-client.tsx', import.meta.url), 'utf8');
+    const block = source.slice(
+      source.indexOf('const telegramStep'),
+      source.indexOf('const selectedAgent = useMemo'),
+    );
+    expect(block).toContain('document.visibilityState !== "visible"');
+    expect(block).toContain('void poll();');
+    expect(block).toContain('window.setInterval(() => void poll(), TELEGRAM_ONBOARDING_POLL_MS)');
+    expect(block).toContain('document.addEventListener("visibilitychange", onVisibilityChange)');
     expect(block).toContain('document.removeEventListener("visibilitychange", onVisibilityChange)');
   });
 });

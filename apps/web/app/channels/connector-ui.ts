@@ -7,6 +7,7 @@ export const X_DEVELOPER_PORTAL = 'https://developer.x.com/en/portal/dashboard';
 // journey; channel overwrites can still narrow it further.
 export const DISCORD_BOT_PERMISSIONS = 68_608;
 export const CHANNEL_STATUS_POLL_MS = 5_000;
+export const TELEGRAM_ONBOARDING_POLL_MS = 2_000;
 
 export function parseDiscordGroupCoordinates(
   value: string,
