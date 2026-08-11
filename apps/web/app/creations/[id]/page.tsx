@@ -1,6 +1,7 @@
 import { cache } from "react";
 import type { Metadata } from "next";
 import Link from "next/link";
+import { cookies } from "next/headers";
 import { notFound } from "next/navigation";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
@@ -16,6 +17,7 @@ import { formatDateTime, formatRelativeTime } from "@/lib/format";
 import type { AccountSummary, CreationDto } from "@/lib/types";
 import { studioRemixHref } from "@/components/studio/prefill";
 import { ReportCreation } from "@/components/creations/report-creation";
+import { forwardedApiAuthCookieHeader } from "@/lib/server-api-auth";
 
 /**
  * /creations/:id — the permalink. Server-rendered (share links get real
@@ -27,9 +29,18 @@ const BUTTON =
   "rounded-md border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground";
 
 /** One fetch shared by generateMetadata and the page render. */
-const loadCreation = cache((id: string): Promise<CreationDto> => {
-  return api.creations.get(id);
-});
+const loadCreation = cache(
+  (id: string, authCookieHeader: string | null): Promise<CreationDto> =>
+    api.creations.get(
+      id,
+      authCookieHeader ? { headers: { cookie: authCookieHeader } } : {},
+    ),
+);
+
+async function requestAuthCookieHeader(): Promise<string | null> {
+  const store = await cookies();
+  return forwardedApiAuthCookieHeader((name) => store.get(name)?.value);
+}
 
 function decodeId(raw: string): string {
   try {
@@ -44,7 +55,7 @@ type Props = { params: Promise<{ id: string }> };
 export async function generateMetadata({ params }: Props): Promise<Metadata> {
   const { id } = await params;
   try {
-    const creation = await loadCreation(decodeId(id));
+    const creation = await loadCreation(decodeId(id), await requestAuthCookieHeader());
     const prompt = promptOf(creation);
     const title = prompt
       ? prompt.length > 64
@@ -95,7 +106,7 @@ export default async function CreationPage({ params }: Props) {
   let creation: CreationDto | null = null;
   let failure: unknown = null;
   try {
-    creation = await loadCreation(decoded);
+    creation = await loadCreation(decoded, await requestAuthCookieHeader());
   } catch (error) {
     if (
       error instanceof ApiError &&

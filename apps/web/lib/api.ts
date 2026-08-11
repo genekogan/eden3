@@ -200,8 +200,8 @@ async function apiFetch<T>(
   return (await res.json()) as T;
 }
 
-function get<T>(path: string): Promise<T> {
-  return apiFetch<T>(path);
+function get<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return apiFetch<T>(path, init);
 }
 
 /** Fetch a raw (non-JSON) response body — file downloads / zip exports. */
@@ -844,9 +844,9 @@ export const api = {
 
   creations: {
     /** GET /api/creations/:id — accepts uuid or legacy 24-hex ids. */
-    async get(id: string): Promise<CreationDto> {
+    async get(id: string, init: RequestInit = {}): Promise<CreationDto> {
       return unwrap<CreationDto>(
-        await get<unknown>(`/creations/${enc(id)}`),
+        await get<unknown>(`/creations/${enc(id)}`, init),
         "creation",
       );
     },
