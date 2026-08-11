@@ -27,14 +27,11 @@ import {
   type StudioCategory,
 } from "@/components/studio/catalog";
 import { AgentSelector } from "./agent-selector";
-import { EnvChip } from "./env-chip";
 import { UserArea } from "./user-area";
 import { useSelectedAgent } from "./selected-agent-context";
 
 /** Minimal 24px stroke icons (multi-subpath `d` strings, lucide-derived). */
 export const ICONS = {
-  newChat:
-    "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2zM12 7.5v5M9.5 10h5",
   chats:
     "M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2zM18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1",
   schedule: "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20M12 6v6l4 2",
@@ -79,7 +76,7 @@ export function NavIcon({ d }: { d: string }) {
 }
 
 const AGENT_NAV = [
-  { sub: "chats", label: "Chats", icon: ICONS.chats },
+  { sub: "chats", label: "Chat", icon: ICONS.chats },
   { sub: "schedule", label: "Schedule", icon: ICONS.schedule },
   { sub: "workspace", label: "Workspace", icon: ICONS.workspace },
   { sub: "library", label: "Library", icon: ICONS.library },
@@ -188,62 +185,42 @@ function AgentNav({
 
   const base = `/agents/${encodeURIComponent(username)}`;
   const isActive = (href: string) => pathname === href || pathname.startsWith(`${href}/`);
-  const newChatHref = `${base}/chats/new`;
 
   return (
-    <>
-      <Link
-        href={newChatHref}
-        onClick={onNavigate}
-        aria-current={pathname === newChatHref ? "page" : undefined}
-        title="New Chat"
-        className={`mb-4 mt-4 flex items-center rounded-lg border py-2 text-sm transition-colors ${rowClass(labels)} ${
-          pathname === newChatHref
-            ? "border-accent/60 bg-accent/15 text-accent-soft"
-            : "border-accent/30 text-accent-soft hover:border-accent/60 hover:bg-accent/10"
-        }`}
-      >
-        <NavIcon d={ICONS.newChat} />
-        <span className={labelClass(labels)}>New Chat</span>
-      </Link>
-      <ul className="space-y-0.5">
-        {AGENT_NAV.filter(
-          (item) =>
-            !isEveUsername(username) || !isEveConcealedSubpath(item.sub),
-        ).map((item) => {
-          const href = `${base}/${item.sub}`;
-          // "New Chat" owns …/chats/new; everything else under chats lights Chats.
-          const active =
-            item.sub === "chats" ? isActive(href) && pathname !== newChatHref : isActive(href);
-          return (
-            <li key={item.sub}>
-              <Link
-                href={href}
-                onClick={onNavigate}
-                aria-current={active ? "page" : undefined}
-                title={item.label}
-                className={`relative flex items-center rounded-lg py-2 text-sm transition-colors ${rowClass(labels)} ${
-                  active
-                    ? "bg-foreground/[0.05] text-foreground"
-                    : "text-muted hover:bg-foreground/[0.03] hover:text-foreground"
-                }`}
-              >
-                {active ? (
-                  <span
-                    aria-hidden
-                    className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-accent"
-                  />
-                ) : null}
-                <span className={active ? "text-accent-soft" : "text-faint"}>
-                  <NavIcon d={item.icon} />
-                </span>
-                <span className={labelClass(labels)}>{item.label}</span>
-              </Link>
-            </li>
-          );
-        })}
-      </ul>
-    </>
+    <ul className="mt-4 space-y-0.5">
+      {AGENT_NAV.filter(
+        (item) => !isEveUsername(username) || !isEveConcealedSubpath(item.sub),
+      ).map((item) => {
+        const href = `${base}/${item.sub}`;
+        const active = isActive(href);
+        return (
+          <li key={item.sub}>
+            <Link
+              href={href}
+              onClick={onNavigate}
+              aria-current={active ? "page" : undefined}
+              title={item.label}
+              className={`relative flex items-center rounded-lg py-2 text-sm transition-colors ${rowClass(labels)} ${
+                active
+                  ? "bg-foreground/[0.05] text-foreground"
+                  : "text-muted hover:bg-foreground/[0.03] hover:text-foreground"
+              }`}
+            >
+              {active ? (
+                <span
+                  aria-hidden
+                  className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-accent"
+                />
+              ) : null}
+              <span className={active ? "text-accent-soft" : "text-faint"}>
+                <NavIcon d={item.icon} />
+              </span>
+              <span className={labelClass(labels)}>{item.label}</span>
+            </Link>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
@@ -351,8 +328,8 @@ export function Sidebar() {
     ? `/agents/${encodeURIComponent(username)}/chats`
     : lastAgentHref;
 
-  const mobileNewChatHref = username
-    ? `/agents/${encodeURIComponent(username)}/chats/new`
+  const mobileChatHref = username
+    ? `/agents/${encodeURIComponent(username)}/chats`
     : "/agents";
 
   return (
@@ -368,11 +345,11 @@ export function Sidebar() {
         </Link>
         <div className="flex items-center gap-2">
           <Link
-            href={mobileNewChatHref}
-            aria-label="New Chat"
+            href={mobileChatHref}
+            aria-label="Chat"
             className="flex size-11 items-center justify-center rounded-lg border border-edge text-muted transition-colors"
           >
-            <NavIcon d={ICONS.newChat} />
+            <NavIcon d={ICONS.chats} />
           </Link>
           <button
             type="button"
@@ -431,7 +408,7 @@ export function Sidebar() {
         data-testid="desktop-sidebar"
         className="sticky top-0 hidden h-dvh w-14 shrink-0 flex-col border-r border-edge bg-surface sm:flex lg:w-60"
       >
-        <div className="flex items-center justify-center gap-2 pb-3 pt-4 lg:justify-between lg:px-4">
+        <div className="flex items-center justify-center pb-3 pt-4 lg:justify-start lg:px-4">
           <Link
             href="/"
             aria-label="Eden home"
@@ -443,9 +420,6 @@ export function Sidebar() {
             </span>
             <span aria-hidden className="block size-2.5 rounded-full bg-accent lg:hidden" />
           </Link>
-          <span className="hidden lg:inline-flex lg:items-center">
-            <EnvChip />
-          </span>
         </div>
 
         <div className="px-2 lg:px-3">
