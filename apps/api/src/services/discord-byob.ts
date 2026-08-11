@@ -81,6 +81,7 @@ export class FetchDiscordCurrentUserClient implements DiscordCurrentUserClientLi
         method: 'GET',
         headers: { authorization: `Bot ${token}` },
         signal: AbortSignal.timeout(this.timeoutMs),
+        redirect: 'error',
       });
       if (response.status === 401 || response.status === 403) {
         return {

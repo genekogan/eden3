@@ -18,7 +18,10 @@ describe('FetchChannelProviderClient', () => {
     });
     expect(fetchImpl).toHaveBeenCalledWith(
       'https://discord.com/api/v10/users/@me',
-      expect.objectContaining({ headers: { authorization: 'Bot discord-secret' } }),
+      expect.objectContaining({
+        headers: { authorization: 'Bot discord-secret' },
+        redirect: 'error',
+      }),
     );
   });
 
@@ -57,6 +60,10 @@ describe('FetchChannelProviderClient', () => {
       bot: { id: '456', username: 'eden_bot', displayName: 'Eden Three' },
     });
     expect(JSON.stringify(result)).not.toContain('abcdefghijklmnopqrstuvwxyzABCDE');
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://api.telegram.org/bot123456789:abcdefghijklmnopqrstuvwxyzABCDE/getMe',
+      expect.objectContaining({ redirect: 'error' }),
+    );
   });
 
   it.each([
@@ -75,7 +82,7 @@ describe('FetchChannelProviderClient', () => {
   });
 
   it('discovers only Discord text destinations', async () => {
-    const fetchImpl = vi.fn(async (input: string | URL | Request) => {
+    const fetchImpl = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/users/@me/guilds')) {
         return new Response(JSON.stringify([{ id: 'guild-1', name: 'Eden' }]), { status: 200 });
@@ -95,6 +102,10 @@ describe('FetchChannelProviderClient', () => {
       { guildId: 'guild-1', guildName: 'Eden', channelId: 'text-1', channelName: 'general' },
       { guildId: 'guild-1', guildName: 'Eden', channelId: 'forum-1', channelName: 'ideas' },
     ]);
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    for (const [, init] of fetchImpl.mock.calls) {
+      expect(init).toEqual(expect.objectContaining({ redirect: 'error' }));
+    }
   });
 
   it('does not invent Telegram destinations before updates arrive', async () => {

@@ -81,6 +81,7 @@ describe('FetchTelegramManagedBotApiClient', () => {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ user_id: '9007199254740002' }),
+        redirect: 'error',
       }),
     );
   });

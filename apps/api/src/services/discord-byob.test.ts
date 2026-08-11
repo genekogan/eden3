@@ -81,6 +81,7 @@ describe('FetchDiscordCurrentUserClient', () => {
     expect(init).toMatchObject({
       method: 'GET',
       headers: { authorization: 'Bot synthetic-token' },
+      redirect: 'error',
     });
     expect(result).toMatchObject({ ok: true, bot: { username: 'edenbot' } });
   });

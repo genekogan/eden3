@@ -179,6 +179,7 @@ export class FetchTelegramManagedBotApiClient implements TelegramManagedBotApiCl
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ user_id: userId }),
           signal: AbortSignal.timeout(this.timeoutMs),
+          redirect: 'error',
         },
       );
     } catch {

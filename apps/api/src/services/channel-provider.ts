@@ -113,6 +113,7 @@ export class FetchChannelProviderClient implements ChannelProviderClientLike {
         const response = await this.fetchImpl('https://discord.com/api/v10/users/@me', {
           headers: { authorization: `Bot ${token}` },
           signal: this.signal(),
+          redirect: 'error',
         });
         if (!response.ok) return providerFailure(response.status);
         const body = (await response.json()) as DiscordUserResponse;
@@ -137,6 +138,7 @@ export class FetchChannelProviderClient implements ChannelProviderClientLike {
       }
       const response = await this.fetchImpl(`https://api.telegram.org/bot${token}/getMe`, {
         signal: this.signal(),
+        redirect: 'error',
       });
       if (!response.ok) return providerFailure(response.status);
       const body = (await response.json()) as TelegramMeResponse;
@@ -176,6 +178,7 @@ export class FetchChannelProviderClient implements ChannelProviderClientLike {
     const guildResponse = await this.fetchImpl('https://discord.com/api/v10/users/@me/guilds', {
       headers: { authorization: `Bot ${token}` },
       signal: this.signal(),
+      redirect: 'error',
     });
     if (!guildResponse.ok) throw new Error(providerFailure(guildResponse.status).code);
     const guilds = (await guildResponse.json()) as unknown;
@@ -193,6 +196,7 @@ export class FetchChannelProviderClient implements ChannelProviderClientLike {
         {
           headers: { authorization: `Bot ${token}` },
           signal: this.signal(),
+          redirect: 'error',
         },
       );
       if (!response.ok) continue;
