@@ -72,6 +72,8 @@ describe('resource DTOs', () => {
       platform: 'app',
       channelConnectionId: null,
       readOnly: false,
+      pinned: true,
+      archivedAt: null,
       agentIds: [uuid('1')],
       userIds: [uuid('2')],
       lastMessageAt: now,

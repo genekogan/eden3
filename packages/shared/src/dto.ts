@@ -186,6 +186,10 @@ export const sessionDto = z.object({
   channelConnectionId: uuidSchema.nullable(),
   /** Channel mirrors are observable in Eden but cannot be injected into. */
   readOnly: z.boolean(),
+  /** User-managed conversation ordering flag. */
+  pinned: z.boolean(),
+  /** Reversible archive timestamp; null means the conversation is active. */
+  archivedAt: isoDateTimeSchema.nullable(),
   /** Agent accounts.id members (session_agents). */
   agentIds: z.array(uuidSchema),
   /** User accounts.id members (session_users). */

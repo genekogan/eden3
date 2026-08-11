@@ -25,7 +25,7 @@ import {
   encodeSseComment,
   encodeSseEvent,
 } from '@eden3/shared';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import type { FastifyPluginAsync, FastifyReply } from 'fastify';
 import { z } from 'zod';
 
@@ -37,6 +37,7 @@ import { projectAgentConcepts } from '../services/concepts';
 import { assertTurnAdmissible, runTurn, type TurnAgent, type TurnSink } from '../services/turns';
 import { canAccessSession } from './sessions';
 import { enqueueLazyMemoryDistillation } from '../services/memory-distillation';
+import { generateSessionTitle } from '../services/session-title';
 
 /**
  * POST /sessions/:idOrNew/messages — the chat turn endpoint.
@@ -69,16 +70,6 @@ const bodySchema = z.object({
   /** Required for `new`, ignored otherwise. */
   agentUsername: z.string().trim().min(1).optional(),
 });
-
-const NEW_SESSION_TITLE_CHARS = 80;
-
-/** Derive a session title from the first message. */
-export function titleFromContent(content: string): string {
-  const collapsed = content.replace(/\s+/g, ' ').trim();
-  return collapsed.length > NEW_SESSION_TITLE_CHARS
-    ? `${collapsed.slice(0, NEW_SESSION_TITLE_CHARS - 1)}…`
-    : collapsed;
-}
 
 interface ResolvedTarget {
   session: Session;
@@ -297,7 +288,9 @@ export async function createSession(
       .values({
         id: sessionId,
         ownerId: viewer.accountId,
-        title: titleFromContent(content),
+        // A cheap isolated Haiku job fills this asynchronously. Keeping it
+        // null avoids exposing the first message verbatim as the title.
+        title: null,
         sessionType: 'chat',
         gatewaySessionKey: key,
       })
@@ -467,6 +460,28 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
         assertChatAgentVisible(account, preResolved.account, preResolved.agent);
         await assertTurnAdmissible(account.accountId, preResolved.agent.model ?? undefined);
         target = await createSession(account, body.agentUsername, body.content, app.gatewayGlue);
+        const titleLogContext = { sessionId: target.session.id };
+        void generateSessionTitle({
+          compat: app.gatewayCompat,
+          agentId: target.agent.openclawId,
+          sessionId: target.session.id,
+          firstMessage: body.content,
+          persistIfUntitled: async (title) => {
+            const [updated] = await db
+              .update(sessions)
+              .set({ title, updatedAt: new Date() })
+              .where(sql`${sessions.id} = ${target.session.id} and ${sessions.title} is null and ${sessions.deleted} = false`)
+              .returning({ id: sessions.id });
+            return updated !== undefined;
+          },
+        }).catch(
+          safeRequestErrorCallback(
+            req.log,
+            titleLogContext,
+            'session title generation failed',
+            'warn',
+          ),
+        );
       } else {
         target = await resolveExisting(req.params.idOrNew, account, app.gatewayGlue);
         await assertTurnAdmissible(

@@ -195,6 +195,8 @@ export const sessions = pgTable(
     gatewayPrimedAt: timestamptz('gateway_primed_at'),
     lastMessageAt: timestamptz('last_message_at'),
     messageCount: integer('message_count').notNull().default(0),
+    /** User-managed reversible archive state; distinct from legacy `visible=false`. */
+    archivedAt: timestamptz('archived_at'),
     createdAt: timestamptz('created_at').notNull().defaultNow(),
     updatedAt: timestamptz('updated_at').notNull().defaultNow(),
     deleted: boolean('deleted').notNull().default(false),

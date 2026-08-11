@@ -43,6 +43,8 @@ import { ApiError } from '../errors';
 // ---------------------------------------------------------------------------
 
 const sessionListCursorSchema = z.object({
+  /** pinned state of the last row (new cursors always include it). */
+  p: z.boolean().optional(),
   /** last_message_at ISO of the last row, or null when paging the null tail. */
   m: z.string().datetime({ offset: true }).nullable(),
   id: z.string().uuid(),
@@ -121,6 +123,8 @@ export function toSessionDto(
     platform: row.platform,
     channelConnectionId: row.channelConnectionId,
     readOnly: row.channelConnectionId !== null || row.sessionType === 'channel',
+    pinned: row.pinned === true,
+    archivedAt: isoOrNull(row.archivedAt),
     agentIds: members.agentIds,
     userIds: members.userIds,
     ...(members.agents ? { agents: members.agents } : {}),
@@ -256,7 +260,21 @@ const listQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(100).default(30),
   /** Filter to sessions this agent participates in (username, uuid, or legacy 24-hex id). */
   agent: z.string().trim().min(1).max(200).optional(),
+  /** Active is the normal rail; archived is the reversible archive view. */
+  archived: z.enum(['active', 'archived']).default('active'),
 });
+
+const updateSessionBodySchema = z
+  .object({
+    title: z.string().trim().min(1).max(120).optional(),
+    pinned: z.boolean().optional(),
+    archived: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    (value) => value.title !== undefined || value.pinned !== undefined || value.archived !== undefined,
+    'At least one conversation change is required',
+  );
 
 /** Resolve an agent reference to an accounts.id, or null when unknown. */
 async function resolveAgentRef(ref: string): Promise<string | null> {
@@ -273,7 +291,7 @@ const detailQuerySchema = z.object({
 export const sessionsRoutes: FastifyPluginAsync = async (app) => {
   // GET /sessions — the caller's sessions, newest activity first.
   app.get('/', { preHandler: app.requireAuth }, async (req) => {
-    const { cursor: rawCursor, limit, agent } = listQuerySchema.parse(req.query);
+    const { cursor: rawCursor, limit, agent, archived } = listQuerySchema.parse(req.query);
     const me = req.account!.accountId;
     const cursor = rawCursor ? decodeSessionListCursor(rawCursor) : null;
 
@@ -286,6 +304,9 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
     const conditions = [
       eq(sessions.deleted, false),
       sql`${sessions.visible} is distinct from false`,
+      archived === 'archived'
+        ? sql`${sessions.archivedAt} is not null`
+        : sql`${sessions.archivedAt} is null`,
       sql`(${sessions.ownerId} = ${me} or exists (
         select 1 from ${sessionUsers}
         where ${sessionUsers.sessionId} = ${sessions.id}
@@ -302,13 +323,18 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
       );
     }
     if (cursor) {
-      // Keyset over (last_message_at desc nulls last, id desc).
-      conditions.push(
+      // Keyset over (pinned desc, last_message_at desc nulls last, id desc).
+      const activityTail =
         cursor.m === null
           ? sql`(${sessions.lastMessageAt} is null and ${sessions.id} < ${cursor.id})`
           : sql`(${sessions.lastMessageAt} < ${cursor.m}::timestamptz
               or (${sessions.lastMessageAt} = ${cursor.m}::timestamptz and ${sessions.id} < ${cursor.id})
-              or ${sessions.lastMessageAt} is null)`,
+              or ${sessions.lastMessageAt} is null)`;
+      conditions.push(
+        cursor.p
+          ? sql`((coalesce(${sessions.pinned}, false) = true and ${activityTail})
+              or coalesce(${sessions.pinned}, false) = false)`
+          : sql`(coalesce(${sessions.pinned}, false) = false and ${activityTail})`,
       );
     }
 
@@ -316,7 +342,11 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
       .select()
       .from(sessions)
       .where(and(...conditions))
-      .orderBy(sql`${sessions.lastMessageAt} desc nulls last`, desc(sessions.id))
+      .orderBy(
+        sql`coalesce(${sessions.pinned}, false) desc`,
+        sql`${sessions.lastMessageAt} desc nulls last`,
+        desc(sessions.id),
+      )
       .limit(limit + 1);
 
     const page = rows.slice(0, limit);
@@ -324,7 +354,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
     const last = page.at(-1);
     const nextCursor =
       rows.length > limit && last
-        ? encodeCursor({ m: isoOrNull(last.lastMessageAt), id: last.id })
+        ? encodeCursor({ p: last.pinned === true, m: isoOrNull(last.lastMessageAt), id: last.id })
         : null;
 
     return {
@@ -334,6 +364,59 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
       nextCursor,
     };
   });
+
+  // PATCH /sessions/:id — rename, pin, and reversibly archive one owned chat.
+  app.patch<{ Params: { id: string } }>(
+    '/:id',
+    { preHandler: app.requireAuth },
+    async (req) => {
+      const body = updateSessionBodySchema.parse(req.body);
+      const session = await resolveSession(req.params.id);
+      if (!session) throw new ApiError(404, 'not_found', 'Session not found');
+      const account = req.account!;
+      if (!account.isAdmin && session.ownerId !== account.accountId) {
+        throw new ApiError(403, 'forbidden', 'Only the conversation owner can manage it');
+      }
+
+      const changes: Partial<typeof sessions.$inferInsert> = { updatedAt: new Date() };
+      if (body.title !== undefined) changes.title = body.title;
+      if (body.pinned !== undefined) changes.pinned = body.pinned;
+      if (body.archived !== undefined) changes.archivedAt = body.archived ? new Date() : null;
+
+      const [updated] = await db
+        .update(sessions)
+        .set(changes)
+        .where(and(eq(sessions.id, session.id), eq(sessions.deleted, false)))
+        .returning();
+      if (!updated) throw new ApiError(404, 'not_found', 'Session not found');
+      const members = await loadMembers([updated.id]);
+      return {
+        session: toSessionDto(
+          updated,
+          members.get(updated.id) ?? { agentIds: [], userIds: [], agents: [] },
+        ),
+      };
+    },
+  );
+
+  // DELETE /sessions/:id — the existing data model uses recoverable soft deletion.
+  app.delete<{ Params: { id: string } }>(
+    '/:id',
+    { preHandler: app.requireAuth },
+    async (req, reply) => {
+      const session = await resolveSession(req.params.id);
+      if (!session) throw new ApiError(404, 'not_found', 'Session not found');
+      const account = req.account!;
+      if (!account.isAdmin && session.ownerId !== account.accountId) {
+        throw new ApiError(403, 'forbidden', 'Only the conversation owner can delete it');
+      }
+      await db
+        .update(sessions)
+        .set({ deleted: true, pinned: false, updatedAt: new Date() })
+        .where(and(eq(sessions.id, session.id), eq(sessions.deleted, false)));
+      return reply.code(204).send();
+    },
+  );
 
   // GET /sessions/:id — session + newest messages (ascending within the page).
   app.get<{ Params: { id: string } }>(

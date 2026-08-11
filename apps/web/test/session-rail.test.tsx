@@ -17,6 +17,8 @@ const session: SessionDto = {
   platform: null,
   channelConnectionId: null,
   readOnly: false,
+  pinned: false,
+  archivedAt: null,
   agentIds: ["00000000-0000-4000-8000-000000000003"],
   userIds: ["00000000-0000-4000-8000-000000000002"],
   agents: [
@@ -54,5 +56,18 @@ describe("agent-scoped conversation rail", () => {
     expect(source).not.toContain('from "@/components/agent-avatar"');
     expect(source).not.toContain("<AgentAvatar");
     expect(source).toContain("<SessionRailItem");
+  });
+
+  it("wires the real share, rename, pin, archive, and soft-delete actions", () => {
+    const source = readFileSync(
+      resolve(import.meta.dirname, "../components/chat/session-rail.tsx"),
+      "utf8",
+    );
+    expect(source).toContain("<SessionShareDialog");
+    expect(source).toContain('api.sessions.update(session.id, body)');
+    expect(source).toContain('pinned: !session.pinned');
+    expect(source).toContain('archived: !archivedView');
+    expect(source).toContain('api.sessions.remove(session.id)');
+    expect(source).toContain('Existing share links will stop working.');
   });
 });

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useReducer, useState } from "react";
+import React from "react";
+import { useCallback, useEffect, useReducer, useState, type ReactNode } from "react";
 
 import { api } from "@/lib/api";
 import { formatDateTime } from "@/lib/format";
@@ -17,9 +18,16 @@ function errorMessage(error: unknown): string {
 export function SessionShareDialog({
   sessionId,
   boundaryMessageId,
+  renderTrigger,
+  open: controlledOpen,
+  onOpenChange,
 }: {
   sessionId: string;
   boundaryMessageId: string | null;
+  /** undefined renders the default button; null renders no trigger. */
+  renderTrigger?: ((open: () => void) => ReactNode) | null;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [state, dispatch] = useReducer(
     sessionShareDialogReducer,
@@ -27,23 +35,38 @@ export function SessionShareDialog({
   );
   const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
-    if (!state.open) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") dispatch({ type: "close" });
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [state.open]);
-
-  const open = () => {
+  const openDialog = useCallback(() => {
     dispatch({ type: "open" });
     dispatch({ type: "load/start" });
     void api.shares
       .list(sessionId)
       .then((response) => dispatch({ type: "load/success", items: response.items }))
       .catch((error) => dispatch({ type: "failure", message: errorMessage(error) }));
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (controlledOpen === true && !state.open) openDialog();
+    if (controlledOpen === false && state.open) dispatch({ type: "close" });
+  }, [controlledOpen, openDialog, state.open]);
+
+  const requestOpen = () => {
+    if (onOpenChange) onOpenChange(true);
+    else openDialog();
   };
+
+  const close = () => {
+    dispatch({ type: "close" });
+    onOpenChange?.(false);
+  };
+
+  useEffect(() => {
+    if (!state.open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [state.open, onOpenChange]);
 
   const create = () => {
     dispatch({ type: "create/start" });
@@ -73,18 +96,22 @@ export function SessionShareDialog({
 
   return (
     <>
-      <button
-        type="button"
-        onClick={open}
-        className="rounded-md border border-edge px-2.5 py-1 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground"
-      >
-        Share
-      </button>
+      {renderTrigger === null ? null : renderTrigger ? (
+        renderTrigger(requestOpen)
+      ) : (
+        <button
+          type="button"
+          onClick={requestOpen}
+          className="rounded-md border border-edge px-2.5 py-1 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground"
+        >
+          Share
+        </button>
+      )}
       {state.open ? (
         <div
           className="fixed inset-0 z-[110] flex items-center justify-center bg-background/75 px-4 backdrop-blur-sm"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget) dispatch({ type: "close" });
+            if (event.target === event.currentTarget) close();
           }}
         >
           <section
@@ -105,7 +132,7 @@ export function SessionShareDialog({
               <button
                 type="button"
                 aria-label="Close share dialog"
-                onClick={() => dispatch({ type: "close" })}
+                onClick={close}
                 className="text-muted hover:text-foreground"
               >
                 ✕

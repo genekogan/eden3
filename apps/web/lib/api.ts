@@ -627,7 +627,7 @@ export const api = {
   sessions: {
     /** GET /api/sessions?cursor&agent — agent filters to that agent's sessions. */
     async list(
-      params: { cursor?: string; agent?: string } = {},
+      params: { cursor?: string; agent?: string; archived?: "active" | "archived" } = {},
     ): Promise<Paginated<SessionDto>> {
       return toPaginated<SessionDto>(
         await get<unknown>(`/sessions${qs(params)}`),
@@ -638,6 +638,26 @@ export const api = {
     /** GET /api/sessions/:id — accepts uuid or legacy 24-hex permalink ids. */
     async get(id: string): Promise<SessionDetail> {
       return toSessionDetail(await get<unknown>(`/sessions/${enc(id)}`));
+    },
+
+    /** Rename, pin/unpin, or archive/unarchive one owned conversation. */
+    async update(
+      id: string,
+      body: { title?: string; pinned?: boolean; archived?: boolean },
+    ): Promise<SessionDto> {
+      return unwrap<SessionDto>(
+        await apiFetch<unknown>(`/sessions/${enc(id)}`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+        "session",
+      );
+    },
+
+    /** Soft-delete one owned conversation. */
+    async remove(id: string): Promise<void> {
+      await apiFetch<unknown>(`/sessions/${enc(id)}`, { method: "DELETE" });
     },
 
     /**

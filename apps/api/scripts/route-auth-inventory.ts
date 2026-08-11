@@ -134,7 +134,7 @@ const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/creations/:idOrExternal', ['DELETE']],
   ['/sessions', ['GET', 'HEAD']],
   ['/sessions/', ['HEAD']],
-  ['/sessions/:id', ['GET', 'HEAD']],
+  ['/sessions/:id', ['DELETE', 'GET', 'HEAD', 'PATCH']],
   ['/sessions/:id/events', ['GET', 'HEAD']],
   ['/sessions/:idOrNew/messages', ['POST']],
   ['/sessions/:sessionId/shares', ['GET', 'HEAD', 'POST']],
