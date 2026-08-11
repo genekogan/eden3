@@ -10,6 +10,8 @@ import {
   connectionHealthLabel,
   connectionStatusLabel,
   discordInviteUrl,
+  discordDestinationSelected,
+  toggleDiscordDestination,
   parseDiscordGroupCoordinates,
   parseTelegramGroupCoordinates,
   telegramManagedStep,
@@ -60,6 +62,34 @@ describe('connector links', () => {
       { groupId: '-100456' },
     ]);
     expect(parseTelegramGroupCoordinates('100123')).toBeNull();
+  });
+
+  it('toggles discovered Discord channels without widening the explicit allowlist', () => {
+    const first = { guildId: '111', channelId: '222' };
+    const second = { guildId: '111', channelId: '333' };
+    expect(toggleDiscordDestination('', first, true)).toBe('111/222');
+    expect(toggleDiscordDestination('111/222', second, true)).toBe('111/222, 111/333');
+    expect(discordDestinationSelected('111/222, 111/333', second)).toBe(true);
+    expect(toggleDiscordDestination('111/222, 111/333', first, false)).toBe('111/333');
+    expect(toggleDiscordDestination('not-canonical', first, true)).toBeNull();
+  });
+
+  it('wires audited destination discovery into the explicit Discord selection', async () => {
+    const source = await readFile(new URL('./channels-client.tsx', import.meta.url), 'utf8');
+    const discovery = source.slice(
+      source.indexOf('const discoverDiscordDestinations'),
+      source.indexOf('const activate ='),
+    );
+    expect(discovery).toContain('api.channels.destinations(connection.id)');
+    expect(discovery).toContain('[connection.id]: result.items');
+    const picker = source.slice(
+      source.indexOf('Discover Discord channels'),
+      source.indexOf('{pairings[connection.id]'),
+    );
+    expect(picker).toContain('discordDestinationSelected(draft.groups, destination)');
+    expect(picker).toContain('toggleDiscordDestination(');
+    expect(picker).toContain('destination.guildName');
+    expect(picker).toContain('destination.channelName');
   });
   it('builds a fixed-scope Discord invite from a validated snowflake', () => {
     // VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY. Keep this least-privilege

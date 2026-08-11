@@ -32,6 +32,42 @@ export function parseTelegramGroupCoordinates(value: string): Array<{ groupId: s
     : null;
 }
 
+type DiscordDestinationCoordinate = { guildId: string; channelId: string };
+
+export function discordDestinationSelected(
+  value: string,
+  destination: DiscordDestinationCoordinate,
+): boolean {
+  const groups = parseDiscordGroupCoordinates(value);
+  return groups?.some(
+    (group) => group.guildId === destination.guildId && group.channelIds.includes(destination.channelId),
+  ) ?? false;
+}
+
+export function toggleDiscordDestination(
+  value: string,
+  destination: DiscordDestinationCoordinate,
+  selected: boolean,
+): string | null {
+  const groups = parseDiscordGroupCoordinates(value);
+  if (!groups) return null;
+  const next = groups.map((group) => ({ ...group, channelIds: [...group.channelIds] }));
+  const group = next.find((candidate) => candidate.guildId === destination.guildId);
+  if (selected) {
+    if (group) {
+      if (!group.channelIds.includes(destination.channelId)) group.channelIds.push(destination.channelId);
+    } else {
+      next.push({ guildId: destination.guildId, channelIds: [destination.channelId] });
+    }
+  } else if (group) {
+    group.channelIds = group.channelIds.filter((channelId) => channelId !== destination.channelId);
+  }
+  return next
+    .filter((candidate) => candidate.channelIds.length > 0)
+    .flatMap((candidate) => candidate.channelIds.map((channelId) => `${candidate.guildId}/${channelId}`))
+    .join(', ');
+}
+
 export type TelegramManagedStep =
   | 'bind_owner'
   | 'choose_bot'

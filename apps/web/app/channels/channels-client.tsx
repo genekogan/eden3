@@ -6,6 +6,7 @@ import type {
   AgentDto,
   ChannelConnectionCreateInput,
   ChannelConnectionDto,
+  ChannelDestinationDto,
   ChannelKind,
   ChannelPairingRequestDto,
   TelegramManagedBotOnboardingStatus,
@@ -24,10 +25,12 @@ import {
   channelClientDeepLink,
   connectionHealthLabel,
   connectionStatusLabel,
+  discordDestinationSelected,
   discordInviteUrl,
   parseDiscordGroupCoordinates,
   parseTelegramGroupCoordinates,
   telegramManagedStep,
+  toggleDiscordDestination,
   trustedTelegramUrl,
   xClientDeepLink,
   xFailureAction,
@@ -134,6 +137,8 @@ export function ChannelsClient({
   const [pairingLinks, setPairingLinks] = useState<Record<string, boolean>>({});
   const [pairingCodes, setPairingCodes] = useState<Record<string, string>>({});
   const [rotateTokens, setRotateTokens] = useState<Record<string, string>>({});
+  const [discordDestinations, setDiscordDestinations] =
+    useState<Record<string, ChannelDestinationDto[]>>({});
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const [xCredentials, setXCredentials] = useState<XByoCredentialsInput>({
     apiKey: "",
@@ -588,6 +593,23 @@ export function ChannelsClient({
     }
   };
 
+  const discoverDiscordDestinations = async (connection: ChannelConnectionDto) => {
+    setBusy(`destinations:${connection.id}`);
+    setNote(null);
+    try {
+      const result = await api.channels.destinations(connection.id);
+      if (!alive.current) return;
+      setDiscordDestinations((current) => ({ ...current, [connection.id]: result.items }));
+      if (result.items.length === 0) {
+        setNote("No visible Discord text channels were found. Install the bot first, then try again.");
+      }
+    } catch (error) {
+      if (alive.current) setNote(errorCopy(error));
+    } finally {
+      if (alive.current) setBusy(null);
+    }
+  };
+
   const activate = async (connection: ChannelConnectionDto) => {
     const draft = drafts[connection.id] ?? initialDraft(connection);
     const allowFrom = parseAllowFrom(draft.allowFrom);
@@ -715,6 +737,7 @@ export function ChannelsClient({
   const renderConnection = (connection: ChannelConnectionDto) => {
     const draft = drafts[connection.id] ?? initialDraft(connection);
     const pending = (pairings[connection.id] ?? []).filter((item) => item.status === "pending");
+    const discoveredDestinations = discordDestinations[connection.id];
     const clientLink = channelClientDeepLink(connection);
     const inviteLink =
       connection.channel === "discord" && connection.bot?.id
@@ -776,6 +799,52 @@ export function ChannelsClient({
           <p className="mt-2 text-xs text-muted">
             Optional. Group replies require an allowed sender and an explicit bot mention. Group memory is isolated from every participant&apos;s private DM memory.
           </p>
+          {connection.channel === "discord" ? (
+            <div className="mt-3">
+              <button
+                type="button"
+                onClick={() => void discoverDiscordDestinations(connection)}
+                disabled={busy === `destinations:${connection.id}`}
+                className="rounded-lg border border-edge px-3 py-2 text-xs text-muted disabled:opacity-50"
+              >
+                {busy === `destinations:${connection.id}` ? "Discovering…" : "Discover Discord channels"}
+              </button>
+              {discoveredDestinations ? (
+                discoveredDestinations.length > 0 ? (
+                  <ul className="mt-3 max-h-56 space-y-1 overflow-y-auto rounded-lg border border-edge bg-surface p-2">
+                    {discoveredDestinations.map((destination) => (
+                      <li key={`${destination.guildId}/${destination.channelId}`}>
+                        <label className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs text-muted hover:bg-background">
+                          <input
+                            type="checkbox"
+                            checked={discordDestinationSelected(draft.groups, destination)}
+                            onChange={(event) => {
+                              const groups = toggleDiscordDestination(
+                                draft.groups,
+                                destination,
+                                event.target.checked,
+                              );
+                              if (groups === null) {
+                                setNote("Fix the manually entered guild/channel pairs before selecting discovered channels.");
+                                return;
+                              }
+                              setDrafts((current) => ({
+                                ...current,
+                                [connection.id]: { ...draft, groups },
+                              }));
+                            }}
+                          />
+                          <span className="truncate">{destination.guildName} / #{destination.channelName}</span>
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-2 text-xs text-faint">No visible Discord text channels found.</p>
+                )
+              ) : null}
+            </div>
+          ) : null}
         </div>
 
         <div className="mt-4 flex flex-wrap gap-2">
