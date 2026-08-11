@@ -950,7 +950,7 @@ export function ChannelsClient({
                       <li><a href={DISCORD_DEVELOPER_PORTAL} target="_blank" rel="noreferrer" className="text-accent-soft underline underline-offset-2">Open the Discord developer portal</a> and create an application.</li>
                       <li>Open Bot, add a bot, then copy its token. Never paste a user token.</li>
                       <li>Save below. Eden validates it with Discord’s bot identity endpoint.</li>
-                      <li>After validation, use the fixed-permission invite shown on the connection.</li>
+                      <li>After validation, use the least-privilege invite shown on the connection. It requests only view, send, and message-history access.</li>
                     </ol>
                   </div>
                   <FormField label="Bot token">

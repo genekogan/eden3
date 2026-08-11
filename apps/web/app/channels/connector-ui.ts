@@ -2,7 +2,10 @@ import type { ChannelConnectionDto, XConnectionDto } from '@/lib/types';
 
 export const DISCORD_DEVELOPER_PORTAL = 'https://discord.com/developers/applications';
 export const X_DEVELOPER_PORTAL = 'https://developer.x.com/en/portal/dashboard';
-export const DISCORD_BOT_PERMISSIONS = 0;
+// Discord VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY. This is the
+// smallest guild permission set needed for Eden's allowlisted receive/reply
+// journey; channel overwrites can still narrow it further.
+export const DISCORD_BOT_PERMISSIONS = 68_608;
 export const CHANNEL_STATUS_POLL_MS = 5_000;
 
 export function parseDiscordGroupCoordinates(

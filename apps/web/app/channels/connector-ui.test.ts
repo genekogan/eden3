@@ -61,6 +61,9 @@ describe('connector links', () => {
     expect(parseTelegramGroupCoordinates('100123')).toBeNull();
   });
   it('builds a fixed-scope Discord invite from a validated snowflake', () => {
+    // VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY. Keep this least-privilege
+    // value exact so onboarding cannot silently regress to an unusable or overbroad bot.
+    expect(DISCORD_BOT_PERMISSIONS).toBe(68_608);
     const url = new URL(discordInviteUrl('123456789')!);
     expect(url.searchParams.get('client_id')).toBe('123456789');
     expect(url.searchParams.get('permissions')).toBe(String(DISCORD_BOT_PERMISSIONS));
