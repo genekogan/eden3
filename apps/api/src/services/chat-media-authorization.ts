@@ -33,6 +33,36 @@ const MEDIA_TOOLS = new Set<StudioToolName>([
 ]);
 const CHAT_VIDEO_MODEL = 'fal/fal-ai/kling-video/v3/pro/text-to-video';
 const CHAT_MUSIC_MODEL = 'google/lyria-3-clip-preview';
+const CHAT_IMAGE_ASPECT_RATIOS = new Set([
+  '1:1',
+  '2:1',
+  '20:9',
+  '19.5:9',
+  '2:3',
+  '3:2',
+  '2.35:1',
+  '3:4',
+  '4:3',
+  '4:5',
+  '5:4',
+  '9:16',
+  '9:19.5',
+  '9:20',
+  '16:9',
+  '21:9',
+  '1:2',
+  '4:1',
+  '1:4',
+  '8:1',
+  '1:8',
+]);
+const CHAT_IMAGE_SIZE_ASPECT_RATIO = new Map([
+  ['1024x1024', '1:1'],
+  ['1536x1024', '3:2'],
+  ['1024x1536', '2:3'],
+  ['2048x2048', '1:1'],
+  ['3840x2160', '16:9'],
+]);
 
 export interface ChatMediaAuthorizationRequest {
   runId?: string;
@@ -139,6 +169,28 @@ function imageModelKey(raw: unknown): keyof typeof IMAGE_MODEL_OPTIONS | null {
   return null;
 }
 
+function chatImageAspectRatio(rawArgs: Record<string, unknown>): string | undefined {
+  const suppliedAspect = rawArgs.aspectRatio;
+  const suppliedSize = rawArgs.size;
+  if (suppliedAspect !== undefined && (
+    typeof suppliedAspect !== 'string' || !CHAT_IMAGE_ASPECT_RATIOS.has(suppliedAspect)
+  )) {
+    throw new Error('chat-media-authorization: unsupported image aspect ratio');
+  }
+  if (suppliedSize !== undefined && (
+    typeof suppliedSize !== 'string' || !CHAT_IMAGE_SIZE_ASPECT_RATIO.has(suppliedSize)
+  )) {
+    throw new Error('chat-media-authorization: unsupported image size');
+  }
+  const sizeAspect = typeof suppliedSize === 'string'
+    ? CHAT_IMAGE_SIZE_ASPECT_RATIO.get(suppliedSize)
+    : undefined;
+  if (suppliedAspect !== undefined && sizeAspect !== undefined && suppliedAspect !== sizeAspect) {
+    throw new Error('chat-media-authorization: ambiguous image geometry');
+  }
+  return typeof suppliedAspect === 'string' ? suppliedAspect : sizeAspect;
+}
+
 /**
  * Verify the separate Studio reservation for a direct OpenClaw tool invoke.
  * The `eden3:studio:<uuid>` context is only an index, never authority: the
@@ -238,7 +290,7 @@ export function quoteChatMediaTool(
 ): StudioGenerationQuote {
   const allowed =
     tool === 'image_generate'
-      ? new Set(['action', 'prompt', 'model'])
+      ? new Set(['action', 'prompt', 'model', 'aspectRatio', 'size'])
       : tool === 'video_generate' || tool === 'music_generate'
         ? new Set(['action', 'prompt', 'duration', 'durationSeconds', 'model'])
         : new Set(['action', 'text']);
@@ -262,6 +314,7 @@ export function quoteChatMediaTool(
   if (tool === 'image_generate') {
     const model = imageModelKey(rawArgs.model);
     if (!model) throw new Error('chat-media-authorization: unsupported image route');
+    chatImageAspectRatio(rawArgs);
     return quoteStudioGeneration(tool, { prompt, model });
   }
   if (rawArgs.duration !== undefined && rawArgs.durationSeconds !== undefined) {
@@ -303,7 +356,12 @@ export function canonicalChatMediaProviderArgs(
   if (tool === 'image_generate') {
     const model = imageModelKey(rawArgs.model);
     if (!model) throw new Error('chat-media-authorization: unsupported image model');
-    return { prompt, model: IMAGE_MODEL_OPTIONS[model].openclawModel };
+    const aspectRatio = chatImageAspectRatio(rawArgs);
+    return {
+      prompt,
+      model: IMAGE_MODEL_OPTIONS[model].openclawModel,
+      ...(aspectRatio ? { aspectRatio } : {}),
+    };
   }
   const durationSeconds = rawArgs.durationSeconds ?? rawArgs.duration ?? (tool === 'video_generate' ? 5 : 30);
   return {
