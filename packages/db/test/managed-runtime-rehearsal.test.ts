@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, it } from 'vitest';
 
 import { latencySummary } from '../src/managed-runtime-rehearsal';
+import { resolveManagedRuntimeEvidencePath } from '../src/managed-runtime-rehearsal-cli';
 
 describe('managed PostgreSQL runtime connection rehearsal', () => {
   it('summarizes latency deterministically without averaging away a tail', () => {
@@ -21,5 +22,12 @@ describe('managed PostgreSQL runtime connection rehearsal', () => {
     expect(source).toContain("ssl: 'verify-full'");
     expect(cli).toContain("error: 'managed_runtime_rehearsal_failed'");
     expect(cli).not.toMatch(/console\.(?:log|error)\([^\n]*(?:databaseUrl|password|host)/);
+  });
+
+  it('resolves documented relative receipts from the repository instead of the package cwd', () => {
+    expect(resolveManagedRuntimeEvidencePath('var/acceptance/managed-runtime.json'))
+      .toMatch(/\/var\/acceptance\/managed-runtime\.json$/);
+    expect(() => resolveManagedRuntimeEvidencePath('../managed-runtime.json')).toThrow(/var\/acceptance/);
+    expect(() => resolveManagedRuntimeEvidencePath('var/acceptance/managed-runtime.txt')).toThrow(/var\/acceptance/);
   });
 });
