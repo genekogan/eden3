@@ -20,6 +20,10 @@ const objectRoute =
   '/media/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
 const sharedObjectRoute =
   '/media/share/:token/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
+// Until edge purge is wired into every visibility/deletion transition, bound
+// browser and CDN retention to one minute. Object bytes remain immutable, but
+// their public authorization can be revoked.
+const PUBLIC_MEDIA_CACHE_CONTROL = 'public, max-age=60, s-maxage=60, immutable';
 
 interface ByteRange {
   start: number;
@@ -71,10 +75,11 @@ export const mediaObjectRoutes: FastifyPluginAsync<MediaObjectRoutesOptions> = a
     reply.header('content-type', resolved.mime);
     reply.header('etag', `"${resolved.sha256}"`);
     if (!sharedRequest) {
-      reply.header(
-        'cache-control',
-        resolved.publiclyReferenced ? 'public, max-age=31536000, immutable' : 'private, no-store',
-      );
+      const cacheControl = resolved.publiclyReferenced
+        ? PUBLIC_MEDIA_CACHE_CONTROL
+        : 'private, no-store';
+      reply.header('cache-control', cacheControl);
+      reply.header('cdn-cache-control', cacheControl);
     }
     const rawRange = request.headers.range;
     const range = parseRange(Array.isArray(rawRange) ? rawRange[0] : rawRange, resolved.sizeBytes);

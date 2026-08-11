@@ -166,6 +166,10 @@ describe('GET /media/:objectId lifecycle boundary', () => {
     const head = await app.inject({ method: 'HEAD', url: `/media/${OBJECT_ID}` });
     expect(head.statusCode).toBe(200);
     expect(head.headers['content-length']).toBe('10');
+    expect(head.headers['cache-control']).toBe(
+      'public, max-age=60, s-maxage=60, immutable',
+    );
+    expect(head.headers['cdn-cache-control']).toBe(head.headers['cache-control']);
     expect(counts().hydrations).toBe(0);
     const range = await app.inject({
       method: 'GET', url: `/media/${OBJECT_ID}`, headers: { range: 'bytes=2-5' },
@@ -173,6 +177,23 @@ describe('GET /media/:objectId lifecycle boundary', () => {
     expect(range.statusCode).toBe(206);
     expect(range.body).toBe('2345');
     expect(range.headers['content-range']).toBe('bytes 2-5/10');
+    expect(range.headers['cache-control']).toBe(
+      'public, max-age=60, s-maxage=60, immutable',
+    );
+  });
+
+  it('bounds private and public cache authority independently of immutable bytes', async () => {
+    const { app, repository } = await setup();
+    const owner = await app.inject({
+      method: 'HEAD', url: `/media/${OBJECT_ID}`, headers: { 'x-test-account': OWNER },
+    });
+    expect(owner.headers['cache-control']).toBe('private, no-store');
+    expect(owner.headers['cdn-cache-control']).toBe('private, no-store');
+
+    repository.row = record({ publicReferenceOwnerAccountId: OWNER });
+    const published = await app.inject({ method: 'HEAD', url: `/media/${OBJECT_ID}` });
+    expect(published.headers['cache-control']).toContain('max-age=60');
+    expect(published.headers['cache-control']).not.toContain('31536000');
   });
 
   it('does not let another tenant publish an object by guessing its durable URL', async () => {
