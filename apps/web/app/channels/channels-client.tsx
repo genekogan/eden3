@@ -17,6 +17,7 @@ import { ContextualHelpLink } from "@/components/help/contextual-help-link";
 import { SkeletonRows } from "@/components/skeleton";
 import { formatRelativeTime } from "@/lib/format";
 import {
+  CHANNEL_STATUS_POLL_MS,
   DISCORD_DEVELOPER_PORTAL,
   X_DEVELOPER_PORTAL,
   channelClientDeepLink,
@@ -217,6 +218,67 @@ export function ChannelsClient({
       activeTelegramIntent.current = null;
     };
   }, [load]);
+
+  const openedPairingConnectionKey = Object.keys(pairings).sort().join(',');
+
+  // Activation and gateway reconnects are asynchronous. Keep the operator's
+  // view current while it is visible, and refresh an opened pairing queue so
+  // a new sender appears without a manual reload. Polling pauses during every
+  // mutation, which also prevents an older list response from overwriting a
+  // just-created, deleted, or reconfigured connection.
+  useEffect(() => {
+    if (phase !== "ready" || busy !== null) return;
+    let disposed = false;
+    let inFlight = false;
+    const openedPairingConnectionIds = openedPairingConnectionKey
+      ? openedPairingConnectionKey.split(',')
+      : [];
+    const poll = async () => {
+      if (disposed || inFlight || document.visibilityState !== "visible") return;
+      inFlight = true;
+      try {
+        const [channelList, pairingSnapshots] = await Promise.all([
+          api.channels.list(),
+          Promise.all(openedPairingConnectionIds.map(async (connectionId) => ({
+            connectionId,
+            result: await api.channels.pairing(connectionId).catch(() => null),
+          }))),
+        ]);
+        if (disposed || !alive.current) return;
+        setConnections(channelList.items);
+        setDrafts((current) => Object.fromEntries(channelList.items.map((item) => [
+          item.id,
+          current[item.id] ?? initialDraft(item),
+        ])));
+        const availablePairingSnapshots = pairingSnapshots.filter(({ result }) => result !== null);
+        if (availablePairingSnapshots.length > 0) {
+          setPairings((current) => ({
+            ...current,
+            ...Object.fromEntries(availablePairingSnapshots.map(({ connectionId, result }) => [
+              connectionId,
+              result!.items,
+            ])),
+          }));
+        }
+      } catch {
+        // Preserve the last known status. Explicit mutations and the initial
+        // load retain their actionable error copy; background polling stays
+        // quiet during a transient API outage.
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => void poll(), CHANNEL_STATUS_POLL_MS);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void poll();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [busy, openedPairingConnectionKey, phase]);
 
   const telegramStep = telegramManagedStep(telegramOnboarding?.intent.state ?? "");
 

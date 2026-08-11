@@ -3,6 +3,7 @@ import type { ChannelConnectionDto, XConnectionDto } from '@/lib/types';
 export const DISCORD_DEVELOPER_PORTAL = 'https://discord.com/developers/applications';
 export const X_DEVELOPER_PORTAL = 'https://developer.x.com/en/portal/dashboard';
 export const DISCORD_BOT_PERMISSIONS = 0;
+export const CHANNEL_STATUS_POLL_MS = 5_000;
 
 export function parseDiscordGroupCoordinates(
   value: string,

@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { readFile } from 'node:fs/promises';
 
 import type { ChannelConnectionDto, XConnectionDto } from '@/lib/types';
 import {
   DISCORD_BOT_PERMISSIONS,
+  CHANNEL_STATUS_POLL_MS,
   channelClientDeepLink,
   connectionHealthLabel,
   discordInviteUrl,
@@ -112,4 +114,21 @@ describe('connector health copy', () => {
     'gives an action for %s',
     (code) => expect(xFailureAction(code)).not.toBeNull(),
   );
+});
+
+describe('channel operation polling', () => {
+  it('uses a bounded visibility-aware cadence for runtime and opened pairing state', async () => {
+    expect(CHANNEL_STATUS_POLL_MS).toBe(5_000);
+    const source = await readFile(new URL('./channels-client.tsx', import.meta.url), 'utf8');
+    const block = source.slice(
+      source.indexOf('const openedPairingConnectionKey'),
+      source.indexOf('const telegramStep'),
+    );
+    expect(block).toContain('phase !== "ready" || busy !== null');
+    expect(block).toContain('document.visibilityState !== "visible"');
+    expect(block).toContain('api.channels.list()');
+    expect(block).toContain('api.channels.pairing(connectionId)');
+    expect(block).toContain('window.setInterval(() => void poll(), CHANNEL_STATUS_POLL_MS)');
+    expect(block).toContain('document.removeEventListener("visibilitychange", onVisibilityChange)');
+  });
 });
