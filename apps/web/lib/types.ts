@@ -370,6 +370,7 @@ export interface ChannelConnectionDto {
     | "verified"
     | "starting"
     | "live"
+    | "stopping"
     | "stopped"
     | "error";
   lastError: { code: string; message: string } | null;

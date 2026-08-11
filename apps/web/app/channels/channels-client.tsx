@@ -66,7 +66,11 @@ function statusTone(connection: ChannelConnectionDto): string {
   if (connection.observedState === "error") {
     return "border-danger/25 bg-danger/10 text-danger-soft";
   }
-  if (connection.observedState === "starting" || connectionStatusLabel(connection) === "reconnecting") {
+  if (
+    connection.observedState === "starting"
+    || connection.observedState === "stopping"
+    || connectionStatusLabel(connection) === "reconnecting"
+  ) {
     return "border-warning/25 bg-warning/10 text-warning-soft";
   }
   return "border-edge bg-foreground/[0.04] text-muted";

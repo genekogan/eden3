@@ -846,7 +846,7 @@ export const channelConnections = pgTable(
       .notNull()
       .default('inactive'),
     observedState: text('observed_state')
-      .$type<'unknown' | 'validating' | 'verified' | 'starting' | 'live' | 'stopped' | 'error'>()
+      .$type<'unknown' | 'validating' | 'verified' | 'starting' | 'live' | 'stopping' | 'stopped' | 'error'>()
       .notNull()
       .default('unknown'),
     status: text('status').notNull().default('connected'),

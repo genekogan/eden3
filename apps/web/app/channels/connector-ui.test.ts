@@ -115,6 +115,9 @@ describe('connector health copy', () => {
     const paused = connection({ observedState: 'stopped', desiredState: 'inactive', status: 'paused' });
     expect(connectionStatusLabel(paused)).toBe('stopped');
     expect(connectionHealthLabel(paused)).toBe('Inactive');
+    expect(connectionHealthLabel(connection({ observedState: 'stopping', desiredState: 'inactive' }))).toBe(
+      'Runtime is stopping',
+    );
   });
 
   it.each(['invalid_credentials', 'revoked', 'rate_limited', 'provider_unavailable'])(

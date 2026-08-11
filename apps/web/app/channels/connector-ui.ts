@@ -108,6 +108,8 @@ export function connectionHealthLabel(
       return 'Checking provider credentials';
     case 'starting':
       return 'Runtime is starting';
+    case 'stopping':
+      return 'Runtime is stopping';
     case 'stopped':
       return 'Inactive';
     case 'error':
