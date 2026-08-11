@@ -137,11 +137,37 @@ describe('0041 account erasure reconciliation', () => {
     expect(sql).toContain("CREATE ROLE eden3_erasure_operator NOLOGIN");
     expect(sql).toContain('rolcanlogin OR rolsuper OR rolcreaterole OR rolbypassrls OR rolreplication');
     expect(sql).toContain("r.rolname='eden3_erasure_operator' AND m.admin_option");
+    expect(sql.match(/JOIN pg_roles member_role ON member_role\.oid=m\.member/g)?.length).toBe(9);
+    expect(sql.match(/member_role\.rolname<>current_user/g)?.length).toBe(3);
+    expect(sql.match(/member_role\.rolname=current_user/g)?.length).toBe(6);
+    expect(sql.match(/TO current_user WITH SET TRUE, INHERIT FALSE/g)?.length).toBe(3);
+    expect(sql.match(/m\.set_option AND NOT m\.inherit_option/g)?.length).toBe(3);
+    expect(sql.match(/AND m\.inherit_option/g)?.length).toBe(3);
+    expect(sql.match(/GRANT CREATE ON SCHEMA public TO eden3_erasure_guard/g)?.length).toBe(1);
+    expect(sql.match(/REVOKE CREATE ON SCHEMA public FROM eden3_erasure_guard/g)?.length).toBe(1);
+    expect(sql.indexOf('GRANT CREATE ON SCHEMA public TO eden3_erasure_guard')).toBeLessThan(
+      sql.indexOf('OWNER TO eden3_erasure_guard'),
+    );
+    expect(sql.lastIndexOf('OWNER TO eden3_erasure_guard')).toBeLessThan(
+      sql.indexOf('REVOKE CREATE ON SCHEMA public FROM eden3_erasure_guard'),
+    );
+    expect(sql.indexOf('CREATE TRIGGER zz_account_erasure_creation_ingest_fence')).toBeLessThan(
+      sql.indexOf('ALTER FUNCTION public.account_erasure_legacy_content_ingest_fence() OWNER TO eden3_erasure_guard'),
+    );
+    expect(sql).not.toContain('WITH SET TRUE, INHERIT TRUE');
     expect(sql).not.toContain('SET search_path=pg_catalog,public AS');
     expect(sql.match(/CREATE OR REPLACE FUNCTION/g)?.length).toBe(
       sql.match(/SET search_path=pg_catalog,public,pg_temp/g)?.length,
     );
     expect(sql).toContain('SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp');
+    expect(sql).toContain(
+      'TO eden3_erasure_operator,eden3_erasure_terminal_writer,SESSION_USER;',
+    );
+    expect(sql.indexOf(
+      'ALTER FUNCTION public.account_erasure_assert_account_writable(uuid) OWNER TO eden3_erasure_guard',
+    )).toBeLessThan(sql.indexOf(
+      'TO eden3_erasure_operator,eden3_erasure_terminal_writer,SESSION_USER;',
+    ));
     expect(sql).toContain('ALTER FUNCTION public.account_erasure_legacy_source_guard()');
     expect(sql).toContain('SET search_path TO pg_catalog, public, pg_temp');
     expect(sql).toContain('OWNER TO eden3_erasure_guard');

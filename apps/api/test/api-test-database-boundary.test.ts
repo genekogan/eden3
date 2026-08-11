@@ -29,7 +29,9 @@ describe('API Vitest database boundary', () => {
       const source = readFileSync(new URL(config, apiRoot), 'utf8');
       const setup = config === 'vitest.config.ts'
         ? './test/setup-database-boundary.ts'
-        : './test/setup-required-database-boundary.ts';
+        : config === 'vitest.managed-postgres.config.ts'
+          ? './test/setup-required-managed-postgres-boundary.ts'
+          : './test/setup-required-database-boundary.ts';
       expect(source, config).toContain(`setupFiles: ['${setup}']`);
     }
   });

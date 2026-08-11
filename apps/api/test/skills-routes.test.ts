@@ -24,6 +24,7 @@ import {
 loadRootEnv();
 
 const marker = makeMarker('skills');
+const managedWaitTimeout = process.env.EDEN3_MANAGED_POSTGRES_TESTS === '1' ? 30_000 : 5_000;
 let ownerId = '';
 let strangerId = '';
 let adminId = '';
@@ -600,7 +601,7 @@ describe('skills routes', () => {
           where aks.agent_id = ${agentId} and aks.enabled = true
         `;
         expect(desired.map((row) => row.slug)).toEqual([winnerSlug]);
-      });
+      }, { timeout: managedWaitTimeout });
       // The second request has committed its DB revision, but its runtime
       // projection cannot pass the first claimant's session advisory lock.
       expect(skillSync.calls.at(-1)).toEqual({

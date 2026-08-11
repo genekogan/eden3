@@ -30,6 +30,15 @@ const sourceDir = mkdtempSync(path.join(tmpdir(), 'eden3-fg-chat-media-src-'));
 const ownedAccounts: string[] = [];
 const ownedSessions: string[] = [];
 
+function retainFencedFixture(fixture: { userId: string; agentId: string; sessionId: string }): void {
+  for (const accountId of [fixture.userId, fixture.agentId]) {
+    const index = ownedAccounts.indexOf(accountId);
+    if (index >= 0) ownedAccounts.splice(index, 1);
+  }
+  const sessionIndex = ownedSessions.indexOf(fixture.sessionId);
+  if (sessionIndex >= 0) ownedSessions.splice(sessionIndex, 1);
+}
+
 async function fixture(fund: number) {
   const suffix = randomUUID().slice(0, 8);
   const [user] = await pg<{ id: string }[]>`
@@ -239,6 +248,7 @@ describe('FG-ECON in-chat media authorization', () => {
       if (revoked === 'session') await pg`update sessions set deleted = true where id = ${f.sessionId}`;
       if (revoked === 'payer') await pg`update accounts set deleted = true where id = ${f.userId}`;
       if (revoked === 'agent') await pg`update accounts set deleted = true where id = ${f.agentId}`;
+      if (revoked !== 'session') retainFencedFixture(f);
       await expect(
         reserveChatMedia({
           request: request(f, 'image_generate', { prompt: revoked }),

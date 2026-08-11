@@ -25,55 +25,7 @@ import {
 
 loadRootEnv();
 
-/**
- * Concepts API against live Postgres with a FAKE gateway provisioner.
- *
- * TABLE BOOTSTRAP: migration 0016 (concepts + concept_images) is committed in
- * this branch but deliberately NOT applied — the main session owns live DBs
- * and applies real migrations. So this suite creates the tables itself with
- * `create table if not exists` DDL that matches
- * packages/db/migrations/0016_harsh_avengers.sql exactly; once the migration
- * is applied for real, this bootstrap becomes a no-op (nothing is dropped).
- */
-
-const CONCEPTS_DDL = [
-  `CREATE TABLE IF NOT EXISTS "concepts" (
-    "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-    "agent_id" uuid NOT NULL,
-    "name" text NOT NULL,
-    "slug" text NOT NULL,
-    "description" text,
-    "instructions" text,
-    "deleted" boolean DEFAULT false NOT NULL,
-    "created_at" timestamp with time zone DEFAULT now() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT now() NOT NULL
-  )`,
-  `CREATE TABLE IF NOT EXISTS "concept_images" (
-    "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-    "concept_id" uuid NOT NULL,
-    "url" text NOT NULL,
-    "local_path" text,
-    "sha256" text NOT NULL,
-    "mime" text NOT NULL,
-    "width" integer,
-    "height" integer,
-    "size_bytes" bigint,
-    "filename" text,
-    "position" integer DEFAULT 0 NOT NULL,
-    "created_at" timestamp with time zone DEFAULT now() NOT NULL
-  )`,
-  `DO $$ BEGIN
-    ALTER TABLE "concept_images" ADD CONSTRAINT "concept_images_concept_id_concepts_id_fk"
-      FOREIGN KEY ("concept_id") REFERENCES "public"."concepts"("id") ON DELETE cascade ON UPDATE no action;
-  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
-  `DO $$ BEGIN
-    ALTER TABLE "concepts" ADD CONSTRAINT "concepts_agent_id_accounts_id_fk"
-      FOREIGN KEY ("agent_id") REFERENCES "public"."accounts"("id") ON DELETE cascade ON UPDATE no action;
-  EXCEPTION WHEN duplicate_object THEN NULL; END $$`,
-  `CREATE INDEX IF NOT EXISTS "concept_images_concept_position_idx" ON "concept_images" USING btree ("concept_id","position")`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS "concepts_agent_slug_uq" ON "concepts" USING btree ("agent_id","slug") WHERE "concepts"."deleted" = false`,
-  `CREATE INDEX IF NOT EXISTS "concepts_agent_created_idx" ON "concepts" USING btree ("agent_id","created_at" DESC NULLS LAST)`,
-];
+/** Concepts API against a fully migrated PostgreSQL database and a fake gateway. */
 
 /** 1x1 transparent PNG. */
 const PNG_1PX = Buffer.from(
@@ -120,8 +72,12 @@ async function fileExists(p: string): Promise<boolean> {
 }
 
 beforeAll(async () => {
-  for (const statement of CONCEPTS_DDL) {
-    await pg.unsafe(statement);
+  const migrationRows = await pg<{ migrated: boolean }[]>`
+    select to_regclass('public.concepts') is not null
+       and to_regclass('public.concept_images') is not null as migrated
+  `;
+  if (migrationRows[0]?.migrated !== true) {
+    throw new Error('concept migrations are required before route tests');
   }
 
   tmpRoot = await mkdtemp(path.join(tmpdir(), 'eden3-concepts-'));

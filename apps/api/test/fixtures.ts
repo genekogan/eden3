@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { mkdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import { DEV_USER_COOKIE } from '@eden3/core';
 import { pg } from '@eden3/db';
@@ -168,12 +171,20 @@ export async function addCollectionCreation(
 
 export async function deleteFixturesByMarker(marker: string): Promise<void> {
   const pattern = `${marker}%`;
-  await pg`delete from manna_vouchers where code::text like ${pattern}`;
-  await pg`delete from distill_state where username::text like ${pattern} or openclaw_id like ${pattern}`;
-  const ids = (
-    await pg<{ id: string }[]>`select id from accounts where username like ${pattern}`
-  ).map((row) => row.id);
-  await pg`delete from skill_definitions where slug like ${pattern}`;
+  const pathSafePattern = `${marker.replaceAll('_', '-')}%`;
+  await pg`delete from manna_vouchers where code::text like ${pattern} or code::text like ${pathSafePattern}`;
+  await pg`
+    delete from distill_state
+    where username::text like ${pattern} or username::text like ${pathSafePattern}
+       or openclaw_id like ${pattern} or openclaw_id like ${pathSafePattern}
+  `;
+  const accounts = await pg<{ id: string; username: string }[]>`
+    select id, username::text
+    from accounts
+    where username like ${pattern} or username like ${pathSafePattern}
+  `;
+  const ids = accounts.map((row) => row.id);
+  await pg`delete from skill_definitions where slug like ${pattern} or slug like ${pathSafePattern}`;
   if (ids.length === 0) return;
   await pg`delete from content_reports where reporter_id = any(${ids}::uuid[]) or target_id = any(${ids}::uuid[])`;
   await pg`delete from agent_skills where agent_id = any(${ids}::uuid[])`;
@@ -251,6 +262,14 @@ export async function deleteFixturesByMarker(marker: string): Promise<void> {
   await pg`update agents set owner_id = null where owner_id = any(${ids}::uuid[])`;
   await pg`delete from agents where account_id = any(${ids}::uuid[])`;
   await pg`delete from accounts where id = any(${ids}::uuid[])`;
+  await Promise.allSettled(
+    accounts.map((row) =>
+      rm(path.join(tmpdir(), 'fake-workspaces', `workspace-${row.username}`), {
+        recursive: true,
+        force: true,
+      }),
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -263,7 +282,11 @@ export interface FakeProvisioner extends ProvisionerLike {
 }
 
 export function makeFakeProvisioner(
-  opts: { failProvision?: boolean; failPersonaUpdate?: boolean } = {},
+  opts: {
+    failProvision?: boolean;
+    failPersonaUpdate?: boolean;
+    workspaceRoot?: string;
+  } = {},
 ): FakeProvisioner {
   const provisions: ProvisionAgentParams[] = [];
   const personaUpdates: UpdatePersonaParams[] = [];
@@ -273,9 +296,14 @@ export function makeFakeProvisioner(
     async provisionAgent(params): Promise<ProvisionAgentResult> {
       provisions.push(params);
       if (opts.failProvision === true) throw new Error('fake provision failure');
+      const hostWorkspaceDir = path.join(
+        opts.workspaceRoot ?? process.env.OPENCLAW_DATA_DIR ?? path.join(tmpdir(), 'fake-workspaces'),
+        `workspace-${params.openclawId}`,
+      );
+      await mkdir(hostWorkspaceDir, { recursive: true });
       return {
         openclawId: params.openclawId,
-        hostWorkspaceDir: `/tmp/fake-workspaces/workspace-${params.openclawId}`,
+        hostWorkspaceDir,
         containerWorkspaceDir: `/home/node/.openclaw/workspace-${params.openclawId}`,
         filesWritten: ['SOUL.md', 'IDENTITY.md'],
         filesSkipped: [],

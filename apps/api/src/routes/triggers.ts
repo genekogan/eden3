@@ -109,6 +109,35 @@ const runBodySchema = z.object({ requestId: z.string().uuid() }).strict();
 const TASK_OWNER_LOCK_SEED = 84;
 
 /**
+ * Friendly, current-principal check for manual task runs. The database write
+ * fence remains the race-free authority, but a task whose owner/agent is
+ * already deleted (or whose owner is being erased) must fail as a stable 409
+ * before the runner attempts to claim the trigger.
+ */
+async function taskPrincipalsAvailableForRun(trigger: Trigger): Promise<boolean> {
+  if (!trigger.userId || !trigger.agentId) return false;
+  const [row] = await pg<{ available: boolean }[]>`
+    select exists (
+      select 1
+      from agents ag
+      join accounts agent_account on agent_account.id = ag.account_id
+      join accounts owner_account on owner_account.id = ag.owner_id
+      where ag.account_id = ${trigger.agentId}
+        and ag.owner_id = ${trigger.userId}
+        and agent_account.type = 'agent'
+        and agent_account.deleted = false
+        and owner_account.type = 'user'
+        and owner_account.deleted = false
+        and not exists (
+          select 1 from account_erasure_jobs j
+          where j.account_id = owner_account.id and j.state <> 'succeeded'
+        )
+    ) as available
+  `;
+  return row?.available === true;
+}
+
+/**
  * Next fire instant for a schedule, with TaskScheduleError mapped onto the
  * 400 envelope. A valid-but-exhausted schedule (a one-time `at` in the past,
  * or nothing within the scan cap) is also a 400: an active task that could
@@ -387,6 +416,16 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
     if (!existing.userId) {
       throw new ApiError(409, 'task_missing_owner', `Task ${existing.id} has no owner`);
     }
+    if (!existing.agentId) {
+      throw new ApiError(409, 'task_missing_agent', `Task ${existing.id} has no agent`);
+    }
+    if (!(await taskPrincipalsAvailableForRun(existing))) {
+      throw new ApiError(
+        409,
+        'task_agent_unavailable',
+        `Task ${existing.id} agent is unavailable`,
+      );
+    }
 
     // Friendly worst-case-reserve pre-check for the task agent's route
     // (race-free authority = the in-debit reservation check).
@@ -437,6 +476,20 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
           429,
           'daily_manna_cap_exceeded',
           `Daily manna cap exceeded: ${err.spentToday} spent today, cap is ${err.cap}`,
+        );
+      }
+      // A deletion/erasure can win after the friendly check but before the
+      // runner's trigger claim. Translate only the exact database fence and
+      // only after current principal state confirms the expected condition;
+      // unrelated 55000 errors remain internal failures.
+      if (
+        (err as { code?: string }).code === '55000' &&
+        !(await taskPrincipalsAvailableForRun(existing))
+      ) {
+        throw new ApiError(
+          409,
+          'task_agent_unavailable',
+          `Task ${existing.id} agent is unavailable`,
         );
       }
       throw err;

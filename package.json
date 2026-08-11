@@ -16,6 +16,7 @@
     "test:credential-exposure": "node --test scripts/credential-exposure.test.mjs && node scripts/credential-exposure.mjs",
     "test:api-full": "pnpm --filter @eden3/api test:full",
     "test:db-scratch-full": "pnpm --filter @eden3/db test:scratch-full",
+    "test:api-managed-postgres": "pnpm --filter @eden3/api test:managed-postgres",
     "typecheck": "pnpm -r typecheck",
     "etl": "pnpm --filter @eden3/etl etl",
     "etl:verify": "pnpm --filter @eden3/etl etl:verify",
@@ -37,7 +38,9 @@
     "tunnel:stop": "bash scripts/tunnel-stop.sh",
     "db:generate": "pnpm --filter @eden3/db generate",
     "db:migrate": "pnpm --filter @eden3/db migrate",
-    "db:managed-preflight": "pnpm --filter @eden3/db managed:preflight"
+    "db:managed-preflight": "pnpm --filter @eden3/db managed:preflight",
+    "db:managed-bootstrap-runtime": "pnpm --filter @eden3/db managed:bootstrap-runtime",
+    "db:managed-runtime-rehearsal": "pnpm --filter @eden3/db managed:runtime-rehearsal"
   },
   "devDependencies": {
     "@playwright/test": "^1.53.2",

@@ -148,15 +148,16 @@ describe('API Postgres test manifest', () => {
     const tombstoneCase = channelsSource.indexOf(
       'fails closed for deleted owners and agents without resurrecting tombstoned fixtures',
     );
-    const preserveBeforeWrite = channelsSource.indexOf('preserveTombstonedFixtures = true');
+    const tombstoneMarkerDeclaration = channelsSource.indexOf(
+      "const tombstoneMarker = makeMarker('channels_tombstone')",
+    );
     const firstTombstoneFixture = channelsSource.indexOf(
-      'insertUserAccount(`${marker}_deleted_owner`)',
+      'insertUserAccount(`${tombstoneMarker}_deleted_owner`)',
     );
-    expect(channelsSource).toContain(
-      'if (!preserveTombstonedFixtures) await deleteFixturesByMarker(marker)',
-    );
+    expect(channelsSource).toContain('await deleteFixturesByMarker(marker)');
+    expect(channelsSource).not.toContain('preserveTombstonedFixtures');
     expect(tombstoneCase).toBeGreaterThanOrEqual(0);
-    expect(preserveBeforeWrite).toBeGreaterThan(tombstoneCase);
-    expect(firstTombstoneFixture).toBeGreaterThan(preserveBeforeWrite);
+    expect(tombstoneMarkerDeclaration).toBeGreaterThanOrEqual(0);
+    expect(firstTombstoneFixture).toBeGreaterThan(tombstoneCase);
   });
 });

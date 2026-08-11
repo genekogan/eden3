@@ -686,7 +686,17 @@ async function recoveredUsageOutcome(occurrence: ScheduledTaskOccurrence): Promi
       createdAt: usageEvents.createdAt,
     })
     .from(usageEvents)
-    .where(and(eq(usageEvents.eventType, 'chat_turn'), eq(usageEvents.turnId, occurrence.id)))
+    .where(
+      and(
+        eq(usageEvents.eventType, 'chat_turn'),
+        eq(usageEvents.turnId, occurrence.id),
+        // Provider admission creates a content-free anchor before any
+        // external call. It is not completion evidence: accepting that row
+        // here can turn a quarantined in-flight occurrence into a false
+        // success. Only the four terminal chat-turn states are replayable.
+        inArray(usageEvents.status, ['completed', 'missing_usage', 'unmetered', 'error']),
+      ),
+    )
     .limit(1);
   if (!row) return null;
   const metadata =

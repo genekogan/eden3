@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 
 import { credit, debit, gatewaySessionKey, resetEnvCache } from '@eden3/core';
 import { loadRootEnv, pg } from '@eden3/db';
 import type { GatewayTurnEvent } from '@eden3/gateway';
 import type { FastifyInstance } from 'fastify';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 
 import { buildServer } from '../src/server';
 import type { ToolsClientLike } from '../src/services/history-sync';
@@ -103,7 +105,7 @@ describe('chat rate limits', () => {
   it('lazy-provisions a pending public agent on first chat access', async () => {
     const suffix = randomUUID().slice(0, 8);
     const username = `${marker}_lazy_${suffix}`.replace(/_/g, '-');
-    const workspaceDir = `/tmp/fake-workspaces/workspace-${username}`;
+    const workspaceDir = path.join(tmpdir(), 'fake-workspaces', `workspace-${username}`);
     await mkdir(workspaceDir, { recursive: true });
     const userId = await insertUserAccount(`${marker}_lazy_user_${suffix}`);
     await insertAgentAccount(username, {
@@ -195,7 +197,7 @@ describe('chat rate limits', () => {
       expect(row).toMatchObject({
         openclawId: username,
         status: 'ready',
-        workspacePath: `/tmp/fake-workspaces/workspace-${username}`,
+        workspacePath: workspaceDir,
       });
       const sessionId = res.headers['x-session-id'];
       expect(typeof sessionId).toBe('string');
@@ -332,10 +334,10 @@ describe('chat rate limits', () => {
         headers: { cookie: devCookie(secondFixture.userId) },
         payload: { content: 'second' },
       });
-      for (let attempt = 0; attempt < 100 && app.turnLimiter.snapshot().queued !== 1; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
-      }
-      expect(app.turnLimiter.snapshot()).toMatchObject({ active: 1, queued: 1 });
+      await vi.waitFor(
+        () => expect(app!.turnLimiter.snapshot()).toMatchObject({ active: 1, queued: 1 }),
+        { timeout: process.env.EDEN3_MANAGED_POSTGRES_TESTS === '1' ? 30_000 : 5_000 },
+      );
 
       const overflow = await app.inject({
         method: 'POST',

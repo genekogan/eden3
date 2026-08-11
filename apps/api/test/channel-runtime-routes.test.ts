@@ -2,11 +2,21 @@ import { randomUUID } from 'node:crypto';
 
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { pg } from '@eden3/db';
 
 import { buildServer } from '../src/server.js';
+import {
+  deleteFixturesByMarker,
+  insertAgentAccount,
+  insertUserAccount,
+  makeMarker,
+} from './fixtures';
 
 let app: FastifyInstance;
+const marker = makeMarker('channel_runtime_contract');
 const runtimeToken = 'runtime-route-contract-token';
+const runtimeAccountId = 'eden-runtime-account';
+const connectionId = randomUUID();
 const syncMessage = vi.fn(async () => ({
   sessionId: randomUUID(),
   messageId: randomUUID(),
@@ -56,6 +66,23 @@ const refundDeliveryFailure = vi.fn(async () => {});
 const markDelivered = vi.fn(async () => {});
 
 beforeAll(async () => {
+  const ownerId = await insertUserAccount(`${marker}_owner`);
+  const agentId = await insertAgentAccount(`${marker}_agent`, {
+    ownerId,
+    openclawId: `${marker}_agent`,
+    workspacePath: `/tmp/${marker}_agent`,
+    provisionStatus: 'ready',
+    provisionedAt: new Date(),
+  });
+  await pg`
+    insert into channel_connections (
+      id,account_id,agent_id,channel,runtime_account_id,desired_state,observed_state,status,
+      token_ciphertext,token_iv,token_auth_tag,token_sha256,key_version,metadata
+    ) values (
+      ${connectionId},${ownerId},${agentId},'discord',${runtimeAccountId},'active','live','connected',
+      'fixture-cipher','fixture-iv','fixture-tag',${'0'.repeat(64)},'v1','{}'::jsonb
+    )
+  `;
   app = await buildServer({
     gateway: null,
     channels: {
@@ -89,13 +116,16 @@ beforeAll(async () => {
   await app.ready();
 });
 
-afterAll(async () => app.close());
+afterAll(async () => {
+  await app.close();
+  await deleteFixturesByMarker(marker);
+});
 
 describe('private channel runtime routes', () => {
   it('authenticates and normalizes a sync-back event without touching Postgres', async () => {
     const payload = {
-      connectionId: randomUUID(),
-      runtimeAccountId: 'eden-runtime-account',
+      connectionId,
+      runtimeAccountId,
       gatewaySessionKey: 'agent:fixture:discord:eden-runtime-account:direct:12345',
       conversationId: 'discord-dm-12345',
       peerId: '12345',
@@ -137,8 +167,8 @@ describe('private channel runtime routes', () => {
   it('exposes the reserve contract only behind runtime auth', async () => {
     const payload = {
       turnId: randomUUID(),
-      connectionId: randomUUID(),
-      runtimeAccountId: 'eden-runtime-account',
+      connectionId,
+      runtimeAccountId,
     };
     const accepted = await app.inject({
       method: 'POST',

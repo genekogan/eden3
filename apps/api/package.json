@@ -10,6 +10,7 @@
     "load:postgres-metrics": "tsx src/testing/load-postgres-metrics-cli.ts",
     "test": "vitest run --passWithNoTests",
     "test:postgres": "vitest run --config vitest.postgres.config.ts",
+    "test:managed-postgres": "EDEN3_MANAGED_POSTGRES_TESTS=1 vitest run --config vitest.managed-postgres.config.ts",
     "test:agent-provision-notification-pg": "EDEN3_AGENT_PROVISION_NOTIFICATION_PG=1 vitest run --config vitest.agent-provision-notification-pg.config.ts",
     "test:e2e-scratch-fixture-pg": "EDEN3_E2E_FIXTURE_PG=1 vitest run --config vitest.e2e-scratch-fixture-pg.config.ts",
     "test:full": "pnpm test && pnpm test:postgres && pnpm test:agent-provision-notification-pg && pnpm test:e2e-scratch-fixture-pg",

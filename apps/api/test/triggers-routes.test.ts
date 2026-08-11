@@ -6,6 +6,7 @@ import type { GatewayTurnEvent, GatewayUsage } from '@eden3/gateway';
 import type { TriggerDto } from '@eden3/shared';
 import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
+import postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { buildServer } from '../src/server';
@@ -77,6 +78,27 @@ function expectLocalParts(
 }
 
 const marker = makeMarker('taskapi');
+const managedPollTimeout = process.env.EDEN3_MANAGED_POSTGRES_TESTS === '1' ? 30_000 : 5_000;
+
+async function restoreDeletedFixtureAccount(accountId: string): Promise<void> {
+  const ownerUrl = process.env.EDEN3_MANAGED_POSTGRES_TESTS === '1'
+    ? process.env.MANAGED_OWNER_DATABASE_URL
+    : process.env.DATABASE_URL;
+  if (!ownerUrl) throw new Error('fixture owner database URL is unavailable');
+  const owner = postgres(ownerUrl, { max: 1 });
+  try {
+    await owner.begin(async (tx) => {
+      // This is isolated disposable-test teardown. The production runtime role
+      // cannot disable the erasure fence; the owner connection restores only
+      // the exact fixture row so ordinary marker cleanup can proceed.
+      await tx.unsafe('alter table public.accounts disable trigger z_account_erasure_fence');
+      await tx`update accounts set deleted=false where id=${accountId}`;
+      await tx.unsafe('alter table public.accounts enable trigger z_account_erasure_fence');
+    });
+  } finally {
+    await owner.end({ timeout: 5 });
+  }
+}
 const agentUsername = `${marker}_bot`;
 let userId = '';
 let otherUserId = '';
@@ -247,6 +269,21 @@ async function seedCanonicalRecoveryOccurrence(options: {
       ${options.usableOutput ? new Date(old.getTime() + 1000).toISOString() : null}
     )
   `;
+  if (options.usableOutput) {
+    // A usable prefix can exist only after provider admission, which creates
+    // the content-free usage anchor consumed by full-reserve-v1 recovery.
+    // Omitting this row exercises an impossible partial-output state and
+    // makes recovery correctly remain retryable instead of terminalizing.
+    await pg`
+      insert into usage_events (
+        event_type, status, user_id, agent_id, session_id, turn_id,
+        provider, model, pricing_basis
+      ) values (
+        'chat_turn', 'provider_admitted', ${userId}, ${agentId}, ${sessionId},
+        ${occurrence.id}, 'anthropic', 'claude-haiku-4-5', 'provider-api'
+      )
+    `;
+  }
   await pg`
     update triggers
     set status = 'running',
@@ -495,13 +532,14 @@ describe('POST /tasks', () => {
           },
         )
         .then(
-          () => ({ ok: true as const, code: null }),
+          () => ({ ok: true as const, code: null, message: null }),
           (error: unknown) => ({
             ok: false as const,
             code:
               typeof error === 'object' && error !== null && 'code' in error
                 ? String(error.code)
                 : null,
+            message: error instanceof Error ? error.message : 'non-error rejection',
           }),
         )
         .finally(() => {
@@ -513,7 +551,10 @@ describe('POST /tasks', () => {
       await agentLock`select pg_advisory_unlock(hashtextextended(${agentId}::text, 84))`;
 
       const [apiResponse, bridgeResult] = await Promise.all([apiAttempt, bridgeAttempt]);
-      expect(Number(apiResponse.statusCode === 201) + Number(bridgeResult.ok)).toBe(1);
+      expect(
+        Number(apiResponse.statusCode === 201) + Number(bridgeResult.ok),
+        bridgeResult.message ?? apiResponse.body,
+      ).toBe(1);
       if (apiResponse.statusCode !== 201) {
         expect(apiResponse.statusCode).toBe(429);
         expect((apiResponse.json() as { error: { code: string } }).error.code).toBe(
@@ -1008,18 +1049,22 @@ describe('POST /tasks', () => {
       ) returning id
     `;
     await pg`update accounts set deleted = true where id = ${deletedAgentId}`;
-    const beforeCalls = compatCalls.length;
-    const denied = await app.inject({
-      method: 'POST',
-      url: `/tasks/${task!.id}/runs`,
-      headers: { cookie: devCookie(userId) },
-      payload: { requestId: randomUUID() },
-    });
-    expect(denied.statusCode).toBe(409);
-    expect((denied.json() as { error: { code: string } }).error.code).toBe(
-      'task_agent_unavailable',
-    );
-    expect(compatCalls).toHaveLength(beforeCalls);
+    try {
+      const beforeCalls = compatCalls.length;
+      const denied = await app.inject({
+        method: 'POST',
+        url: `/tasks/${task!.id}/runs`,
+        headers: { cookie: devCookie(userId) },
+        payload: { requestId: randomUUID() },
+      });
+      expect(denied.statusCode).toBe(409);
+      expect((denied.json() as { error: { code: string } }).error.code).toBe(
+        'task_agent_unavailable',
+      );
+      expect(compatCalls).toHaveLength(beforeCalls);
+    } finally {
+      await restoreDeletedFixtureAccount(deletedAgentId);
+    }
   });
 
   it('auto-pauses when the worst-case reservation no longer fits the automation budget (rejected pre-provider)', async () => {
@@ -1778,14 +1823,26 @@ describe('POST /tasks', () => {
     try {
       await fenceEntered;
       const reaperNow = new Date();
-      await pg`
+      const [staled] = await pg<{
+        status: string;
+        pending_occurrence_id: string | null;
+        pending_occurrence_claim_id: string | null;
+        updated_at: string;
+      }[]>`
         update triggers
         set updated_at = ${new Date(reaperNow.getTime() - 30 * 60_000).toISOString()}
         where id = ${task.id}
+        returning status, pending_occurrence_id, pending_occurrence_claim_id,
+                  updated_at::text
       `;
+      expect(staled).toMatchObject({
+        status: 'running',
+        pending_occurrence_id: occurrence.id,
+      });
+      expect(staled?.pending_occurrence_claim_id).toEqual(expect.any(String));
       releaseFence();
       await expect
-        .poll(() => compatCalls.length, { timeout: 5000 })
+        .poll(() => compatCalls.length, { timeout: managedPollTimeout })
         .toBe(callsBefore + 1);
 
       const reaper = new TaskScheduler({
@@ -1872,19 +1929,42 @@ describe('POST /tasks', () => {
             select count(*)::int as count from manna_transactions
             where idempotency_key = ${reservationKey}
           `;
+          const [providerRun] = await pg<{ usable: boolean }[]>`
+            select usable_output_at is not null as usable
+            from turn_provider_runs where turn_id = ${occurrence.id}
+          `;
           return {
             providerCalls: compatCalls.length - callsBefore,
             reservation: reservation?.count ?? 0,
+            usableOutput: providerRun?.usable ?? false,
           };
-        }, { timeout: 5000 })
-        .toEqual({ providerCalls: 1, reservation: 1 });
+        }, { timeout: managedPollTimeout })
+        .toEqual({ providerCalls: 1, reservation: 1, usableOutput: true });
 
-      const reaperNow = new Date();
-      await pg`
+      // Advance the scheduler clock beyond the lease window. A slow managed
+      // database may finish a legitimate first-token lease refresh after the
+      // polling query observes the durable output marker; a future test clock
+      // makes that eventual refresh stale too, exactly as a genuinely hung
+      // provider becomes stale in production.
+      const staledAt = new Date();
+      const reaperNow = new Date(staledAt.getTime() + 30 * 60_000);
+      const [staled] = await pg<{
+        status: string;
+        pending_occurrence_id: string | null;
+        pending_occurrence_claim_id: string | null;
+        updated_at: string;
+      }[]>`
         update triggers
-        set updated_at = ${new Date(reaperNow.getTime() - 30 * 60_000).toISOString()}
+        set updated_at = ${staledAt.toISOString()}
         where id = ${task.id}
+        returning status, pending_occurrence_id, pending_occurrence_claim_id,
+                  updated_at::text
       `;
+      expect(staled).toMatchObject({
+        status: 'running',
+        pending_occurrence_id: occurrence.id,
+      });
+      expect(staled?.pending_occurrence_claim_id).toEqual(expect.any(String));
       const reaper = new TaskScheduler({
         runTask: async () => {
           throw new Error('provider runner must not execute recovery');
@@ -2470,7 +2550,7 @@ describe('POST /tasks', () => {
     try {
       await bothSelected;
       releaseSelections();
-      await expect.poll(() => compatCalls.length, { timeout: 5000 }).toBe(callsBefore + 1);
+      await expect.poll(() => compatCalls.length, { timeout: managedPollTimeout }).toBe(callsBefore + 1);
       releaseProvider();
       const results = await raced;
       expect(results.flatMap((result) => result.outcomes)).toEqual(
@@ -2566,7 +2646,7 @@ describe('POST /tasks', () => {
               providerCalls: compatCalls.length - compatCallsBefore,
             };
           },
-          { timeout: 5000 },
+          { timeout: managedPollTimeout },
         )
         .toEqual({ status: 'running', providerCalls: 1 });
 
@@ -2632,7 +2712,7 @@ describe('POST /tasks', () => {
               providerCalls: compatCalls.length - callsBefore,
             };
           },
-          { timeout: 5000 },
+          { timeout: managedPollTimeout },
         )
         .toEqual({ status: 'running', providerCalls: 1 });
 

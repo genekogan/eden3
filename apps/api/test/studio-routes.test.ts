@@ -714,7 +714,7 @@ describe('POST /studio/generate', () => {
       expect(res.statusCode).toBe(503);
       const error = (res.json() as { error: { code: string; message: string } }).error;
       expect(error.code).toBe('refund_pending');
-      expect(error.message).toContain('refund is pending');
+      expect(error.message).toBe('Service temporarily unavailable');
       expect(error.message).not.toContain('ledger unavailable');
       expect((await getBalance(richUserId)).total).toBe(before.total - imageQuote.manna);
 

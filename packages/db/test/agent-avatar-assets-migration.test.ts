@@ -49,5 +49,29 @@ describe('agent avatar asset custody migration', () => {
       'GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE public.agent_avatar_assets',
     );
     expect(sql).toContain('TO eden3_erasure_operator');
+    expect(sql).toContain('GRANT CREATE ON SCHEMA public TO eden3_erasure_guard');
+    expect(sql).toContain('REVOKE CREATE ON SCHEMA public FROM eden3_erasure_guard');
+    expect(sql).toContain('SET ROLE eden3_erasure_guard');
+    expect(sql).toContain(
+      'GRANT EXECUTE ON FUNCTION public.account_erasure_legacy_content_ingest_fence() TO SESSION_USER',
+    );
+    expect(sql).toContain(
+      'REVOKE EXECUTE ON FUNCTION public.account_erasure_legacy_content_ingest_fence() FROM SESSION_USER',
+    );
+    expect(sql.indexOf('GRANT CREATE ON SCHEMA public TO eden3_erasure_guard')).toBeLessThan(
+      sql.indexOf('SET ROLE eden3_erasure_guard'),
+    );
+    expect(sql.indexOf('SET ROLE eden3_erasure_guard')).toBeLessThan(
+      sql.indexOf('CREATE OR REPLACE FUNCTION public.account_erasure_legacy_content_ingest_fence()'),
+    );
+    expect(sql.indexOf('GRANT EXECUTE ON FUNCTION public.account_erasure_legacy_content_ingest_fence() TO SESSION_USER')).toBeLessThan(
+      sql.indexOf('CREATE TRIGGER zz_account_erasure_avatar_ingest_fence'),
+    );
+    expect(sql.indexOf('CREATE TRIGGER zz_account_erasure_avatar_ingest_fence')).toBeLessThan(
+      sql.indexOf('REVOKE EXECUTE ON FUNCTION public.account_erasure_legacy_content_ingest_fence() FROM SESSION_USER'),
+    );
+    expect(sql.indexOf('ALTER FUNCTION public.account_erasure_legacy_content_ingest_fence() OWNER TO eden3_erasure_guard')).toBeLessThan(
+      sql.indexOf('REVOKE CREATE ON SCHEMA public FROM eden3_erasure_guard'),
+    );
   });
 });

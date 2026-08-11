@@ -145,6 +145,10 @@ END;
 $$;
 --> statement-breakpoint
 
+GRANT CREATE ON SCHEMA public TO eden3_erasure_guard;
+--> statement-breakpoint
+SET ROLE eden3_erasure_guard;
+--> statement-breakpoint
 CREATE OR REPLACE FUNCTION public.account_erasure_legacy_content_ingest_fence() RETURNS trigger
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE v_row jsonb := to_jsonb(NEW); v_old jsonb := CASE WHEN TG_OP='UPDATE' THEN to_jsonb(OLD) ELSE NULL END;
@@ -198,9 +202,19 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+GRANT EXECUTE ON FUNCTION public.account_erasure_legacy_content_ingest_fence() TO SESSION_USER;
+--> statement-breakpoint
+RESET ROLE;
+--> statement-breakpoint
 CREATE TRIGGER zz_account_erasure_avatar_ingest_fence
 BEFORE INSERT OR UPDATE ON public.agent_avatar_assets
 FOR EACH ROW EXECUTE FUNCTION public.account_erasure_legacy_content_ingest_fence();
+--> statement-breakpoint
+SET ROLE eden3_erasure_guard;
+--> statement-breakpoint
+REVOKE EXECUTE ON FUNCTION public.account_erasure_legacy_content_ingest_fence() FROM SESSION_USER;
+--> statement-breakpoint
+RESET ROLE;
 --> statement-breakpoint
 
 CREATE OR REPLACE FUNCTION public.account_erasure_avatar_target_success_guard() RETURNS trigger
@@ -228,3 +242,4 @@ GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE public.agent_avatar_assets
 ALTER FUNCTION public.account_erasure_avatar_asset_guard() OWNER TO eden3_erasure_guard;
 ALTER FUNCTION public.account_erasure_avatar_source_guard() OWNER TO eden3_erasure_guard;
 ALTER FUNCTION public.account_erasure_legacy_content_ingest_fence() OWNER TO eden3_erasure_guard;
+REVOKE CREATE ON SCHEMA public FROM eden3_erasure_guard;

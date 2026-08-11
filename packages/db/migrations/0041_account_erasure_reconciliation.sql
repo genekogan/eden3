@@ -155,22 +155,60 @@ DO $$ BEGIN
 	IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='eden3_erasure_terminal_writer') THEN
 		CREATE ROLE eden3_erasure_terminal_writer NOLOGIN;
 	END IF;
+	-- PostgreSQL 16 providers may auto-grant only ADMIN on roles created by a
+	-- non-superuser migration principal while leaving SET/INHERIT disabled.
+	-- Ownership transfer needs SET, but the migration principal must never
+	-- inherit the guard/operator capabilities into ordinary statements.
+	GRANT eden3_erasure_operator TO current_user WITH SET TRUE, INHERIT FALSE;
+	GRANT eden3_erasure_guard TO current_user WITH SET TRUE, INHERIT FALSE;
+	GRANT eden3_erasure_terminal_writer TO current_user WITH SET TRUE, INHERIT FALSE;
 	IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='eden3_erasure_operator'
 		AND (rolcanlogin OR rolsuper OR rolcreaterole OR rolbypassrls OR rolreplication))
 		OR EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
-			WHERE r.rolname='eden3_erasure_operator' AND m.admin_option)
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_operator' AND m.admin_option
+			AND member_role.rolname<>current_user)
+		OR EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_operator' AND member_role.rolname=current_user
+			AND m.inherit_option)
+		OR NOT EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_operator' AND member_role.rolname=current_user
+			AND m.set_option AND NOT m.inherit_option)
 	THEN RAISE EXCEPTION 'unsafe preexisting eden3_erasure_operator role'; END IF;
 	IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='eden3_erasure_guard'
 		AND (rolcanlogin OR rolsuper OR rolcreaterole OR rolbypassrls OR rolreplication))
 		OR EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
-			WHERE r.rolname='eden3_erasure_guard')
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_guard' AND member_role.rolname<>current_user)
+		OR EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_guard' AND member_role.rolname=current_user
+			AND m.inherit_option)
+		OR NOT EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_guard' AND member_role.rolname=current_user
+			AND m.set_option AND NOT m.inherit_option)
 	THEN RAISE EXCEPTION 'unsafe preexisting eden3_erasure_guard role'; END IF;
 	IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='eden3_erasure_terminal_writer'
 		AND (rolcanlogin OR rolsuper OR rolcreaterole OR rolbypassrls OR rolreplication))
 		OR EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
-			WHERE r.rolname='eden3_erasure_terminal_writer' AND m.admin_option)
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_terminal_writer' AND m.admin_option
+			AND member_role.rolname<>current_user)
+		OR EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_terminal_writer' AND member_role.rolname=current_user
+			AND m.inherit_option)
+		OR NOT EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles r ON r.oid=m.roleid
+			JOIN pg_roles member_role ON member_role.oid=m.member
+			WHERE r.rolname='eden3_erasure_terminal_writer' AND member_role.rolname=current_user
+			AND m.set_option AND NOT m.inherit_option)
 	THEN RAISE EXCEPTION 'unsafe preexisting eden3_erasure_terminal_writer role'; END IF;
 END $$;
+--> statement-breakpoint
+GRANT CREATE ON SCHEMA public TO eden3_erasure_guard;
 --> statement-breakpoint
 CREATE OR REPLACE FUNCTION public.account_erasure_operator_authorized()
 RETURNS boolean LANGUAGE sql STABLE SET search_path=pg_catalog,public,pg_temp AS $$
@@ -254,9 +292,11 @@ BEGIN
 END;
 $$;
 REVOKE EXECUTE ON FUNCTION public.account_erasure_assert_account_writable(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION public.account_erasure_assert_account_writable(uuid)
-	TO eden3_erasure_operator,eden3_erasure_terminal_writer;
 ALTER FUNCTION public.account_erasure_assert_account_writable(uuid) OWNER TO eden3_erasure_guard;
+SET ROLE eden3_erasure_guard;
+GRANT EXECUTE ON FUNCTION public.account_erasure_assert_account_writable(uuid)
+	TO eden3_erasure_operator,eden3_erasure_terminal_writer,SESSION_USER;
+RESET ROLE;
 --> statement-breakpoint
 
 CREATE OR REPLACE FUNCTION public.account_erasure_manifest_digest_guard() RETURNS trigger
@@ -404,7 +444,6 @@ GRANT SELECT ON account_erasure_targets,account_erasure_jobs,media_assets,concep
 	TO eden3_erasure_guard;
 ALTER FUNCTION public.account_erasure_lock_legacy_content(text,text,text,text,text,text,text,text,text,text)
 	OWNER TO eden3_erasure_guard;
-ALTER FUNCTION public.account_erasure_legacy_content_ingest_fence() OWNER TO eden3_erasure_guard;
 --> statement-breakpoint
 CREATE TRIGGER zz_account_erasure_media_ingest_fence BEFORE INSERT OR UPDATE ON media_assets
 FOR EACH ROW EXECUTE FUNCTION public.account_erasure_legacy_content_ingest_fence();
@@ -414,6 +453,8 @@ FOR EACH ROW EXECUTE FUNCTION public.account_erasure_legacy_content_ingest_fence
 --> statement-breakpoint
 CREATE TRIGGER zz_account_erasure_creation_ingest_fence BEFORE INSERT OR UPDATE ON creations
 FOR EACH ROW EXECUTE FUNCTION public.account_erasure_legacy_content_ingest_fence();
+--> statement-breakpoint
+ALTER FUNCTION public.account_erasure_legacy_content_ingest_fence() OWNER TO eden3_erasure_guard;
 --> statement-breakpoint
 
 CREATE OR REPLACE FUNCTION public.account_erasure_concept_source_guard() RETURNS trigger
@@ -1286,3 +1327,5 @@ ALTER FUNCTION public.account_erasure_snapshot_guard()
 	SET search_path TO pg_catalog, public, pg_temp;
 ALTER FUNCTION public.account_erasure_statement_lock()
 	SET search_path TO pg_catalog, public, pg_temp;
+--> statement-breakpoint
+REVOKE CREATE ON SCHEMA public FROM eden3_erasure_guard;

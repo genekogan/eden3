@@ -42,6 +42,7 @@ import {
 loadRootEnv();
 
 const marker = makeMarker('channels');
+const tombstoneMarker = makeMarker('channels_tombstone');
 const originalChannelConnectionLimit = process.env.MAX_CHANNEL_CONNECTIONS_PER_USER;
 const vault = new AesGcmSecretVault({ key: randomBytes(32).toString('base64') });
 const runtimeToken = 'channel-runtime-test-credential';
@@ -54,7 +55,6 @@ let secondAgentId = '';
 let secondAgentUsername = '';
 let adminAgentUsername = '';
 let app: FastifyInstance;
-let preserveTombstonedFixtures = false;
 
 const ensureCalls: Array<Record<string, unknown>> = [];
 const removeCalls: Array<Record<string, unknown>> = [];
@@ -223,7 +223,11 @@ const xClient: XUserClientLike = {
   },
 };
 
-const managedBotToken = '987654321:ABCDEFGHIJKLMNOPQRSTUVWXYZabcd';
+const managedBotOwnerId =
+  100_000 +
+  Number(BigInt(`0x${createHash('sha256').update(marker).digest('hex').slice(0, 12)}`));
+const managedBotId = managedBotOwnerId + 1;
+const managedBotToken = `${managedBotId}:${randomBytes(24).toString('base64url')}`;
 const telegramManagedBotApi: TelegramManagedBotApiClientLike = {
   getManagedBotToken: vi.fn(async () => managedBotToken),
 };
@@ -259,7 +263,7 @@ async function createConnection(params: {
       ...(params.label ? { label: params.label } : {}),
     },
   });
-  expect(response.statusCode).toBe(201);
+  expect(response.statusCode, response.body).toBe(201);
   return (response.json() as { connection: ConnectionDto }).connection;
 }
 
@@ -357,7 +361,7 @@ beforeAll(async () => {
 afterAll(async () => {
   try {
     await app?.close();
-    if (!preserveTombstonedFixtures) await deleteFixturesByMarker(marker);
+    await deleteFixturesByMarker(marker);
   } finally {
     await pg.end({ timeout: 5 });
     if (originalChannelConnectionLimit === undefined) {
@@ -384,21 +388,28 @@ describe('channel custody and validation', () => {
     const ownerLockKey = `channel-account:${ownerId}`;
     const lock = await pg.reserve();
     const intentId = randomUUID();
-    await pg`
-      insert into channel_onboarding_intents (
-        id, account_id, channel, intent_secret_hash, provider_owner_id_hash,
-        state, expires_at
-      ) values (
-        ${intentId}, ${ownerId}, 'telegram',
-        ${createHash('sha256').update(`intent-${intentId}`).digest('hex')},
-        ${createHash('sha256').update(`owner-${intentId}`).digest('hex')},
-        'exchanging', now() + interval '15 minutes'
-      )
-    `;
-    await lock`select pg_advisory_lock(hashtextextended(${ownerLockKey}, 0))`;
     let settled = 0;
     let attempts: Array<Promise<unknown>> = [];
     try {
+      await pg`
+        insert into channel_onboarding_intents (
+          id, account_id, channel, intent_secret_hash, state, expires_at
+        ) values (
+          ${intentId}, ${ownerId}, 'telegram',
+          ${createHash('sha256').update(`intent-${intentId}`).digest('hex')},
+          'pending_owner', now() + interval '15 minutes'
+        )
+      `;
+      await pg`
+        update channel_onboarding_intents
+        set state='awaiting_bot',
+            provider_owner_id_hash=${createHash('sha256').update(`owner-${intentId}`).digest('hex')}
+        where id=${intentId}
+      `;
+      await pg`
+        update channel_onboarding_intents set state='exchanging' where id=${intentId}
+      `;
+      await lock`select pg_advisory_lock(hashtextextended(${ownerLockKey}, 0))`;
       const xAttempt = new PostgresChannelCredentialCustody(vault)
         .sealScoped({
           accountId: ownerId,
@@ -458,6 +469,11 @@ describe('channel custody and validation', () => {
     } finally {
       await lock`select pg_advisory_unlock(hashtextextended(${ownerLockKey}, 0))`;
       await Promise.allSettled(attempts);
+      await pg`
+        update channel_onboarding_intents
+        set state='failed', last_error_code='test_cleanup'
+        where id=${intentId} and state in ('pending_owner', 'awaiting_bot', 'exchanging')
+      `;
       lock.release();
       restoreLimit();
     }
@@ -780,7 +796,9 @@ describe('channel custody and validation', () => {
   });
 
   it('rejects duplicate tokens and provider bot identities across connections and rotation', async () => {
-    const botId = '987654321';
+    const botId = `9${BigInt(`0x${createHash('sha256').update(marker).digest('hex').slice(0, 12)}`)
+      .toString()
+      .padStart(14, '0')}`;
     const first = await createConnection({
       token: `valid_${marker}_bot-${botId}_first`,
     });
@@ -1031,7 +1049,7 @@ describe('Telegram Managed Bots onboarding', () => {
       method: 'POST',
       url: '/channels/telegram/managed-bots/webhook',
       headers: { 'x-telegram-bot-api-secret-token': 'wrong-secret' },
-      payload: { message: { text: `/start ${nonce}`, from: { id: 42424242 } } },
+      payload: { message: { text: `/start ${nonce}`, from: { id: managedBotOwnerId } } },
     });
     expect(unauthorized.statusCode).toBe(401);
 
@@ -1039,7 +1057,7 @@ describe('Telegram Managed Bots onboarding', () => {
       method: 'POST',
       url: '/channels/telegram/managed-bots/webhook',
       headers: { 'x-telegram-bot-api-secret-token': 'synthetic-telegram-webhook-secret' },
-      payload: { message: { text: `/start ${nonce}`, from: { id: 42424242 } } },
+      payload: { message: { text: `/start ${nonce}`, from: { id: managedBotOwnerId } } },
     });
     expect(bound.statusCode).toBe(200);
     expect(bound.json()).toEqual({ ok: true, accepted: true });
@@ -1058,8 +1076,8 @@ describe('Telegram Managed Bots onboarding', () => {
 
     const managedUpdate = {
       managed_bot: {
-        user: { id: 42424242, first_name: 'Telegram', last_name: 'Owner', username: 'owner_name' },
-        bot: { id: 52525252, is_bot: true, first_name: 'Eden', last_name: 'Managed', username: 'edenfixturebot' },
+        user: { id: managedBotOwnerId, first_name: 'Telegram', last_name: 'Owner', username: 'owner_name' },
+        bot: { id: managedBotId, is_bot: true, first_name: 'Eden', last_name: 'Managed', username: 'edenfixturebot' },
       },
     };
     const stored = await app.inject({
@@ -1068,8 +1086,13 @@ describe('Telegram Managed Bots onboarding', () => {
       headers: { 'x-telegram-bot-api-secret-token': 'synthetic-telegram-webhook-secret' },
       payload: managedUpdate,
     });
+    const [storedIntent] = await pg<{ state: string; last_error_code: string | null }[]>`
+      select state, last_error_code
+      from channel_onboarding_intents
+      where id = ${created.intent.id}
+    `;
     expect(stored.statusCode).toBe(200);
-    expect(stored.json()).toEqual({ ok: true, accepted: true });
+    expect(stored.json(), JSON.stringify(storedIntent)).toEqual({ ok: true, accepted: true });
 
     const completed = await app.inject({
       method: 'GET',
@@ -1088,7 +1111,7 @@ describe('Telegram Managed Bots onboarding', () => {
       },
     });
     expect(completed.body).not.toContain(managedBotToken);
-    expect(completed.body).not.toContain('42424242');
+    expect(completed.body).not.toContain(String(managedBotOwnerId));
     expect(completed.json().connection).not.toHaveProperty('tokenPreview');
     const connectionId = completed.json().connection.id as string;
 
@@ -1102,7 +1125,7 @@ describe('Telegram Managed Bots onboarding', () => {
     expect(persisted[0]?.token_ciphertext).not.toContain(managedBotToken);
     expect(JSON.stringify(persisted[0]?.metadata)).not.toContain(managedBotToken);
     expect(JSON.stringify(persisted[0]?.metadata)).not.toContain(managedBotToken.slice(-4));
-    expect(JSON.stringify(persisted[0]?.metadata)).not.toContain('42424242');
+    expect(JSON.stringify(persisted[0]?.metadata)).not.toContain(String(managedBotOwnerId));
     const telegramAudits = await pg<{ metadata: Record<string, unknown> }[]>`
       select metadata from secret_access_audit_events where secret_id = ${connectionId}
     `;
@@ -2366,9 +2389,8 @@ describe('Postgres channel group identity isolation', () => {
       // scratch database. This case deliberately creates 0041 tombstones that
       // must never be resurrected just to make generic fixture cleanup pass;
       // retain its unique marker rows until the mandatory scratch drop.
-      preserveTombstonedFixtures = true;
-      const deletedOwnerId = await insertUserAccount(`${marker}_deleted_owner`);
-      const deletedOwnerAgentUsername = `${marker}-deleted-owner-agent`;
+      const deletedOwnerId = await insertUserAccount(`${tombstoneMarker}_deleted_owner`);
+      const deletedOwnerAgentUsername = `${tombstoneMarker}-deleted-owner-agent`;
       await insertAgentAccount(deletedOwnerAgentUsername, {
         ownerId: deletedOwnerId,
         public: true,
@@ -2376,7 +2398,7 @@ describe('Postgres channel group identity isolation', () => {
         provisionStatus: 'ready',
       });
       const ownerConnection = await createConnection({
-        token: `valid_${marker}_deleted_owner`,
+        token: `valid_${tombstoneMarker}_deleted_owner`,
         agentUsername: deletedOwnerAgentUsername,
         ownerAccountId: deletedOwnerId,
       });
@@ -2391,9 +2413,9 @@ describe('Postgres channel group identity isolation', () => {
         connectionId: ownerConnection.id,
         runtimeAccountId: ownerConnection.runtimeAccountId,
         ...ownerRuntime,
-        gatewaySessionKey: `agent:${marker}:discord:${ownerConnection.runtimeAccountId}:direct:deleted-owner`,
+        gatewaySessionKey: `agent:${tombstoneMarker}:discord:${ownerConnection.runtimeAccountId}:direct:deleted-owner`,
         peerId: '77889944',
-        externalMessageId: `${marker}:deleted-owner`,
+        externalMessageId: `${tombstoneMarker}:deleted-owner`,
         role: 'user',
         content: 'must not reach session sync',
         createdAt: new Date().toISOString(),
@@ -2408,8 +2430,8 @@ describe('Postgres channel group identity isolation', () => {
       });
       expect(deletedOwner.statusCode).toBe(404);
 
-      const deletedAgentOwnerId = await insertUserAccount(`${marker}_deleted_agent_owner`);
-      const deletedAgentUsername = `${marker}-deleted-agent`;
+      const deletedAgentOwnerId = await insertUserAccount(`${tombstoneMarker}_deleted_agent_owner`);
+      const deletedAgentUsername = `${tombstoneMarker}-deleted-agent`;
       const deletedAgentId = await insertAgentAccount(deletedAgentUsername, {
         ownerId: deletedAgentOwnerId,
         public: true,
@@ -2417,7 +2439,7 @@ describe('Postgres channel group identity isolation', () => {
         provisionStatus: 'ready',
       });
       const agentConnection = await createConnection({
-        token: `valid_${marker}_deleted_agent`,
+        token: `valid_${tombstoneMarker}_deleted_agent`,
         agentUsername: deletedAgentUsername,
         ownerAccountId: deletedAgentOwnerId,
       });
@@ -2438,8 +2460,8 @@ describe('Postgres channel group identity isolation', () => {
           connectionId: agentConnection.id,
           runtimeAccountId: agentConnection.runtimeAccountId,
           ...agentRuntime,
-          gatewaySessionKey: `agent:${marker}:discord:${agentConnection.runtimeAccountId}:direct:deleted-agent`,
-          externalMessageId: `${marker}:deleted-agent`,
+          gatewaySessionKey: `agent:${tombstoneMarker}:discord:${agentConnection.runtimeAccountId}:direct:deleted-agent`,
+          externalMessageId: `${tombstoneMarker}:deleted-agent`,
         },
       });
       expect(deletedAgent.statusCode).toBe(404);

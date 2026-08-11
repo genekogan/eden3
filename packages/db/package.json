@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./catalog-lock": "./src/catalog-lock.ts",
+    "./managed-postgres-preflight": "./src/managed-postgres-preflight.ts",
     "./schema": "./src/schema.ts",
     "./client": "./src/client.ts"
   },
@@ -13,6 +14,8 @@
     "generate": "drizzle-kit generate",
     "migrate": "tsx src/migrate.ts",
     "managed:preflight": "tsx src/managed-preflight-cli.ts",
+    "managed:bootstrap-runtime": "tsx src/managed-runtime-bootstrap-cli.ts",
+    "managed:runtime-rehearsal": "tsx src/managed-runtime-rehearsal-cli.ts",
     "studio": "drizzle-kit studio",
     "ping": "tsx src/ping.ts",
     "ready": "tsx src/ready.ts",
