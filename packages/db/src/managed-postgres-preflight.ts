@@ -17,7 +17,11 @@ export interface ManagedPostgresEvidence extends ManagedPostgresAuthority {
   latestMigrationId: number;
 }
 
-const DATABASE_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,62}$/;
+// These names are later used as unquoted identifiers by the one-shot runtime
+// bootstrap. Keep the shared authority grammar inside PostgreSQL's ordinary
+// identifier alphabet instead of admitting a URL-valid name that the
+// bootstrap cannot safely address.
+const DATABASE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 
 export function parseManagedPostgresUrl(
   raw: string,

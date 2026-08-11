@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type postgres from 'postgres';
 
 const ROLE_NAME = /^eden3_runtime_[a-z0-9_]{1,43}$/;
-const DATABASE_NAME = /^[A-Za-z_][A-Za-z0-9_-]{0,62}$/;
+const DATABASE_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const PASSWORD = /^[A-Za-z0-9_-]{32,128}$/;
 
 export interface ManagedRuntimeBootstrapOptions {

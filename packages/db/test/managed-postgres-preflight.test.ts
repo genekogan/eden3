@@ -26,6 +26,7 @@ describe('managed PostgreSQL read-only rehearsal boundary', () => {
     'postgres://eden3_runtime:synthetic@db.example.invalid:5432/eden3_managed_rehearsal?sslmode=require',
     'postgres://eden3_runtime@db.example.invalid:5432/eden3_managed_rehearsal?sslmode=verify-full',
     'postgres://eden3_runtime:synthetic@db.example.invalid:5432/postgres?sslmode=verify-full',
+    'postgres://eden3_runtime:synthetic@db.example.invalid:5432/eden3-managed-rehearsal?sslmode=verify-full',
     'postgres://eden3_runtime:synthetic@db.example.invalid:5432/eden3_managed_rehearsal?sslmode=verify-full&application_name=eden3',
   ])('refuses unsafe or ambiguous managed URL %s', (url) => {
     expect(() => parseManagedPostgresUrl(url, 'eden3_managed_rehearsal')).toThrow(/exact credentialed TLS/);

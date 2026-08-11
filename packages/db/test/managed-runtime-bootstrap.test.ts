@@ -39,6 +39,7 @@ describe('managed PostgreSQL runtime role bootstrap', () => {
   it.each([
     { databaseName: 'postgres', roleName: 'runtime', password: 'synthetic_credential_material_1234567890' },
     { databaseName: 'eden3 managed', roleName: 'eden3_runtime_rehearsal', password: 'synthetic_credential_material_1234567890' },
+    { databaseName: 'eden3-managed', roleName: 'eden3_runtime_rehearsal', password: 'synthetic_credential_material_1234567890' },
     { databaseName: 'eden3_managed_rehearsal', roleName: 'eden3_runtime_rehearsal;drop role x', password: 'synthetic_credential_material_1234567890' },
     { databaseName: 'eden3_managed_rehearsal', roleName: 'eden3_runtime_rehearsal', password: "unsafe'password_material_1234567890" },
   ])('refuses a noncanonical bootstrap input %#', (options) => {
