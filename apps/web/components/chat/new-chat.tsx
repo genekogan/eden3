@@ -245,6 +245,15 @@ function NewSessionComposer({
                     {agent.description}
                   </p>
                 ) : null}
+                {agent.username.toLowerCase() === "eve" ? (
+                  <Link
+                    href="/agents/builder"
+                    title="Make me my own agent"
+                    className="mt-5 rounded-lg border border-accent/40 bg-accent px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/90"
+                  >
+                    Make me my own agent
+                  </Link>
+                ) : null}
                 {recent.length > 0 ? (
                   <div className="mt-6 flex gap-2">
                     {recent.slice(0, 5).map((creation) => (

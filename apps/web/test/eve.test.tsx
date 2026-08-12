@@ -43,12 +43,19 @@ describe("eve empty-state entry", () => {
       resolve(WEB_ROOT, "components/shell/agent-selector.tsx"),
       "utf8",
     );
+    const newChat = readFileSync(
+      resolve(WEB_ROOT, "components/chat/new-chat.tsx"),
+      "utf8",
+    );
 
     expect(directory).toContain("<EveEmptyState />");
     expect(sidebar).not.toContain("EveSidebarEntry");
     expect(sidebar).not.toContain('data-testid="eve-sidebar-entry"');
     expect(sidebar).toContain("!isEveUsername(username) || !isEveConcealedSubpath(item.sub)");
     expect(selector).toContain("@eve · Eden guide");
+    expect(newChat).toContain('agent.username.toLowerCase() === "eve"');
+    expect(newChat).toContain('href="/agents/builder"');
+    expect(newChat).toContain('title="Make me my own agent"');
   });
 });
 
