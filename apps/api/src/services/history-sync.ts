@@ -86,7 +86,7 @@ export interface AttachmentSighting {
 }
 
 /** Injected from server.ts — the media pipeline (media agent) implements it. */
-export type AttachmentCallback = (sighting: AttachmentSighting) => void;
+export type AttachmentCallback = (sighting: AttachmentSighting) => void | Promise<void>;
 
 /** Structural tools-client dependency (tests stub it; prod passes OpenClawToolsClient). */
 export interface ToolsClientLike {
@@ -486,7 +486,7 @@ export class HistorySync {
     if (callback) {
       for (const sighting of sightings) {
         try {
-          callback(sighting);
+          await callback(sighting);
         } catch (err) {
           this.onError(err, session.id);
         }
@@ -533,11 +533,6 @@ export class HistorySync {
   private async trailingTick(sessionId: string, initial = false): Promise<void> {
     const state = this.trailing.get(sessionId);
     if (!state) return;
-    if (!initial && Date.now() > state.until) {
-      clearInterval(state.timer);
-      this.trailing.delete(sessionId);
-      return;
-    }
     if (state.running) return; // previous pass still in flight
     state.running = true;
     try {
@@ -546,6 +541,14 @@ export class HistorySync {
       this.onError(err, sessionId);
     } finally {
       state.running = false;
+      // The boundary tick is a real sync pass, not merely a timer reaper.
+      // Otherwise an async completion that lands inside the advertised
+      // window but after the previous interval is silently missed (for
+      // example a video completing at t=119s with a 120s/15s schedule).
+      if (!initial && Date.now() >= state.until) {
+        clearInterval(state.timer);
+        this.trailing.delete(sessionId);
+      }
     }
   }
 

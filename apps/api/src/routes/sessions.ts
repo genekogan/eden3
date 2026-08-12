@@ -89,6 +89,25 @@ export const decodeSessionListCursor = (encoded: string): SessionListCursor =>
 export const decodeMessagesCursor = (encoded: string): MessagesCursor =>
   decodeCursor(messagesCursorSchema, encoded);
 
+/** Keep a session read available even when the local gateway is unhealthy. */
+export async function waitForBestEffortHistoryRefresh(
+  refresh: Promise<unknown>,
+  timeoutMs = 2_500,
+): Promise<'completed' | 'failed' | 'timed_out'> {
+  let timer: NodeJS.Timeout | null = null;
+  const timeout = new Promise<'timed_out'>((resolve) => {
+    timer = setTimeout(() => resolve('timed_out'), timeoutMs);
+    timer.unref?.();
+  });
+  const settled = refresh.then(
+    () => 'completed' as const,
+    () => 'failed' as const,
+  );
+  const outcome = await Promise.race([settled, timeout]);
+  if (timer) clearTimeout(timer);
+  return outcome;
+}
+
 // ---------------------------------------------------------------------------
 // DTO mapping
 // ---------------------------------------------------------------------------
@@ -430,6 +449,23 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
         throw new ApiError(403, 'forbidden', 'You do not have access to this session');
       }
       const cursor = rawCursor ? decodeMessagesCursor(rawCursor) : null;
+
+      // Trailing-sync timers are intentionally in-memory. A restart or a
+      // provider completion at the edge of that window must still heal when
+      // the user reloads the conversation. Refresh only the newest page,
+      // after authorization, and keep this read available if the local
+      // gateway is slow/down.
+      if (!cursor && app.historySync && session.gatewaySessionKey) {
+        const refresh = app.historySync.syncSession({
+          session: { id: session.id, gatewaySessionKey: session.gatewaySessionKey },
+        });
+        const outcome = await waitForBestEffortHistoryRefresh(refresh);
+        if (outcome === 'failed') {
+          req.log.warn({ sessionId: session.id }, 'session history refresh failed');
+        } else if (outcome === 'timed_out') {
+          req.log.warn({ sessionId: session.id }, 'session history refresh timed out');
+        }
+      }
 
       // Fetch newest-first, then reverse. Channel providers can deliver events
       // out of order or with equal timestamps, so source_sequence precedes the

@@ -1,6 +1,9 @@
-import { existsSync } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { createWriteStream, existsSync } from 'node:fs';
+import { mkdtemp, readdir, rm, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { pipeline as streamPipeline } from 'node:stream/promises';
+import { Readable, Transform } from 'node:stream';
 
 import chokidar, { type FSWatcher } from 'chokidar';
 
@@ -604,9 +607,77 @@ export interface AttachmentSightingHandlerOptions {
   /** stat() retries while waiting for the file to be host-visible. */
   statRetries?: number;
   statRetryDelayMs?: number;
+  /** Injectable only for deterministic remote-completion tests. */
+  fetchImpl?: typeof fetch;
+  /** Absolute cap for one provider completion download (default 256 MiB). */
+  remoteDownloadLimitBytes?: number;
+  /** Parent for owned temporary download directories (default OS temp). */
+  remoteTempRoot?: string;
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+const REMOTE_MEDIA_LIMIT_BYTES = 256 * 1024 * 1024;
+const REMOTE_MEDIA_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.webp', '.gif',
+  '.mp4', '.webm', '.mov',
+  '.mp3', '.wav', '.ogg', '.oga', '.m4a', '.aac', '.flac', '.opus',
+]);
+
+/**
+ * OpenClaw's FAL completion agent can emit the finished artifact as an HTTPS
+ * CDN URL instead of writing it into the shared gateway media directory.
+ * Accept only FAL's frozen media authority; arbitrary model-authored URLs must
+ * never become server-side fetches.
+ */
+export function trustedGatewayMediaUrl(raw: string): URL | null {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  const hostname = url.hostname.toLowerCase();
+  if (
+    url.protocol !== 'https:' ||
+    url.username !== '' ||
+    url.password !== '' ||
+    url.hash !== '' ||
+    !(hostname === 'fal.media' || hostname.endsWith('.fal.media'))
+  ) return null;
+  const extension = path.extname(url.pathname).toLowerCase();
+  return REMOTE_MEDIA_EXTENSIONS.has(extension) ? url : null;
+}
+
+async function downloadTrustedGatewayMedia(
+  url: URL,
+  destination: string,
+  opts: Pick<AttachmentSightingHandlerOptions, 'fetchImpl' | 'remoteDownloadLimitBytes'>,
+): Promise<void> {
+  const limit = opts.remoteDownloadLimitBytes ?? REMOTE_MEDIA_LIMIT_BYTES;
+  const response = await (opts.fetchImpl ?? fetch)(url, { redirect: 'error' });
+  if (!response.ok || !response.body) throw new Error('provider media download failed');
+  const declared = response.headers.get('content-length');
+  if (declared !== null) {
+    const bytes = Number(declared);
+    if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > limit) {
+      throw new Error('provider media download size refused');
+    }
+  }
+  let received = 0;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      callback(received > limit ? new Error('provider media download exceeded limit') : null, chunk);
+    },
+  });
+  await streamPipeline(
+    Readable.fromWeb(response.body as never),
+    limiter,
+    createWriteStream(destination, { flags: 'wx', mode: 0o600 }),
+  );
+  if (received === 0) throw new Error('provider media download was empty');
+}
 
 /**
  * Build the `AttachmentCallback` that server wiring passes to
@@ -616,11 +687,12 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * defaults to that message's sender, and the exact pending media authorization
  * is settled with the attachment in one transaction.
  *
- * Fire-and-forget (the callback contract is synchronous); failures are
- * logged, never thrown. `lastRun` exposes the trailing task for tests.
+ * The returned callback is awaitable so history sync cannot claim a terminal
+ * completion before the attachment is durable. Failures are logged, never
+ * thrown. `lastRun` exposes the trailing task for tests and legacy callers.
  */
 export function createAttachmentSightingHandler(opts: AttachmentSightingHandlerOptions): {
-  (sighting: AttachmentSightingLike): void;
+  (sighting: AttachmentSightingLike): Promise<void>;
   lastRun: Promise<void>;
 } {
   const dirs = opts.dirs ?? resolveOpenclawDirs();
@@ -629,63 +701,80 @@ export function createAttachmentSightingHandler(opts: AttachmentSightingHandlerO
   const retryDelayMs = opts.statRetryDelayMs ?? 2000;
 
   const run = async (sighting: AttachmentSightingLike): Promise<void> => {
-    const hostPath = containerPathToHost(sighting.path, dirs);
+    const remoteUrl = trustedGatewayMediaUrl(sighting.path);
+    let ownedTempDir: string | null = null;
+    let hostPath = containerPathToHost(sighting.path, dirs);
+    if (!hostPath && remoteUrl) {
+      ownedTempDir = await mkdtemp(path.join(opts.remoteTempRoot ?? tmpdir(), 'eden3-media-sighting-'));
+      hostPath = path.join(ownedTempDir, `artifact${path.extname(remoteUrl.pathname).toLowerCase()}`);
+      try {
+        await downloadTrustedGatewayMedia(remoteUrl, hostPath, opts);
+      } catch (error) {
+        await rm(ownedTempDir, { recursive: true, force: true });
+        throw error;
+      }
+    }
     if (!hostPath) {
       log.warn(
-        `media-sighting: path ${sighting.path} (session ${sighting.sessionId}) maps outside the gateway dirs — skipped`,
+        `media-sighting: attachment for session ${sighting.sessionId} is not an approved gateway path — skipped`,
       );
       return;
     }
-    // The completion message is posted AFTER the file is written, but the
-    // sshfs bind can lag — retry stat briefly.
-    let found = false;
-    for (let attempt = 0; attempt < Math.max(1, retries); attempt += 1) {
-      try {
-        const stats = await stat(hostPath);
-        if (stats.isFile() && stats.size > 0) {
-          found = true;
-          break;
+    try {
+      // The completion message is posted AFTER the file is written, but the
+      // sshfs bind can lag — retry stat briefly.
+      let found = false;
+      for (let attempt = 0; attempt < Math.max(1, retries); attempt += 1) {
+        try {
+          const stats = await stat(hostPath);
+          if (stats.isFile() && stats.size > 0) {
+            found = true;
+            break;
+          }
+        } catch {
+          // not visible yet
         }
-      } catch {
-        // not visible yet
+        await sleep(retryDelayMs);
       }
-      await sleep(retryDelayMs);
-    }
-    if (!found) {
-      log.warn(`media-sighting: ${hostPath} never became visible on the host — skipped`);
-      return;
-    }
-
-    opts.watcher?.markProcessed(hostPath);
-    const kind = attachmentKindForMime(mimeForPath(hostPath));
-    if (opts.isStudioKindQuarantined) {
-      let quarantined = true;
-      try {
-        quarantined = await opts.isStudioKindQuarantined(kind);
-      } catch (err) {
-        log.warn(`media-sighting: Studio quarantine check failed closed: ${String(err)}`);
-      }
-      if (quarantined) {
-        await opts.pipeline.ingestFile(hostPath, {
-          tool: toolFromPath(hostPath, kind),
-        });
+      if (!found) {
+        log.warn(`media-sighting: approved gateway artifact never became visible — skipped`);
         return;
       }
+
+      if (!ownedTempDir) opts.watcher?.markProcessed(hostPath);
+      const kind = attachmentKindForMime(mimeForPath(hostPath));
+      if (opts.isStudioKindQuarantined) {
+        let quarantined = true;
+        try {
+          quarantined = await opts.isStudioKindQuarantined(kind);
+        } catch (err) {
+          log.warn(`media-sighting: Studio quarantine check failed closed: ${String(err)}`);
+        }
+        if (quarantined) {
+          await opts.pipeline.ingestFile(hostPath, {
+            tool: toolFromPath(hostPath, kind),
+          });
+          return;
+        }
+      }
+      await opts.pipeline.ingestFile(hostPath, {
+        sessionId: sighting.sessionId,
+        messageId: sighting.messageId,
+        tool: toolFromPath(hostPath, kind),
+      });
+      log.info(
+        `media-sighting: attached gateway artifact to message ${sighting.messageId} in session ${sighting.sessionId}`,
+      );
+    } finally {
+      if (ownedTempDir) await rm(ownedTempDir, { recursive: true, force: true });
     }
-    await opts.pipeline.ingestFile(hostPath, {
-      sessionId: sighting.sessionId,
-      messageId: sighting.messageId,
-      tool: toolFromPath(hostPath, kind),
-    });
-    log.info(
-      `media-sighting: attached ${path.basename(hostPath)} to message ${sighting.messageId} in session ${sighting.sessionId}`,
-    );
   };
 
-  const handler = (sighting: AttachmentSightingLike): void => {
-    handler.lastRun = run(sighting).catch((err) => {
-      log.error(`media-sighting: failed for ${sighting.path}: ${String(err)}`);
+  const handler = (sighting: AttachmentSightingLike): Promise<void> => {
+    handler.lastRun = run(sighting).catch(() => {
+      log.error(`media-sighting: attachment ingest failed for session ${sighting.sessionId}`);
     });
+    return handler.lastRun;
   };
   handler.lastRun = Promise.resolve();
   return handler;

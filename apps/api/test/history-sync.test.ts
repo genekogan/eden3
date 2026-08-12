@@ -278,6 +278,7 @@ describe('HistorySync scheduling (no db, no gateway)', () => {
       const tools = { sessionsHistory: vi.fn() };
       const sync = new HistorySync({ tools });
       // no_gateway_key target: each pass is a cheap synchronous short-circuit.
+      const passes = vi.spyOn(sync, 'syncSession');
       sync.scheduleTrailingSync({ session: sessionWithoutKey }, { windowMs: 40_000, intervalMs: 15_000 });
       sync.scheduleTrailingSync({ session: sessionWithoutKey }, { windowMs: 40_000, intervalMs: 15_000 });
       expect(sync.trailingCount).toBe(1); // re-schedule extends, never duplicates
@@ -287,6 +288,10 @@ describe('HistorySync scheduling (no db, no gateway)', () => {
       expect(sync.trailingCount).toBe(1);
       await vi.advanceTimersByTimeAsync(60_000); // beyond the window — reaper tick
       expect(sync.trailingCount).toBe(0);
+      // Immediate + t=15s + t=30s + the first boundary tick at t=45s.
+      // The boundary pass is load-bearing: a completion at t=39s must not be
+      // dropped merely because the preceding interval ran at t=30s.
+      expect(passes).toHaveBeenCalledTimes(4);
 
       sync.scheduleTrailingSync({ session: sessionWithoutKey });
       expect(sync.trailingCount).toBe(1);

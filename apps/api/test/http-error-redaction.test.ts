@@ -47,7 +47,6 @@ const REVIEWED_BACKGROUND_THROWABLE_LOG_ANCHORS: string[] = [
   "services/task-scheduler.ts|callback:catch>callback:setInterval>method:start|this.log|task-scheduler: tick failed|this.log?.error({ err }, 'task-scheduler: tick failed')",
   "services/task-scheduler.ts|callback:catch>method:ensureGatewayJobsCleaned|this.log|task-scheduler: legacy gateway cron cleanup failed|this.log?.warn({ err }, 'task-scheduler: legacy gateway cron cleanup failed')",
   "services/task-scheduler.ts|method:processDue|this.log|task-scheduler: scheduled run failed|this.log?.error({ err, triggerId: row.id }, 'task-scheduler: scheduled run failed')",
-  'workers/media-watcher.ts|callback:catch>variable:handler>function:createAttachmentSightingHandler|log|(dynamic)|log.error(`media-sighting: failed for ${sighting.path}: ${String(err)}`)',
   'workers/media-watcher.ts|callback:watcher.on:error>callback:(anonymous)>method:start|this.log|(dynamic)|this.log.error(`media-watcher: watch error: ${String(err)}`)',
   'workers/media-watcher.ts|method:handleStableFile|this.log|(dynamic)|this.log.warn(`media-watcher: Studio quarantine check failed closed: ${String(err)}`)',
   'workers/media-watcher.ts|method:handleStableFile|this.log|(dynamic)|this.log.warn(`media-watcher: history-sync failed for ${filePath}: ${String(err)}`)',
