@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { PgClient } from '@eden3/db';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 let pg: PgClient;
 let EventsBus: typeof import('../src/events-bus').EventsBus;
@@ -98,6 +98,15 @@ describe('agent provisioning notifications (disposable Postgres)', () => {
 
   afterAll(async () => {
     await pg.end({ timeout: 5 });
+  });
+
+  afterEach(async () => {
+    // This suite is lease-bound to an explicitly disposable database. TRUNCATE
+    // is the only truthful teardown for the retained erasure-job fixture:
+    // production DELETE intentionally refuses to remove those replay records.
+    // CASCADE restores the exact empty migrated baseline required by the next
+    // gated PostgreSQL evidence suite in `test:full`.
+    await pg.unsafe('truncate table accounts cascade');
   });
 
   it('finishes ready, publishes once, and makes stale replay a no-op', async () => {

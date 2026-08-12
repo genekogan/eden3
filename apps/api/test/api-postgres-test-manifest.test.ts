@@ -95,6 +95,15 @@ describe('API Postgres test manifest', () => {
       readFileSync(new URL('../../../package.json', import.meta.url), 'utf8'),
     ) as { scripts?: Record<string, string> };
     expect(root.scripts?.['test:api-full']).toBe('pnpm --filter @eden3/api test:full');
+
+    const notificationProof = readFileSync(
+      new URL('./agent-provisioning-notification-pg.test.ts', import.meta.url),
+      'utf8',
+    );
+    expect(notificationProof.match(/afterEach\s*\(/g)).toHaveLength(1);
+    expect(notificationProof.match(/truncate table accounts cascade/g)).toHaveLength(1);
+    expect(notificationProof.indexOf('afterEach(async () =>'))
+      .toBeLessThan(notificationProof.indexOf("pg.unsafe('truncate table accounts cascade')"));
   });
 
   it('fails closed on missing gated-proof flags instead of skipping test bodies', () => {
