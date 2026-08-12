@@ -2436,6 +2436,82 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       vi.useRealTimers();
     }
   });
+
+  it('replaces a stale pairing code and expires an undeliverable code without a retry storm', async () => {
+    vi.useFakeTimers();
+    try {
+      const seenCodes = [];
+      let releaseOld;
+      const oldInFlight = new Promise((resolve) => {
+        releaseOld = resolve;
+      });
+      const { bridge } = mockBridge(
+        hostedConfig(),
+        {
+          '/channels/runtime/pairing': async (body) => {
+            seenCodes.push(body.code);
+            if (body.code === 'old-code') await oldInFlight;
+            return { ok: true };
+          },
+        },
+        { now: Date.now },
+      );
+      const context = {
+        channelId: 'discord',
+        accountId: 'account-a',
+        senderId: PEER_A,
+      };
+
+      const oldAttempt = bridge.onPairingRequested(
+        { channel: 'discord', accountId: 'account-a', senderId: PEER_A, code: 'old-code' },
+        context,
+      );
+      await vi.waitFor(() => expect(seenCodes).toEqual(['old-code']));
+      const newAttempt = bridge.onPairingRequested(
+        { channel: 'discord', accountId: 'account-a', senderId: PEER_A, code: 'new-code' },
+        context,
+      );
+      expect(seenCodes).toEqual(['old-code']);
+      releaseOld();
+      await Promise.all([oldAttempt, newAttempt]);
+      expect(seenCodes).toEqual(['old-code', 'new-code']);
+
+      const alwaysFailing = mockBridge(
+        hostedConfig(),
+        {
+          '/channels/runtime/pairing': async () => {
+            throw new Error('sustained callback outage');
+          },
+        },
+        { now: Date.now },
+      );
+      await alwaysFailing.bridge.onPairingRequested(
+        {
+          channel: 'discord',
+          accountId: 'account-a',
+          senderId: PEER_A,
+          code: 'expiring-code',
+        },
+        context,
+      );
+      await vi.advanceTimersByTimeAsync(
+        channelRuntimeBridgeInternals.PAIRING_CALLBACK_TTL_MS +
+          channelRuntimeBridgeInternals.PAIRING_CALLBACK_RETRY_MAX_MS,
+      );
+      const attemptsAtExpiry = alwaysFailing.calls.filter((call) =>
+        call.path.endsWith('/pairing'),
+      ).length;
+      await vi.advanceTimersByTimeAsync(
+        channelRuntimeBridgeInternals.PAIRING_CALLBACK_RETRY_MAX_MS * 4,
+      );
+      expect(alwaysFailing.calls.filter((call) => call.path.endsWith('/pairing'))).toHaveLength(
+        attemptsAtExpiry,
+      );
+      expect(attemptsAtExpiry).toBeLessThan(30);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('runtime callback HTTP client', () => {
