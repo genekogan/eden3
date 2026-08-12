@@ -998,6 +998,39 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     }
   });
 
+  it('admits the canonical 7.1 Discord group hook with a routed conversation target', async () => {
+    const current = mockBridge(groupHostedConfig());
+    const groupSession = 'agent:agent-a:discord:channel:758719600895590444';
+    current.bridge.onMessageReceived(
+      {
+        content: 'mentioned group message',
+        messageId: '1532630091471786200',
+        senderId: PEER_A,
+        from: 'discord:channel:758719600895590444',
+        metadata: {
+          guildId: '758719600895590441',
+          senderId: PEER_A,
+          wasMentioned: true,
+        },
+      },
+      {
+        channelId: 'discord',
+        accountId: 'account-a',
+        conversationId: 'channel:758719600895590444',
+        sessionKey: groupSession,
+        messageId: '1532630091471786200',
+        senderId: PEER_A,
+      },
+    );
+
+    await expect(
+      current.bridge.onBeforeAgentRun(
+        { accountId: 'account-a', senderId: PEER_A, prompt: 'mentioned group message', messages: [] },
+        { runId: RUN_A, sessionKey: groupSession, messageProvider: 'discord', agentId: 'agent-a' },
+      ),
+    ).resolves.toEqual({ outcome: 'pass' });
+  });
+
   it('durably commits bot-loop suppression before admitting a bot-authored turn', () => {
     const operations = [];
     const stored = new Map();
