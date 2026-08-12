@@ -35,6 +35,7 @@ export interface MediaObjectHydrator {
 
 export interface ResolvedMediaObject {
   objectId: string;
+  ownerAccountId: string;
   displayName: string;
   mime: string;
   sizeBytes: number;
@@ -87,6 +88,7 @@ export class MediaObjectResolver {
     ) throw notFound();
     return {
       objectId: row.id,
+      ownerAccountId: row.ownerAccountId,
       displayName: row.displayName,
       mime: row.verifiedMime,
       sizeBytes: row.verifiedSizeBytes,

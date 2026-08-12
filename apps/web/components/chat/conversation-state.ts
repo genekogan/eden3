@@ -33,6 +33,7 @@ export interface UserEchoItem {
   kind: "user-echo";
   clientId: string;
   content: string;
+  attachments: MessageAttachment[];
   at: string;
 }
 
@@ -121,7 +122,7 @@ export type ConversationAction =
       olderCursor?: string | null;
       position: HistoryPosition;
     }
-  | { type: "send"; clientId: string; content: string; at: string }
+  | { type: "send"; clientId: string; content: string; attachments?: MessageAttachment[]; at: string }
   | {
       /** Adopt an in-flight new-session stream handed off from /chat. */
       type: "adopt";
@@ -540,6 +541,7 @@ export function conversationReducer(
         kind: "user-echo",
         clientId: echoClientId(action.clientId),
         content: action.content,
+        attachments: action.type === "send" ? (action.attachments ?? []) : [],
         at: action.at,
       };
       const stream: AssistantStreamItem = {

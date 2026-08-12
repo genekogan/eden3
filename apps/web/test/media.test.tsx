@@ -77,6 +77,30 @@ describe("media rendering", () => {
     expect(html).not.toContain('/creations/00000000-0000-4000-8000-000000000004');
   });
 
+  it("renders a text attachment as a downloadable file card, never as broken media", () => {
+    const message: MessageDto = {
+      id: "00000000-0000-4000-8000-000000000001",
+      externalId: null,
+      sessionId: "00000000-0000-4000-8000-000000000002",
+      senderId: "00000000-0000-4000-8000-000000000003",
+      role: "user",
+      content: "Summarize this.",
+      attachments: [{ url: "/media/00000000-0000-4000-8000-000000000004", mime: "text/plain" }],
+      toolCalls: null,
+      reactions: null,
+      replyToExternalId: null,
+      createdAt: "2026-08-11T21:51:35.073Z",
+    };
+    const html = renderToStaticMarkup(
+      <MessageRow message={message} sender={null} showAvatar={false} />,
+    );
+    expect(html).toContain("Attached file");
+    expect(html).toContain("text/plain");
+    expect(html).toContain("download=");
+    expect(html).not.toContain("<img");
+    expect(html).not.toContain("View larger");
+  });
+
   it("renders a focused media viewer with an in-place image and download action", () => {
     const html = renderToStaticMarkup(
       <AttachmentLightbox

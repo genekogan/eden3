@@ -152,6 +152,24 @@ describe('OpenClawCompatClient.chatTurn', () => {
     });
   });
 
+  it('sends verified images as native OpenAI multimodal content parts', async () => {
+    const { fetchImpl, calls } = makeFetch(() => sseResponse([frame('[DONE]')]));
+    await collect(client(fetchImpl).chatTurn({
+      ...turnParams,
+      images: [
+        { mime: 'image/png', base64: 'aW1hZ2UtMQ==' },
+        { mime: 'image/webp', base64: 'aW1hZ2UtMg==' },
+      ],
+    }));
+    const body = JSON.parse(String(calls[0]!.init.body));
+    expect(body.messages).toEqual([{ role: 'user', content: [
+      { type: 'text', text: 'hi' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,aW1hZ2UtMQ==' } },
+      { type: 'image_url', image_url: { url: 'data:image/webp;base64,aW1hZ2UtMg==' } },
+    ] }]);
+    expect(JSON.stringify(body)).not.toContain('objectId');
+  });
+
   it('sends a trusted provider/model override through the 7.1 compat header only', async () => {
     const { fetchImpl, calls } = makeFetch(() => sseResponse([frame('[DONE]')]));
     await collect(

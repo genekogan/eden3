@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import {
   DailyCapExceededError,
+  getEnv,
   InsufficientMannaError,
   gatewaySessionKey,
   resolveAgentByUsername,
@@ -38,6 +39,13 @@ import { assertTurnAdmissible, runTurn, type TurnAgent, type TurnSink } from '..
 import { canAccessSession } from './sessions';
 import { enqueueLazyMemoryDistillation } from '../services/memory-distillation';
 import { generateSessionTitle } from '../services/session-title';
+import {
+  MAX_CHAT_ATTACHMENT_BYTES,
+  prepareLegacyAssistantImages,
+  prepareChatAttachments,
+  recentAssistantImageReferences,
+} from '../services/chat-attachments';
+import type { MediaObjectResolver } from '../services/media-object-repository';
 
 /**
  * POST /sessions/:idOrNew/messages — the chat turn endpoint.
@@ -62,13 +70,14 @@ import { generateSessionTitle } from '../services/session-title';
  */
 
 const bodySchema = z.object({
-  content: z
-    .string()
-    .min(1)
-    .max(20_000)
-    .refine((value) => value.trim().length > 0, 'content must not be blank'),
+  content: z.string().max(20_000).default(''),
+  attachments: z.array(z.object({ objectId: z.string().uuid() })).max(8).default([]),
   /** Required for `new`, ignored otherwise. */
   agentUsername: z.string().trim().min(1).optional(),
+}).superRefine((value, context) => {
+  if (value.content.trim().length === 0 && value.attachments.length === 0) {
+    context.addIssue({ code: 'custom', path: ['content'], message: 'content or an attachment is required' });
+  }
 });
 
 interface ResolvedTarget {
@@ -428,6 +437,7 @@ function openSseSink(reply: FastifyReply, sessionId: string): TurnSink {
 
 export interface ChatRoutesOptions {
   providerEvidenceDb?: DbHandle;
+  mediaResolver?: MediaObjectResolver;
 }
 
 export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opts) => {
@@ -445,6 +455,15 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
           'OPENCLAW_GATEWAY_TOKEN is not configured — chat is unavailable',
         );
       }
+
+      // Validate explicit objects before a new-session insert or any economic
+      // reservation. Contextual images require the resolved session below.
+      const explicitObjectIds = body.attachments.map((attachment) => attachment.objectId);
+      const explicitAttachments = await prepareChatAttachments({
+        objectIds: explicitObjectIds,
+        viewerAccountId: account.accountId,
+        resolver: opts.mediaResolver,
+      });
 
       let target: ResolvedTarget;
       if (req.params.idOrNew === 'new') {
@@ -466,7 +485,7 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
           compat: app.gatewayCompat,
           agentId: target.agent.openclawId,
           sessionId: target.session.id,
-          firstMessage: body.content,
+          firstMessage: body.content.trim() || `${body.attachments.length} attached file${body.attachments.length === 1 ? '' : 's'}`,
           forbiddenTitles: [target.agent.username],
           persistIfCurrent: async (title) => {
             const [updated] = await db
@@ -490,6 +509,22 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
           account.accountId,
           target.agent.gatewayModelOverride ?? target.agent.model,
         );
+      }
+
+      const contextualReferences = explicitObjectIds.length === 0
+        ? await recentAssistantImageReferences(target.session.id)
+        : { objectIds: [], legacy: [] };
+      const contextualImages = await prepareChatAttachments({
+        objectIds: contextualReferences.objectIds,
+        viewerAccountId: account.accountId,
+        resolver: opts.mediaResolver,
+      });
+      const legacyContextualImages = await prepareLegacyAssistantImages(
+        contextualReferences.legacy,
+        getEnv().MEDIA_DIR,
+      );
+      if (contextualImages.totalBytes + legacyContextualImages.totalBytes > MAX_CHAT_ATTACHMENT_BYTES) {
+        throw new ApiError(413, 'chat_attachments_too_large', 'Chat attachments may total at most 20 MiB');
       }
 
       const turnLimit = await concurrentTurnLimit(account.accountId);
@@ -534,6 +569,13 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
             agent: target.agent,
             user: account,
             content: body.content,
+            attachments: explicitAttachments.persisted,
+            gatewayImages: [
+              ...explicitAttachments.images,
+              ...contextualImages.images,
+              ...legacyContextualImages.images,
+            ],
+            gatewayAttachmentText: explicitAttachments.supplementalText,
             beginStream: () => openSseSink(reply, target.session.id),
           },
         );

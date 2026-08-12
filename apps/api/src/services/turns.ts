@@ -23,6 +23,7 @@ import {
   type SessionEvent,
   type Usage,
 } from '@eden3/shared';
+import type { MessageAttachment } from '@eden3/shared';
 import { accounts, db, messages, sessions, usageEvents, type Session } from '@eden3/db';
 import {
   ClaudeTranscriptUsageCapture,
@@ -197,6 +198,12 @@ export interface RunTurnParams {
   user: AuthSession;
   /** The user's message exactly as typed (persisted verbatim). */
   content: string;
+  /** Server-authorized objects persisted on the user message. */
+  attachments?: MessageAttachment[];
+  /** Server-hydrated image inputs for OpenClaw's native vision content. */
+  gatewayImages?: ChatTurnParams['images'];
+  /** Safely wrapped text/JSON attachment contents appended only gateway-side. */
+  gatewayAttachmentText?: string | null;
   /** Optional product surface that initiated this turn. */
   source?:
     | {
@@ -594,6 +601,7 @@ async function persistMessage(row: {
   content: string;
   name?: string | null;
   edenMessageData?: unknown;
+  attachments?: MessageAttachment[];
 }, dbc?: DbHandle): Promise<{ id: string; createdAt: Date }> {
   const persist = async (handle: DbHandle): Promise<{ id: string; createdAt: Date }> => {
     const [inserted] = await handle
@@ -605,6 +613,7 @@ async function persistMessage(row: {
         content: row.content,
         name: row.name ?? null,
         edenMessageData: row.edenMessageData ?? null,
+        attachments: row.attachments && row.attachments.length > 0 ? row.attachments : null,
       })
       .returning({ id: messages.id, createdAt: messages.createdAt });
     if (!inserted) throw new Error('message insert returned no row');
@@ -914,6 +923,9 @@ async function runClaimedTurn(
           peerContext ?? content,
         ].join('\n\n');
       }
+      if (params.gatewayAttachmentText) {
+        gatewayMessage = `${gatewayMessage}\n\n${params.gatewayAttachmentText}`;
+      }
 
       // 3. Persist the user message VERBATIM (the primer exists only gateway-
       //    side; history-sync backfills the gateway id via the PRIMER_HEADER
@@ -923,6 +935,7 @@ async function runClaimedTurn(
         senderId: user.accountId,
         role: 'user',
         content,
+        attachments: params.attachments,
       });
 
       // 4. Media/trailing-sync correlation window.
@@ -1168,6 +1181,7 @@ async function runClaimedTurn(
       agentId: agent.openclawId,
       sessionKey: gatewaySessionKey,
       userMessage: gatewayMessage,
+      images: params.gatewayImages,
       // Eden's DB configuration is authoritative on every request. OpenClaw
       // persists `/model` session overrides; omitting this header could execute
       // one model/runtime while billing the DB-selected model.

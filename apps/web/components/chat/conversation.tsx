@@ -49,6 +49,7 @@ import {
 } from "./conversation-state";
 import type { LocalItem } from "./conversation-state";
 import { Composer, ComposerNotice } from "./composer";
+import type { ComposerAttachment } from "./composer";
 import { SessionShareDialog } from "./session-share-dialog";
 import {
   InlineError,
@@ -292,12 +293,12 @@ export function SessionConversation({
   );
 
   const send = useCallback(
-    (content: string) => {
+    (content: string, attachments: ComposerAttachment[] = []) => {
       const active = activePumpRef.current;
       if (active && !active.done) return; // one live turn at a time
       setNotice(null);
       stickRef.current = true;
-      const pump = startSessionTurn(canonicalIdRef.current, content);
+      const pump = startSessionTurn(canonicalIdRef.current, content, attachments);
       // The optimistic echo + bubble are seeded here; mark the pump adopted
       // so the adoption effect below doesn't seed them a second time.
       adoptedPumpRef.current = pump.clientId;
@@ -305,6 +306,7 @@ export function SessionConversation({
         type: "send",
         clientId: pump.clientId,
         content,
+        attachments: pump.attachments,
         at: nowIso(),
       });
       attachPump(pump);

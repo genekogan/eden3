@@ -665,7 +665,7 @@ export const api = {
      * stream the first turn. The new session's id arrives on `turn.started`.
      */
     sendNew(
-      body: { content: string; agentUsername: string },
+      body: { content: string; agentUsername: string; attachments?: Array<{ objectId: string }> },
       options?: SseStreamOptions,
     ): AsyncGenerator<SessionEvent, void, undefined> {
       return sseStream("/sessions/new/messages", body, options);
@@ -675,9 +675,10 @@ export const api = {
     send(
       id: string,
       content: string,
+      attachments: Array<{ objectId: string }> = [],
       options?: SseStreamOptions,
     ): AsyncGenerator<SessionEvent, void, undefined> {
-      return sseStream(`/sessions/${enc(id)}/messages`, { content }, options);
+      return sseStream(`/sessions/${enc(id)}/messages`, { content, attachments }, options);
     },
 
     /** GET /api/sessions/:id/events — see subscribeSession. */

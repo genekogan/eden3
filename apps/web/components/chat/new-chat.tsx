@@ -27,6 +27,7 @@ import {
 import { startNewSessionTurn } from "./turn-pump";
 import type { TurnPump } from "./turn-pump";
 import { Composer, ComposerNotice } from "./composer";
+import type { ComposerAttachment } from "./composer";
 import { Markdown } from "./markdown";
 
 interface SendNotice {
@@ -106,7 +107,7 @@ function NewSessionComposer({
   }, [username, reloadNonce]);
 
   const send = useCallback(
-    async (content: string) => {
+    async (content: string, attachments: ComposerAttachment[] = []) => {
       if (!agent || pendingPumpRef.current) return;
       setNotice(null);
       setPendingContent(content);
@@ -116,6 +117,7 @@ function NewSessionComposer({
       // the reply keeps streaming straight through the route change.
       const { pump, ready } = startNewSessionTurn({
         content,
+        attachments,
         agentUsername: agent.username,
         agent,
       });

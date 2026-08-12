@@ -18,7 +18,8 @@
  * so a remounting view (strict mode, back-navigation) can re-adopt it.
  */
 
-import type { AgentDto, SessionEvent } from "@/lib/types";
+import type { AgentDto, MessageAttachment, SessionEvent } from "@/lib/types";
+import type { ComposerAttachment } from "./composer";
 import {
   describeSendError,
   isAbortError,
@@ -43,6 +44,7 @@ export interface TurnPump {
   readonly clientId: string;
   /** The user message that started the turn (echo + retry payload). */
   readonly content: string;
+  readonly attachments: MessageAttachment[];
   /** Agent context for avatar/title before the session record loads. */
   readonly agent: AgentDto | null;
   /** Session the turn belongs to; null until turn.started/header on a new session. */
@@ -67,6 +69,7 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
 class Pump implements TurnPump {
   readonly clientId = crypto.randomUUID();
   readonly content: string;
+  readonly attachments: MessageAttachment[];
   readonly agent: AgentDto | null;
   sessionId: string | null;
   done = false;
@@ -76,8 +79,9 @@ class Pump implements TurnPump {
   private listeners = new Set<(entry: PumpEntry) => void>();
   readonly controller = new AbortController();
 
-  constructor(content: string, agent: AgentDto | null, sessionId: string | null) {
+  constructor(content: string, attachments: MessageAttachment[], agent: AgentDto | null, sessionId: string | null) {
     this.content = content;
+    this.attachments = attachments;
     this.agent = agent;
     this.sessionId = sessionId;
   }
@@ -186,10 +190,10 @@ async function consume(
  * POST /api/sessions/:id/messages — start a turn in an existing session.
  * The pump is registered immediately; attach to render it.
  */
-export function startSessionTurn(sessionId: string, content: string): TurnPump {
-  const pump = new Pump(content, null, sessionId);
+export function startSessionTurn(sessionId: string, content: string, attachments: ComposerAttachment[] = []): TurnPump {
+  const pump = new Pump(content, attachments.map((item) => item.attachment), null, sessionId);
   register(pump);
-  const events = api.sessions.send(sessionId, content, {
+  const events = api.sessions.send(sessionId, content, attachments.map(({ objectId }) => ({ objectId })), {
     signal: pump.controller.signal,
   });
   void consume(pump, events);
@@ -210,10 +214,12 @@ export interface NewSessionTurn {
 /** POST /api/sessions/new/messages — start a session with its first turn. */
 export function startNewSessionTurn(body: {
   content: string;
+  attachments?: ComposerAttachment[];
   agentUsername: string;
   agent: AgentDto | null;
 }): NewSessionTurn {
-  const pump = new Pump(body.content, body.agent, null);
+  const attachments = body.attachments ?? [];
+  const pump = new Pump(body.content, attachments.map((item) => item.attachment), body.agent, null);
 
   const ready = new Promise<string>((resolve, reject) => {
     void (async () => {
@@ -226,7 +232,7 @@ export function startNewSessionTurn(body: {
       };
       try {
         const { sessionIdHint, events } = await startNewSessionStream(
-          { content: body.content, agentUsername: body.agentUsername },
+          { content: body.content, agentUsername: body.agentUsername, attachments: attachments.map(({ objectId }) => ({ objectId })) },
           pump.controller.signal,
         );
         if (sessionIdHint && !pump.sessionId) {

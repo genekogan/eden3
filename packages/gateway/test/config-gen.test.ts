@@ -434,10 +434,10 @@ describe('ensureBaseline', () => {
         providers: {
           anthropic: {
             models: [
-              { id: 'claude-haiku-4-5', name: 'claude-haiku-4-5' },
-              { id: 'claude-sonnet-4-5', name: 'claude-sonnet-4-5' },
-              { id: 'claude-sonnet-4-6', name: 'claude-sonnet-4-6' },
-              { id: 'claude-opus-4-6', name: 'claude-opus-4-6' },
+              { id: 'claude-haiku-4-5', name: 'claude-haiku-4-5', input: ['text', 'image'] },
+              { id: 'claude-sonnet-4-5', name: 'claude-sonnet-4-5', input: ['text', 'image'] },
+              { id: 'claude-sonnet-4-6', name: 'claude-sonnet-4-6', input: ['text', 'image'] },
+              { id: 'claude-opus-4-6', name: 'claude-opus-4-6', input: ['text', 'image'] },
             ],
           },
         },
@@ -833,8 +833,11 @@ describe('ensureBaseline', () => {
     ).providers.anthropic.models;
     expect(providerModels.slice(0, 2)).toEqual([
       { id: 'operator-model', name: 'Operator model', custom: true },
-      { id: 'claude-opus-4-6', name: 'Custom Opus label', contextWindow: 123 },
+      { id: 'claude-opus-4-6', name: 'Custom Opus label', contextWindow: 123, input: ['text', 'image'] },
     ]);
+    for (const model of providerModels.filter((entry) => String(entry.id).startsWith('claude-'))) {
+      expect(model.input).toEqual(['text', 'image']);
+    }
     const modelConfigs = (
       first.config.agents as { defaults: { models: Record<string, Record<string, unknown>> } }
     ).defaults.models;

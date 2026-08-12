@@ -65,7 +65,7 @@ export interface NewSessionStream {
  * Throws ApiError on a non-2xx response (402 = insufficient manna).
  */
 export async function startNewSessionStream(
-  body: { content: string; agentUsername: string },
+  body: { content: string; agentUsername: string; attachments?: Array<{ objectId: string }> },
   signal?: AbortSignal,
 ): Promise<NewSessionStream> {
   const path = "/sessions/new/messages";

@@ -792,9 +792,19 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     dataDir: defaultOpenclawDataDir(),
   });
 
+  // Chat attachment validation and the public object routes must share the
+  // exact same resolver/runtime. Construct it once before either route is
+  // registered so no chat-only hydration path can drift from media custody.
+  const storageRuntime =
+    opts.storage?.runtime ??
+    (opts.storage?.enabled === true
+      ? await createStorageRuntime({ mediaDir: env.MEDIA_DIR, logger: app.log })
+      : null);
+
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
   await app.register(chatRoutes, {
     prefix: '/sessions',
+    ...(storageRuntime ? { mediaResolver: storageRuntime.mediaResolver } : {}),
     ...(opts.accountErasure
       ? { providerEvidenceDb: opts.accountErasure.providerEvidenceDb }
       : {}),
@@ -853,11 +863,6 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(sessionShareRoutes, {
     repository: opts.shares?.repository ?? new PostgresSessionShareRepository(),
   });
-  const storageRuntime =
-    opts.storage?.runtime ??
-    (opts.storage?.enabled === true
-      ? await createStorageRuntime({ mediaDir: env.MEDIA_DIR, logger: app.log })
-      : null);
   if (storageRuntime) {
     // Register the lifecycle-aware UUID route before the legacy static
     // wildcard. The backend and hydration cache are separately rooted and

@@ -60,7 +60,7 @@ export class OpenClawCompatClient {
    * reading and end the iteration (no error / no turn.completed).
    */
   async *chatTurn(params: ChatTurnParams): AsyncGenerator<GatewayTurnEvent, void, void> {
-    const { agentId, sessionKey, userMessage, modelOverride, maxOutputTokens, signal } = params;
+    const { agentId, sessionKey, userMessage, images, modelOverride, maxOutputTokens, signal } = params;
     if (signal?.aborted) return;
 
     // Scoped key routes the turn to the agent (see types.ts: the `model`
@@ -83,7 +83,18 @@ export class OpenClawCompatClient {
           stream: true,
           stream_options: { include_usage: true },
           ...(maxOutputTokens !== undefined ? { max_tokens: maxOutputTokens } : {}),
-          messages: [{ role: 'user', content: userMessage }],
+          messages: [{
+            role: 'user',
+            content: images && images.length > 0
+              ? [
+                  { type: 'text', text: userMessage },
+                  ...images.map((image) => ({
+                    type: 'image_url',
+                    image_url: { url: `data:${image.mime};base64,${image.base64}` },
+                  })),
+                ]
+              : userMessage,
+          }],
         }),
         redirect: 'error',
         ...(signal ? { signal } : {}),

@@ -159,8 +159,10 @@ function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
     <>
       <div className="mt-2 flex flex-col gap-3">
         {attachments.map((attachment, index) => {
-          const image = !isVideoMedia(attachment.url, attachment.mime ?? null) &&
-            !isAudioMedia(attachment.url, attachment.mime ?? null);
+          const image = attachment.mime?.startsWith("image/") ?? false;
+          const video = isVideoMedia(attachment.url, attachment.mime ?? null);
+          const audio = isAudioMedia(attachment.url, attachment.mime ?? null);
+          const media = image || video || audio;
           return (
             <figure key={`${attachment.url}:${index}`} className="max-w-md">
               {image ? (
@@ -178,7 +180,7 @@ function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
                     height={attachment.height ?? null}
                   />
                 </button>
-              ) : (
+              ) : media ? (
                 <MediaFull
                   url={attachment.url}
                   mime={attachment.mime ?? null}
@@ -186,16 +188,32 @@ function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
                   width={attachment.width ?? null}
                   height={attachment.height ?? null}
                 />
+              ) : (
+                <a
+                  href={attachment.url}
+                  download={attachmentDownloadName(attachment)}
+                  className="flex min-w-64 items-center gap-3 rounded-xl border border-edge bg-surface px-4 py-3 text-sm transition-colors hover:border-accent/40"
+                >
+                  <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-foreground/[0.05] text-[10px] font-medium uppercase text-muted">
+                    {attachment.mime === "application/json" ? "JSON" : "TXT"}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block truncate font-medium text-foreground">Attached file</span>
+                    <span className="block truncate text-xs text-faint">{attachment.mime ?? "file"}</span>
+                  </span>
+                </a>
               )}
               <figcaption className="mt-1.5 flex items-center justify-end gap-1 text-[11px] text-faint">
-                <button
-                  type="button"
-                  onClick={() => setExpanded(attachment)}
-                  className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 transition-colors hover:bg-foreground/[0.05] hover:text-accent-soft"
-                >
-                  <ExpandIcon />
-                  View larger
-                </button>
+                {media ? (
+                  <button
+                    type="button"
+                    onClick={() => setExpanded(attachment)}
+                    className="inline-flex items-center gap-1.5 rounded-md px-2 py-1 transition-colors hover:bg-foreground/[0.05] hover:text-accent-soft"
+                  >
+                    <ExpandIcon />
+                    View larger
+                  </button>
+                ) : null}
                 <a
                   href={attachment.url}
                   download={attachmentDownloadName(attachment)}
@@ -532,7 +550,7 @@ export function MessageRow({
 // ---------------------------------------------------------------------------
 
 export function UserEchoBubble({ item }: { item: UserEchoItem }) {
-  return <UserBubble content={item.content} at={item.at} pending />;
+  return <UserBubble content={item.content} attachments={item.attachments} at={item.at} pending />;
 }
 
 /** Live assistant turn: typing dots until the first token, then markdown. */

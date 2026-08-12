@@ -101,6 +101,14 @@ export interface ChatTurnParams {
    */
   userMessage: string;
   /**
+   * Verified image inputs for this turn. Bytes are supplied only by Eden's
+   * owned-object resolver; callers must never forward browser data URIs.
+   */
+  images?: ReadonlyArray<{
+    mime: 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+    base64: string;
+  }>;
+  /**
    * Optional canonical provider/model override. OpenClaw 2026.7.1 accepts
    * this only through `x-openclaw-model`; the compat body model remains the
    * agent-addressing shim (`openclaw/<agentId>`). Used by trusted Eden REM
