@@ -2378,6 +2378,64 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       ]),
     );
   });
+
+  it('retries a transient pairing callback, coalesces duplicates, and resumes after restart', async () => {
+    vi.useFakeTimers();
+    try {
+      let attempts = 0;
+      const { bridge, calls } = mockBridge(hostedConfig(), {
+        '/channels/runtime/pairing': async () => {
+          attempts += 1;
+          if (attempts < 3) throw new Error('transient callback outage');
+          return { ok: true };
+        },
+      });
+      const event = {
+        channel: 'discord',
+        accountId: 'account-a',
+        senderId: PEER_A,
+        code: 'one-time-code',
+      };
+      const context = {
+        channelId: 'discord',
+        accountId: 'account-a',
+        senderId: PEER_A,
+      };
+
+      await bridge.onPairingRequested(event, context);
+      expect(attempts).toBe(1);
+
+      // Native providers may repeat the same event while Eden is unavailable.
+      // One pending code must retain one retry loop rather than multiplying work.
+      await bridge.onPairingRequested(event, context);
+      expect(attempts).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(attempts).toBe(2);
+
+      await bridge.onGatewayStop();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(attempts).toBe(2);
+
+      // A same-process gateway reconnect retries the retained private code once;
+      // success removes it so no later backoff can duplicate the request.
+      await bridge.onGatewayStart();
+      expect(attempts).toBe(3);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(attempts).toBe(3);
+
+      const pairingCalls = calls.filter((call) => call.path.endsWith('/pairing'));
+      expect(pairingCalls).toHaveLength(3);
+      expect(pairingCalls.every((call) => call.options?.timeoutMs === 1_500)).toBe(true);
+      expect(pairingCalls.map((call) => call.body)).toEqual([
+        expect.objectContaining({ peerId: PEER_A, code: 'one-time-code' }),
+        expect.objectContaining({ peerId: PEER_A, code: 'one-time-code' }),
+        expect.objectContaining({ peerId: PEER_A, code: 'one-time-code' }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('runtime callback HTTP client', () => {
