@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -14,6 +14,9 @@ import {
 import {
   createDurableDeliverySuccessOutbox,
 } from '../../../infra/openclaw/plugins/eden3-channel-runtime/delivery-outbox.js';
+import {
+  createDurablePairingCallbackOutbox,
+} from '../../../infra/openclaw/plugins/eden3-channel-runtime/pairing-callback-outbox.js';
 import {
   ChannelRuntimeClientError,
   createChannelRuntimeClient,
@@ -185,6 +188,34 @@ function memoryDeliverySuccessOutbox() {
   };
 }
 
+function memoryPairingCallbackOutbox(initial = []) {
+  const entries = new Map(
+    initial.map((marker) => [
+      `${marker.connectionId}\0${marker.runtimeAccountId}\0${marker.peerId}`,
+      structuredClone(marker),
+    ]),
+  );
+  return {
+    record(marker) {
+      const key = `${marker.connectionId}\0${marker.runtimeAccountId}\0${marker.peerId}`;
+      entries.set(key, structuredClone(marker));
+      return marker;
+    },
+    list() {
+      return [...entries.values()].map((marker) => structuredClone(marker));
+    },
+    remove(marker) {
+      const key = `${marker.connectionId}\0${marker.runtimeAccountId}\0${marker.peerId}`;
+      const existing = entries.get(key);
+      if (!existing) return false;
+      if (existing.code !== marker.code || existing.expiresAt !== marker.expiresAt) {
+        throw new Error('channel pairing callback marker conflict');
+      }
+      return entries.delete(key);
+    },
+  };
+}
+
 function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) {
   const calls = [];
   const client = {
@@ -227,6 +258,7 @@ function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) 
       client,
       now: () => 1_800_000_000_000,
       deliverySuccessOutbox: memoryDeliverySuccessOutbox(),
+      pairingCallbackOutbox: memoryPairingCallbackOutbox(),
       ...bridgeOptions,
     }),
     calls,
@@ -2510,6 +2542,57 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       expect(attemptsAtExpiry).toBeLessThan(30);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('encrypts a failed pairing callback and replays it once after a full process restart', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'eden3-pairing-callback-'));
+    const filePath = join(directory, 'pairing-callbacks.json');
+    const secret = 'synthetic-gateway-token-for-pairing-outbox';
+    try {
+      const firstOutbox = createDurablePairingCallbackOutbox({ filePath, secret });
+      const first = mockBridge(
+        hostedConfig(),
+        {
+          '/channels/runtime/pairing': async () => {
+            throw new Error('API unavailable before process death');
+          },
+        },
+        { pairingCallbackOutbox: firstOutbox, now: Date.now },
+      );
+      await first.bridge.onPairingRequested(
+        {
+          channel: 'discord',
+          accountId: 'account-a',
+          senderId: PEER_A,
+          code: 'private-one-time-code',
+        },
+        { channelId: 'discord', accountId: 'account-a', senderId: PEER_A },
+      );
+      await first.bridge.onGatewayStop();
+
+      const stored = readFileSync(filePath, 'utf8');
+      expect(stored).not.toContain('private-one-time-code');
+      expect(stored).not.toContain(PEER_A);
+      expect(firstOutbox.list()).toHaveLength(1);
+
+      const recoveredOutbox = createDurablePairingCallbackOutbox({ filePath, secret });
+      const recovered = mockBridge(
+        hostedConfig(),
+        { '/channels/runtime/pairing': async () => ({ ok: true }) },
+        { pairingCallbackOutbox: recoveredOutbox, now: Date.now },
+      );
+      await recovered.bridge.onGatewayStart();
+      expect(recovered.calls.filter((call) => call.path.endsWith('/pairing'))).toHaveLength(1);
+      expect(recovered.calls.find((call) => call.path.endsWith('/pairing')).body).toMatchObject({
+        connectionId: CONNECTION_A,
+        peerId: PEER_A,
+        code: 'private-one-time-code',
+      });
+      expect(recoveredOutbox.list()).toEqual([]);
+      await recovered.bridge.onGatewayStop();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });
