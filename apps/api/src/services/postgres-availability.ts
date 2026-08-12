@@ -50,6 +50,16 @@ function matchesAuthority(value: Record<string, unknown>, authority: DatabaseAut
   return address === authority.hostname && Number.isSafeInteger(port) && port === authority.port;
 }
 
+function hasPostgresJsQueryShape(value: Record<string, unknown>): boolean {
+  return (
+    Object.hasOwn(value, 'query') &&
+    Object.hasOwn(value, 'parameters') &&
+    Object.hasOwn(value, 'args') &&
+    Array.isArray(value.args) &&
+    Object.hasOwn(value, 'types')
+  );
+}
+
 /**
  * Classify only structured PostgreSQL connectivity failures. Generic network
  * failures are admitted only when their address and port match DATABASE_URL,
@@ -70,8 +80,12 @@ export function isPostgresUnavailableError(
     if (!candidate) continue;
     const code = errorCode(candidate);
     if (code && (code.startsWith('08') || POSTGRES_UNAVAILABLE_STATES.has(code))) return true;
-    if (code && POSTGRES_CONNECTION_CODES.has(code) && matchesAuthority(candidate, authority)) {
-      return true;
+    if (code && POSTGRES_CONNECTION_CODES.has(code)) {
+      // Node sometimes omits address/port from an established socket reset.
+      // postgres.js still attaches its query metadata fields to that error,
+      // giving us a library-specific origin signal without classifying a
+      // provider or gateway ECONNRESET as database loss.
+      if (matchesAuthority(candidate, authority) || hasPostgresJsQueryShape(candidate)) return true;
     }
     if ('cause' in candidate) queue.push({ value: candidate.cause, depth: current.depth + 1 });
     if (Array.isArray(candidate.errors)) {
@@ -82,4 +96,3 @@ export function isPostgresUnavailableError(
   }
   return false;
 }
-
