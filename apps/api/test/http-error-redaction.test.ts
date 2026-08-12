@@ -297,6 +297,46 @@ describe('HTTP 5xx disclosure boundary', () => {
     expect(lines.join('\n')).not.toContain(SECRET_CODE);
   });
 
+  it.each([
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'ETIMEDOUT',
+    'CONNECTION_CLOSED',
+    'CONNECTION_DESTROYED',
+    '08006',
+    '57P03',
+  ])('maps transient database connection failure %s to a retryable safe 503', async (failureCode) => {
+    const lines: string[] = [];
+    const app = Fastify({
+      logger: {
+        level: 'error',
+        base: undefined,
+        stream: { write: (line: string) => lines.push(line) },
+      },
+    });
+    apps.push(app);
+    registerApiErrorHandler(app, { bodyLimitBytes: 1_024 });
+    app.get('/database-failure', async () => {
+      throw Object.assign(new Error(SENSITIVE), {
+        code: failureCode,
+        address: SENSITIVE,
+      });
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/database-failure' });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: {
+        code: 'database_unavailable',
+        message: 'Service temporarily unavailable',
+        statusCode: 503,
+      },
+    });
+    expect(response.body).not.toContain(SENSITIVE);
+    expect(lines.join('\n')).not.toContain(SENSITIVE);
+  });
+
   it('enforces redaction through the actual DB-free buildServer composition', async () => {
     const mediaDir = await mkdtemp(path.join(tmpdir(), 'eden3-5xx-redaction-'));
     tempDirs.push(mediaDir);
