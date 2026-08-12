@@ -24,6 +24,7 @@ const PUBLIC_SERVER_ERROR_CODES = new Set([
   'backend_part_size_mismatch',
   'channel_custody_unavailable',
   'configuration_error',
+  'database_unavailable',
   'erasure_intent_mismatch',
   'erasure_ledger_mismatch',
   'erasure_ledger_unavailable',

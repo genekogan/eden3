@@ -306,6 +306,7 @@ describe('HTTP 5xx disclosure boundary', () => {
     '08006',
     '57P03',
   ])('maps transient database connection failure %s to a retryable safe 503', async (failureCode) => {
+    vi.stubEnv('DATABASE_URL', 'postgresql://eden3@127.0.0.1:5433/eden3_runtime_test');
     const lines: string[] = [];
     const app = Fastify({
       logger: {
@@ -319,7 +320,8 @@ describe('HTTP 5xx disclosure boundary', () => {
     app.get('/database-failure', async () => {
       throw Object.assign(new Error(SENSITIVE), {
         code: failureCode,
-        address: SENSITIVE,
+        address: '127.0.0.1',
+        port: 5433,
       });
     });
 
@@ -335,6 +337,31 @@ describe('HTTP 5xx disclosure boundary', () => {
     });
     expect(response.body).not.toContain(SENSITIVE);
     expect(lines.join('\n')).not.toContain(SENSITIVE);
+  });
+
+  it('does not misclassify a provider-origin network failure as database loss', async () => {
+    vi.stubEnv('DATABASE_URL', 'postgresql://eden3@127.0.0.1:5433/eden3_runtime_test');
+    const app = Fastify({ logger: false });
+    apps.push(app);
+    registerApiErrorHandler(app, { bodyLimitBytes: 1_024 });
+    app.get('/provider-failure', async () => {
+      throw Object.assign(new Error(SENSITIVE), {
+        code: 'ECONNREFUSED',
+        address: '203.0.113.10',
+        port: 443,
+      });
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/provider-failure' });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({
+      error: {
+        code: 'internal_error',
+        message: 'Internal server error',
+        statusCode: 500,
+      },
+    });
   });
 
   it('enforces redaction through the actual DB-free buildServer composition', async () => {

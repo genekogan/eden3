@@ -71,6 +71,7 @@ import { ChatMediaReservationReaper } from './services/chat-media-authorization'
 import { ChatMediaCompletionReconciler } from './services/chat-media-reconciler';
 import type { SessionShareRepository } from './services/session-shares';
 import { PostgresSessionShareRepository } from './services/session-shares-postgres';
+import { isPostgresUnavailableError } from './services/postgres-availability';
 import type { CompatClientLike } from './services/turns';
 import { createAttachmentSightingHandler, MediaWatcher } from './workers/media-watcher';
 import { accountRoutes } from './routes/account';
@@ -347,6 +348,10 @@ export function registerApiErrorHandler(
       statusCode = 413;
       code = 'payload_too_large';
       message = `Request body exceeds ${options.bodyLimitBytes} bytes`;
+    } else if (isPostgresUnavailableError(err)) {
+      statusCode = 503;
+      code = 'database_unavailable';
+      message = 'Database temporarily unavailable';
     } else {
       statusCode =
         typeof err.statusCode === 'number' && err.statusCode >= 400 ? err.statusCode : 500;
