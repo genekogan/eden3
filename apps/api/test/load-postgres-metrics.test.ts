@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { summarizeLoadPostgresSamples } from '../src/testing/load-postgres-metrics';
+import {
+  resolveLoadPostgresMetricsOutput,
+  summarizeLoadPostgresSamples,
+} from '../src/testing/load-postgres-metrics';
 
 describe('load PostgreSQL metrics', () => {
   it('reports bounded pool/wait peaks and monotonic database-stat deltas', () => {
@@ -50,5 +53,15 @@ describe('load PostgreSQL metrics', () => {
 
   it('refuses empty evidence rather than reporting a false zero', () => {
     expect(() => summarizeLoadPostgresSamples([])).toThrow(/at least one sample/);
+  });
+
+  it('resolves documented relative receipts from the repository root, not the package cwd', () => {
+    const root = '/workspace/eden3';
+    expect(resolveLoadPostgresMetricsOutput(root, 'var/acceptance/load/postgres.json'))
+      .toBe('/workspace/eden3/var/acceptance/load/postgres.json');
+    expect(resolveLoadPostgresMetricsOutput(root, '/workspace/eden3/var/acceptance/load/postgres.json'))
+      .toBe('/workspace/eden3/var/acceptance/load/postgres.json');
+    expect(() => resolveLoadPostgresMetricsOutput(root, '../outside.json')).toThrow(/under var\/acceptance/);
+    expect(() => resolveLoadPostgresMetricsOutput(root, 'var/acceptance/load/postgres.txt')).toThrow(/JSON file/);
   });
 });
