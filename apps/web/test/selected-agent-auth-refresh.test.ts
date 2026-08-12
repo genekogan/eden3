@@ -12,10 +12,14 @@ describe("selected-agent authentication refresh", () => {
       'import { api, onAgentInventoryChange, onDevUserChange } from "@/lib/api"',
     );
     expect(source).toMatch(
-      /onDevUserChange\(\(user\) => \{\s*setViewer\(user\);\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,
+      /onDevUserChange\(\(user\) => \{\s*setViewer\(user\);\s*setViewerResolved\(true\);\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,
     );
 
     expect(source.match(/onDevUserChange\(/g)).toHaveLength(1);
+    expect(source).toContain("const [viewerResolved, setViewerResolved] = useState(false);");
+    expect(source).toMatch(
+      /if \(!viewerResolved\) return;\s*if \(viewer === null\) \{\s*setMyAgents\(\[\]\);\s*setMyAgentsPhase\("ready"\);\s*return;\s*\}\s*let cancelled = false;\s*void \(async \(\) => \{\s*try \{\s*const page = await api\.agents\.list\(\{ scope: "mine" \}\);/,
+    );
   });
 
   it("refreshes the owned-agent inventory after successful agent mutations", async () => {

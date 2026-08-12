@@ -101,6 +101,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const [myAgentsPhase, setMyAgentsPhase] = useState<"loading" | "ready" | "error">("loading");
   const [myAgentsNonce, setMyAgentsNonce] = useState(0);
   const [viewer, setViewer] = useState<DevUser | null>(null);
+  const [viewerResolved, setViewerResolved] = useState(false);
 
   // Dev impersonation can change after this provider's initial auth read.
   // Refresh viewer authority and the owned-agent inventory immediately so
@@ -108,6 +109,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     return onDevUserChange((user) => {
       setViewer(user);
+      setViewerResolved(true);
       setMyAgentsPhase("loading");
       setMyAgentsNonce((nonce) => nonce + 1);
     });
@@ -129,10 +131,16 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     void api.dev
       .me()
       .then((user) => {
-        if (!cancelled) setViewer(user);
+        if (!cancelled) {
+          setViewer(user);
+          setViewerResolved(true);
+        }
       })
       .catch(() => {
-        if (!cancelled) setViewer(null);
+        if (!cancelled) {
+          setViewer(null);
+          setViewerResolved(true);
+        }
       });
     return () => {
       cancelled = true;
@@ -190,6 +198,12 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
 
   // ---- my agents (once per session, refreshable) --------------------------
   useEffect(() => {
+    if (!viewerResolved) return;
+    if (viewer === null) {
+      setMyAgents([]);
+      setMyAgentsPhase("ready");
+      return;
+    }
     let cancelled = false;
     void (async () => {
       try {
@@ -206,7 +220,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [myAgentsNonce]);
+  }, [myAgentsNonce, viewer, viewerResolved]);
 
   const refreshAgent = useCallback(() => {
     if (username) agentCache.delete(username);
