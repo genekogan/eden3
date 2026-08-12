@@ -1,3 +1,5 @@
+import path from 'node:path';
+
 export interface LoadPostgresSample {
   atMs: number;
   sessions: number;
@@ -10,6 +12,20 @@ export interface LoadPostgresSample {
   blockHits: number;
   tempBytes: number;
   deadlocks: number;
+}
+
+export function resolveLoadPostgresMetricsOutput(root: string, raw: string): string {
+  const repositoryRoot = path.resolve(root);
+  const acceptanceRoot = path.join(repositoryRoot, 'var', 'acceptance');
+  const resolved = path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(repositoryRoot, raw);
+  const relative = path.relative(acceptanceRoot, resolved);
+  if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('LOAD_POSTGRES_SAMPLE_OUT must be under var/acceptance');
+  }
+  if (!resolved.endsWith('.json')) {
+    throw new Error('LOAD_POSTGRES_SAMPLE_OUT must be a JSON file');
+  }
+  return resolved;
 }
 
 function average(values: readonly number[]): number {

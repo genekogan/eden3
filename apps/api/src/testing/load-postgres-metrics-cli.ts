@@ -4,7 +4,11 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
-import { summarizeLoadPostgresSamples, type LoadPostgresSample } from './load-postgres-metrics';
+import {
+  resolveLoadPostgresMetricsOutput,
+  summarizeLoadPostgresSamples,
+  type LoadPostgresSample,
+} from './load-postgres-metrics';
 import { parseLoadScratchDatabaseUrl } from './load-scratch-fixture';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../..');
@@ -74,11 +78,7 @@ async function main() {
   };
   const out = process.env.LOAD_POSTGRES_SAMPLE_OUT;
   if (out) {
-    const resolved = path.resolve(out);
-    const allowed = path.join(ROOT, 'var', 'acceptance') + path.sep;
-    if (!resolved.startsWith(allowed) || !resolved.endsWith('.json')) {
-      throw new Error('LOAD_POSTGRES_SAMPLE_OUT must be a JSON file under var/acceptance');
-    }
+    const resolved = resolveLoadPostgresMetricsOutput(ROOT, out);
     await mkdir(path.dirname(resolved), { recursive: true, mode: 0o700 });
     await writeFile(resolved, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
   }
