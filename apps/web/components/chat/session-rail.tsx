@@ -69,6 +69,7 @@ function isChannelSession(session: SessionDto): boolean {
 }
 
 type ChannelFilter = "all" | "direct" | "channels";
+const SESSION_TITLE_POLL_LIMIT = 20;
 
 /**
  * One conversation row. The surrounding rail is already scoped to the
@@ -396,7 +397,7 @@ export function SessionRail({
         titlePolls.current.delete(session.id);
         return false;
       }
-      return (titlePolls.current.get(session.id) ?? 0) < 6;
+      return (titlePolls.current.get(session.id) ?? 0) < SESSION_TITLE_POLL_LIMIT;
     });
     if (pending.length === 0) return;
     for (const session of pending) {
@@ -581,7 +582,7 @@ export function SessionRail({
                     archivedView={archivedView}
                     titlePending={
                       !session.title?.trim() &&
-                      (titlePolls.current.get(session.id) ?? 0) < 6
+                      (titlePolls.current.get(session.id) ?? 0) < SESSION_TITLE_POLL_LIMIT
                     }
                     onChanged={replaceSession}
                     onRemoved={() => removeSession(session)}

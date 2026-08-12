@@ -77,6 +77,18 @@ describe("agent-scoped conversation rail", () => {
     expect(html).not.toContain(">rocket<");
   });
 
+  it("keeps polling long enough for the bounded asynchronous title turn", () => {
+    const source = readFileSync(
+      resolve(import.meta.dirname, "../components/chat/session-rail.tsx"),
+      "utf8",
+    );
+    const configuredLimit = source.match(/const SESSION_TITLE_POLL_LIMIT = (\d+);/)?.[1];
+    expect(configuredLimit).toBeDefined();
+    expect(Number(configuredLimit)).toBeGreaterThanOrEqual(20);
+    expect(source.match(/< SESSION_TITLE_POLL_LIMIT/g)).toHaveLength(2);
+    expect(source).toContain("window.setTimeout(() => void load(), 1_000)");
+  });
+
   it("wires the real share, rename, pin, archive, and soft-delete actions", () => {
     const source = readFileSync(
       resolve(import.meta.dirname, "../components/chat/session-rail.tsx"),

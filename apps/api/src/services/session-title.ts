@@ -3,7 +3,11 @@ import type { ChatTurnParams, GatewayTurnEvent } from '@eden3/gateway';
 /** Cheap, bounded platform model used only for conversation housekeeping. */
 export const SESSION_TITLE_MODEL = 'anthropic/claude-haiku-4-5';
 export const SESSION_TITLE_MAX_OUTPUT_TOKENS = 32;
-export const SESSION_TITLE_TIMEOUT_MS = 5_000;
+// The title turn is deliberately tiny, but a healthy gateway/provider can
+// still take longer than five seconds under concurrent first-turn load. Keep
+// the deadline bounded while allowing the cheap request to finish instead of
+// leaving the session permanently untitled.
+export const SESSION_TITLE_TIMEOUT_MS = 15_000;
 const SESSION_TITLE_INPUT_CHARS = 1_200;
 const SESSION_TITLE_MAX_CHARS = 72;
 const SESSION_TITLE_MAX_WORDS = 7;

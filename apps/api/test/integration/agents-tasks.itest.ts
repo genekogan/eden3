@@ -51,6 +51,25 @@ let legacyTriggerId = '';
 const cli = new OpenClawCli();
 const cronSync = new CronSync({ cli });
 
+async function waitForProvisionedAgent(username: string): Promise<void> {
+  const deadline = Date.now() + 120_000;
+  let lastStatus = 'missing';
+  while (Date.now() < deadline) {
+    const [row] = await pg<{ provision_status: string }[]>`
+      select g.provision_status
+      from agents g join accounts a on a.id = g.account_id
+      where a.username = ${username}
+    `;
+    lastStatus = row?.provision_status ?? 'missing';
+    if (lastStatus === 'ready') return;
+    if (lastStatus === 'failed') {
+      throw new Error(`agent ${username} reached terminal failed provisioning`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`agent ${username} did not become ready (last=${lastStatus})`);
+}
+
 beforeAll(async () => {
   if (TOKEN === '') {
     throw new Error(
@@ -116,7 +135,9 @@ describe('POST /agents (live gateway provisioning)', () => {
     expect(res.statusCode).toBe(201);
     const { agent } = res.json() as { agent: AgentDto };
     expect(agent.username).toBe(agentUsername);
-    expect(agent.provisionStatus).toBe('ready');
+    expect(agent.provisionStatus).toBe('provisioning');
+    expect(await app.agentProvisioningWorker.tick()).toBe(1);
+    await waitForProvisionedAgent(agentUsername);
 
     // Workspace rendered on the host, no placeholder leakage.
     const soul = await fs.readFile(

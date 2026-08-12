@@ -402,27 +402,32 @@ describe('POST /sessions/new/messages (live gateway + postgres)', () => {
   }, 120_000);
 
   it('persisted both turns: messages, counters, gateway key, manna ledger', async () => {
-    const [session] = await pg<
-      {
-        ownerId: string;
-        gatewaySessionKey: string;
-        gatewayPrimedAt: Date | null;
-        messageCount: number;
-        lastMessageAt: Date | null;
-        title: string | null;
-      }[]
-    >`
-      select owner_id as "ownerId", gateway_session_key as "gatewaySessionKey",
-             gateway_primed_at as "gatewayPrimedAt", message_count as "messageCount",
-             last_message_at as "lastMessageAt", title
-      from sessions where id = ${sessionId}`;
+    const session = await eventually(async () => {
+      const [row] = await pg<
+        {
+          ownerId: string;
+          gatewaySessionKey: string;
+          gatewayPrimedAt: Date | null;
+          messageCount: number;
+          lastMessageAt: Date | null;
+          title: string | null;
+        }[]
+      >`
+        select owner_id as "ownerId", gateway_session_key as "gatewaySessionKey",
+               gateway_primed_at as "gatewayPrimedAt", message_count as "messageCount",
+               last_message_at as "lastMessageAt", title
+        from sessions where id = ${sessionId}`;
+      return row?.title?.trim() ? row : null;
+    }, { timeoutMs: 30_000, intervalMs: 500 });
     expect(session).toBeDefined();
     expect(session!.ownerId).toBe(ownerId);
     expect(session!.gatewaySessionKey).toBe(`${GATEWAY_SESSION_KEY_PREFIX}${sessionId}`);
     expect(session!.gatewayPrimedAt).toBeNull(); // native session — never primed
     expect(session!.messageCount).toBeGreaterThanOrEqual(4);
     expect(session!.lastMessageAt).not.toBeNull();
-    expect(session!.title).toContain(codename); // derived from the first message
+    expect(session!.title).not.toBeNull(); // asynchronously derived from the first message
+    expect(session!.title).not.toBe(agentUsername);
+    expect(session!.title!.length).toBeLessThanOrEqual(72);
 
     const rows = await pg<
       { role: string; content: string; senderId: string; edenMessageData: unknown }[]

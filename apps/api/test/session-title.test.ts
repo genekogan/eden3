@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   SESSION_TITLE_MAX_OUTPUT_TOKENS,
   SESSION_TITLE_MODEL,
+  SESSION_TITLE_TIMEOUT_MS,
   generateSessionTitle,
   normalizeSessionTitle,
   sessionTitlePrompt,
@@ -51,6 +52,7 @@ describe('asynchronous session titles', () => {
     });
     expect(calls[0]?.userMessage).toContain('Return only the title');
     expect(calls[0]?.userMessage).toContain('do not use tools');
+    expect(SESSION_TITLE_TIMEOUT_MS).toBeGreaterThanOrEqual(15_000);
   });
 
   it('does not persist errors, empty turns, or a title superseded by human rename', async () => {
