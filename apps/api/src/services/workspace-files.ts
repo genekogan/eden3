@@ -667,7 +667,20 @@ export async function writeWorkspaceFile(params: {
     );
   }
 
-  const { directory, name } = await openPinnedParent(params.root, rel, true);
+  let pinnedParent: Awaited<ReturnType<typeof openPinnedParent>>;
+  try {
+    pinnedParent = await openPinnedParent(params.root, rel, true);
+  } catch (error) {
+    // O_NOFOLLOW|O_DIRECTORY reports a symlinked or concurrently replaced
+    // ancestor as ENOTDIR/ELOOP (platform dependent). That is a rejected user
+    // path, not an internal server failure; the retained descriptors still
+    // guarantee that no neighbor mutation occurred.
+    if (isPathRaceOrTypeError(error)) {
+      throw new ApiError(400, 'workspace_path_forbidden', 'This path cannot be edited');
+    }
+    throw error;
+  }
+  const { directory, name } = pinnedParent;
   let current: PinnedWorkspaceFile | null = null;
   let temporary: FileHandle | null = null;
   let temporaryPath: string | null = null;
