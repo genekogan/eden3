@@ -1,6 +1,7 @@
 import { getEnv, resetEnvCache } from '@eden3/core';
 import { loadRootEnv } from '@eden3/db';
 import type { FastifyInstance } from 'fastify';
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -11,6 +12,10 @@ import { buildServer } from '../src/server';
 loadRootEnv();
 
 let app: FastifyInstance;
+
+const TEST_CLERK_PUBLIC_KEY = generateKeyPairSync('rsa', { modulusLength: 2048 })
+  .publicKey.export({ type: 'spki', format: 'pem' })
+  .toString();
 
 function withEnv(name: string, value: string): () => void {
   const original = process.env[name];
@@ -294,6 +299,7 @@ describe('dev routes gate (AUTH_PROVIDER / EDEN3_DEV_ROUTES)', () => {
   it('does not mount /dev under clerk auth without the explicit flag (deployment shape)', async () => {
     const restoreProvider = withEnv('AUTH_PROVIDER', 'clerk');
     const restoreFlag = withEnv('EDEN3_DEV_ROUTES', '0');
+    const restoreKey = withEnv('CLERK_JWT_KEY', TEST_CLERK_PUBLIC_KEY);
     const probe = await buildServer();
     try {
       for (const [method, url] of [
@@ -310,6 +316,7 @@ describe('dev routes gate (AUTH_PROVIDER / EDEN3_DEV_ROUTES)', () => {
       }
     } finally {
       await probe.close();
+      restoreKey();
       restoreFlag();
       restoreProvider();
     }
@@ -334,6 +341,7 @@ describe('dev routes gate (AUTH_PROVIDER / EDEN3_DEV_ROUTES)', () => {
   it('mounts /dev under hybrid auth with EDEN3_DEV_ROUTES=1 (local stack shape)', async () => {
     const restoreProvider = withEnv('AUTH_PROVIDER', 'hybrid');
     const restoreFlag = withEnv('EDEN3_DEV_ROUTES', '1');
+    const restoreKey = withEnv('CLERK_JWT_KEY', TEST_CLERK_PUBLIC_KEY);
     const probe = await buildServer();
     try {
       const res = await probe.inject({ method: 'POST', url: '/dev/logout' });
@@ -341,6 +349,7 @@ describe('dev routes gate (AUTH_PROVIDER / EDEN3_DEV_ROUTES)', () => {
       expect((res.json() as { ok: boolean }).ok).toBe(true);
     } finally {
       await probe.close();
+      restoreKey();
       restoreFlag();
       restoreProvider();
     }
