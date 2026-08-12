@@ -63,6 +63,7 @@ const CHAT_IMAGE_SIZE_ASPECT_RATIO = new Map([
   ['2048x2048', '1:1'],
   ['3840x2160', '16:9'],
 ]);
+const CHAT_IMAGE_OUTPUT_FORMATS = new Set(['png', 'jpeg', 'webp']);
 
 export interface ChatMediaAuthorizationRequest {
   runId?: string;
@@ -290,7 +291,7 @@ export function quoteChatMediaTool(
 ): StudioGenerationQuote {
   const allowed =
     tool === 'image_generate'
-      ? new Set(['action', 'prompt', 'model', 'aspectRatio', 'size'])
+      ? new Set(['action', 'prompt', 'model', 'aspectRatio', 'size', 'count', 'outputFormat'])
       : tool === 'video_generate' || tool === 'music_generate'
         ? new Set(['action', 'prompt', 'duration', 'durationSeconds', 'model'])
         : new Set(['action', 'text']);
@@ -312,6 +313,16 @@ export function quoteChatMediaTool(
     throw new Error(`chat-media-authorization: invalid ${tool} prompt`);
   }
   if (tool === 'image_generate') {
+    if (rawArgs.count !== undefined && rawArgs.count !== 1) {
+      throw new Error('chat-media-authorization: image count must be one');
+    }
+    if (
+      rawArgs.outputFormat !== undefined &&
+      (typeof rawArgs.outputFormat !== 'string' ||
+        !CHAT_IMAGE_OUTPUT_FORMATS.has(rawArgs.outputFormat))
+    ) {
+      throw new Error('chat-media-authorization: unsupported image output format');
+    }
     const model = imageModelKey(rawArgs.model);
     if (!model) throw new Error('chat-media-authorization: unsupported image route');
     chatImageAspectRatio(rawArgs);
@@ -361,6 +372,10 @@ export function canonicalChatMediaProviderArgs(
       prompt,
       model: IMAGE_MODEL_OPTIONS[model].openclawModel,
       ...(aspectRatio ? { aspectRatio } : {}),
+      ...(rawArgs.count === 1 ? { count: 1 } : {}),
+      ...(typeof rawArgs.outputFormat === 'string'
+        ? { outputFormat: rawArgs.outputFormat }
+        : {}),
     };
   }
   const durationSeconds = rawArgs.durationSeconds ?? rawArgs.duration ?? (tool === 'video_generate' ? 5 : 30);

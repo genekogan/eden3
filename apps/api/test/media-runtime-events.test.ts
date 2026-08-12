@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { SessionEvent } from '@eden3/shared';
 import {
+  mediaAuthorizationFailureCode,
   publishChatMediaFailed,
   publishChatMediaPending,
 } from '../src/routes/media-runtime';
@@ -11,6 +12,20 @@ import {
 const SESSION_ID = '6c1f5b7e-3d2a-4e8b-9f10-2a3b4c5d6e7f';
 
 describe('media runtime UI lifecycle events', () => {
+  it('classifies authorization failures without logging provider or account detail', () => {
+    expect(
+      mediaAuthorizationFailureCode(
+        new Error('chat-media-authorization: unsupported image_generate argument quality'),
+      ),
+    ).toBe('unsupported_image_argument');
+    expect(
+      mediaAuthorizationFailureCode(
+        new Error('chat-media-authorization: media action already pending for session'),
+      ),
+    ).toBe('media_already_pending');
+    expect(mediaAuthorizationFailureCode(new Error('database host detail'))).toBe('unknown');
+  });
+
   it('publishes pending at provider admission and terminal failure safely', () => {
     const events: Array<{ sessionId: string; event: SessionEvent }> = [];
     const bus = {

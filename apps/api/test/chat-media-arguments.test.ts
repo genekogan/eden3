@@ -36,6 +36,19 @@ describe('in-chat image argument normalization', () => {
     }
   });
 
+  it('accepts OpenClaw one-image and output-format defaults without changing the quote', () => {
+    for (const outputFormat of ['png', 'jpeg', 'webp']) {
+      const args = { prompt: 'x', count: 1, outputFormat };
+      expect(quoteChatMediaTool('image_generate', args).units).toEqual({ image: 1 });
+      expect(canonicalChatMediaProviderArgs('image_generate', args)).toEqual({
+        prompt: 'x',
+        model: 'fal/fal-ai/flux/dev',
+        count: 1,
+        outputFormat,
+      });
+    }
+  });
+
   it('fails closed on unpriced, unknown, or conflicting geometry', () => {
     for (const args of [
       { prompt: 'x', size: '4096x4096' },
@@ -43,6 +56,8 @@ describe('in-chat image argument normalization', () => {
       { prompt: 'x', aspectRatio: '16:9', size: '1024x1024' },
       { prompt: 'x', resolution: '4K' },
       { prompt: 'x', count: 2 },
+      { prompt: 'x', count: 0 },
+      { prompt: 'x', outputFormat: 'gif' },
     ]) {
       expect(() => quoteChatMediaTool('image_generate', args)).toThrow();
     }

@@ -33,6 +33,35 @@ const failureSchema = z
   })
   .strict();
 
+/** Stable, non-sensitive diagnostics for failures at the runtime media boundary. */
+export function mediaAuthorizationFailureCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (message.includes('invalid runId')) return 'invalid_run_id';
+  if (message.includes('invalid toolCallId')) return 'invalid_tool_call_id';
+  if (message.includes('invalid sessionKey')) return 'invalid_session_key';
+  if (message.includes('invalid agentId')) return 'invalid_agent_id';
+  if (message.includes('session/agent binding unavailable')) return 'session_agent_binding';
+  if (message.includes('media action already pending')) return 'media_already_pending';
+  if (message.includes('provider admission ticket already consumed')) return 'ticket_consumed';
+  if (message.includes('durable authorization refused')) return 'durable_authorization';
+  if (message.includes('unsupported image_generate argument')) return 'unsupported_image_argument';
+  if (message.includes('unsupported tool')) return 'unsupported_tool';
+  if (message.includes('unsupported image aspect ratio')) return 'unsupported_image_aspect_ratio';
+  if (message.includes('unsupported image size')) return 'unsupported_image_size';
+  if (message.includes('ambiguous image geometry')) return 'ambiguous_image_geometry';
+  if (message.includes('unsupported image output format')) return 'unsupported_image_output_format';
+  if (message.includes('image count must be one')) return 'invalid_image_count';
+  if (message.includes('unsupported image model')) return 'unsupported_image_model';
+  if (message.includes('unsupported image route')) return 'unsupported_image_route';
+  if (message.includes('invalid tts text')) return 'invalid_tts_text';
+  if (message.includes('in-chat tts is deferred')) return 'tts_deferred';
+  const name = error instanceof Error ? error.name : '';
+  if (name === 'InsufficientMannaError') return 'insufficient_manna';
+  if (name === 'DailyCapExceededError') return 'daily_cap';
+  if (name === 'RollingSpendCapExceededError') return 'rolling_cap';
+  return 'unknown';
+}
+
 export interface MediaRuntimeRoutesOptions {
   providerEvidenceDb?: DbHandle;
 }
@@ -139,7 +168,12 @@ export const mediaRuntimeRoutes: FastifyPluginAsync<MediaRuntimeRoutesOptions> =
           providerArgs,
         };
       } catch (err) {
-        logSafeRequestWarning(req.log, err, {}, 'chat media authorization denied');
+        logSafeRequestWarning(
+          req.log,
+          err,
+          { failureCode: mediaAuthorizationFailureCode(err) },
+          'chat media authorization denied',
+        );
         throw new ApiError(409, 'media_authorization_denied', 'Media generation is unavailable');
       }
     },
