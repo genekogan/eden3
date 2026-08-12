@@ -146,6 +146,7 @@ export function SessionConversation({
   const adoptedPumpRef = useRef<string | null>(null);
   const localTurnsRef = useRef<Set<string>>(new Set());
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const channelOpenedRef = useRef(false);
 
   // Scroll management (used inside callbacks defined below).
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -172,6 +173,17 @@ export function SessionConversation({
       /* quiet — the live tail already rendered everything we streamed */
     }
   }, [adoptCanonical]);
+
+  const scheduleHistoryRefresh = useCallback(
+    (delay = 0) => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      refreshTimerRef.current = setTimeout(() => {
+        refreshTimerRef.current = null;
+        void refreshHistory();
+      }, delay);
+    },
+    [refreshHistory],
+  );
 
   const loadHistory = useCallback(async () => {
     setLoadPhase((phase) => (phase === "ready" ? phase : "loading"));
@@ -383,6 +395,7 @@ export function SessionConversation({
   const channelReady = loadPhase === "ready";
   useEffect(() => {
     if (!channelReady) return;
+    channelOpenedRef.current = false;
     const unsubscribe = api.sessions.subscribe(
       canonicalId,
       (event) => {
@@ -392,20 +405,43 @@ export function SessionConversation({
           !localTurnsRef.current.has(event.turnId)
         ) {
           // A turn from another tab/trigger finished — swap in its rows.
-          if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
-          refreshTimerRef.current = setTimeout(
-            () => void refreshHistory(),
-            700,
-          );
+          scheduleHistoryRefresh(700);
         }
       },
       {
-        onOpen: () => setChannelUp(true),
+        onOpen: () => {
+          const resumed = channelOpenedRef.current;
+          channelOpenedRef.current = true;
+          setChannelUp(true);
+          // EventsBus is intentionally live-only. If EventSource reconnects,
+          // reconcile durable rows so mobile suspension or an API restart
+          // cannot leave completed media/turns invisible until a manual reload.
+          if (resumed) scheduleHistoryRefresh();
+        },
         onConnectionError: () => setChannelUp(false),
       },
     );
     return unsubscribe;
-  }, [channelReady, canonicalId, refreshHistory]);
+  }, [channelReady, canonicalId, scheduleHistoryRefresh]);
+
+  useEffect(() => {
+    if (!channelReady) return;
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") scheduleHistoryRefresh();
+    };
+    const onOnline = () => scheduleHistoryRefresh();
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) scheduleHistoryRefresh();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("pageshow", onPageShow);
+    };
+  }, [channelReady, scheduleHistoryRefresh]);
 
   // -------------------------------------------------------------------------
   // Scroll behavior
