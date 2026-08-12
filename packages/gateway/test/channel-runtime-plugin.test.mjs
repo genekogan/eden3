@@ -966,6 +966,106 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     }
   });
 
+  it('durably commits bot-loop suppression before admitting a bot-authored turn', () => {
+    const operations = [];
+    const stored = new Map();
+    let nextDescriptor = 10;
+    const io = {
+      readFileSync(path) {
+        const body = stored.get(path);
+        if (body === undefined) {
+          const error = new Error('missing');
+          error.code = 'ENOENT';
+          throw error;
+        }
+        return body;
+      },
+      mkdirSync(path) {
+        operations.push(['mkdir', path]);
+      },
+      openSync(path, flags) {
+        operations.push(['open', path, flags]);
+        return nextDescriptor++;
+      },
+      writeFileSync(descriptor, body) {
+        operations.push(['write', descriptor]);
+        stored.set('pending', body);
+      },
+      fsyncSync(descriptor) {
+        operations.push(['fsync', descriptor]);
+      },
+      closeSync(descriptor) {
+        operations.push(['close', descriptor]);
+      },
+      renameSync(from, to) {
+        operations.push(['rename', from, to]);
+        stored.set(to, stored.get('pending'));
+      },
+      unlinkSync(path) {
+        operations.push(['unlink', path]);
+      },
+    };
+    const breaker = createDurableBotLoopBreaker({
+      filePath: '/runtime/channel-loop.json',
+      io,
+      now: () => 1_800_000_000_000,
+    });
+
+    expect(breaker.admitBot(CONNECTION_A, 'discord-group-a')).toBe(true);
+    const fileFsync = operations.findIndex(([kind, descriptor]) => kind === 'fsync' && descriptor === 10);
+    const rename = operations.findIndex(([kind]) => kind === 'rename');
+    const directoryFsync = operations.findIndex(
+      ([kind, descriptor]) => kind === 'fsync' && descriptor === 11,
+    );
+    expect(fileFsync).toBeGreaterThanOrEqual(0);
+    expect(rename).toBeGreaterThan(fileFsync);
+    expect(directoryFsync).toBeGreaterThan(rename);
+
+    const restarted = createDurableBotLoopBreaker({
+      filePath: '/runtime/channel-loop.json',
+      io,
+      now: () => 1_800_000_000_001,
+    });
+    expect(restarted.admitBot(CONNECTION_A, 'discord-group-a')).toBe(false);
+  });
+
+  it('fails bot-authored turns closed when loop-state durability cannot be established', () => {
+    let writes = 0;
+    const io = {
+      readFileSync() {
+        const error = new Error('missing');
+        error.code = 'ENOENT';
+        throw error;
+      },
+      mkdirSync() {},
+      openSync(path, flags) {
+        if (flags === 'r') return 11;
+        return 10;
+      },
+      writeFileSync() {
+        writes += 1;
+      },
+      fsyncSync(descriptor) {
+        if (descriptor === 10) throw new Error('disk failure');
+      },
+      closeSync() {},
+      renameSync() {
+        throw new Error('rename must not run after file fsync failure');
+      },
+      unlinkSync() {},
+    };
+    const breaker = createDurableBotLoopBreaker({
+      filePath: '/runtime/channel-loop.json',
+      io,
+      now: () => 1_800_000_000_000,
+    });
+
+    expect(breaker.admitBot(CONNECTION_A, 'discord-group-a')).toBe(false);
+    expect(writes).toBe(1);
+    expect(breaker.admitBot(CONNECTION_A, 'discord-group-b')).toBe(false);
+    expect(writes).toBe(1);
+  });
+
   it('fails a group turn closed when its agent uses a runtime without turn-scoped tool narrowing', async () => {
     const config = groupHostedConfig();
     config.agents.list[0].model = 'anthropic/claude-sonnet-4-6';
