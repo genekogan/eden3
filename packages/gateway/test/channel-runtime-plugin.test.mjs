@@ -1031,6 +1031,41 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     ).resolves.toEqual({ outcome: 'pass' });
   });
 
+  it('admits the canonical 7.1 Telegram group hook with a provider-routed target', async () => {
+    const current = mockBridge(telegramGroupHostedConfig());
+    const conversationId = '-1001234567890';
+    const groupSession = `agent:agent-a:telegram:group:${conversationId}`;
+    current.bridge.onMessageReceived(
+      {
+        content: 'mentioned Telegram group message',
+        messageId: '85',
+        senderId: PEER_A,
+        from: `telegram:group:${conversationId}`,
+        metadata: { senderId: PEER_A, wasMentioned: true },
+      },
+      {
+        channelId: 'telegram',
+        accountId: 'account-a',
+        conversationId: `telegram:group:${conversationId}`,
+        sessionKey: groupSession,
+        messageId: '85',
+        senderId: PEER_A,
+      },
+    );
+
+    await expect(
+      current.bridge.onBeforeAgentRun(
+        {
+          accountId: 'account-a',
+          senderId: PEER_A,
+          prompt: 'mentioned Telegram group message',
+          messages: [],
+        },
+        { runId: RUN_A, sessionKey: groupSession, messageProvider: 'telegram', agentId: 'agent-a' },
+      ),
+    ).resolves.toEqual({ outcome: 'pass' });
+  });
+
   it('durably commits bot-loop suppression before admitting a bot-authored turn', () => {
     const operations = [];
     const stored = new Map();
