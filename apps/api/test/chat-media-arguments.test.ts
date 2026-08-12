@@ -63,3 +63,53 @@ describe('in-chat image argument normalization', () => {
     }
   });
 });
+
+describe('in-chat image-to-video argument normalization', () => {
+  const generatedImage =
+    '/tmp/eden-review/openclaw/media/tool-image-generation/image-1---bunny.png';
+
+  it('prices and preserves one generated-image reference on the fixed image-to-video route', () => {
+    const args = {
+      prompt: 'a bunny hopping gently',
+      image: generatedImage,
+      durationSeconds: 4,
+    };
+
+    expect(quoteChatMediaTool('video_generate', args)).toMatchObject({
+      model: 'fal-ai/kling-video/v3/pro/image-to-video',
+      units: { video_second: 4 },
+      costUsd: 0.448,
+    });
+    expect(canonicalChatMediaProviderArgs('video_generate', args)).toEqual({
+      prompt: 'a bunny hopping gently',
+      image: generatedImage,
+      durationSeconds: 4,
+      model: 'fal/fal-ai/kling-video/v3/pro/image-to-video',
+    });
+  });
+
+  it('normalizes OpenClaw single-entry images while rejecting ambiguous or unsafe references', () => {
+    expect(
+      canonicalChatMediaProviderArgs('video_generate', {
+        prompt: 'hop',
+        images: [generatedImage],
+      }),
+    ).toMatchObject({ image: generatedImage });
+
+    for (const args of [
+      { prompt: 'hop', image: 'https://attacker.invalid/bunny.png' },
+      { prompt: 'hop', image: '/etc/passwd' },
+      { prompt: 'hop', image: '/tmp/media/tool-image-generation/../private.png' },
+      { prompt: 'hop', image: generatedImage, images: [generatedImage] },
+      { prompt: 'hop', images: [] },
+      { prompt: 'hop', images: [generatedImage, generatedImage] },
+      {
+        prompt: 'hop',
+        image: generatedImage,
+        model: 'fal/fal-ai/kling-video/v3/pro/text-to-video',
+      },
+    ]) {
+      expect(() => quoteChatMediaTool('video_generate', args)).toThrow();
+    }
+  });
+});

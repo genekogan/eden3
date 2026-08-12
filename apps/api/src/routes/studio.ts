@@ -155,6 +155,8 @@ function textLength(args: Record<string, unknown>): number {
 
 const VIDEO_DURATION_SECONDS = { min: 2, max: 10, default: 5 } as const;
 const MUSIC_DURATION_SECONDS = { min: 5, max: 120, default: 30 } as const;
+export const VIDEO_TEXT_MODEL = 'fal-ai/kling-video/v3/pro/text-to-video';
+export const VIDEO_IMAGE_MODEL = 'fal-ai/kling-video/v3/pro/image-to-video';
 
 /**
  * Image model tiers (repriced 2026-07-10): the default is the cheap
@@ -205,7 +207,7 @@ const STUDIO_METERING: Record<StudioToolName, StudioMeteringSpec> = {
   video_generate: {
     action: 'video',
     provider: 'fal',
-    model: 'fal-ai/kling-video/v3/pro/text-to-video',
+    model: VIDEO_TEXT_MODEL,
     unit: 'video_second',
     defaultQuantity: VIDEO_DURATION_SECONDS.default,
     quantityFromArgs: (args) =>
@@ -270,7 +272,9 @@ export function quoteStudioGeneration(
           const option = imageModelOption(args);
           return { ...spec, provider: option.provider, model: option.model };
         })()
-      : spec;
+      : tool === 'video_generate' && args.videoMode === 'image-to-video'
+        ? { ...spec, model: VIDEO_IMAGE_MODEL }
+        : spec;
   const quantity = priced.quantityFromArgs(args);
   const estimate = costFromParams({
     provider: priced.provider,

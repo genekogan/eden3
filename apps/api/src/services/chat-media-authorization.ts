@@ -14,6 +14,8 @@ import {
   DEFAULT_IMAGE_MODEL,
   IMAGE_MODEL_OPTIONS,
   quoteStudioGeneration,
+  VIDEO_IMAGE_MODEL,
+  VIDEO_TEXT_MODEL,
   type StudioGenerationQuote,
   type StudioToolName,
 } from '../routes/studio';
@@ -31,7 +33,8 @@ const MEDIA_TOOLS = new Set<StudioToolName>([
   'music_generate',
   'tts',
 ]);
-const CHAT_VIDEO_MODEL = 'fal/fal-ai/kling-video/v3/pro/text-to-video';
+const CHAT_VIDEO_TEXT_MODEL = `fal/${VIDEO_TEXT_MODEL}`;
+const CHAT_VIDEO_IMAGE_MODEL = `fal/${VIDEO_IMAGE_MODEL}`;
 const CHAT_MUSIC_MODEL = 'google/lyria-3-clip-preview';
 const CHAT_IMAGE_ASPECT_RATIOS = new Set([
   '1:1',
@@ -64,6 +67,7 @@ const CHAT_IMAGE_SIZE_ASPECT_RATIO = new Map([
   ['3840x2160', '16:9'],
 ]);
 const CHAT_IMAGE_OUTPUT_FORMATS = new Set(['png', 'jpeg', 'webp']);
+const CHAT_VIDEO_REFERENCE_BASENAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,239}\.(?:png|jpe?g|webp)$/i;
 
 export interface ChatMediaAuthorizationRequest {
   runId?: string;
@@ -192,6 +196,36 @@ function chatImageAspectRatio(rawArgs: Record<string, unknown>): string | undefi
   return typeof suppliedAspect === 'string' ? suppliedAspect : sizeAspect;
 }
 
+function chatVideoImageReference(rawArgs: Record<string, unknown>): string | undefined {
+  if (rawArgs.image !== undefined && rawArgs.images !== undefined) {
+    throw new Error('chat-media-authorization: ambiguous video image reference');
+  }
+  const raw = rawArgs.image ?? rawArgs.images;
+  const value = Array.isArray(raw)
+    ? raw.length === 1 && typeof raw[0] === 'string'
+      ? raw[0]
+      : null
+    : typeof raw === 'string'
+      ? raw
+      : raw === undefined
+        ? undefined
+        : null;
+  if (value === null) {
+    throw new Error('chat-media-authorization: invalid video image reference');
+  }
+  if (value === undefined) return undefined;
+  if (
+    !value.startsWith('/') ||
+    value.includes('\\') ||
+    value.split('/').includes('..') ||
+    !value.includes('/media/tool-image-generation/') ||
+    !CHAT_VIDEO_REFERENCE_BASENAME.test(value.slice(value.lastIndexOf('/') + 1))
+  ) {
+    throw new Error('chat-media-authorization: unsupported video image reference');
+  }
+  return value;
+}
+
 /**
  * Verify the separate Studio reservation for a direct OpenClaw tool invoke.
  * The `eden3:studio:<uuid>` context is only an index, never authority: the
@@ -292,8 +326,10 @@ export function quoteChatMediaTool(
   const allowed =
     tool === 'image_generate'
       ? new Set(['action', 'prompt', 'model', 'aspectRatio', 'size', 'count', 'outputFormat'])
-      : tool === 'video_generate' || tool === 'music_generate'
-        ? new Set(['action', 'prompt', 'duration', 'durationSeconds', 'model'])
+      : tool === 'video_generate'
+        ? new Set(['action', 'prompt', 'duration', 'durationSeconds', 'model', 'image', 'images'])
+        : tool === 'music_generate'
+          ? new Set(['action', 'prompt', 'duration', 'durationSeconds', 'model'])
         : new Set(['action', 'text']);
   for (const key of Object.keys(rawArgs)) {
     if (!allowed.has(key)) {
@@ -343,11 +379,20 @@ export function quoteChatMediaTool(
   ) {
     throw new Error(`chat-media-authorization: invalid ${tool} duration`);
   }
-  const expectedModel = tool === 'video_generate' ? CHAT_VIDEO_MODEL : CHAT_MUSIC_MODEL;
+  const videoImage = tool === 'video_generate' ? chatVideoImageReference(rawArgs) : undefined;
+  const expectedModel = tool === 'video_generate'
+    ? videoImage
+      ? CHAT_VIDEO_IMAGE_MODEL
+      : CHAT_VIDEO_TEXT_MODEL
+    : CHAT_MUSIC_MODEL;
   if (rawArgs.model !== undefined && rawArgs.model !== expectedModel) {
     throw new Error(`chat-media-authorization: unsupported ${tool} model`);
   }
-  const args: Record<string, unknown> = { prompt, duration };
+  const args: Record<string, unknown> = {
+    prompt,
+    duration,
+    ...(videoImage ? { videoMode: 'image-to-video' } : {}),
+  };
   return quoteStudioGeneration(tool, args);
 }
 
@@ -379,10 +424,16 @@ export function canonicalChatMediaProviderArgs(
     };
   }
   const durationSeconds = rawArgs.durationSeconds ?? rawArgs.duration ?? (tool === 'video_generate' ? 5 : 30);
+  const videoImage = tool === 'video_generate' ? chatVideoImageReference(rawArgs) : undefined;
   return {
     prompt,
+    ...(videoImage ? { image: videoImage } : {}),
     durationSeconds,
-    model: tool === 'video_generate' ? CHAT_VIDEO_MODEL : CHAT_MUSIC_MODEL,
+    model: tool === 'video_generate'
+      ? videoImage
+        ? CHAT_VIDEO_IMAGE_MODEL
+        : CHAT_VIDEO_TEXT_MODEL
+      : CHAT_MUSIC_MODEL,
   };
 }
 

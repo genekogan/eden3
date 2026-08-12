@@ -6,7 +6,7 @@
  * snapshot and should be reconciled against provider invoices/pricing updates.
  */
 
-export const COST_TABLE_VERSION = '2026-07-06.launch-v1';
+export const COST_TABLE_VERSION = '2026-08-12.media-v2';
 
 export const DEFAULT_MANNA_PER_USD = 1_000;
 export const DEFAULT_MARKUP = 0.35;
@@ -275,6 +275,14 @@ export const COST_TABLE: readonly CostTableEntry[] = [
     effectiveDate: '2026-07-06',
     source: RATE_SOURCE,
     estimated: true,
+  },
+  {
+    provider: 'fal',
+    model: 'fal-ai/kling-video/v3/pro/image-to-video',
+    unit: 'video_second',
+    usdPerUnit: 0.112,
+    effectiveDate: '2026-08-12',
+    source: 'fal Kling Video v3 Pro image-to-video pricing page, audio disabled',
   },
   {
     provider: 'fal',
