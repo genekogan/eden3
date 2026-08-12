@@ -29,6 +29,13 @@ describe('closed runtime attestation inputs', () => {
         nonce: valid.EDEN3_E2E_RUNTIME_NONCE,
       });
     }
+    expect(runtimeAttestationFromEnvironment({
+      ...valid,
+      DATABASE_URL: 'postgres://eden3@127.0.0.1:55452/eden3_runtime_load_m3_candidate',
+    })).toEqual({
+      integrationHead: valid.EDEN3_E2E_INTEGRATION_HEAD,
+      nonce: valid.EDEN3_E2E_RUNTIME_NONCE,
+    });
   });
 
   it('rejects partial, malformed, production, and canonical DB inputs', () => {
@@ -53,6 +60,11 @@ describe('closed runtime attestation inputs', () => {
       'postgres://127.0.0.1:5433/eden3_runtime_e2e_short',
       'postgres://127.0.0.1:5433/eden3_runtime_e2e_gate3_attestation_extra/path',
       'postgres://127.0.0.1:5433/eden3_runtime_e2e_gate3_attestation?host=remote.example',
+      'postgres://eden3@127.0.0.1:5433/eden3_runtime_load_m3_candidate',
+      'postgres://eden3:secret@127.0.0.1:55452/eden3_runtime_load_m3_candidate',
+      'postgres://eden3@remote.example:55452/eden3_runtime_load_m3_candidate',
+      'postgres://eden3@127.0.0.1:55452/eden3_runtime_load_m3_candidate?sslmode=disable',
+      'postgres://eden3@127.0.0.1:55452/eden3_runtime_load_short',
     ]) {
       expect(() => runtimeAttestationFromEnvironment({
         ...valid,
