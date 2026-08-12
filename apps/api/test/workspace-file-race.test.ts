@@ -168,7 +168,7 @@ describe('workspace file descriptor pinning', () => {
     }
   });
 
-  it.runIf(process.platform === 'linux')(
+  it(
     'reports a symlinked ancestor as a rejected write without touching the neighbor',
     async () => {
       const fixture = await freshFixture();
@@ -178,15 +178,17 @@ describe('workspace file descriptor pinning', () => {
           path.join(fixture.neighbor, 'notes'),
           path.join(fixture.root, 'escape-dir'),
         );
-        await expect(writeWorkspaceFile({
+        const write = writeWorkspaceFile({
           root: fixture.root,
           path: 'escape-dir/injected.txt',
           content: 'must stay contained',
           baseSha256: 'new',
-        })).rejects.toMatchObject({
-          statusCode: 400,
-          code: 'workspace_path_forbidden',
         });
+        await expect(write).rejects.toMatchObject(
+          process.platform === 'linux'
+            ? { statusCode: 400, code: 'workspace_path_forbidden' }
+            : { statusCode: 503, code: 'workspace_secure_write_unavailable' },
+        );
         await expect(fs.readFile(neighborTarget)).rejects.toMatchObject({ code: 'ENOENT' });
       } finally {
         await fs.rm(fixture.parent, { recursive: true, force: true });
