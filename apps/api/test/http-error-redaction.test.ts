@@ -364,6 +364,35 @@ describe('HTTP 5xx disclosure boundary', () => {
     });
   });
 
+  it('maps an addressless postgres.js socket reset to a retryable safe 503', async () => {
+    vi.stubEnv('DATABASE_URL', 'postgresql://eden3@127.0.0.1:5433/eden3_runtime_test');
+    const app = Fastify({ logger: false });
+    apps.push(app);
+    registerApiErrorHandler(app, { bodyLimitBytes: 1_024 });
+    app.get('/database-failure', async () => {
+      // postgres.js annotates socket failures with these own fields even when
+      // Node's ECONNRESET contains no address/port authority.
+      throw Object.assign(new Error(SENSITIVE), {
+        code: 'ECONNRESET',
+        query: undefined,
+        parameters: undefined,
+        args: [],
+        types: null,
+      });
+    });
+
+    const response = await app.inject({ method: 'GET', url: '/database-failure' });
+
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toEqual({
+      error: {
+        code: 'database_unavailable',
+        message: 'Service temporarily unavailable',
+        statusCode: 503,
+      },
+    });
+  });
+
   it('enforces redaction through the actual DB-free buildServer composition', async () => {
     const mediaDir = await mkdtemp(path.join(tmpdir(), 'eden3-5xx-redaction-'));
     tempDirs.push(mediaDir);
