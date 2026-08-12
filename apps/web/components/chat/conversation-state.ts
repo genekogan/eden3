@@ -156,6 +156,11 @@ export type ConversationAction =
       retryContent: string | null;
       at: string;
     }
+  | {
+      /** Replace transient shimmers with durable authorization truth. */
+      type: "pending/reconcile";
+      pending: Array<{ tool: string; createdAt: string }>;
+    }
   | { type: "stream/finished"; clientId: string }
   | {
       /** Event from the long-lived per-session channel. */
@@ -518,6 +523,17 @@ export function conversationReducer(
   action: ConversationAction,
 ): ConversationState {
   switch (action.type) {
+    case "pending/reconcile": {
+      let next: ConversationState = {
+        ...state,
+        local: state.local.filter((item) => item.kind !== "media-pending"),
+      };
+      for (const pending of action.pending) {
+        next = appendShimmer(next, pending.tool, pending.createdAt);
+      }
+      return next;
+    }
+
     case "history/merge": {
       const serverMessages =
         action.position === "init"

@@ -102,6 +102,23 @@ export async function fetchSessionPage(
     session: (obj.session ?? data) as SessionDto,
     messages: Array.isArray(obj.messages) ? (obj.messages as MessageDto[]) : [],
     nextCursor: typeof obj.nextCursor === "string" ? obj.nextCursor : null,
+    pendingMedia: Array.isArray(obj.pendingMedia)
+      ? obj.pendingMedia.flatMap((item) => {
+          if (!item || typeof item !== "object") return [];
+          const candidate = item as Record<string, unknown>;
+          const tool = candidate.tool;
+          const createdAt = candidate.createdAt;
+          if (
+            (tool !== "image_generate" &&
+              tool !== "video_generate" &&
+              tool !== "music_generate") ||
+            typeof createdAt !== "string"
+          ) {
+            return [];
+          }
+          return [{ tool, createdAt }];
+        })
+      : [],
   };
 }
 

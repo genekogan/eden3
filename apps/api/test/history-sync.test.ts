@@ -11,6 +11,7 @@ import {
   historyMessageDate,
   isInterSessionBanner,
   planHistorySync,
+  retryableAttachmentSightings,
   type ExistingMessageLike,
 } from '../src/services/history-sync';
 
@@ -258,6 +259,39 @@ describe('planHistorySync', () => {
     const plan = planHistorySync([], [{ role: 'assistant', content: 'text' } as GatewayHistoryMessage]);
     expect(plan.inserts).toEqual([]);
     expect(plan.skipped).toBe(1);
+  });
+});
+
+describe('durable attachment retry planning', () => {
+  it('retries a persisted completion until its attachment is durable, then stops', () => {
+    const completion = gwMessage(
+      'assistant',
+      'Done\nMEDIA:https://v3b.fal.media/files/run/output.mp4',
+      'video0001',
+    );
+    const base = {
+      id: 'message-video',
+      externalId: 'gw:video0001',
+      role: 'assistant',
+      content: 'Done\nMEDIA:https://v3b.fal.media/files/run/output.mp4',
+    };
+    expect(
+      retryableAttachmentSightings('session-video', [{ ...base, attachments: [] }], [completion]),
+    ).toEqual([
+      {
+        sessionId: 'session-video',
+        messageId: 'message-video',
+        path: 'https://v3b.fal.media/files/run/output.mp4',
+        role: 'assistant',
+      },
+    ]);
+    expect(
+      retryableAttachmentSightings(
+        'session-video',
+        [{ ...base, attachments: [{ url: '/media/durable.mp4' }] }],
+        [completion],
+      ),
+    ).toEqual([]);
   });
 });
 

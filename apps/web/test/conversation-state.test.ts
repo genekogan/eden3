@@ -272,6 +272,45 @@ describe("media lifecycle", () => {
     creationId: CREATION_ID,
   };
 
+  it("reconstructs durable pending work after navigation and clears it at terminal history", () => {
+    const restored = run([
+      {
+        type: "pending/reconcile",
+        pending: [{ tool: "video_generate", createdAt: AT }],
+      },
+    ]);
+    expect(restored.local).toContainEqual(
+      expect.objectContaining({ kind: "media-pending", tool: "video_generate", at: AT }),
+    );
+
+    const terminal = run([{ type: "pending/reconcile", pending: [] }], restored);
+    expect(terminal.local.some((item) => item.kind === "media-pending")).toBe(false);
+  });
+
+  it("replaces stale live shimmers with the durable authorization set", () => {
+    const live = run([
+      {
+        type: "channel/event",
+        event: { type: "media.pending", sessionId: SESSION_ID, tool: "image_generate" },
+        at: AT,
+      },
+    ]);
+    const reconciled = run(
+      [
+        {
+          type: "pending/reconcile",
+          pending: [{ tool: "music_generate", createdAt: "2026-07-03T12:01:00.000Z" }],
+        },
+      ],
+      live,
+    );
+    expect(
+      reconciled.local
+        .filter((item) => item.kind === "media-pending")
+        .map((item) => item.tool),
+    ).toEqual(["music_generate"]);
+  });
+
   it("shimmer appears on media.pending and retires on media.attached", () => {
     let state = run([
       { type: "send", clientId: "c1", content: "make art", at: AT },

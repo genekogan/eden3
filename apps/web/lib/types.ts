@@ -225,6 +225,11 @@ export interface SessionDetail {
   messages: MessageDto[];
   /** Cursor for older messages; null when the whole history is present. */
   nextCursor: string | null;
+  /** Durable admitted media work, present even after navigation/restart. */
+  pendingMedia: Array<{
+    tool: "image_generate" | "video_generate" | "music_generate";
+    createdAt: string;
+  }>;
 }
 
 /** GET /api/collections/:id */

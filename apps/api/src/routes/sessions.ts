@@ -12,6 +12,7 @@ import {
   sessionAgents,
   sessionUsers,
   sessions,
+  usageEvents,
   type Message,
   type Session,
 } from '@eden3/db';
@@ -21,6 +22,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 
 import { ApiError } from '../errors';
+import { CHAT_MEDIA_EVENT_TYPE } from '../services/chat-media-authorization';
 
 /**
  * Session read routes.
@@ -529,6 +531,31 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
         : [];
       const senders = new Map(senderRows.map((row) => [row.id, toAccountSummary(row)]));
       const members = await loadMembers([session.id]);
+      const pendingRows = !cursor
+        ? await db
+            .select({ metadata: usageEvents.metadata, createdAt: usageEvents.createdAt })
+            .from(usageEvents)
+            .where(
+              and(
+                eq(usageEvents.eventType, CHAT_MEDIA_EVENT_TYPE),
+                eq(usageEvents.sessionId, session.id),
+                inArray(usageEvents.status, ['pending', 'provider_admitted']),
+              ),
+            )
+            .orderBy(usageEvents.createdAt)
+            .limit(8)
+        : [];
+      const pendingMedia = pendingRows.flatMap((row) => {
+        const metadata = row.metadata;
+        if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) return [];
+        const tool = (metadata as { tool?: unknown }).tool;
+        if (
+          tool !== 'image_generate' &&
+          tool !== 'video_generate' &&
+          tool !== 'music_generate'
+        ) return [];
+        return [{ tool, createdAt: row.createdAt.toISOString() }];
+      });
 
       return {
         session: toSessionDto(
@@ -539,6 +566,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
           toMessageDto(row, row.senderId ? senders.get(row.senderId) : undefined),
         ),
         nextCursor,
+        pendingMedia,
       };
     },
   );

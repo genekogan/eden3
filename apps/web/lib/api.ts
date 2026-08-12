@@ -487,6 +487,22 @@ function toSessionDetail(data: unknown): SessionDetail {
     session: (obj.session ?? data) as SessionDto,
     messages: Array.isArray(obj.messages) ? (obj.messages as MessageDto[]) : [],
     nextCursor: typeof obj.nextCursor === "string" ? obj.nextCursor : null,
+    pendingMedia: Array.isArray(obj.pendingMedia)
+      ? obj.pendingMedia.flatMap((item) => {
+          const candidate = asRecord(item);
+          const tool = candidate.tool;
+          const createdAt = candidate.createdAt;
+          if (
+            (tool !== "image_generate" &&
+              tool !== "video_generate" &&
+              tool !== "music_generate") ||
+            typeof createdAt !== "string"
+          ) {
+            return [];
+          }
+          return [{ tool, createdAt }];
+        })
+      : [],
   };
 }
 

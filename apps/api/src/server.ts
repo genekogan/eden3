@@ -68,6 +68,7 @@ import {
   StudioReservationReaper,
 } from './services/studio-reservations';
 import { ChatMediaReservationReaper } from './services/chat-media-authorization';
+import { ChatMediaCompletionReconciler } from './services/chat-media-reconciler';
 import type { SessionShareRepository } from './services/session-shares';
 import { PostgresSessionShareRepository } from './services/session-shares-postgres';
 import type { CompatClientLike } from './services/turns';
@@ -386,6 +387,8 @@ declare module 'fastify' {
     studioReservationReaper: StudioReservationReaper;
     /** Orphaned in-chat media compensation loop (DEBT-007). */
     chatMediaReservationReaper: ChatMediaReservationReaper;
+    /** Restart-safe durable async media transcript reconciliation loop. */
+    chatMediaCompletionReconciler: ChatMediaCompletionReconciler | null;
     /** Eden-managed, activity-gated native deep + metered REM loop. */
     memoryDreamScheduler: MemoryDreamScheduler | null;
     /** Durable, fenced async agent-build worker (tests may drive tick()). */
@@ -627,6 +630,15 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         }),
     );
   }
+  const chatMediaCompletionReconciler = historySync
+    ? new ChatMediaCompletionReconciler(historySync, {
+        onError: (_error, context) =>
+          app.log.error({ context }, 'chat-media completion reconciliation failed'),
+      })
+    : null;
+  app.decorate('chatMediaCompletionReconciler', chatMediaCompletionReconciler);
+  app.addHook('onClose', async () => chatMediaCompletionReconciler?.stop());
+  if (opts.media?.autoStartWatcher === true) chatMediaCompletionReconciler?.start();
   app.addHook('onClose', async () => {
     await mediaWatcher.stop();
   });

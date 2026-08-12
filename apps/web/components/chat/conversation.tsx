@@ -166,6 +166,7 @@ export function SessionConversation({
         messages: detail.messages,
         position: "refresh",
       });
+      dispatch({ type: "pending/reconcile", pending: detail.pendingMedia });
       setLoadPhase("ready");
     } catch {
       /* quiet — the live tail already rendered everything we streamed */
@@ -185,6 +186,7 @@ export function SessionConversation({
         olderCursor: detail.nextCursor,
         position: "init",
       });
+      dispatch({ type: "pending/reconcile", pending: detail.pendingMedia });
       setLoadPhase("ready");
     } catch (error) {
       if (adoptedPumpRef.current !== null) {

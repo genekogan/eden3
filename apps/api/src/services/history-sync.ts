@@ -193,6 +193,8 @@ export interface ExistingMessageLike {
    * keep the message rather than risk dropping a legitimate one).
    */
   createdAt?: Date | null;
+  /** Existing durable attachments; used to retry a sighting after transient ingest failure. */
+  attachments?: unknown;
 }
 
 /**
@@ -225,6 +227,40 @@ export interface HistorySyncPlan {
   backfills: PlannedBackfill[];
   /** History entries skipped (already synced, banners, or no gateway id). */
   skipped: number;
+}
+
+/**
+ * Re-emit transcript sightings whose message was persisted but whose media
+ * attachment was not. This makes CDN/download/storage failures retryable on
+ * the next durable reconciliation pass rather than permanently losing the
+ * tool result after its gateway id has been deduped.
+ */
+export function retryableAttachmentSightings(
+  sessionId: string,
+  existing: ExistingMessageLike[],
+  history: GatewayHistoryMessage[],
+): AttachmentSighting[] {
+  const byExternalId = new Map(
+    existing
+      .filter((row) => row.externalId !== null)
+      .map((row) => [row.externalId!, row]),
+  );
+  const sightings: AttachmentSighting[] = [];
+  for (const message of history) {
+    const externalId = gatewayExternalId(message);
+    if (!externalId) continue;
+    const row = byExternalId.get(externalId);
+    if (!row || (Array.isArray(row.attachments) && row.attachments.length > 0)) continue;
+    for (const attachmentPath of extractAttachmentPaths(historyMessageText(message))) {
+      sightings.push({
+        sessionId,
+        messageId: row.id,
+        path: attachmentPath,
+        role: message.role,
+      });
+    }
+  }
+  return sightings;
 }
 
 /**
@@ -400,7 +436,7 @@ export class HistorySync {
    * insert what is missing (bumping session counters), backfill gateway ids
    * onto rows we streamed ourselves, and report attachment lines.
    */
-  async syncSession(target: SyncTarget): Promise<SyncResult> {
+  async syncSession(target: SyncTarget, signal?: AbortSignal): Promise<SyncResult> {
     const { session } = target;
     const none: SyncResult = { inserted: 0, backfilled: 0, attachments: 0, historyCount: 0 };
     const sessionKey = session.gatewaySessionKey;
@@ -418,6 +454,7 @@ export class HistorySync {
       sessionKey,
       agentId: agentOpenclawId,
       limit: this.historyLimit,
+      ...(signal ? { signal } : {}),
     });
     if (history.messages.length === 0) return none;
 
@@ -428,6 +465,7 @@ export class HistorySync {
         role: messages.role,
         content: messages.content,
         createdAt: messages.createdAt,
+        attachments: messages.attachments,
       })
       .from(messages)
       .where(eq(messages.sessionId, session.id))
@@ -435,7 +473,7 @@ export class HistorySync {
       .limit(EXISTING_ROWS_LIMIT);
 
     const plan = planHistorySync(existing, history.messages);
-    const sightings: AttachmentSighting[] = [];
+    const sightings = retryableAttachmentSightings(session.id, existing, history.messages);
     let inserted = 0;
 
     await db.transaction(async (tx) => {
