@@ -136,6 +136,18 @@ describe('resolveDataDir', () => {
   });
 });
 
+describe('resolveSandboxAssetsDir', () => {
+  it('stays anchored to the checkout when the OpenClaw data directory is relocated', () => {
+    const expected = path.resolve(
+      fileURLToPath(new URL('../../../assets/sandbox/', import.meta.url)),
+    );
+    expect(resolveSandboxAssetsDir('/tmp/isolated-review/openclaw-data', {})).toBe(expected);
+    expect(resolveSandboxAssetsDir('/tmp/isolated-review/openclaw-data', {
+      EDEN3_SANDBOX_ASSETS_DIR: '/tmp/review-assets',
+    })).toBe('/tmp/review-assets');
+  });
+});
+
 describe('read/writeOpenClawConfig', () => {
   it('round-trips and returns {} for a missing file', async () => {
     expect(await readOpenClawConfig(dataDir)).toEqual({});
