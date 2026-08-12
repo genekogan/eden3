@@ -18,7 +18,7 @@ import { db, pg, sessions } from '@eden3/db';
 import Fastify from 'fastify';
 import postgres from 'postgres';
 import { drizzle } from 'drizzle-orm/postgres-js';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { requireAuth } from '../../src/auth-plugin';
 import { ApiError } from '../../src/errors';
@@ -283,6 +283,17 @@ beforeAll(async () => {
     operatorLogin: OPERATOR_LOGIN,
     ordinaryApplicationLogin: ORDINARY_LOGIN,
   });
+});
+
+afterEach(async () => {
+  // Most cases intentionally stop with accepted or partially executed
+  // erasures. Production correctly retains those jobs and prevents deleting
+  // fenced accounts. This suite is guarded to a disposable scratch database,
+  // so truncate the aggregate roots between cases instead of weakening the
+  // production retention boundary or letting the global claimer see stale
+  // work from a previous case.
+  vi.restoreAllMocks();
+  await pg.unsafe('truncate table account_erasure_jobs, accounts cascade');
 });
 
 afterAll(async () => {
@@ -759,6 +770,9 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       mediaDir: mediaRoot,
       baseUrl: '/media',
     }));
+    // Keep this test's cross-owner shared-byte election independent from the
+    // canonical 1px fixture hash used by the concept-publication cases.
+    const avatarBody = Buffer.concat([PNG_1PX, Buffer.from('avatar-custody')]);
     const outstanding = new Set<Promise<unknown>>();
     const app = Fastify();
     app.decorateRequest('account', null);
@@ -801,7 +815,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         payload: {
           mime: 'image/png',
           filename: 'upload-first-avatar.png',
-          dataBase64: PNG_1PX.toString('base64'),
+          dataBase64: avatarBody.toString('base64'),
         },
       });
       outstanding.add(uploadRequest);
@@ -818,7 +832,8 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       await waitForOperatorOwnerLockWait(uploadOwner, () => intentSettled);
 
       pausingStore.resume();
-      expect((await uploadRequest).statusCode).toBe(200);
+      const uploadResponse = await uploadRequest;
+      expect(uploadResponse.statusCode, uploadResponse.body).toBe(200);
       const accepted = await intentRequest;
       const [avatar] = await pg<{
         id: string; url: string; local_path: string; sha256: string; state: string;
@@ -858,9 +873,26 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         sha256: stored.sha256,
       });
       const targetStore = erasureTargetStore(mediaRoot);
-      const claim = await targetStore.claimTarget();
-      if (!claim || 'status' in claim) throw new Error('expected avatar erasure target claim');
-      expect(claim).toMatchObject({ kind: 'legacy_avatar_asset', resourceId: avatar!.id });
+      const claimAvatar = async (resourceId: string) => {
+        for (let index = 0; index < 3; index += 1) {
+          const candidate = await targetStore.claimTarget();
+          if (!candidate || 'status' in candidate) {
+            throw new Error('expected avatar erasure target claim');
+          }
+          if (candidate.kind === 'legacy_avatar_asset') {
+            expect(candidate.resourceId).toBe(resourceId);
+            return candidate;
+          }
+          // The account's runtime target is independent and may sort first by
+          // UUID. Defer it through the real retry path so this avatar-focused
+          // case does not depend on incidental target ordering.
+          expect(candidate.kind).toBe('agent_runtime');
+          await expect(targetStore.failTarget(candidate, 'test_runtime_deferred'))
+            .resolves.toBe('retried');
+        }
+        throw new Error('avatar erasure target was not claimable');
+      };
+      const claim = await claimAvatar(avatar!.id);
       const executor = new LocalLegacyErasureExecutor(targetStore.legacyMediaBoundary, {
         erase: async () => { throw new Error('local avatar must not use external erasure'); },
       });
@@ -878,14 +910,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         actorIsAdmin: false,
         confirmUsername: foreignUsername,
       }, erasureStore(), ledger(), recoverySink())).resolves.toMatchObject({ status: 'pending' });
-      const foreignClaim = await targetStore.claimTarget();
-      if (!foreignClaim || 'status' in foreignClaim) {
-        throw new Error('expected last avatar owner erasure target claim');
-      }
-      expect(foreignClaim).toMatchObject({
-        kind: 'legacy_avatar_asset',
-        resourceId: foreignAvatar!.id,
-      });
+      const foreignClaim = await claimAvatar(foreignAvatar!.id);
       await expect(executor.erase({ ...foreignClaim, signal: AbortSignal.timeout(5_000) }))
         .resolves.toEqual({ confirmedAbsent: true });
       await expect(targetStore.completeTarget(foreignClaim)).resolves.toBe('completed');
@@ -2289,6 +2314,9 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
   }, 30_000);
 
   it('fails closed on malformed foreign collection contributor provenance', async () => {
+    await pg`
+      insert into accounts (id,type,username)
+      values (${FOREIGN},'user','erase_runtime_foreign')`;
     const malformedCases: unknown[] = [
       { contributor: 'embedded-legacy-identity' },
       [null],
