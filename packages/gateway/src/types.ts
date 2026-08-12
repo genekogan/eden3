@@ -56,8 +56,9 @@ export function scopedSessionKey(agentId: string, sessionKey: string): string {
 
 /**
  * The exact filler string the gateway's OpenAI-compat shim substitutes when an
- * assistant turn produced no text (typically: the agent kicked off an async
- * tool like image_generate and said nothing). Treat it as an EMPTY turn.
+ * assistant turn produced no text. Treat it as an EMPTY turn; only the API's
+ * durable media-authorization ledger can determine whether a media tool is
+ * actually running.
  *
  * Source of truth: openclaw `src/gateway/openai-http.ts`
  * (`resolveAgentResponseText`) — note the literal INCLUDES the trailing
@@ -144,8 +145,8 @@ export type GatewayTurnEvent =
       text: string;
       /**
        * True when the assistant produced no real text — either genuinely
-       * empty or the literal NO_RESPONSE_SENTINEL filler (async tool pending;
-       * map to media.pending upstream rather than showing filler text).
+       * empty or the literal NO_RESPONSE_SENTINEL filler. This is not itself
+       * evidence of an async tool; media lifecycle comes from authorization.
        */
       emptyTurn: boolean;
       usage?: GatewayUsage;

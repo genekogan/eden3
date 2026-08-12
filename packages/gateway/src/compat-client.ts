@@ -33,8 +33,8 @@ import {
  *        total_tokens, prompt_tokens_details:{cached_tokens}}}
  *   5. data: [DONE]
  *
- * Empty assistant turns (agent kicked off an async tool and said nothing) are
- * filled by the compat shim with the literal text "No response from OpenClaw."
+ * Empty assistant turns are filled by the compat shim with the literal text
+ * "No response from OpenClaw."
  * (trailing period included — see NO_RESPONSE_SENTINEL; the shim emits it as
  * one single content chunk when no delta was streamed). That exact full-turn
  * content is mapped to `turn.completed.emptyTurn === true` with text '' and

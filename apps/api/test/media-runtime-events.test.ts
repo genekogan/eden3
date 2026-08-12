@@ -108,4 +108,17 @@ describe('media runtime UI lifecycle events', () => {
       'publishChatMediaFailed(app.eventsBus, context, body.errorCode)',
     );
   });
+
+  it('never invents media activity from a silent chat completion', () => {
+    const turnsSource = readFileSync(
+      resolve(import.meta.dirname, '../src/services/turns.ts'),
+      'utf8',
+    );
+    expect(turnsSource).not.toContain("tool: 'unknown'");
+    expect(turnsSource).not.toMatch(
+      /if \(event\.emptyTurn\)[\s\S]{0,300}type: 'media\.pending'/,
+    );
+    expect(turnsSource).toContain('DIRECT_CHAT_EMPTY_REPLY');
+    expect(turnsSource).toContain('hasCurrentTurnMediaAuthorization');
+  });
 });

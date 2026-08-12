@@ -23,7 +23,12 @@ import { HistorySync } from '../src/services/history-sync';
 import { automationMannaSpendLastHour } from '../src/services/automation-budget';
 import type { SubscriptionTurnClaimsLike } from '../src/services/subscription-turn-claims';
 import { TurnRegistry } from '../src/services/turn-registry';
-import { runTurn, type CompatClientLike, type TurnSink } from '../src/services/turns';
+import {
+  DIRECT_CHAT_EMPTY_REPLY,
+  runTurn,
+  type CompatClientLike,
+  type TurnSink,
+} from '../src/services/turns';
 
 const marker = `turnusage_${randomUUID().slice(0, 8)}`;
 
@@ -483,7 +488,7 @@ describe('runTurn usage events', () => {
     expect(ledger.some((row) => row.type === 'spend:chat:settle')).toBe(false);
   });
 
-  it('persists empty media turns without the OpenClaw filler and emits media.pending', async () => {
+  it('turns a silent direct reply into a visible clarification without inventing media', async () => {
     const fixture = await makeFixture();
     const compat: CompatClientLike = {
       async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
@@ -507,7 +512,7 @@ describe('runTurn usage events', () => {
       session: fixture.session,
       agent: fixture.agent,
       user: fixture.user,
-      content: 'make an image',
+      content: 'asdflkjasdlkfjsadflkjghghghghghgh1211212',
       beginStream: () => ({
         emit(event) {
           emitted.push(event);
@@ -522,16 +527,74 @@ describe('runTurn usage events', () => {
     >`
       select content, eden_message_data as "edenMessageData"
       from messages where id = ${outcome.assistantMessageId}`;
-    expect(assistant?.content).toBe('');
+    expect(assistant?.content).toBe("I’m not sure what you mean. What would you like me to do?");
     expect(assistant?.content).not.toBe(NO_RESPONSE_SENTINEL);
-    expect(assistant?.edenMessageData?.emptyTurn).toBe(true);
+    expect(assistant?.edenMessageData?.emptyTurn).toBe(false);
+    expect(outcome.emptyTurn).toBe(false);
+    expect(emitted).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: 'media.pending' })]),
+    );
     expect(emitted).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ type: 'media.pending', sessionId: fixture.session.id }),
+        expect.objectContaining({
+          type: 'token',
+          delta: "I’m not sure what you mean. What would you like me to do?",
+        }),
         expect.objectContaining({ type: 'turn.completed', messageId: outcome.assistantMessageId }),
       ]),
     );
     expect(JSON.stringify(emitted)).not.toContain(NO_RESPONSE_SENTINEL);
+  });
+
+  it('keeps an authorized async-media turn empty without publishing a second pending event', async () => {
+    const fixture = await makeFixture();
+    const mediaAuthorizationId = randomUUID();
+    const compat: CompatClientLike = {
+      async *chatTurn(): AsyncGenerator<GatewayTurnEvent, void, void> {
+        yield { type: 'turn.started' };
+        await pg`
+          insert into usage_events (
+            event_type, status, user_id, agent_id, session_id, turn_id, metadata
+          ) values (
+            'chat_media', 'provider_admitted', ${fixture.user.accountId},
+            ${fixture.agent.accountId}, ${fixture.session.id}, ${mediaAuthorizationId},
+            '{"tool":"image_generate","action":"image"}'::jsonb
+          )`;
+        yield {
+          type: 'turn.completed',
+          text: '',
+          emptyTurn: true,
+          finishReason: 'stop',
+          usage: { promptTokens: 10, completionTokens: 0, totalTokens: 10 },
+        };
+      },
+    };
+    const emitted: SessionEvent[] = [];
+
+    const outcome = await runTurn(makeDeps(compat), {
+      session: fixture.session,
+      agent: fixture.agent,
+      user: fixture.user,
+      content: 'make an image',
+      beginStream: () => ({
+        emit(event) {
+          emitted.push(event);
+        },
+        end() {},
+      }),
+    });
+
+    expect(outcome).toMatchObject({ errorCode: null, errorMessage: null });
+    const [assistant] = await pg<{ content: string | null }[]>`
+      select content from messages where id = ${outcome.assistantMessageId}`;
+    expect(assistant?.content).toBe('');
+    expect(outcome.emptyTurn).toBe(true);
+    expect(emitted).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'token', delta: DIRECT_CHAT_EMPTY_REPLY }),
+        expect.objectContaining({ type: 'media.pending' }),
+      ]),
+    );
   });
 
   it('records the selected agent model and thinking level in usage metadata', async () => {

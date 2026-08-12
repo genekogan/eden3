@@ -61,6 +61,7 @@ import {
   PostgresSubscriptionTurnClaims,
   type SubscriptionTurnClaimsLike,
 } from './subscription-turn-claims';
+import { CHAT_MEDIA_EVENT_TYPE } from './chat-media-authorization';
 import {
   claimTurnProviderStart,
   insertTurnAuthorization,
@@ -72,6 +73,9 @@ import {
 } from './turn-authorization';
 
 export { renderPeerContext };
+
+export const DIRECT_CHAT_EMPTY_REPLY =
+  'I’m not sure what you mean. What would you like me to do?';
 
 /**
  * Keep platform Eve's persisted OpenClaw history private to one authenticated
@@ -717,6 +721,21 @@ async function runClaimedTurn(
     });
   };
 
+  const hasCurrentTurnMediaAuthorization = async (): Promise<boolean> => {
+    const rows = (await turnDb.execute(sql`
+      select 1 from usage_events
+      where event_type = ${CHAT_MEDIA_EVENT_TYPE}
+        and session_id = ${session.id}
+        and user_id = ${user.accountId}
+        and agent_id = ${agent.accountId}
+        and created_at >= (
+          select created_at from messages where id = ${userMessage.id}
+        )
+      limit 1
+    `)) as unknown as unknown[];
+    return rows.length > 0;
+  };
+
   // 1. Worst-case economic authorization (MVP gap 42). The ceiling is
   // fail-closed policy: a model without a TURN_CEILINGS entry cannot run a
   // metered turn at all.
@@ -1337,6 +1356,27 @@ async function runClaimedTurn(
             publish({ type: 'error', turnId, code: errorCode, message: errorMessage });
             break;
           }
+          let assistantText = event.text;
+          let effectiveEmptyTurn = event.emptyTurn;
+          let synthesizedDirectReply = false;
+          if (event.emptyTurn && params.source === undefined) {
+            let mediaAuthorized = false;
+            try {
+              mediaAuthorized = await hasCurrentTurnMediaAuthorization();
+            } catch (err) {
+              // A database read failure cannot justify inventing media work or
+              // leaving a direct user with a blank assistant row. The normal
+              // terminal transaction below still decides whether this turn
+              // can commit safely.
+              onError(err, 'confirm empty-turn media authorization');
+            }
+            if (!mediaAuthorized) {
+              assistantText = DIRECT_CHAT_EMPTY_REPLY;
+              effectiveEmptyTurn = false;
+              synthesizedDirectReply = true;
+            }
+          }
+          outcome.emptyTurn = effectiveEmptyTurn;
           const metering = meterChatUsage(effectiveUsage, meteringModel);
           const meteredManna = metering.status === 'metered' ? metering.manna : null;
           // The hard economic ceiling: settle ≤ authorized-max, always. A
@@ -1386,7 +1426,9 @@ async function runClaimedTurn(
                 }
               : null,
             settlement: null as ChatChargeSettlement | null,
-            emptyTurn: event.emptyTurn,
+            emptyTurn: effectiveEmptyTurn,
+            gatewayEmptyTurn: event.emptyTurn,
+            synthesizedDirectReply,
             finishReason: event.finishReason ?? null,
             source: params.source ?? null,
           };
@@ -1439,7 +1481,7 @@ async function runClaimedTurn(
                   sessionId: session.id,
                   senderId: agent.accountId,
                   role: 'assistant',
-                  content: event.text,
+                  content: assistantText,
                   name: agent.username,
                   edenMessageData: { ...messageData, settlement },
                 },
@@ -1458,7 +1500,7 @@ async function runClaimedTurn(
                   settlement,
                   messageId: inserted.id,
                   finishReason: event.finishReason ?? null,
-                  emptyTurn: event.emptyTurn,
+                  emptyTurn: effectiveEmptyTurn,
                   usageCapture: usageCapture ?? null,
                   usageSource,
                 },
@@ -1513,10 +1555,10 @@ async function runClaimedTurn(
             accountId: user.accountId,
             balance: terminal.balanceTotal,
           });
-          if (event.emptyTurn) {
-            // Agent said nothing — typically an async media tool is running
-            // (spike: compat filler suppressed upstream). Signal the UI.
-            publish({ type: 'media.pending', sessionId: session.id, tool: 'unknown' });
+          if (synthesizedDirectReply) {
+            // Publish only after the assistant row and settlement are durable.
+            // A reconnect can therefore recover the same visible reply.
+            publish({ type: 'token', turnId, delta: assistantText });
           }
           const sharedUsage = toSharedUsage(effectiveUsage);
           publish({
