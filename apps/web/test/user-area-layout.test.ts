@@ -38,4 +38,12 @@ describe("sidebar account footer layout", () => {
     expect(notificationCenterSource).not.toContain('item.readAt === null ? "bg-accent');
     expect(notificationCenterSource).toContain("focus-visible:ring-accent/50");
   });
+
+  it("paints an opaque isolated notification surface above the conversation rail", () => {
+    expect(notificationCenterSource).toContain('backgroundColor: "var(--color-raised)"');
+    expect(notificationCenterSource).toContain('isolation: "isolate"');
+    expect(notificationCenterSource).toContain("z-[100]");
+    expect(notificationCenterSource).toContain("divide-y divide-edge/50");
+    expect(notificationCenterSource).toContain("min-h-12");
+  });
 });

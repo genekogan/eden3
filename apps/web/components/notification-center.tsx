@@ -122,9 +122,14 @@ export function NotificationCenter({
       {open ? (
         <section
           aria-label="Notifications"
-          className="fixed bottom-14 left-2 z-[60] flex max-h-[calc(100vh-4rem)] w-[min(21rem,calc(100vw-1rem))] flex-col overflow-hidden rounded-xl border border-edge bg-raised shadow-xl shadow-black/30 sm:absolute sm:bottom-full sm:left-0 sm:mb-2"
+          // Paint an explicit opaque surface instead of relying only on the
+          // utility class. This popover sits above the conversation rail; any
+          // inherited/transient opacity makes the rail's titles look like
+          // duplicated notification copy.
+          style={{ backgroundColor: "var(--color-raised)", isolation: "isolate" }}
+          className="fixed bottom-14 left-2 z-[100] flex max-h-[calc(100vh-4rem)] w-[min(21rem,calc(100vw-1rem))] flex-col overflow-hidden rounded-xl border border-edge bg-raised opacity-100 shadow-xl shadow-black/30 sm:absolute sm:bottom-full sm:left-0 sm:mb-2"
         >
-          <header className="flex items-center justify-between border-b border-edge px-3 py-2.5">
+          <header className="relative z-[1] flex shrink-0 items-center justify-between border-b border-edge bg-raised px-3 py-2.5">
             <h2 className="text-sm font-medium">Notifications</h2>
             {state.unreadCount > 0 ? (
               <button
@@ -139,11 +144,11 @@ export function NotificationCenter({
           {state.items.length === 0 ? (
             <p className="px-3 py-6 text-center text-sm text-faint">You’re all caught up.</p>
           ) : (
-            <ul className="min-h-0 overflow-y-auto p-1.5">
+            <ul className="relative z-[1] min-h-0 divide-y divide-edge/50 overflow-y-auto bg-raised px-1.5">
               {state.items.map((item) => (
                 <li
                   key={item.id}
-                  className="group flex items-start gap-2 rounded-lg px-2 py-2 transition-colors hover:bg-foreground/[0.035]"
+                  className="group flex min-h-12 items-start gap-2 px-2 py-2.5 transition-colors hover:bg-foreground/[0.035]"
                 >
                   {item.readAt === null ? (
                     <span
