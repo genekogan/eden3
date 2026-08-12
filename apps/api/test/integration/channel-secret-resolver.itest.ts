@@ -59,7 +59,7 @@ function callBridge(
 ): Promise<{ values: Record<string, string>; errors?: Record<string, string>; _stderr: string }> {
   const requesters = ids.map((id) => ({
     id,
-    configPath: ['channels', 'discord', 'accounts', runtimeAccountId, 'token'],
+    configPath: `channels.discord.accounts.${runtimeAccountId}.token`,
     channel: 'discord',
     runtimeAccountId,
     agentId: agentOpenclawId,
