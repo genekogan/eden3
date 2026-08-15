@@ -12,7 +12,7 @@ describe('schema readiness', () => {
     const missing = await checkSchemaReadiness(async () => hashes.slice(0, -1));
     expect(missing).toMatchObject({
       status: 'missing_migrations',
-      expectedMigration: '0047_voice_backend',
+      expectedMigration: '0048_voice_clone_clip_bounds',
       expectedCount: hashes.length,
       appliedCount: hashes.length - 1,
       missingCount: 1,
@@ -22,7 +22,7 @@ describe('schema readiness', () => {
     const ready = await checkSchemaReadiness(async () => hashes);
     expect(ready).toMatchObject({
       status: 'ready',
-      expectedMigration: '0047_voice_backend',
+      expectedMigration: '0048_voice_clone_clip_bounds',
       expectedCount: hashes.length,
       appliedCount: hashes.length,
       missingCount: 0,

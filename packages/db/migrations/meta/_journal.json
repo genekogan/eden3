@@ -337,6 +337,13 @@
       "when": 1786810300000,
       "tag": "0047_voice_backend",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1786810400000,
+      "tag": "0048_voice_clone_clip_bounds",
+      "breakpoints": true
     }
   ]
 }

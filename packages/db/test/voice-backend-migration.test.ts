@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const migrationPath = fileURLToPath(new URL('../migrations/0047_voice_backend.sql', import.meta.url));
+const boundsMigrationPath = fileURLToPath(new URL('../migrations/0048_voice_clone_clip_bounds.sql', import.meta.url));
 const journalPath = fileURLToPath(new URL('../migrations/meta/_journal.json', import.meta.url));
 
 describe('0047 voice backend custody', () => {
@@ -23,10 +24,18 @@ describe('0047 voice backend custody', () => {
     expect(migration).toContain("account_erasure_target_claim_matches(v_owner,'voice_output'");
     expect(migration).toContain('account_erasure_unclaimed_seal_matches(v_owner)');
     expect(migration).toContain('"attempt_count" between 0 and 1');
-    expect(migration).toContain('"duration_ms" between 100 and 30000');
-    expect(migration).toContain('"size_bytes" between 1 and 20971520');
+    expect(migration).toContain('"duration_ms" between 3000 and 10000');
+    expect(migration).toContain('"size_bytes" between 1 and 16777216');
     expect(migration).toContain('account_erasure_assert_no_open_work');
     expect(migration).toContain("v.status IN ('pending_validation','cloning','provider_create_ambiguous','provider_delete_pending','provider_delete_failed')");
+  });
+
+  it('widens clip bounds additively without rewriting an applied 0047', async () => {
+    const migration = await readFile(boundsMigrationPath, 'utf8');
+    expect(migration).toContain('DROP CONSTRAINT "voice_clone_clips_size_chk"');
+    expect(migration).toContain('"size_bytes" between 1 and 20971520');
+    expect(migration).toContain('DROP CONSTRAINT "voice_clone_clips_duration_chk"');
+    expect(migration).toContain('"duration_ms" between 100 and 30000');
   });
 
   it('keeps migration timestamps strictly increasing so 0047 cannot be skipped after 0046', async () => {

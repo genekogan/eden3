@@ -58,8 +58,8 @@ CREATE TABLE "voice_clone_clips" (
 	CONSTRAINT "voice_clone_clips_position_uq" UNIQUE("clone_id","position"),
 	CONSTRAINT "voice_clone_clips_hash_chk" CHECK ("sha256" ~ '^[0-9a-f]{64}$'),
 	CONSTRAINT "voice_clone_clips_mime_chk" CHECK ("mime" in ('audio/wav','audio/mpeg')),
-	CONSTRAINT "voice_clone_clips_size_chk" CHECK ("size_bytes" between 1 and 20971520),
-	CONSTRAINT "voice_clone_clips_duration_chk" CHECK ("duration_ms" between 100 and 30000)
+	CONSTRAINT "voice_clone_clips_size_chk" CHECK ("size_bytes" between 1 and 16777216),
+	CONSTRAINT "voice_clone_clips_duration_chk" CHECK ("duration_ms" between 3000 and 10000)
 );
 --> statement-breakpoint
 CREATE TABLE "voice_quotes" (
