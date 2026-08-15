@@ -16,16 +16,30 @@ class MemoryDraftStore {
   chunks: DictationChunkRecord[] = [];
 
   async putDraft(draft: DictationDraftRecord) { this.draft = draft; }
+  private current(draft: DictationDraftRecord) {
+    if (!this.draft || this.draft.id !== draft.id || this.draft.generation !== draft.generation) {
+      throw new Error("This dictation was resumed in another view.");
+    }
+    return this.draft;
+  }
+  async claimDraft(draft: DictationDraftRecord) {
+    const current = this.current(draft);
+    this.draft = { ...current, generation: current.generation + 1, updatedAt: Date.now() };
+    return this.draft;
+  }
   async appendChunk(draft: DictationDraftRecord, audio: Blob, durationMs: number) {
+    this.current(draft);
     this.chunks.push({ draftId: draft.id, index: draft.nextChunkIndex, bytes: audio.size, audio });
     this.draft = { ...draft, durationMs, nextChunkIndex: draft.nextChunkIndex + 1, updatedAt: Date.now() };
     return this.draft;
   }
   async updatePhase(draft: DictationDraftRecord, phase: DictationDraftRecord["phase"]) {
+    this.current(draft);
     this.draft = { ...draft, phase, updatedAt: Date.now() };
     return this.draft;
   }
   async complete(draft: DictationDraftRecord, transcript: string) {
+    this.current(draft);
     this.draft = { ...draft, phase: "complete" as const, transcript, updatedAt: Date.now() };
     return this.draft;
   }
@@ -33,9 +47,11 @@ class MemoryDraftStore {
   async acknowledge(draftId: string, throughIndex: number) {
     this.chunks = this.chunks.filter((chunk) => chunk.draftId !== draftId || chunk.index > throughIndex);
   }
-  async deleteDraft(draftId: string) {
-    this.chunks = this.chunks.filter((chunk) => chunk.draftId !== draftId);
+  async deleteDraft(draft: DictationDraftRecord) {
+    this.current(draft);
+    this.chunks = this.chunks.filter((chunk) => chunk.draftId !== draft.id);
     this.draft = null;
+    return true;
   }
 }
 
@@ -162,5 +178,41 @@ describe("durable dictation session", () => {
     await expect(finishing).rejects.toThrow(/cancelled/);
     expect(finalize).not.toHaveBeenCalled();
     expect(store.draft).toBeNull();
+  });
+
+  it("fences an old SPA finalize after a recovered instance consumes the draft", async () => {
+    const store = new MemoryDraftStore();
+    let releaseOld!: () => void;
+    const oldWait = new Promise<void>((resolve) => { releaseOld = resolve; });
+    let finalizeCalls = 0;
+    const remote = transport({
+      finalize: vi.fn(async () => {
+        finalizeCalls += 1;
+        if (finalizeCalls === 1) await oldWait;
+        return { transcript: finalizeCalls === 1 ? "stale words" : "accepted words" };
+      }),
+    });
+    const oldSession = await DurableDictationSession.create({
+      ownerId: "account-1",
+      store: store as never,
+      transport: remote,
+    });
+    await oldSession.append(new Blob(["audio"]), 1_000);
+    await oldSession.flush();
+    const oldFinish = oldSession.finish();
+    await vi.waitFor(() => expect(store.draft?.phase).toBe("finalizing"));
+    const recovered = await DurableDictationSession.recover(store.draft!, {
+      ownerId: "account-1",
+      store: store as never,
+      transport: remote,
+    });
+    await expect(recovered.finish()).resolves.toBe("accepted words");
+    await expect(recovered.consume()).resolves.toBe("accepted words");
+    expect(store.draft).toBeNull();
+
+    releaseOld();
+    await expect(oldFinish).rejects.toThrow(/resumed in another view/);
+    expect(store.draft).toBeNull();
+    expect(finalizeCalls).toBe(2);
   });
 });

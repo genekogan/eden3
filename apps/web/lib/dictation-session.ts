@@ -1,4 +1,5 @@
 import {
+  DictationDraftSupersededError,
   DictationDraftStore,
   currentDictationCustodyEpoch,
   type DictationDraftRecord,
@@ -88,6 +89,7 @@ export class DurableDictationSession {
       id: crypto.randomUUID(),
       ownerId: options.ownerId,
       custodyEpoch: currentDictationCustodyEpoch(),
+      generation: 1,
       remoteId: remote.id,
       finalizeKey: crypto.randomUUID(),
       mimeType: "audio/pcm;rate=16000;channels=1",
@@ -101,11 +103,13 @@ export class DurableDictationSession {
     return new DurableDictationSession(draft, options);
   }
 
-  static recover(
+  static async recover(
     draft: DictationDraftRecord,
     options: DurableDictationOptions,
-  ): DurableDictationSession {
-    return new DurableDictationSession(draft, options);
+  ): Promise<DurableDictationSession> {
+    if (draft.ownerId !== options.ownerId) throw new Error("Dictation belongs to another account.");
+    const claimed = await options.store.claimDraft(draft);
+    return new DurableDictationSession(claimed, options);
   }
 
   get durationMs(): number {
@@ -120,7 +124,7 @@ export class DurableDictationSession {
 
   private async ensureActive(): Promise<void> {
     if (!this.cancelled) return;
-    await this.options.store.deleteDraft(this.draft.id);
+    await this.options.store.deleteDraft(this.draft).catch(() => false);
     throw new Error("Dictation was cancelled.");
   }
 
@@ -215,8 +219,12 @@ export class DurableDictationSession {
       this.closed = true;
       return transcript;
     } catch (error) {
+      if (error instanceof DictationDraftSupersededError) {
+        this.closed = true;
+        throw error;
+      }
       if (this.cancelled) {
-        await this.options.store.deleteDraft(this.draft.id);
+        await this.options.store.deleteDraft(this.draft).catch(() => false);
         throw error;
       }
       this.draft = await this.options.store.updatePhase(this.draft, "failed");
@@ -224,10 +232,11 @@ export class DurableDictationSession {
     }
   }
 
-  /** Delete the completed local receipt only after the UI accepted its text. */
-  async consume(): Promise<void> {
-    if (!this.closed || this.draft.phase !== "complete") return;
-    await this.options.store.deleteDraft(this.draft.id);
+  /** Atomically win one transcript-delivery lease before the UI inserts text. */
+  async consume(): Promise<string | null> {
+    if (!this.closed || this.draft.phase !== "complete") return null;
+    await this.options.store.deleteDraft(this.draft);
+    return this.draft.transcript?.trim() ?? "";
   }
 
   async cancel(): Promise<void> {
@@ -238,7 +247,9 @@ export class DurableDictationSession {
       try {
         await this.options.transport.cancel(this.draft.remoteId);
       } finally {
-        await this.options.store.deleteDraft(this.draft.id);
+        await this.options.store.deleteDraft(this.draft).catch((error) => {
+          if (!(error instanceof DictationDraftSupersededError)) throw error;
+        });
         this.closed = true;
       }
     })();

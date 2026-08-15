@@ -111,6 +111,7 @@ describe("dictation UI helpers", () => {
     clearDictationPurgeFence(fence, fenceStore);
     const delayedDraft = {
       id: "delayed", ownerId: "account-1", custodyEpoch: oldEpoch,
+      generation: 1,
       remoteId: "remote", finalizeKey: "finalize", mimeType: "audio/pcm",
       createdAt: 1, updatedAt: 1, durationMs: 1_000, nextChunkIndex: 1, phase: "recording" as const,
     };
@@ -148,6 +149,7 @@ describe("dictation UI helpers", () => {
       id,
       ownerId,
       custodyEpoch: "test-epoch",
+      generation: 1,
       remoteId: `remote-${id}`,
       finalizeKey: `finalize-${id}`,
       mimeType: "audio/pcm;rate=16000;channels=1",
