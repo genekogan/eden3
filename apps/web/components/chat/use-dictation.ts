@@ -120,10 +120,10 @@ export function useDictation({
         if (mountedRef.current) {
           setState((current) => ({ ...current, phase: "transcribing", message: null }));
         }
-        const transcript = await session.finish();
+        await session.finish();
         if (mountedRef.current) {
-          onTranscript(transcript);
-          await session.consume();
+          const accepted = await session.consume();
+          if (accepted !== null) onTranscript(accepted);
           setState({ phase: "idle", elapsedMs: 0, message: null });
         }
       } catch (error) {
@@ -289,12 +289,13 @@ export function useDictation({
         const [draft] = await store().recoverableDrafts(ownerId);
         if (!draft || disposed || sessionRef.current) return;
         setState({ phase: "recovering", elapsedMs: draft.durationMs, message: "Recovering your recording…" });
-        const recovered = DurableDictationSession.recover(draft, { ownerId, store: store(), transport });
+        const recovered = await DurableDictationSession.recover(draft, { ownerId, store: store(), transport });
+        if (disposed || sessionRef.current) return;
         sessionRef.current = recovered;
-        const transcript = await recovered.finish();
+        await recovered.finish();
         if (!disposed) {
-          onTranscript(transcript);
-          await recovered.consume();
+          const accepted = await recovered.consume();
+          if (accepted !== null) onTranscript(accepted);
           setState({ phase: "idle", elapsedMs: 0, message: null });
         }
       } catch (error) {
