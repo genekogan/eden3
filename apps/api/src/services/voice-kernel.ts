@@ -82,6 +82,7 @@ interface DirectVoiceJobRow {
   status: 'queued' | 'generating' | 'attachment_pending' | 'completed' | 'failed';
   generation: number;
   execution_id: string | null;
+  refresh_state: 'none' | 'pending' | 'published';
   last_error_code: string | null;
   updated_at: Date | string;
 }
@@ -103,7 +104,7 @@ export interface VoiceKernelOptions {
   dailyMannaCap?: number;
   cleanupArtifact: (sha256: string, mime: string) => Promise<void>;
   /** Idempotently removes one unshared, private voice-clip object and cache entry. */
-  deletePrivateClip?: (object: StoredObject) => Promise<void>;
+  deletePrivateClip?: (object: StoredObject, signal?: AbortSignal) => Promise<void>;
 }
 
 function rows<T>(result: unknown): T[] {
@@ -689,7 +690,7 @@ export class VoiceKernel {
   private async settleDirectVoiceAttachment(
     messageId: string,
     signal?: AbortSignal,
-  ): Promise<{ execution: VoiceExecutionDto; message: MessageDto; newlySettled: boolean }> {
+  ): Promise<{ execution: VoiceExecutionDto; message: MessageDto; refreshPending: boolean }> {
     assertVoiceReconciliationActive(signal);
     try {
       return await this.dbc.transaction(async (tx) => {
@@ -697,7 +698,7 @@ export class VoiceKernel {
       assertVoiceReconciliationActive(signal);
       const job = rows<DirectVoiceJobRow>(jobResult)[0];
       if (!job) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
-      if (job.status === 'completed') return { ...(await this.loadDirectVoiceResult(tx, job)), newlySettled: false };
+      if (job.status === 'completed') return { ...(await this.loadDirectVoiceResult(tx, job)), refreshPending: job.refresh_state === 'pending' };
       if (job.status !== 'attachment_pending' || !job.execution_id) {
         throw new VoiceKernelError(409, 'voice_execution_in_progress', 'Voice note is still being prepared');
       }
@@ -739,13 +740,13 @@ export class VoiceKernel {
       assertVoiceReconciliationActive(signal);
       if (rows(usageResult).length !== 1) throw new Error('direct voice settlement lost usage custody');
       const jobCompleted = await tx.execute(sql`
-        update direct_voice_jobs set status='completed',completed_at=statement_timestamp(),updated_at=statement_timestamp(),last_error_code=null
+        update direct_voice_jobs set status='completed',refresh_state='pending',completed_at=statement_timestamp(),updated_at=statement_timestamp(),last_error_code=null
         where message_id=${job.message_id} and status='attachment_pending'
         returning message_id
       `);
       assertVoiceReconciliationActive(signal);
       if (rows(jobCompleted).length !== 1) throw new Error('direct voice settlement lost job custody');
-        return { execution: executionDto(completed, false), message: directVoiceMessageDto(message), newlySettled: true };
+        return { execution: executionDto(completed, false), message: directVoiceMessageDto(message), refreshPending: true };
       });
     } catch (error) {
       if (error instanceof VoiceKernelError && error.code === 'voice_message_not_eligible') {
@@ -767,14 +768,14 @@ export class VoiceKernel {
   private async processDirectVoiceJob(
     messageId: string,
     signal?: AbortSignal,
-  ): Promise<{ execution: VoiceExecutionDto; message: MessageDto; newlySettled: boolean }> {
+  ): Promise<{ execution: VoiceExecutionDto; message: MessageDto; refreshPending: boolean }> {
     assertVoiceReconciliationActive(signal);
     const claim = await this.dbc.transaction(async (tx) => {
       assertVoiceReconciliationActive(signal);
       const result = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
       const job = rows<DirectVoiceJobRow>(result)[0];
       if (!job) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
-      if (job.status === 'completed') return { result: { ...(await this.loadDirectVoiceResult(tx, job)), newlySettled: false }, job: null } as const;
+      if (job.status === 'completed') return { result: { ...(await this.loadDirectVoiceResult(tx, job)), refreshPending: job.refresh_state === 'pending' }, job: null } as const;
       if (job.status === 'attachment_pending') return { result: null, job } as const;
       if (job.status !== 'queued') throw new VoiceKernelError(409, 'voice_execution_in_progress', 'Voice note is already being prepared');
       await tx.execute(sql`update direct_voice_jobs set status='generating',updated_at=statement_timestamp(),last_error_code=null where message_id=${messageId} and status='queued'`);
@@ -840,9 +841,8 @@ export class VoiceKernel {
     }
   }
 
-  async processAutomaticDirectVoice(messageId: string): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
-    const { newlySettled: _newlySettled, ...result } = await this.processDirectVoiceJob(messageId);
-    return result;
+  async processAutomaticDirectVoice(messageId: string): Promise<{ execution: VoiceExecutionDto; message: MessageDto; refreshPending: boolean }> {
+    return await this.processDirectVoiceJob(messageId);
   }
 
   async directVoiceNote(
@@ -851,7 +851,7 @@ export class VoiceKernel {
     messageId: string,
     _clientIdempotencyKey: string,
     requiredMode?: 'always',
-  ): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
+  ): Promise<{ execution: VoiceExecutionDto; message: MessageDto; refreshPending: boolean }> {
     const disposition = await this.dbc.transaction(async (tx) => {
       let result = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
       let job = rows<DirectVoiceJobRow>(result)[0];
@@ -890,9 +890,21 @@ export class VoiceKernel {
       `);
       return { completed: null } as const;
     });
-    if (disposition.completed) return disposition.completed;
-    const { newlySettled: _newlySettled, ...result } = await this.processDirectVoiceJob(messageId);
-    return result;
+    if (disposition.completed) {
+      const state = await this.dbc.execute(sql`select refresh_state from direct_voice_jobs where message_id=${messageId}`);
+      return { ...disposition.completed, refreshPending: rows<{ refresh_state: string }>(state)[0]?.refresh_state === 'pending' };
+    }
+    return await this.processDirectVoiceJob(messageId);
+  }
+
+  /** A refresh event is acknowledged only after its idempotent refetch signal was published. */
+  async markDirectVoiceRefreshPublished(messageId: string): Promise<boolean> {
+    const result = await this.dbc.execute(sql`
+      update direct_voice_jobs set refresh_state='published',updated_at=statement_timestamp()
+      where message_id=${messageId} and status='completed' and refresh_state='pending'
+      returning message_id
+    `);
+    return rows(result).length === 1;
   }
 
   /** Durable outbox recovery; safe to run repeatedly and across processes. */
@@ -902,14 +914,19 @@ export class VoiceKernel {
   ): Promise<{ processed: number; settled: Array<{ sessionId: string; messageId: string }> }> {
     assertVoiceReconciliationActive(signal);
     const result = await this.dbc.execute(sql`
-      select message_id,status,generation,execution_id from direct_voice_jobs
+      select message_id,session_id,status,generation,execution_id,refresh_state from direct_voice_jobs
       where status in ('queued','attachment_pending') or (status='generating' and updated_at<${cutoff.toISOString()})
+        or (status='completed' and refresh_state='pending')
       order by updated_at,message_id limit 100
     `);
     const settled: Array<{ sessionId: string; messageId: string }> = [];
-    for (const pending of rows<Pick<DirectVoiceJobRow, 'message_id' | 'status' | 'generation' | 'execution_id'>>(result)) {
+    for (const pending of rows<Pick<DirectVoiceJobRow, 'message_id' | 'session_id' | 'status' | 'generation' | 'execution_id' | 'refresh_state'>>(result)) {
       assertVoiceReconciliationActive(signal);
       try {
+        if (pending.status === 'completed' && pending.refresh_state === 'pending') {
+          settled.push({ sessionId: pending.session_id, messageId: pending.message_id });
+          continue;
+        }
         if (pending.status === 'attachment_pending' && pending.execution_id) {
           const terminalResult = await this.dbc.execute(sql`select status from voice_executions where id=${pending.execution_id}`);
           const terminal = rows<{ status: string }>(terminalResult)[0];
@@ -941,7 +958,7 @@ export class VoiceKernel {
           }
         }
         const recovered = await this.processDirectVoiceJob(pending.message_id, signal);
-        if (recovered.newlySettled) {
+        if (recovered.refreshPending) {
           settled.push({ sessionId: recovered.message.sessionId, messageId: recovered.message.id });
         }
       } catch (error) {
@@ -1275,10 +1292,11 @@ export class VoiceKernel {
       }
     }
     clone = await this.dbc.transaction(async (tx) => {
-      // Once private-object cleanup starts, the row lock is the generation
-      // fence. Finish physical+DB custody atomically even if the scheduler's
-      // wall-clock deadline expires; a newer pass will block and then replay
-      // the terminal row instead of overlapping this irreversible section.
+      assertVoiceReconciliationActive(signal);
+      // The row locks fence reference election while bounded storage deletion
+      // runs. Abort propagates through the object backend so a stuck provider
+      // cannot retain a database connection beyond the reconciliation lease;
+      // any abort rolls this transaction back for a later clean retry.
       const currentResult = await tx.execute(sql`
         select * from voice_clones where id=${id} and owner_account_id=${ownerAccountId}
           and status in ('revoked','provider_delete_pending','provider_delete_failed') for update
@@ -1309,6 +1327,7 @@ export class VoiceKernel {
         throw new VoiceKernelError(503, 'voice_storage_unavailable', 'Voice clip deletion storage is unavailable');
       }
       for (const clip of removable) {
+        assertVoiceReconciliationActive(signal);
         if (!clip.verified_sha256 || clip.verified_size_bytes === null || !clip.verified_mime || clip.backing_store === 'legacy') {
           throw new VoiceKernelError(409, 'clone_delete_pending', 'Voice clip deletion metadata is incomplete');
         }
@@ -1321,11 +1340,14 @@ export class VoiceKernel {
             sha256: clip.verified_sha256,
             sizeBytes: Number(clip.verified_size_bytes),
             mime: clip.verified_mime,
-          });
-        } catch {
+          }, signal);
+          assertVoiceReconciliationActive(signal);
+        } catch (error) {
+          if (signal?.aborted) throw error;
           throw new VoiceKernelError(503, 'clone_clip_cleanup_pending', 'Voice clip deletion requires retry');
         }
       }
+      assertVoiceReconciliationActive(signal);
       await tx.execute(sql`delete from voice_clone_clips where clone_id=${id}`);
       if (removable.length > 0) {
         const ids = removable.map((clip) => clip.id);

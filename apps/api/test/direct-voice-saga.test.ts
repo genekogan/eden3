@@ -30,6 +30,7 @@ function rowsFor(statement: unknown, missing?: 'message' | 'usage' | 'job', comp
     message_id: MESSAGE, owner_account_id: OWNER, session_id: SESSION, agent_account_id: AGENT,
     voice_id: 'deepinfra:kokoro:af_bella:v1', text_sha256: 'a'.repeat(64), mode: 'always',
     status: completed ? 'completed' : 'attachment_pending', generation: 0, execution_id: EXECUTION, last_error_code: null,
+    refresh_state: completed ? 'pending' : 'none',
     updated_at: new Date(),
   }];
   if (query.startsWith('select * from voice_executions')) return [{
@@ -95,9 +96,9 @@ describe('direct voice attachment settlement saga', () => {
       execute: vi.fn(async () => []),
     });
     const result = await (kernel as unknown as {
-      settleDirectVoiceAttachment(messageId: string): Promise<{ newlySettled: boolean }>;
+      settleDirectVoiceAttachment(messageId: string): Promise<{ refreshPending: boolean }>;
     }).settleDirectVoiceAttachment(MESSAGE);
-    expect(result.newlySettled).toBe(false);
+    expect(result.refreshPending).toBe(true);
     expect(executed.some((query) => query.startsWith('update messages set attachments'))).toBe(false);
     expect(executed.some((query) => query.startsWith("update usage_events set status='completed'"))).toBe(false);
   });

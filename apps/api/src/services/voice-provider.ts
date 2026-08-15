@@ -1,7 +1,24 @@
-import { setTimeout as delay } from 'node:timers/promises';
-
 const MAX_PROVIDER_BYTES = 10 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 25_000;
+
+interface ProviderResponseCustody {
+  signal: AbortSignal;
+  abort: () => void;
+  release: () => void;
+}
+
+const responseCustody = new WeakMap<Response, ProviderResponseCustody>();
+
+function releaseProviderResponse(response: Response): void {
+  responseCustody.get(response)?.release();
+  responseCustody.delete(response);
+}
+
+function abortProviderResponse(response: Response): void {
+  responseCustody.get(response)?.abort();
+  void response.body?.cancel().catch(() => undefined);
+  releaseProviderResponse(response);
+}
 
 export class VoiceProviderError extends Error {
   constructor(
@@ -53,26 +70,43 @@ function safeHeader(response: Response, name: string): string | null {
   return value && /^[A-Za-z0-9_.:-]{1,255}$/.test(value) ? value : null;
 }
 
-async function boundedBytes(response: Response, maximum = MAX_PROVIDER_BYTES): Promise<Buffer> {
+async function boundedBytes(response: Response, maximum = MAX_PROVIDER_BYTES, signal?: AbortSignal): Promise<Buffer> {
   const declared = Number(response.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > maximum) {
     throw new VoiceProviderError('provider_response_too_large', true);
   }
   if (!response.body) throw new VoiceProviderError('provider_response_invalid', true);
   const reader = response.body.getReader();
+  const custody = responseCustody.get(response);
+  // Direct test/helper callers still receive a bounded body read. Provider
+  // calls use the one absolute signal created before the request started.
+  const activeSignal = signal ?? custody?.signal ?? AbortSignal.timeout(DEFAULT_TIMEOUT_MS);
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maximum) {
-      await reader.cancel();
-      throw new VoiceProviderError('provider_response_too_large', true);
+  const aborted = new Promise<never>((_resolve, reject) => {
+    const rejectAbort = () => reject(activeSignal.reason ?? new DOMException('Aborted', 'AbortError'));
+    if (activeSignal.aborted) rejectAbort();
+    else activeSignal.addEventListener('abort', rejectAbort, { once: true });
+  });
+  try {
+    while (true) {
+      const { done, value } = await Promise.race([reader.read(), aborted]);
+      if (done) break;
+      total += value.byteLength;
+      if (total > maximum) {
+        throw new VoiceProviderError('provider_response_too_large', true);
+      }
+      chunks.push(value);
     }
-    chunks.push(value);
+    return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total);
+  } catch (error) {
+    await reader.cancel(error).catch(() => undefined);
+    if (error instanceof VoiceProviderError) throw error;
+    throw new VoiceProviderError('provider_result_indeterminate', true);
+  } finally {
+    reader.releaseLock();
+    releaseProviderResponse(response);
   }
-  return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total);
 }
 
 async function fetchAtMostOnce(
@@ -82,29 +116,40 @@ async function fetchAtMostOnce(
   signal?: AbortSignal,
 ): Promise<Response> {
   const controller = new AbortController();
-  const timer = delay(DEFAULT_TIMEOUT_MS, undefined, { signal: controller.signal })
-    .then(() => controller.abort())
-    .catch(() => undefined);
+  const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
   let started = false;
   try {
     started = true;
-    return await fetchFn(url, { ...init, signal: controller.signal, redirect: 'error' });
+    const response = await fetchFn(url, { ...init, signal: controller.signal, redirect: 'error' });
+    let released = false;
+    responseCustody.set(response, {
+      signal: controller.signal,
+      abort: () => controller.abort(new DOMException('Provider response rejected', 'AbortError')),
+      release: () => {
+        if (released) return;
+        released = true;
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', abort);
+      },
+    });
+    return response;
   } catch {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
     throw new VoiceProviderError(
       started ? 'provider_result_indeterminate' : 'provider_unavailable',
       started,
     );
-  } finally {
-    controller.abort();
-    signal?.removeEventListener('abort', abort);
-    await timer;
   }
 }
 
 function assertOk(response: Response): void {
   if (response.ok) return;
+  // Error bodies are never useful to Eden and may be hostile/unbounded. Abort
+  // the underlying fetch and cancel its stream before releasing the deadline.
+  abortProviderResponse(response);
   throw new VoiceProviderError(
     response.status >= 500 ? 'provider_unavailable' : 'provider_rejected',
     true,
@@ -230,7 +275,11 @@ export class CartesiaVoiceClient implements VoiceProviderClient {
     const response = await fetchAtMostOnce(this.fetchFn, `https://api.cartesia.ai/voices/${encodeURIComponent(providerVoiceId)}`, {
       method: 'DELETE', headers: this.headers(),
     }, signal);
-    if (response.status !== 204 && response.status !== 404) assertOk(response);
+    try {
+      if (response.status !== 204 && response.status !== 404) assertOk(response);
+    } finally {
+      releaseProviderResponse(response);
+    }
   }
 
   async findOwnedCloneByName(name: string, signal?: AbortSignal): Promise<{ providerVoiceId: string } | null> {
@@ -300,4 +349,4 @@ export class ElevenLabsVoiceClient implements VoiceProviderClient {
   }
 }
 
-export const voiceProviderInternals = { boundedBytes, MAX_PROVIDER_BYTES };
+export const voiceProviderInternals = { boundedBytes, MAX_PROVIDER_BYTES, DEFAULT_TIMEOUT_MS };

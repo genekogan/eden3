@@ -9,6 +9,7 @@ CREATE TABLE "direct_voice_jobs" (
 	"status" text DEFAULT 'queued' NOT NULL,
 	"generation" integer DEFAULT 0 NOT NULL,
 	"execution_id" uuid REFERENCES "voice_executions"("id") ON DELETE set null,
+	"refresh_state" text DEFAULT 'none' NOT NULL,
 	"last_error_code" text,
 	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
 	"updated_at" timestamp with time zone DEFAULT now() NOT NULL,
@@ -19,10 +20,15 @@ CREATE TABLE "direct_voice_jobs" (
 	CONSTRAINT "direct_voice_jobs_generation_chk" CHECK ("generation" between 0 and 100),
 	CONSTRAINT "direct_voice_jobs_terminal_chk" CHECK (("status"='completed')=("completed_at" is not null)),
 	CONSTRAINT "direct_voice_jobs_execution_chk" CHECK (("status" in ('attachment_pending','completed'))=("execution_id" is not null)),
+	CONSTRAINT "direct_voice_jobs_refresh_chk" CHECK (
+		("status"='completed' and "refresh_state" in ('pending','published')) or
+		("status"<>'completed' and "refresh_state"='none')
+	),
 	CONSTRAINT "direct_voice_jobs_error_chk" CHECK ("last_error_code" is null or "last_error_code" ~ '^[a-z0-9_]{1,100}$')
 );
 CREATE UNIQUE INDEX "direct_voice_jobs_execution_uq" ON "direct_voice_jobs" ("execution_id") WHERE "execution_id" is not null;
-CREATE INDEX "direct_voice_jobs_reconcile_idx" ON "direct_voice_jobs" ("status","updated_at","message_id") WHERE "status" in ('queued','generating','attachment_pending');
+CREATE INDEX "direct_voice_jobs_reconcile_idx" ON "direct_voice_jobs" ("status","refresh_state","updated_at","message_id")
+	WHERE "status" in ('queued','generating','attachment_pending') or ("status"='completed' and "refresh_state"='pending');
 --> statement-breakpoint
 
 CREATE TRIGGER a_account_erasure_statement_lock BEFORE INSERT OR UPDATE OR DELETE ON "direct_voice_jobs"

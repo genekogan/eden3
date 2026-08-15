@@ -77,4 +77,83 @@ describe('voice providers are bounded and provider-free under test', () => {
     const oversized = new Response(new Uint8Array(4), { headers: { 'content-length': String(voiceProviderInternals.MAX_PROVIDER_BYTES + 1) } });
     await expect(voiceProviderInternals.boundedBytes(oversized)).rejects.toBeInstanceOf(VoiceProviderError);
   });
+
+  it('cancels a never-ending response body when its reconciliation lease aborts', async () => {
+    const cancel = vi.fn();
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull: () => new Promise<void>(() => undefined),
+      cancel,
+    }));
+    const controller = new AbortController();
+    const pending = voiceProviderInternals.boundedBytes(response, 1024, controller.signal);
+    controller.abort(new DOMException('lease expired', 'AbortError'));
+    await expect(pending).rejects.toMatchObject({ code: 'provider_result_indeterminate' });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('uses one cumulative deadline across slow headers and a slow response body', async () => {
+    vi.useFakeTimers();
+    const external = new AbortController();
+    const added = vi.spyOn(external.signal, 'addEventListener');
+    const removed = vi.spyOn(external.signal, 'removeEventListener');
+    try {
+      const fetchFn = vi.fn((_input: string | URL | Request, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+        const signal = init?.signal as AbortSignal;
+        const headerTimer = setTimeout(() => {
+          resolve(new Response(new ReadableStream<Uint8Array>({
+            start(controller) {
+              const bodyTimer = setTimeout(() => {
+                controller.enqueue(new Uint8Array([1]));
+                controller.close();
+              }, 10_000);
+              signal.addEventListener('abort', () => {
+                clearTimeout(bodyTimer);
+                controller.error(signal.reason);
+              }, { once: true });
+            },
+          })));
+        }, 20_000);
+        signal.addEventListener('abort', () => {
+          clearTimeout(headerTimer);
+          reject(signal.reason);
+        }, { once: true });
+      }));
+      const client = new DeepInfraKokoroClient('test-token', fetchFn as typeof fetch);
+      const pending = client.synthesize({
+        model: 'hexgrad/Kokoro-82M', providerVoiceId: 'af_bella', text: 'hello', signal: external.signal,
+      });
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'provider_result_indeterminate' });
+      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(voiceProviderInternals.DEFAULT_TIMEOUT_MS - 20_000);
+      await rejected;
+      expect(added).toHaveBeenCalled();
+      expect(removed).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts and cancels every rejected provider response body without retaining deadlines', async () => {
+    const signals: AbortSignal[] = [];
+    const cancels: Array<ReturnType<typeof vi.fn>> = [];
+    const fetchFn = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      signals.push(init?.signal as AbortSignal);
+      const cancel = vi.fn();
+      cancels.push(cancel);
+      return new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined),
+        cancel,
+      }), { status: 503 });
+    });
+    const client = new DeepInfraKokoroClient('test-token', fetchFn as typeof fetch);
+    for (let index = 0; index < 3; index += 1) {
+      await expect(client.synthesize({
+        model: 'hexgrad/Kokoro-82M', providerVoiceId: 'af_bella', text: 'hello',
+      })).rejects.toMatchObject({ code: 'provider_unavailable' });
+    }
+    await Promise.resolve();
+    expect(signals).toHaveLength(3);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    expect(cancels.every((cancel) => cancel.mock.calls.length === 1)).toBe(true);
+  });
 });

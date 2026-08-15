@@ -50,6 +50,8 @@ export interface TurnPump {
   /** Session the turn belongs to; null until turn.started/header on a new session. */
   readonly sessionId: string | null;
   readonly done: boolean;
+  /** Resolves only after the server's durable turn.started acknowledgement. */
+  readonly accepted: Promise<void>;
   /**
    * Replay entries with seq > fromSeq synchronously, then deliver live ones.
    * Returns a detach function (never aborts the underlying request).
@@ -78,15 +80,32 @@ class Pump implements TurnPump {
   private log: PumpEntry[] = [];
   private listeners = new Set<(entry: PumpEntry) => void>();
   readonly controller = new AbortController();
+  readonly accepted: Promise<void>;
+  private acceptResolve!: () => void;
+  private acceptReject!: (error: Error) => void;
+  private acceptanceSettled = false;
 
   constructor(content: string, attachments: MessageAttachment[], agent: AgentDto | null, sessionId: string | null) {
     this.content = content;
     this.attachments = attachments;
     this.agent = agent;
     this.sessionId = sessionId;
+    this.accepted = new Promise<void>((resolve, reject) => {
+      this.acceptResolve = resolve;
+      this.acceptReject = reject;
+    });
+    // Callers may intentionally ignore acceptance (adopted/background turns).
+    void this.accepted.catch(() => undefined);
   }
 
   push(entry: DistributiveOmit<PumpEntry, "seq">): void {
+    if (!this.acceptanceSettled && entry.kind === "event" && entry.event.type === "turn.started") {
+      this.acceptanceSettled = true;
+      this.acceptResolve();
+    } else if (!this.acceptanceSettled && ["rejected", "failed", "aborted", "finished"].includes(entry.kind)) {
+      this.acceptanceSettled = true;
+      this.acceptReject(new Error(entry.kind === "rejected" || entry.kind === "failed" ? entry.message : "Turn was not accepted."));
+    }
     this.seq += 1;
     const sequenced = { ...entry, seq: this.seq } as PumpEntry;
     this.log.push(sequenced);
@@ -288,3 +307,5 @@ export function startNewSessionTurn(body: {
 
   return { pump, ready };
 }
+
+export const turnPumpInternals = { Pump };

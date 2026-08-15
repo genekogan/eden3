@@ -1495,13 +1495,16 @@ export class ObjectService {
   }
 
   /** Idempotently erase one exact private object from cache and its backing store. */
-  async deletePrivate(object: StoredObject): Promise<void> {
+  async deletePrivate(object: StoredObject, signal?: AbortSignal): Promise<void> {
     this.assertDescriptor(object);
     if (object.backingStore === 'legacy') throw new Error('Legacy objects require their dedicated deletion workflow');
+    signal?.throwIfAborted();
     // Remove the local hydrated copy first. If backing deletion fails, the
     // durable descriptor remains and a later read can hydrate it again.
     await this.cache.remove(object.objectId);
-    await this.backend.delete(object.backingKey);
+    signal?.throwIfAborted();
+    await this.backend.delete(object.backingKey, signal);
+    signal?.throwIfAborted();
   }
 
   /** Proves a legacy source and the candidate backend resolve to identical verified bytes. */

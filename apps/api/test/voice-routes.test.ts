@@ -76,7 +76,8 @@ async function harness() {
     synthesize: vi.fn(async () => execution),
     assignment: vi.fn(async (_owner, _username, value) => ({ ...value, updatedAt: '2026-08-15T12:00:00.000Z' })),
     deleteAssignment: vi.fn(),
-    directVoiceNote: vi.fn(async () => ({ execution, message: { id: '77777777-7777-4777-8777-777777777777' } })),
+    directVoiceNote: vi.fn(async () => ({ execution, message: { id: '77777777-7777-4777-8777-777777777777' }, refreshPending: true })),
+    markDirectVoiceRefreshPublished: vi.fn(async () => true),
     cloneQuote: vi.fn(async () => ({ provider: 'cartesia', kind: 'instant', manna: 0, costUsd: 0, expiresAt: quote.expiresAt })),
     createClone: vi.fn(async () => clone),
     listClones: vi.fn(async () => []),
@@ -193,6 +194,7 @@ describe('voice HTTP contract', () => {
     kernel.directVoiceNote.mockResolvedValueOnce({
       execution: { ...execution, replayed: true },
       message: { id: '77777777-7777-4777-8777-777777777777' },
+      refreshPending: false,
     });
     const replay = await app.inject({
       method: 'POST',

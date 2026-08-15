@@ -232,11 +232,19 @@ export class DurableDictationSession {
     }
   }
 
-  /** Atomically win one transcript-delivery lease before the UI inserts text. */
-  async consume(): Promise<string | null> {
+  /**
+   * Hand the completed transcript to a durable, idempotent composer commit
+   * before erasing microphone custody. The draft remains recoverable if the
+   * handoff fails or the view disappears, and a losing CAS reports null.
+   */
+  async consume(
+    deliver: (transcript: string, deliveryId: string) => boolean | Promise<boolean>,
+  ): Promise<string | null> {
     if (!this.closed || this.draft.phase !== "complete") return null;
-    await this.options.store.deleteDraft(this.draft);
-    return this.draft.transcript?.trim() ?? "";
+    const transcript = this.draft.transcript?.trim() ?? "";
+    if (!await deliver(transcript, this.draft.id)) return null;
+    const deleted = await this.options.store.deleteDraft(this.draft);
+    return deleted ? transcript : null;
   }
 
   async cancel(): Promise<void> {

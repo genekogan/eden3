@@ -412,16 +412,16 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
     await pg`
       insert into direct_voice_jobs(
         message_id,owner_account_id,session_id,agent_account_id,voice_id,text_sha256,
-        mode,status,execution_id,completed_at
+        mode,status,execution_id,refresh_state,completed_at
       ) values
         (${humanMessage},${human},${humanSession},null,'deepinfra:kokoro:test:v1',
-          ${sha('human terminal voice')},'on_demand','completed',${executionId},statement_timestamp()),
+          ${sha('human terminal voice')},'on_demand','completed',${executionId},'published',statement_timestamp()),
         (${agentMessage},${foreign},${agentSession},${agent},'deepinfra:kokoro:test:v1',
-          ${sha('owned agent terminal voice')},'always','failed',null,null),
+          ${sha('owned agent terminal voice')},'always','failed',null,'none',null),
         (${foreignMessage},${foreign},${foreignSession},null,'deepinfra:kokoro:test:v1',
-          ${sha('foreign terminal voice')},'on_demand','failed',null,null),
+          ${sha('foreign terminal voice')},'on_demand','failed',null,'none',null),
         (${activeMessage},${activeHuman},${activeSession},null,'deepinfra:kokoro:test:v1',
-          ${sha('active queued voice')},'on_demand','queued',null,null)`;
+          ${sha('active queued voice')},'on_demand','queued',null,'none',null)`;
 
     const result = await requestAccountErasure({
       actorAccountId: human,
