@@ -29,6 +29,7 @@ const app = await buildServer({
   media: { autoStartWatcher: true },
   storage: { enabled: true, autoStartPolicyWorker: true },
   scheduler: { autoStart: true }, // eden3-side scheduled-task firing
+  transcriptions: { autoStartWorker: true },
 });
 
 await app.listen({ port: env.API_PORT, host: '127.0.0.1' });

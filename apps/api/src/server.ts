@@ -99,6 +99,7 @@ import { triggersRoutes } from './routes/triggers';
 import { usageRoutes } from './routes/usage';
 import { workspaceRoutes } from './routes/workspace';
 import { uploadsRoutes } from './routes/uploads';
+import { transcriptionsRoutes } from './routes/transcriptions';
 import {
   createStorageRuntime,
   storageCleanupIntervalMs,
@@ -113,6 +114,10 @@ import {
   safeCapabilityErrorMessage,
   safeNotFoundMessage,
 } from './services/share-cache-policy';
+import {
+  createTranscriptionRuntime,
+  type TranscriptionRuntime,
+} from './services/transcription-runtime';
 
 const requireCjs = createRequire(import.meta.url);
 const pkg = requireCjs('../package.json') as { version: string };
@@ -170,6 +175,12 @@ export interface BuildServerOptions {
     runtime?: StorageRuntime;
     /** Run the durable quarantine outbox loop; production entrypoints enable it. */
     autoStartPolicyWorker?: boolean;
+  };
+  transcriptions?: {
+    /** Fully injected runtime for deterministic route/server tests. */
+    runtime?: TranscriptionRuntime;
+    /** Production entrypoints start the durable provider worker. */
+    autoStartWorker?: boolean;
   };
   scheduler?: {
     /**
@@ -880,6 +891,23 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(sessionShareRoutes, {
     repository: opts.shares?.repository ?? new PostgresSessionShareRepository(),
   });
+  const transcriptionRuntime =
+    opts.transcriptions?.runtime ??
+    await createTranscriptionRuntime({
+      onError: (_error) => app.log.error({}, 'transcription worker tick failed'),
+    });
+  await app.register(transcriptionsRoutes, {
+    prefix: '/transcriptions',
+    service: transcriptionRuntime.service,
+    rateLimit: {
+      windowMs: env.TRANSCRIPTION_RATE_LIMIT_WINDOW_MS,
+      max: env.TRANSCRIPTION_RATE_LIMIT_MAX,
+    },
+  });
+  app.addHook('onClose', async () => transcriptionRuntime.stop());
+  if (opts.transcriptions?.autoStartWorker === true) {
+    app.addHook('onReady', async () => transcriptionRuntime.start());
+  }
   if (storageRuntime) {
     // Register the lifecycle-aware UUID route before the legacy static
     // wildcard. The backend and hydration cache are separately rooted and
