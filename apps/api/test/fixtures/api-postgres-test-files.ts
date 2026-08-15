@@ -41,6 +41,7 @@ export const API_POSTGRES_TEST_FILES = [
   'test/studio-reservation-reaper.test.ts',
   'test/studio-routes.test.ts',
   'test/task-scheduler.test.ts',
+  'test/transcription-postgres.test.ts',
   'test/triggers-routes.test.ts',
   'test/turn-reservation-reaper.test.ts',
   'test/turns-authorization.test.ts',

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -40,6 +40,7 @@ import {
   attestAccountErasureDatabaseBoundary,
   type AccountErasureDatabaseBoundary,
   PostgresAccountErasureStore,
+  PostgresAccountErasurePresealReconciler,
   PostgresAccountErasureTargetStore,
   LocalLegacyErasureExecutor,
 } from '../../src/services/account-erasure-postgres';
@@ -70,6 +71,12 @@ import {
   PostgresChannelTurnStore,
 } from '../../src/services/channel-metering';
 import { makeFakeProvisioner, makeFakeToolSync } from '../fixtures';
+import { PrivateTranscriptionAudioStore } from '../../src/services/transcription-audio-custody';
+import { PostgresTranscriptionRepository } from '../../src/services/transcription-postgres';
+import {
+  DeterministicTranscriptionProvider,
+  TranscriptionService,
+} from '../../src/services/transcriptions';
 
 const databaseName = new URL(process.env.DATABASE_URL ?? 'postgres://invalid/invalid')
   .pathname.slice(1);
@@ -1607,6 +1614,58 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       trigger_occurrence: null,
     });
     expect(reservations[WORK_TURN_OUTPUT]).toBeDefined();
+  }, 30_000);
+
+  it('reverses queued STT exactly and deletes private audio before its erasure locator', async () => {
+    const accountId = randomUUID();
+    const username = `erase_stt_${accountId.slice(0, 8)}`;
+    const audioRoot = await mkdtemp(join(tmpdir(), 'eden-erasure-stt-'));
+    try {
+      await pg`insert into accounts(id,type,username) values (${accountId},'user',${username})`;
+      await credit({ accountId, amount: 100, type: 'credit:test' });
+      const audio = new PrivateTranscriptionAudioStore(audioRoot);
+      await audio.initialize();
+      const repository = new PostgresTranscriptionRepository({
+        db,
+        audio,
+        dailyMannaCap: 10_000,
+        maxActivePerOwner: 2,
+        maxCreatedPerOwnerPerDay: 100,
+      });
+      const service = new TranscriptionService({
+        repository,
+        provider: new DeterministicTranscriptionProvider(),
+      });
+      const created = await service.create(accountId, {
+        idempotencyKey: randomUUID(),
+        language: 'en',
+      });
+      const body = Buffer.alloc(32_000, 3);
+      await service.appendChunk(accountId, created.id, 0, {
+        body,
+        sha256: createHash('sha256').update(body).digest('hex'),
+      });
+      const before = await getBalance(accountId);
+      await service.finalize(accountId, created.id, {
+        idempotencyKey: randomUUID(),
+        finalChunkNumber: 0,
+      });
+      const intent = await erasureStore().acceptIntent({ accountId, confirmUsername: username });
+      const reconciler = new PostgresAccountErasurePresealReconciler(operatorPg as never, audio);
+
+      await reconciler.reconcile({ accountId, jobId: intent.jobId, mode: 'unclaimed' });
+
+      expect(await getBalance(accountId)).toEqual(before);
+      const [truth] = await pg<{ sessions: number; usage_status: string; usage_manna: number }[]>`
+        select
+          (select count(*)::int from transcription_sessions where id=${created.id}) sessions,
+          (select status from usage_events where event_type='speech_transcription' and turn_id=${created.id}) usage_status,
+          (select manna from usage_events where event_type='speech_transcription' and turn_id=${created.id}) usage_manna`;
+      expect(truth).toEqual({ sessions: 0, usage_status: 'error', usage_manna: 0 });
+      await expect(access(join(audioRoot, accountId, created.id))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      await rm(audioRoot, { recursive: true, force: true });
+    }
   }, 30_000);
 
   it('holds unresolved Stripe and outbound effects before inventory in direct and recovery paths', async () => {
