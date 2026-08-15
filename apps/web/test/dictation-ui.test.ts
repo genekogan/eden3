@@ -12,6 +12,7 @@ import {
   DICTATION_DRAFT_TTL_MS,
   DICTATION_DB_NAME,
   DICTATION_COMPOSER_DRAFTS_KEY,
+  DICTATION_CUSTODY_EPOCH_KEY,
   DICTATION_SIGN_OUT_PURGE_DEADLINE_MS,
   beginDictationPurgeFence,
   commitDictationTranscriptToComposer,
@@ -36,6 +37,21 @@ const workletSource = readFileSync(
   new URL("../public/audio/pcm-recorder-worklet.js", import.meta.url),
   "utf8",
 );
+
+async function composerRows(indexedDB: IDBFactory): Promise<Array<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open(DICTATION_DB_NAME);
+    open.addEventListener("error", () => reject(open.error));
+    open.addEventListener("success", () => {
+      const database = open.result;
+      const transaction = database.transaction("composerDrafts", "readonly");
+      const request = transaction.objectStore("composerDrafts").getAll();
+      request.addEventListener("success", () => resolve(request.result as Array<Record<string, unknown>>));
+      request.addEventListener("error", () => reject(request.error));
+      transaction.addEventListener("complete", () => database.close());
+    });
+  });
+}
 
 describe("dictation UI helpers", () => {
   it("inserts reviewed transcript text without sending or destroying a typed draft", () => {
@@ -182,6 +198,102 @@ describe("dictation UI helpers", () => {
       .resolves.toBe("survives upgrade");
     await new DictationDraftStore(options).purgeAll();
     await expect(loadDictationComposerDraft("account-1", "session:upgrade", options)).resolves.toBeNull();
+  });
+
+  it("transactionally imports legacy composer custody and removes plaintext only after commit", async () => {
+    const now = Date.now();
+    const legacy = JSON.stringify({
+      version: 1,
+      records: [
+        {
+          ownerId: "account-1", custodyEpoch: "legacy-epoch", contextKey: "session:legacy",
+          value: "typed legacy transcript", deliveryIds: ["delivery-legacy"], updatedAt: now,
+        },
+        {
+          ownerId: "other-account", custodyEpoch: "legacy-epoch", contextKey: "session:foreign",
+          value: "foreign", deliveryIds: [], updatedAt: now,
+        },
+        {
+          ownerId: "account-1", custodyEpoch: "old-epoch", contextKey: "session:old",
+          value: "old epoch", deliveryIds: [], updatedAt: now,
+        },
+        {
+          ownerId: "account-1", custodyEpoch: "legacy-epoch", contextKey: "session:stale",
+          value: "stale", deliveryIds: [], updatedAt: now - DICTATION_DRAFT_TTL_MS - 1,
+        },
+        { ownerId: 42, value: "malformed" },
+      ],
+    });
+    const values = new Map<string, string>([
+      [DICTATION_COMPOSER_DRAFTS_KEY, legacy], [DICTATION_CUSTODY_EPOCH_KEY, "legacy-epoch"],
+    ]);
+    let failLegacyRemoval = true;
+    const purgeFenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => {
+        if (key === DICTATION_COMPOSER_DRAFTS_KEY && failLegacyRemoval) throw new Error("interrupted after commit");
+        values.delete(key);
+      },
+    };
+    const indexedDB = new IDBFactory();
+    const options = { indexedDB, purgeFenceStore };
+    await expect(loadDictationComposerDraft("account-1", "session:legacy", options))
+      .rejects.toThrow("interrupted after commit");
+    expect(values.get(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(legacy);
+
+    failLegacyRemoval = false;
+    await expect(loadDictationComposerDraft("account-1", "session:legacy", options))
+      .resolves.toBe("typed legacy transcript");
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(false);
+    await expect(composerRows(indexedDB)).resolves.toMatchObject([{
+      ownerId: "account-1", custodyEpoch: "legacy-epoch", contextKey: "session:legacy",
+    }]);
+    // Replay after an interrupted import retains the legacy delivery id, so
+    // the same completed dictation cannot append a second time.
+    await expect(commitDictationTranscriptToComposer(
+      "account-1", "session:legacy", "delivery-legacy", "typed legacy transcript", options,
+    )).resolves.toBe("typed legacy transcript");
+  });
+
+  it("retains legacy plaintext when IndexedDB migration cannot take custody", async () => {
+    const legacy = JSON.stringify({
+      version: 1,
+      records: [{
+        ownerId: "account-1", custodyEpoch: "legacy-epoch", contextKey: "session:legacy",
+        value: "must not disappear", deliveryIds: [], updatedAt: Date.now(),
+      }],
+    });
+    const values = new Map<string, string>([
+      [DICTATION_COMPOSER_DRAFTS_KEY, legacy], [DICTATION_CUSTODY_EPOCH_KEY, "legacy-epoch"],
+    ]);
+    const purgeFenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const brokenFactory = { open: () => { throw new Error("indexeddb unavailable"); } } as unknown as IDBFactory;
+    await expect(loadDictationComposerDraft("account-1", "session:legacy", {
+      indexedDB: brokenFactory, purgeFenceStore,
+    })).rejects.toThrow("indexeddb unavailable");
+    expect(values.get(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(legacy);
+  });
+
+  it("purges an unreadable legacy envelope without admitting any record", async () => {
+    const values = new Map<string, string>([
+      [DICTATION_COMPOSER_DRAFTS_KEY, "{not-json"], [DICTATION_CUSTODY_EPOCH_KEY, "legacy-epoch"],
+    ]);
+    const purgeFenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const indexedDB = new IDBFactory();
+    await expect(loadDictationComposerDraft("account-1", "session:legacy", {
+      indexedDB, purgeFenceStore,
+    })).resolves.toBeNull();
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(false);
+    await expect(composerRows(indexedDB)).resolves.toEqual([]);
   });
 
   it("invalidates a pre-fence writer even after the recovery purge clears its tombstone", () => {
