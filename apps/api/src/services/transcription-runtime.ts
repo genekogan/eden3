@@ -4,7 +4,7 @@ import { CartesiaTranscriptionProvider } from './cartesia-transcription-provider
 import { startBackgroundWorkerLoop, type BackgroundWorkerLoop } from './background-worker-loop';
 import { PrivateTranscriptionAudioStore } from './transcription-audio-custody';
 import { PostgresTranscriptionRepository } from './transcription-postgres';
-import { TranscriptionService } from './transcriptions';
+import { TranscriptionService, type TranscriptionProvider } from './transcriptions';
 
 export interface TranscriptionRuntime {
   service: TranscriptionService;
@@ -14,6 +14,8 @@ export interface TranscriptionRuntime {
 
 export async function createTranscriptionRuntime(options: {
   onError?: (error: unknown) => void;
+  /** Explicit provider injection for provider-free runtimes; undefined alone enables env resolution. */
+  provider?: TranscriptionProvider | null;
 } = {}): Promise<TranscriptionRuntime> {
   const env = getEnv();
   const audio = new PrivateTranscriptionAudioStore(env.TRANSCRIPTION_AUDIO_DIR);
@@ -24,9 +26,11 @@ export async function createTranscriptionRuntime(options: {
     maxActivePerOwner: env.TRANSCRIPTION_MAX_ACTIVE_PER_USER,
     maxCreatedPerOwnerPerDay: env.TRANSCRIPTION_MAX_CREATED_PER_USER_PER_DAY,
   });
-  const provider = env.CARTESIA_API_KEY
-    ? new CartesiaTranscriptionProvider({ apiKey: env.CARTESIA_API_KEY })
-    : null;
+  const provider = options.provider === undefined
+    ? (env.CARTESIA_API_KEY
+        ? new CartesiaTranscriptionProvider({ apiKey: env.CARTESIA_API_KEY })
+        : null)
+    : options.provider;
   const service = new TranscriptionService({ repository, provider });
   let loop: BackgroundWorkerLoop | null = null;
   return {
