@@ -173,6 +173,11 @@ export interface RunTurnDeps {
    * supplies the handle whose login/database identity was attested at boot.
    */
   db?: DbHandle;
+  /** Runs in the terminal assistant transaction (for durable side-effect outboxes). */
+  afterAssistantPersist?: (
+    tx: DbHandle,
+    input: { ownerAccountId: string; sessionId: string; messageId: string; agentAccountId: string; content: string },
+  ) => Promise<void>;
   /** Error sink for non-fatal background failures (default: swallow). */
   onError?: (err: unknown, context: string) => void;
 }
@@ -1487,6 +1492,13 @@ async function runClaimedTurn(
                 },
                 tx,
               );
+              await deps.afterAssistantPersist?.(tx, {
+                ownerAccountId: user.accountId,
+                sessionId: session.id,
+                messageId: inserted.id,
+                agentAccountId: agent.accountId,
+                content: assistantText,
+              });
               await recordUsageEvent(
                 {
                   status:

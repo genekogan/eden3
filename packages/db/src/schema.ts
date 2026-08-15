@@ -1798,6 +1798,28 @@ export const voiceExecutions = pgTable('voice_executions', {
   index('voice_executions_owner_created_idx').on(t.ownerAccountId, t.createdAt),
 ]);
 
+/** Durable, message-owned outbox for direct-chat voice delivery. */
+export const directVoiceJobs = pgTable('direct_voice_jobs', {
+  messageId: uuid('message_id').primaryKey().references(() => messages.id, { onDelete: 'cascade' }),
+  ownerAccountId: uuid('owner_account_id').notNull().references(() => accounts.id, { onDelete: 'restrict' }),
+  sessionId: uuid('session_id').notNull().references(() => sessions.id, { onDelete: 'cascade' }),
+  agentAccountId: uuid('agent_account_id').references(() => accounts.id, { onDelete: 'set null' }),
+  voiceId: text('voice_id').notNull(),
+  textSha256: text('text_sha256').notNull(),
+  mode: text('mode').$type<'on_demand' | 'always'>().notNull(),
+  status: text('status').$type<'queued' | 'generating' | 'attachment_pending' | 'completed' | 'failed'>().notNull().default('queued'),
+  generation: integer('generation').notNull().default(0),
+  executionId: uuid('execution_id').references(() => voiceExecutions.id, { onDelete: 'set null' }),
+  lastErrorCode: text('last_error_code'),
+  createdAt: timestamptz('created_at').notNull().defaultNow(),
+  updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  completedAt: timestamptz('completed_at'),
+}, (t) => [
+  uniqueIndex('direct_voice_jobs_execution_uq').on(t.executionId).where(sql`${t.executionId} is not null`),
+  index('direct_voice_jobs_reconcile_idx').on(t.status, t.updatedAt, t.messageId)
+    .where(sql`${t.status} in ('queued','generating','attachment_pending')`),
+]);
+
 // ---------------------------------------------------------------------------
 // storage_uploads — a durable resumable multipart session. The composite FK
 // binds its redundant owner to the object's owner at the database boundary.

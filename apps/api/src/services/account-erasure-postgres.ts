@@ -533,6 +533,8 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
         select exists(
           select 1 from voice_executions v join principals p on p.id in (v.owner_account_id,v.agent_account_id)
             where v.status in ('pending','provider_started','transcoding','refund_pending','artifact_cleanup_pending')
+          union all select 1 from direct_voice_jobs v join principals p on p.id in (v.owner_account_id,v.agent_account_id)
+            where v.status in ('queued','generating','attachment_pending')
           union all select 1 from voice_clones v join principals p on p.id=v.owner_account_id
             where v.status in ('pending_validation','cloning','provider_create_ambiguous','provider_delete_pending','provider_delete_failed')
         ) open`;
@@ -622,6 +624,8 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
             where u.status in ('pending','provider_admitted','running','refund_pending')
           union all select v.id::text from voice_executions v join principals p on p.id in (v.owner_account_id,v.agent_account_id)
             where v.status in ('pending','provider_started','transcoding','refund_pending','artifact_cleanup_pending')
+          union all select v.message_id::text from direct_voice_jobs v join principals p on p.id in (v.owner_account_id,v.agent_account_id)
+            where v.status in ('queued','generating','attachment_pending')
           union all select v.id::text from voice_clones v join principals p on p.id=v.owner_account_id
             where v.status in ('pending_validation','cloning','provider_create_ambiguous','provider_delete_pending','provider_delete_failed')
           union all select r.id::text from memory_dream_runs r join principals p on p.id=r.agent_account_id
@@ -799,6 +803,20 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           values (${input.jobId},${row.session_id},${row.message_id},${row.author_principal_id})
           on conflict (job_id,message_id) do nothing`;
       }
+
+      // Messages and sessions are privacy-scrubbed rather than physically
+      // deleted, so their FK cascades never remove terminal direct-voice
+      // receipts. Active jobs were rejected above; delete every principal-
+      // owned/agent terminal row under the erasure seal before scrubbing the
+      // referenced messages and before deleting noncompleted executions.
+      await tx`
+        with principals as (
+          select ${input.accountId}::uuid id union all
+          select account_id from agents where owner_id=${input.accountId}
+        )
+        delete from direct_voice_jobs v
+        where v.owner_account_id in (select id from principals)
+          or v.agent_account_id in (select id from principals)`;
 
       await tx`
         with principals as (select ${input.accountId}::uuid id union all select account_id from agents where owner_id=${input.accountId}),
