@@ -31,9 +31,22 @@ describe('voice contract invariants', () => {
     expect(quote.model).toBe('hexgrad/Kokoro-82M');
   });
 
+  it('binds retry identity to the voice and transcript, not a disposable quote row', () => {
+    const stable = {
+      operation: 'preview' as const,
+      voiceId: 'deepinfra:kokoro:af_bella:v1',
+      textSha256: 'a'.repeat(64),
+    };
+    expect(voiceKernelInternals.executionRequestHash(stable))
+      .toBe(voiceKernelInternals.executionRequestHash({ ...stable }));
+    expect(voiceKernelInternals.executionRequestHash(stable))
+      .not.toBe(voiceKernelInternals.executionRequestHash({ ...stable, voiceId: 'deepinfra:kokoro:af_heart:v1' }));
+  });
+
   it('keeps pre/post transcode limits conservative per destination', () => {
     expect(voiceAudioInternals.LIMITS.preview).toEqual({ durationMs: 30_000, bytes: 2 * 1024 * 1024 });
     expect(voiceAudioInternals.LIMITS.discord).toEqual({ durationMs: 120_000, bytes: 8 * 1024 * 1024 });
+    expect(voiceAudioInternals.CLONE_CLIP_LIMITS).toEqual({ minimumDurationMs: 100, maximumDurationMs: 30_000, maximumBytes: 20 * 1024 * 1024 });
     expect(Buffer.from(voiceAudioInternals.waveform(Buffer.alloc(1024, 7)), 'base64')).toHaveLength(64);
   });
 });

@@ -859,6 +859,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
               : {}),
           },
           cleanupArtifact: (sha256, mime) => voiceMediaStore.deleteByDigest(sha256, mime),
+          ...(storageRuntime
+            ? { deletePrivateClip: (object: Parameters<typeof storageRuntime.deletePrivateObject>[0]) => storageRuntime.deletePrivateObject(object) }
+            : {}),
         }),
         autoStartReconciler: process.env.NODE_ENV === 'production',
       };

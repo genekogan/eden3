@@ -47,6 +47,7 @@ export const API_POSTGRES_TEST_FILES = [
   'test/turns-authorization.test.ts',
   'test/turns-refund.test.ts',
   'test/turns-usage.test.ts',
+  'test/voice-postgres.test.ts',
   'test/workspace-routes.test.ts',
 ] as const;
 

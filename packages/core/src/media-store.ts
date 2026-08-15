@@ -1266,6 +1266,15 @@ export class StagingCache {
     entry.lastUsed = this.now();
     await this.evictFor(0);
   }
+
+  /** Remove one exact unpinned object. Refuse while a consumer still owns it. */
+  async remove(objectId: string): Promise<void> {
+    await this.ensureLoaded();
+    const entry = this.entries.get(objectId);
+    if (entry?.pins) throw new Error('Cannot remove a pinned staging cache entry');
+    await rm(this.pathFor(objectId), { force: true });
+    this.entries.delete(objectId);
+  }
 }
 
 export interface ObjectManifestEntry {
@@ -1483,6 +1492,16 @@ export class ObjectService {
       await Promise.all(acquired.map((entry) => entry.release()));
       throw error;
     }
+  }
+
+  /** Idempotently erase one exact private object from cache and its backing store. */
+  async deletePrivate(object: StoredObject): Promise<void> {
+    this.assertDescriptor(object);
+    if (object.backingStore === 'legacy') throw new Error('Legacy objects require their dedicated deletion workflow');
+    // Remove the local hydrated copy first. If backing deletion fails, the
+    // durable descriptor remains and a later read can hydrate it again.
+    await this.cache.remove(object.objectId);
+    await this.backend.delete(object.backingKey);
   }
 
   /** Proves a legacy source and the candidate backend resolve to identical verified bytes. */

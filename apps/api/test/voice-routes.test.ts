@@ -135,6 +135,7 @@ describe('voice HTTP contract', () => {
     expect(kernel.synthesize).toHaveBeenCalledWith({
       ownerAccountId: OWNER,
       operation: 'preview',
+      voiceId: VOICE_ID,
       quoteId: quote.quoteId,
       text: 'hello',
       idempotencyKey: 'preview-key-123',

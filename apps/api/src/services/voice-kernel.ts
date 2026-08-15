@@ -11,6 +11,7 @@ import {
   reverseReservation,
   type DbHandle,
   type MediaStore,
+  type StoredObject,
 } from '@eden3/core';
 import { db, pg } from '@eden3/db';
 import type { VoiceAssignmentDto, VoiceCatalogEntryDto, VoiceCloneDto, VoiceExecutionDto, VoiceQuoteDto } from '@eden3/shared';
@@ -85,6 +86,8 @@ export interface VoiceKernelOptions {
   now?: () => Date;
   dailyMannaCap?: number;
   cleanupArtifact: (sha256: string, mime: string) => Promise<void>;
+  /** Idempotently removes one unshared, private voice-clip object and cache entry. */
+  deletePrivateClip?: (object: StoredObject) => Promise<void>;
 }
 
 function rows<T>(result: unknown): T[] {
@@ -104,6 +107,26 @@ function exactTranscript(raw: string, operation: VoiceOperation = 'chat'): { tex
 
 function requestHash(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function executionRequestHash(input: {
+  operation: VoiceOperation;
+  voiceId: string;
+  textSha256: string;
+  agentAccountId?: string;
+  sessionId?: string;
+  messageId?: string;
+  channelTurnId?: string;
+}): string {
+  return requestHash({
+    operation: input.operation,
+    voiceId: input.voiceId,
+    textSha256: input.textSha256,
+    agentAccountId: input.agentAccountId ?? null,
+    sessionId: input.sessionId ?? null,
+    messageId: input.messageId ?? null,
+    channelTurnId: input.channelTurnId ?? null,
+  });
 }
 
 function iso(value: Date | string): string {
@@ -288,6 +311,7 @@ export class VoiceKernel {
   async synthesize(input: {
     ownerAccountId: string;
     operation: VoiceOperation;
+    voiceId: string;
     quoteId: string;
     text: string;
     idempotencyKey: string;
@@ -297,11 +321,7 @@ export class VoiceKernel {
     channelTurnId?: string;
   }): Promise<VoiceExecutionDto> {
     const transcript = exactTranscript(input.text, input.operation);
-    const requestSha256 = requestHash({
-      operation: input.operation, quoteId: input.quoteId, textSha256: transcript.sha256,
-      agentAccountId: input.agentAccountId ?? null, sessionId: input.sessionId ?? null,
-      messageId: input.messageId ?? null, channelTurnId: input.channelTurnId ?? null,
-    });
+    const requestSha256 = executionRequestHash({ ...input, textSha256: transcript.sha256 });
 
     const admission = await this.dbc.transaction(async (tx) => {
       const priorResult = await tx.execute(sql`
@@ -317,7 +337,7 @@ export class VoiceKernel {
       const quoteResult = await tx.execute(sql`select * from voice_quotes where id=${input.quoteId} and owner_account_id=${input.ownerAccountId} for update`);
       const quote = rows<QuoteRow>(quoteResult)[0];
       if (!quote || quote.consumed_at !== null || new Date(quote.expires_at).getTime() <= this.now().getTime() ||
-        quote.operation !== input.operation || quote.text_sha256 !== transcript.sha256 ||
+        quote.operation !== input.operation || quote.voice_id !== input.voiceId || quote.text_sha256 !== transcript.sha256 ||
         quote.character_count !== transcript.characterCount || quote.table_version !== COST_TABLE_VERSION) {
         throw new VoiceKernelError(409, 'voice_quote_mismatch', 'Voice quote is expired, consumed, or mismatched');
       }
@@ -523,7 +543,7 @@ export class VoiceKernel {
     const row = rows<{ content: string | null; agent_account_id: string; voice_id: string }>(result)[0];
     if (!row?.content) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
     const quote = await this.quote(ownerAccountId, 'chat', row.voice_id, row.content);
-    const execution = await this.synthesize({ ownerAccountId, operation: 'chat', quoteId: quote.quoteId, text: row.content, idempotencyKey, agentAccountId: row.agent_account_id, sessionId, messageId });
+    const execution = await this.synthesize({ ownerAccountId, operation: 'chat', voiceId: row.voice_id, quoteId: quote.quoteId, text: row.content, idempotencyKey, agentAccountId: row.agent_account_id, sessionId, messageId });
     await this.dbc.execute(sql`
       update messages set attachments=coalesce(attachments,'[]'::jsonb)||${JSON.stringify([{ url: execution.url, mime: execution.mime, durationMs: execution.durationMs, voiceExecutionId: execution.id }])}::jsonb
       where id=${messageId} and session_id=${sessionId} and not exists (
@@ -547,7 +567,7 @@ export class VoiceKernel {
     const row = rows<{ account_id: string; agent_id: string; session_id: string | null; channel: 'discord' | 'telegram'; voice_id: string; voice_mode: string }>(result)[0];
     if (!row || row.voice_mode !== 'always') throw new VoiceKernelError(409, 'channel_voice_not_enabled', 'Channel voice is not enabled');
     const quote = await this.quote(row.account_id, row.channel, row.voice_id, input.text);
-    const execution = await this.synthesize({ ownerAccountId: row.account_id, operation: row.channel, quoteId: quote.quoteId, text: input.text, idempotencyKey: input.idempotencyKey, agentAccountId: row.agent_id, sessionId: row.session_id ?? undefined, channelTurnId: input.turnId });
+    const execution = await this.synthesize({ ownerAccountId: row.account_id, operation: row.channel, voiceId: row.voice_id, quoteId: quote.quoteId, text: input.text, idempotencyKey: input.idempotencyKey, agentAccountId: row.agent_id, sessionId: row.session_id ?? undefined, channelTurnId: input.turnId });
     const waveformResult = await this.dbc.execute(sql`select waveform from voice_executions where id=${execution.id}`);
     return { ...execution, waveform: rows<{ waveform: string | null }>(waveformResult)[0]?.waveform ?? null };
   }
@@ -604,7 +624,7 @@ export class VoiceKernel {
         if (prior.request_sha256 !== requestSha256) throw new VoiceKernelError(409, 'idempotency_conflict', 'Idempotency key was used for another clone');
         return { row: prior, replay: true };
       }
-      const lockedResult = await tx.execute(sql`select id,verified_sha256,state from storage_objects where id in (${sql.join(input.clipObjectIds.map((id) => sql`${id}`), sql`, `)}) and owner_account_id=${input.ownerAccountId} and purpose='voice-clip' for update`);
+      const lockedResult = await tx.execute(sql`select id,verified_sha256,state from storage_objects where id in (${sql.join(input.clipObjectIds.map((id) => sql`${id}`), sql`, `)}) and owner_account_id=${input.ownerAccountId} and purpose='voice-clip' order by id for update`);
       const locked = new Map(rows<{ id: string; verified_sha256: string | null; state: string }>(lockedResult).map((row) => [row.id, row]));
       if (metas.some((meta) => locked.get(meta.object_id)?.state !== 'available' || locked.get(meta.object_id)?.verified_sha256 !== meta.sha256)) {
         throw new VoiceKernelError(409, 'voice_clip_hash_mismatch', 'Voice clip changed before clone admission');
@@ -748,10 +768,72 @@ export class VoiceKernel {
         throw new VoiceKernelError(502, 'clone_delete_pending', 'Clone deletion requires reconciliation');
       }
     }
-    const completed = await this.dbc.execute(sql`update voice_clones set status='deleted',provider_deleted_at=statement_timestamp(),deleted_at=statement_timestamp(),failure_code=null,updated_at=statement_timestamp() where id=${id} and owner_account_id=${ownerAccountId} and status in ('revoked','provider_delete_pending','provider_delete_failed') returning *`);
-    clone = cloneDto(rows<Record<string, unknown>>(completed)[0]!);
+    clone = await this.dbc.transaction(async (tx) => {
+      const currentResult = await tx.execute(sql`
+        select * from voice_clones where id=${id} and owner_account_id=${ownerAccountId}
+          and status in ('revoked','provider_delete_pending','provider_delete_failed') for update
+      `);
+      const current = rows<Record<string, unknown>>(currentResult)[0];
+      if (!current) throw new VoiceKernelError(409, 'clone_delete_pending', 'Clone deletion requires reconciliation');
+      // Lock every candidate object in canonical order first. The following
+      // statement gets a fresh READ COMMITTED snapshot after any concurrent
+      // clone admission finishes, so its reference election cannot be stale.
+      await tx.execute(sql`
+        select o.id from voice_clone_clips clip join storage_objects o on o.id=clip.object_id
+        where clip.clone_id=${id} and o.owner_account_id=${ownerAccountId} and o.purpose='voice-clip'
+        order by o.id for update of o
+      `);
+      const clipResult = await tx.execute(sql`
+        select o.id,o.backing_store,o.backing_key,o.state,o.verified_sha256,o.verified_size_bytes,o.verified_mime,
+          not exists (select 1 from voice_clone_clips other where other.object_id=o.id and other.clone_id<>${id}) unshared
+        from voice_clone_clips clip join storage_objects o on o.id=clip.object_id
+        where clip.clone_id=${id} and o.owner_account_id=${ownerAccountId} and o.purpose='voice-clip'
+        order by clip.position
+      `);
+      const clips = rows<{
+        id: string; backing_store: 'local' | 'r2' | 'legacy'; backing_key: string; state: StoredObject['state'];
+        verified_sha256: string | null; verified_size_bytes: string | number | null; verified_mime: string | null; unshared: boolean;
+      }>(clipResult);
+      const removable = clips.filter((clip) => clip.unshared);
+      if (removable.length > 0 && !this.options.deletePrivateClip) {
+        throw new VoiceKernelError(503, 'voice_storage_unavailable', 'Voice clip deletion storage is unavailable');
+      }
+      for (const clip of removable) {
+        if (!clip.verified_sha256 || clip.verified_size_bytes === null || !clip.verified_mime || clip.backing_store === 'legacy') {
+          throw new VoiceKernelError(409, 'clone_delete_pending', 'Voice clip deletion metadata is incomplete');
+        }
+        try {
+          await this.options.deletePrivateClip!({
+            objectId: clip.id,
+            backingStore: clip.backing_store,
+            backingKey: clip.backing_key,
+            state: clip.state,
+            sha256: clip.verified_sha256,
+            sizeBytes: Number(clip.verified_size_bytes),
+            mime: clip.verified_mime,
+          });
+        } catch {
+          throw new VoiceKernelError(503, 'clone_clip_cleanup_pending', 'Voice clip deletion requires retry');
+        }
+      }
+      await tx.execute(sql`delete from voice_clone_clips where clone_id=${id}`);
+      if (removable.length > 0) {
+        const ids = removable.map((clip) => clip.id);
+        await tx.execute(sql`
+          delete from storage_objects where id in (${sql.join(ids.map((objectId) => sql`${objectId}`), sql`, `)})
+            and owner_account_id=${ownerAccountId} and purpose='voice-clip'
+            and not exists (select 1 from voice_clone_clips remaining where remaining.object_id=storage_objects.id)
+        `);
+      }
+      const completed = await tx.execute(sql`
+        update voice_clones set status='deleted',provider_deleted_at=coalesce(provider_deleted_at,statement_timestamp()),
+          deleted_at=statement_timestamp(),failure_code=null,updated_at=statement_timestamp()
+        where id=${id} and owner_account_id=${ownerAccountId} returning *
+      `);
+      return cloneDto(rows<Record<string, unknown>>(completed)[0]!);
+    });
     return clone;
   }
 }
 
-export const voiceKernelInternals = { exactTranscript, requestHash, TEXT_LIMITS };
+export const voiceKernelInternals = { exactTranscript, requestHash, executionRequestHash, TEXT_LIMITS };

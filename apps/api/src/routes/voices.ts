@@ -90,6 +90,7 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
     const execution = await boundary(() => kernel.synthesize({
       ownerAccountId: request.account!.accountId,
       operation: 'preview',
+      voiceId: body.voiceId,
       quoteId: quote.quoteId,
       text: body.text,
       idempotencyKey: body.idempotencyKey,

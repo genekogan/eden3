@@ -104,6 +104,8 @@ const LIMITS = {
   telegram: { durationMs: 120_000, bytes: 8 * 1024 * 1024 },
 } as const;
 
+const CLONE_CLIP_LIMITS = { minimumDurationMs: 100, maximumDurationMs: 30_000, maximumBytes: 20 * 1024 * 1024 } as const;
+
 export class FfmpegVoiceAudioProcessor implements VoiceAudioProcessor {
   constructor(private readonly root = path.join(tmpdir(), 'eden3-voice')) {}
 
@@ -121,18 +123,18 @@ export class FfmpegVoiceAudioProcessor implements VoiceAudioProcessor {
   }
 
   async inspectClip(input: Buffer, mime: 'audio/wav' | 'audio/mpeg'): Promise<{ durationMs: number }> {
-    if (input.length === 0 || input.length > 16 * 1024 * 1024) throw new VoiceAudioError('audio_invalid');
+    if (input.length === 0 || input.length > CLONE_CLIP_LIMITS.maximumBytes) throw new VoiceAudioError('audio_invalid');
     return await this.withFile(input, mime, async (inputPath, dir) => {
       const info = await probe(inputPath);
-      if (info.durationMs < 3_000 || info.durationMs > 10_000) throw new VoiceAudioError('duration_exceeded');
+      if (info.durationMs < CLONE_CLIP_LIMITS.minimumDurationMs || info.durationMs > CLONE_CLIP_LIMITS.maximumDurationMs) throw new VoiceAudioError('duration_exceeded');
       const analysisPath = path.join(dir, 'analysis.pcm');
       await run([
         'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', inputPath,
         '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
-        '-t', '10', '-f', 's16le', analysisPath,
+        '-t', '30', '-f', 's16le', analysisPath,
       ], 12_000);
       const pcm = await readFile(analysisPath);
-      if (pcm.length < 16000 * 2 * 3 || pcm.length > 16000 * 2 * 10 + 4096 || pcm.length % 2 !== 0) {
+      if (pcm.length < 16000 * 2 * (CLONE_CLIP_LIMITS.minimumDurationMs / 1000) || pcm.length > 16000 * 2 * 30 + 4096 || pcm.length % 2 !== 0) {
         throw new VoiceAudioError('audio_invalid');
       }
       let energy = 0;
@@ -211,4 +213,4 @@ export class FfmpegVoiceAudioProcessor implements VoiceAudioProcessor {
   }
 }
 
-export const voiceAudioInternals = { LIMITS, waveform };
+export const voiceAudioInternals = { LIMITS, CLONE_CLIP_LIMITS, waveform };

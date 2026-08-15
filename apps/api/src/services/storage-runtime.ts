@@ -8,6 +8,7 @@ import {
   R2ObjectBackend,
   StagingCache,
   type ObjectBackend,
+  type StoredObject,
 } from '@eden3/core';
 
 import { MediaObjectResolver } from './media-object-repository';
@@ -35,6 +36,7 @@ export interface StorageRuntime {
   backend: ObjectBackend;
   objectRoot: string | null;
   cacheRoot: string;
+  deletePrivateObject(object: StoredObject): Promise<void>;
 }
 
 export interface CreateStorageRuntimeOptions {
@@ -248,6 +250,7 @@ export async function createStorageRuntime(options: CreateStorageRuntimeOptions)
     backend,
     objectRoot: backend instanceof LocalObjectBackend ? objectRoot : null,
     cacheRoot,
+    deletePrivateObject: (object) => objectService.deletePrivate(object),
   };
 }
 

@@ -23,7 +23,7 @@ describe('0047 voice backend custody', () => {
     expect(migration).toContain("account_erasure_target_claim_matches(v_owner,'voice_output'");
     expect(migration).toContain('account_erasure_unclaimed_seal_matches(v_owner)');
     expect(migration).toContain('"attempt_count" between 0 and 1');
-    expect(migration).toContain('"duration_ms" between 3000 and 10000');
+    expect(migration).toContain('"duration_ms" between 100 and 30000');
     expect(migration).toContain('"size_bytes" between 1 and 20971520');
     expect(migration).toContain('account_erasure_assert_no_open_work');
     expect(migration).toContain("v.status IN ('pending_validation','cloning','provider_create_ambiguous','provider_delete_pending','provider_delete_failed')");
