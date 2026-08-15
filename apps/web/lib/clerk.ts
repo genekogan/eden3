@@ -5,6 +5,9 @@
 // one from an RSC throws, which broke /creations/:id SSR — BUG-W5-2).
 export interface ClerkJs {
   isSignedIn: boolean;
+  user?: {
+    imageUrl: string;
+  } | null;
   session?: {
     getToken(): Promise<string | null>;
   } | null;

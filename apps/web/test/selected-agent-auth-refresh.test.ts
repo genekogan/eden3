@@ -9,13 +9,17 @@ describe("selected-agent authentication refresh", () => {
       "utf8",
     );
     expect(source).toContain(
-      'import { api, onAgentInventoryChange, onDevUserChange } from "@/lib/api"',
+      'onAgentInventoryChange,\n  onDevUserChange,\n} from "@/lib/api"',
     );
     expect(source).toMatch(
       /onDevUserChange\(\(user\) => \{\s*setViewer\(user\);\s*setViewerResolved\(true\);\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,
     );
 
     expect(source.match(/onDevUserChange\(/g)).toHaveLength(1);
+    expect(source).toContain('import { loadClerk, selectAuthMode } from "@/lib/clerk"');
+    expect(source).toMatch(
+      /if \(selectAuthMode\(\) !== "clerk"\) return;[\s\S]*const imageUrl = clerk\.user\?\.imageUrl;[\s\S]*api\.account\.syncIdentityAvatar\(imageUrl\)/,
+    );
     expect(source).toContain("const [viewerResolved, setViewerResolved] = useState(false);");
     expect(source).toMatch(
       /if \(!viewerResolved\) return;\s*if \(viewer === null\) \{\s*setMyAgents\(\[\]\);\s*setMyAgentsPhase\("ready"\);\s*return;\s*\}\s*let cancelled = false;\s*void \(async \(\) => \{\s*try \{\s*const page = await api\.agents\.list\(\{ scope: "mine" \}\);/,
@@ -34,7 +38,7 @@ describe("selected-agent authentication refresh", () => {
     );
 
     expect(contextSource).toContain(
-      'import { api, onAgentInventoryChange, onDevUserChange } from "@/lib/api"',
+      'onAgentInventoryChange,\n  onDevUserChange,\n} from "@/lib/api"',
     );
     expect(contextSource).toMatch(
       /onAgentInventoryChange\(\(\) => \{\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,

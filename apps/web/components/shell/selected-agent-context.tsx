@@ -20,7 +20,12 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, onAgentInventoryChange, onDevUserChange } from "@/lib/api";
+import {
+  api,
+  onAgentInventoryChange,
+  onDevUserChange,
+} from "@/lib/api";
+import { loadClerk, selectAuthMode } from "@/lib/clerk";
 import type { AgentDto, DevUser } from "@/lib/types";
 import { clearLastAgent, getLastAgent, setLastAgent } from "@/lib/last-agent";
 
@@ -102,6 +107,26 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const [myAgentsNonce, setMyAgentsNonce] = useState(0);
   const [viewer, setViewer] = useState<DevUser | null>(null);
   const [viewerResolved, setViewerResolved] = useState(false);
+
+  // Clerk copies Google/OAuth profile photos into user.imageUrl. Import that
+  // first-party identity image once per shell boot; the API preserves any
+  // explicit Eden /media upload as the higher-priority profile choice.
+  useEffect(() => {
+    if (selectAuthMode() !== "clerk") return;
+    let cancelled = false;
+    void loadClerk()
+      .then(async (clerk) => {
+        const imageUrl = clerk.user?.imageUrl;
+        if (!imageUrl) return;
+        if (!cancelled) await api.account.syncIdentityAvatar(imageUrl);
+      })
+      .catch(() => {
+        // Identity-photo sync is best effort and must never block sign-in.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Dev impersonation can change after this provider's initial auth read.
   // Refresh viewer authority and the owned-agent inventory immediately so

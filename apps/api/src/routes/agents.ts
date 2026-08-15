@@ -58,6 +58,13 @@ import {
 import { publicCreationModerationSql } from '../services/public-creation-moderation';
 import { runMemoryRetrievalProbe } from '../services/memory-retrieval';
 import { publishNotificationChanged } from '../services/app-notifications';
+import {
+  ALLOWED_AVATAR_MIMES,
+  AVATAR_UPLOAD_BODY_LIMIT_BYTES,
+  MAX_AVATAR_BYTES,
+  avatarBodySchema,
+  decodeAvatarData,
+} from '../services/avatar-upload';
 import { assertNativeAgentCreationAllowed } from '../services/native-agent-admission';
 
 /**
@@ -186,12 +193,6 @@ const importBodySchema = z.object({
   bundle: agentExportBundleSchema,
 });
 
-// ---- Avatar upload (mirrors the concept-image validation) -----------------
-const ALLOWED_AVATAR_MIMES = new Set(['image/png', 'image/jpeg', 'image/webp']);
-const MAX_AVATAR_BYTES = 8 * 1024 * 1024;
-/** base64 inflates ~4/3; 12MB leaves room for the JSON envelope around 8MB. */
-const AVATAR_UPLOAD_BODY_LIMIT_BYTES = 12 * 1024 * 1024;
-
 /** Only a fully provisioned row pointing at its derived workspace is live-editable. */
 function canHotUpdateAgent(agent: Agent): agent is Agent & { openclawId: string; workspacePath: string } {
   if (
@@ -206,27 +207,6 @@ function canHotUpdateAgent(agent: Agent): agent is Agent & { openclawId: string;
     `workspace-${agent.openclawId}`,
   );
   return path.resolve(agent.workspacePath) === path.resolve(canonicalWorkspace);
-}
-
-const avatarBodySchema = z.object({
-  filename: z.string().trim().min(1).max(300).optional(),
-  mime: z.string().trim().min(1).max(200),
-  /** Raw base64 (a data: URL prefix is tolerated and stripped). */
-  dataBase64: z.string().min(1),
-});
-
-/** Decode base64 (tolerating a `data:` URL prefix); null on empty/invalid. */
-function decodeUploadData(dataBase64: string): Buffer | null {
-  const raw =
-    dataBase64.includes(',') && dataBase64.trimStart().startsWith('data:')
-      ? dataBase64.slice(dataBase64.indexOf(',') + 1)
-      : dataBase64;
-  try {
-    const buffer = Buffer.from(raw, 'base64');
-    return buffer.length > 0 ? buffer : null;
-  } catch {
-    return null;
-  }
 }
 
 /** Fresh fragment per query (postgres.js fragments are single-use-safe). */
@@ -1275,7 +1255,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
           `Unsupported image type "${mime}" — expected png, jpeg, or webp`,
         );
       }
-      const buffer = decodeUploadData(body.dataBase64);
+      const buffer = decodeAvatarData(body.dataBase64);
       if (!buffer) {
         return sendError(reply, 400, 'invalid_image_data', 'dataBase64 is not valid base64');
       }

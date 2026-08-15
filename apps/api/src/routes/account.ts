@@ -1,11 +1,19 @@
+import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { finished } from 'node:stream/promises';
 
+import {
+  LocalMediaStore,
+  normalizeMime,
+  probeImageSize,
+  type MediaStore,
+} from '@eden3/core';
 import { pg } from '@eden3/db';
 import { ZipArchive } from 'archiver';
 import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
 
-import { ApiError, logSafeRequestError } from '../errors';
+import { ApiError, logSafeRequestError, sendError } from '../errors';
 import {
   accountErasureRequestSchema,
   requestAccountErasure,
@@ -13,6 +21,45 @@ import {
   type AccountErasureLedgerSink,
   type AccountErasureRecoveryManifestSink,
 } from '../services/account-erasure';
+import {
+  ALLOWED_AVATAR_MIMES,
+  AVATAR_UPLOAD_BODY_LIMIT_BYTES,
+  MAX_AVATAR_BYTES,
+  avatarBodySchema,
+  decodeAvatarData,
+} from '../services/avatar-upload';
+
+interface AccountAvatarRow {
+  id: string;
+  username: string;
+  type: 'user' | 'agent';
+  userImage: string | null;
+}
+
+const identityAvatarSchema = z.object({
+  imageUrl: z.string().trim().min(1).max(4096),
+});
+
+/** Clerk copies OAuth profile photos behind this stable, first-party image host. */
+export function normalizeClerkIdentityImageUrl(raw: string): string | null {
+  try {
+    const url = new URL(raw);
+    if (
+      url.protocol !== 'https:' ||
+      url.hostname !== 'img.clerk.com' ||
+      url.username !== '' ||
+      url.password !== '' ||
+      url.port !== '' ||
+      url.hash !== '' ||
+      url.pathname === '/'
+    ) {
+      return null;
+    }
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
 
 /**
  * A complete, owner-scoped account export.
@@ -476,9 +523,136 @@ export interface AccountRoutesOptions {
     ledger: AccountErasureLedgerSink;
     recoveryManifestSink: AccountErasureRecoveryManifestSink;
   };
+  /** Injectable for isolated route tests; production defaults to MEDIA_DIR. */
+  mediaStore?: MediaStore;
 }
 
 export const accountRoutes: FastifyPluginAsync<AccountRoutesOptions> = async (app, options) => {
+  let store = options.mediaStore;
+  const getStore = (): MediaStore => (store ??= new LocalMediaStore());
+  const userDto = (row: AccountAvatarRow, isAdmin: boolean) => ({
+    id: row.id,
+    username: row.username,
+    type: row.type,
+    userImage: row.userImage,
+    isAdmin,
+  });
+
+  // Clerk/Google identity import is deliberately lower priority than an Eden
+  // upload. Re-auth may refresh a Clerk-owned URL, but never overwrite a
+  // durable /media avatar selected in Account Settings.
+  app.patch('/avatar/identity', { preHandler: app.requireAuth, bodyLimit: 8_192 }, async (req, reply) => {
+    const body = identityAvatarSchema.parse(req.body);
+    const imageUrl = normalizeClerkIdentityImageUrl(body.imageUrl);
+    if (!imageUrl) {
+      return sendError(reply, 400, 'invalid_identity_avatar', 'Identity image URL is not trusted');
+    }
+    const accountId = req.account!.accountId;
+    const row = await pg.begin(async (tx) => {
+      const [current] = await tx<AccountAvatarRow[]>`
+        select id,username::text as username,type,user_image as "userImage"
+        from accounts where id=${accountId} and type='user' and deleted=false
+        for update`;
+      if (!current) throw new ApiError(404, 'account_not_found', 'Account not found');
+      const currentIdentityUrl = current.userImage
+        ? normalizeClerkIdentityImageUrl(current.userImage)
+        : null;
+      if (current.userImage !== null && currentIdentityUrl === null) return current;
+      if (current.userImage === imageUrl) return current;
+      const [updated] = await tx<AccountAvatarRow[]>`
+        update accounts set user_image=${imageUrl},updated_at=statement_timestamp()
+        where id=${accountId}
+        returning id,username::text as username,type,user_image as "userImage"`;
+      return updated ?? current;
+    });
+    return { user: userDto(row, req.account!.isAdmin ?? false) };
+  });
+
+  app.post(
+    '/avatar',
+    {
+      preHandler: app.requireAuth,
+      bodyLimit: AVATAR_UPLOAD_BODY_LIMIT_BYTES,
+    },
+    async (req, reply) => {
+      const body = avatarBodySchema.parse(req.body);
+      const mime = normalizeMime(body.mime);
+      if (!ALLOWED_AVATAR_MIMES.has(mime)) {
+        return sendError(reply, 400, 'unsupported_image_type', 'Only png, jpeg, or webp images are supported');
+      }
+      const buffer = decodeAvatarData(body.dataBase64);
+      if (!buffer) {
+        return sendError(reply, 400, 'invalid_image_data', 'dataBase64 is not valid base64');
+      }
+      if (buffer.length > MAX_AVATAR_BYTES) {
+        return sendError(reply, 400, 'image_too_large', 'Images must be 8MB or smaller');
+      }
+      if (!probeImageSize(buffer)) {
+        return sendError(reply, 400, 'invalid_image_data', 'File does not look like a valid png/jpeg/webp image');
+      }
+
+      const accountId = req.account!.accountId;
+      const expectedSha256 = createHash('sha256').update(buffer).digest('hex');
+      const row = await pg.begin(async (tx) => {
+        const [current] = await tx<AccountAvatarRow[]>`
+          select id,username::text as username,type,user_image as "userImage"
+          from accounts where id=${accountId} and type='user' and deleted=false
+          for update`;
+        if (!current) throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+        const activeErasure = await tx`
+          select 1 from account_erasure_jobs
+          where account_id=${accountId} and state <> 'succeeded'
+          limit 1`;
+        if (activeErasure.length > 0) {
+          throw new ApiError(409, 'account_erasure_active', 'Account deletion is in progress');
+        }
+        await tx`select account_erasure_lock_legacy_content(
+          ${expectedSha256},${null},${null},${null},${null},
+          ${null},${null},${null},${null},${null})`;
+        const next = await getStore().put(buffer, { mime });
+        if (next.sha256 !== expectedSha256) {
+          throw new Error('avatar media store returned a mismatched content address');
+        }
+        await tx`
+          update agent_avatar_assets set state='retired',retired_at=statement_timestamp(),
+            updated_at=statement_timestamp()
+          where agent_account_id=${accountId} and state='current'`;
+        await tx`
+          insert into agent_avatar_assets
+            (owner_account_id,agent_account_id,url,local_path,sha256,mime,size_bytes)
+          values (${accountId},${accountId},${next.url},${next.localPath},
+            ${next.sha256},${next.mime},${next.sizeBytes})`;
+        const [updated] = await tx<AccountAvatarRow[]>`
+          update accounts set user_image=${next.url},updated_at=statement_timestamp()
+          where id=${accountId}
+          returning id,username::text as username,type,user_image as "userImage"`;
+        return updated ?? { ...current, userImage: next.url };
+      });
+      return { user: userDto(row, req.account!.isAdmin ?? false) };
+    },
+  );
+
+  app.delete('/avatar', { preHandler: app.requireAuth }, async (req) => {
+    const accountId = req.account!.accountId;
+    const row = await pg.begin(async (tx) => {
+      const [current] = await tx<AccountAvatarRow[]>`
+        select id,username::text as username,type,user_image as "userImage"
+        from accounts where id=${accountId} and type='user' and deleted=false
+        for update`;
+      if (!current) throw new ApiError(404, 'account_not_found', 'Account not found');
+      await tx`
+        update agent_avatar_assets set state='retired',retired_at=statement_timestamp(),
+          updated_at=statement_timestamp()
+        where agent_account_id=${accountId} and state='current'`;
+      const [updated] = await tx<AccountAvatarRow[]>`
+        update accounts set user_image=null,updated_at=statement_timestamp()
+        where id=${accountId}
+        returning id,username::text as username,type,user_image as "userImage"`;
+      return updated ?? { ...current, userImage: null };
+    });
+    return { user: userDto(row, req.account!.isAdmin ?? false) };
+  });
+
   app.delete('/', { preHandler: app.requireAuth, bodyLimit: 1_024 }, async (req, reply) => {
     if (!options.erasure) {
       throw new ApiError(503, 'account_erasure_unavailable', 'Account erasure is not configured');

@@ -29,6 +29,8 @@ describe("settings page", () => {
     );
 
     expect(html).toContain("@gene");
+    expect(html).toContain("Add photo");
+    expect(html).toContain("sign-in photo is imported automatically");
     expect(html).toContain("acct-123");
     expect(html).toContain("Admin access");
     expect(html).toContain("Enabled");

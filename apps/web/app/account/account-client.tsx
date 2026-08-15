@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import { api, ApiError, isEndpointMissing } from "@/lib/api";
 import type { AuthMeResponse, BillingSubscriptionSummary } from "@/lib/types";
 import { formatDate, formatMannaExact } from "@/lib/format";
+import { AccountAvatarEditor } from "./account-avatar-editor";
 
 type Phase = "loading" | "ready" | "error";
 type SettingsData = AuthMeResponse & {
@@ -85,7 +86,13 @@ function AccountExportButton({ username }: { username: string }) {
   );
 }
 
-export function SettingsSummary({ data }: { data: SettingsData }) {
+export function SettingsSummary({
+  data,
+  onUserChange = () => {},
+}: {
+  data: SettingsData;
+  onUserChange?: (user: NonNullable<AuthMeResponse["user"]>) => void;
+}) {
   const user = data.user;
   const manna = data.manna;
   const subscription = data.subscription;
@@ -107,26 +114,7 @@ export function SettingsSummary({ data }: { data: SettingsData }) {
   return (
     <div className="mt-10 grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(320px,0.75fr)]">
       <section className="rounded-xl border border-edge bg-surface p-6">
-        <div className="flex flex-wrap items-center gap-4">
-          {user.userImage ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={user.userImage}
-              alt=""
-              className="size-14 rounded-full border border-edge object-cover"
-            />
-          ) : (
-            <div className="grid size-14 place-items-center rounded-full border border-edge bg-foreground/[0.04] font-mono text-lg uppercase text-accent-soft">
-              {user.username.slice(0, 1)}
-            </div>
-          )}
-          <div className="min-w-0">
-            <h2 className="truncate text-2xl font-light">@{user.username}</h2>
-            <p className="mt-1 text-sm text-muted">
-              {user.type ?? "user"} account{user.isAdmin ? " · admin" : ""}
-            </p>
-          </div>
-        </div>
+        <AccountAvatarEditor user={user} onChange={onUserChange} />
 
         <dl className="mt-6">
           <AccountRow label="Account id" value={user.id} />
@@ -308,7 +296,10 @@ export function SettingsClient() {
           </button>
         </section>
       ) : data ? (
-        <SettingsSummary data={data} />
+        <SettingsSummary
+          data={data}
+          onUserChange={(user) => setData((current) => current ? { ...current, user } : current)}
+        />
       ) : null}
     </div>
   );

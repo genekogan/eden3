@@ -92,6 +92,8 @@ const AUTHENTICATED_ROUTES: readonly PathMethods[] = [
 
 const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/account', ['DELETE']],
+  ['/account/avatar', ['DELETE', 'POST']],
+  ['/account/avatar/identity', ['PATCH']],
   ['/account/export', ['GET', 'HEAD']],
   ['/agents/:username', ['PATCH']],
   ['/agents/:username/activity', ['GET', 'HEAD']],

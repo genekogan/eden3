@@ -604,6 +604,36 @@ export const api = {
   },
 
   account: {
+    /** Import a Clerk/Google identity photo without overriding an Eden upload. */
+    async syncIdentityAvatar(imageUrl: string): Promise<DevUser> {
+      const user = unwrap<DevUser>(
+        await patch<unknown>("/account/avatar/identity", { imageUrl }),
+        "user",
+      );
+      emitDevUserChange(user);
+      return user;
+    },
+
+    /** Upload the signed-in human account's Eden-owned profile photo. */
+    async uploadAvatar(input: AgentAvatarUploadInput): Promise<DevUser> {
+      const user = unwrap<DevUser>(
+        await post<unknown>("/account/avatar", input),
+        "user",
+      );
+      emitDevUserChange(user);
+      return user;
+    },
+
+    /** Remove the current account photo while retaining deletion custody. */
+    async removeAvatar(): Promise<DevUser> {
+      const user = unwrap<DevUser>(
+        await apiFetch<unknown>("/account/avatar", { method: "DELETE" }),
+        "user",
+      );
+      emitDevUserChange(user);
+      return user;
+    },
+
     /** GET /api/account/export — complete owner-scoped account ZIP. */
     exportBundle(): Promise<Blob> {
       return apiBlob("/account/export");
@@ -889,7 +919,7 @@ export const api = {
 
   feed: {
     /**
-     * GET /api/feed/creations?cursor&agent&user -> {creations[], nextCursor}.
+     * GET /api/feed/creations?cursor&agent&user&agentOnly -> {creations[], nextCursor}.
      * `user: "me"` = the signed-in viewer's own creations incl. non-public rows.
      */
     async creations(
@@ -898,6 +928,7 @@ export const api = {
         cursor?: string;
         agent?: string;
         user?: string;
+        agentOnly?: "true";
       } = {},
     ): Promise<Paginated<CreationDto>> {
       return toPaginated<CreationDto>(
