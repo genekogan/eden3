@@ -10,9 +10,15 @@ import { PCM_UPLOAD_CHUNK_SAMPLES } from "../lib/pcm-recorder";
 import {
   DICTATION_DRAFT_TTL_MS,
   DICTATION_SIGN_OUT_PURGE_DEADLINE_MS,
+  beginDictationPurgeFence,
+  clearDictationPurgeFence,
+  currentDictationCustodyEpoch,
+  currentDictationPurgeFence,
   partitionDictationDrafts,
   purgeDictationDraftsBeforeSignOut,
+  resolveDictationPurgeFenceAfterRecovery,
   type DictationDraftRecord,
+  type DictationPurgeFenceStore,
 } from "../lib/dictation-storage";
 import {
   DICTATION_FINALIZE_POLL_TIMEOUT_MS,
@@ -62,17 +68,78 @@ describe("dictation UI helpers", () => {
   });
 
   it("gives sign-out cleanup a bounded commit window without trapping auth", async () => {
-    expect(await purgeDictationDraftsBeforeSignOut(async () => undefined)).toBe("purged");
+    const values = new Map<string, string>();
+    const fenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    expect(await purgeDictationDraftsBeforeSignOut(async () => undefined, 500, fenceStore)).toBe("purged");
+    // Success intentionally remains fenced through the auth transition.
+    const successfulEpoch = currentDictationPurgeFence(fenceStore)!;
+    expect(successfulEpoch).toBeTruthy();
+    clearDictationPurgeFence(successfulEpoch, fenceStore);
     expect(await purgeDictationDraftsBeforeSignOut(async () => {
       throw new Error("indexeddb failed");
-    })).toBe("failed");
+    }, 500, fenceStore)).toBe("failed");
+    const failedEpoch = currentDictationPurgeFence(fenceStore)!;
+    expect(failedEpoch).toBeTruthy();
+    clearDictationPurgeFence(failedEpoch, fenceStore);
 
     const never = new Promise<void>(() => undefined);
     expect(await purgeDictationDraftsBeforeSignOut(
       () => never,
       1,
+      fenceStore,
     )).toBe("timed_out");
+    const timedOutEpoch = currentDictationPurgeFence(fenceStore)!;
+    expect(timedOutEpoch).toBeTruthy();
+    clearDictationPurgeFence(timedOutEpoch, fenceStore);
     expect(DICTATION_SIGN_OUT_PURGE_DEADLINE_MS).toBeLessThanOrEqual(500);
+  });
+
+  it("invalidates a pre-fence writer even after the recovery purge clears its tombstone", () => {
+    const values = new Map<string, string>();
+    const fenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const oldEpoch = currentDictationCustodyEpoch(fenceStore);
+    const fence = beginDictationPurgeFence(fenceStore);
+    expect(currentDictationCustodyEpoch(fenceStore)).not.toBe(oldEpoch);
+    clearDictationPurgeFence(fence, fenceStore);
+    const delayedDraft = {
+      id: "delayed", ownerId: "account-1", custodyEpoch: oldEpoch,
+      remoteId: "remote", finalizeKey: "finalize", mimeType: "audio/pcm",
+      createdAt: 1, updatedAt: 1, durationMs: 1_000, nextChunkIndex: 1, phase: "recording" as const,
+    };
+    expect(partitionDictationDrafts([delayedDraft], "account-1", 1, currentDictationCustodyEpoch(fenceStore))).toEqual({
+      admitted: [], purgeIds: ["delayed"],
+    });
+  });
+
+  it("clears the tombstone only after authenticated recovery's second purge succeeds", async () => {
+    const values = new Map<string, string>();
+    const fenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    beginDictationPurgeFence(fenceStore);
+    const order: string[] = [];
+    await resolveDictationPurgeFenceAfterRecovery(async () => {
+      order.push("second-purge");
+      expect(currentDictationPurgeFence(fenceStore)).toBeTruthy();
+    }, fenceStore);
+    order.push("recovery-admission");
+    expect(order).toEqual(["second-purge", "recovery-admission"]);
+    expect(currentDictationPurgeFence(fenceStore)).toBeNull();
+
+    beginDictationPurgeFence(fenceStore);
+    await resolveDictationPurgeFenceAfterRecovery(async () => { throw new Error("blocked"); }, fenceStore);
+    expect(currentDictationPurgeFence(fenceStore)).toBeTruthy();
+    clearDictationPurgeFence(currentDictationPurgeFence(fenceStore)!, fenceStore);
   });
 
   it("admits only fresh drafts owned by the current authenticated account", () => {
@@ -80,6 +147,7 @@ describe("dictation UI helpers", () => {
     const draft = (id: string, ownerId: string, updatedAt = now): DictationDraftRecord => ({
       id,
       ownerId,
+      custodyEpoch: "test-epoch",
       remoteId: `remote-${id}`,
       finalizeKey: `finalize-${id}`,
       mimeType: "audio/pcm;rate=16000;channels=1",
@@ -96,7 +164,7 @@ describe("dictation UI helpers", () => {
       draft("other", "account-2"),
       draft("stale", "account-1", now - DICTATION_DRAFT_TTL_MS - 1),
       legacy as DictationDraftRecord,
-    ], "account-1", now);
+    ], "account-1", now, "test-epoch");
     expect(result.admitted.map((item) => item.id)).toEqual(["mine"]);
     expect(result.purgeIds.sort()).toEqual(["legacy", "other", "stale"]);
   });

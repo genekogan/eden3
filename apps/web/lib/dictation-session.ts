@@ -1,5 +1,6 @@
 import {
   DictationDraftStore,
+  currentDictationCustodyEpoch,
   type DictationDraftRecord,
 } from "./dictation-storage";
 
@@ -86,6 +87,7 @@ export class DurableDictationSession {
     const draft: DictationDraftRecord = {
       id: crypto.randomUUID(),
       ownerId: options.ownerId,
+      custodyEpoch: currentDictationCustodyEpoch(),
       remoteId: remote.id,
       finalizeKey: crypto.randomUUID(),
       mimeType: "audio/pcm;rate=16000;channels=1",

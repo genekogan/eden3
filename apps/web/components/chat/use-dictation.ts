@@ -6,7 +6,12 @@ import {
   MAX_DICTATION_MS,
   type DictationTransport,
 } from "@/lib/dictation-session";
-import { DictationDraftStore } from "@/lib/dictation-storage";
+import {
+  currentDictationPurgeFence,
+  DictationDraftStore,
+  purgeDictationDraftsBeforeSignOut,
+  subscribeDictationPurgeFence,
+} from "@/lib/dictation-storage";
 import { edenDictationTransport } from "@/lib/dictation-transport";
 import { PcmRecorder } from "@/lib/pcm-recorder";
 import type { ViewerPhase } from "@/components/shell/selected-agent-context";
@@ -163,6 +168,10 @@ export function useDictation({
       setState({ phase: "error", elapsedMs: 0, message: "Sign in before using dictation." });
       return;
     }
+    if (currentDictationPurgeFence()) {
+      setState({ phase: "error", elapsedMs: 0, message: "Finish signing out before starting dictation." });
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || !PcmRecorder.supported()) {
       setState({
         phase: "error",
@@ -249,6 +258,12 @@ export function useDictation({
     }
   }, [ownerId, ownerPhase, releaseStream, state.phase, stop, store, transport]);
 
+  useEffect(() => subscribeDictationPurgeFence(() => {
+    // localStorage's storage event reaches sibling tabs; the custom event
+    // reaches this tab. Both stop custody before any more chunks can commit.
+    void cancel();
+  }), [cancel]);
+
   // A refresh cannot keep the physical microphone open, but every completed
   // short PCM chunk is durable. On return, finish the interrupted recording
   // and restore its transcript instead of silently losing it.
@@ -267,7 +282,7 @@ export function useDictation({
         await new Promise((resolve) => setTimeout(resolve, 1_250));
         const disposition = dictationRecoveryDisposition(ownerPhase, ownerId);
         if (disposition === "purge") {
-          await store().purgeAll();
+          await purgeDictationDraftsBeforeSignOut(() => store().purgeAll());
           return;
         }
         if (disposition !== "recover" || !ownerId) return;
