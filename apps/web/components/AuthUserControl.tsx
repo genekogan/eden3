@@ -6,7 +6,7 @@ import {
   emitMannaUpdate,
 } from "@/lib/api";
 import { loadClerk, selectAuthMode } from "@/lib/clerk";
-import { purgeAllDictationDrafts } from "@/lib/dictation-storage";
+import { purgeDictationDraftsBeforeSignOut } from "@/lib/dictation-storage";
 
 export function AuthUserControl({
   variant = "footer",
@@ -17,9 +17,9 @@ export function AuthUserControl({
 
   const signOut = async () => {
     setBusy(true);
-    // Browser audio cleanup is important, but IndexedDB can be blocked by a
-    // stale tab. It must never prevent the authoritative auth transition.
-    void purgeAllDictationDrafts().catch(() => undefined);
+    // Give the atomic browser-audio purge a bounded chance to commit before
+    // navigation; broken IndexedDB can delay sign-out by at most 500ms.
+    await purgeDictationDraftsBeforeSignOut();
     try {
       if (selectAuthMode() === "clerk") {
         const clerk = await loadClerk();

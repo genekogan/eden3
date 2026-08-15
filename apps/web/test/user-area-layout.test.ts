@@ -14,6 +14,10 @@ const authUserControlSource = readFileSync(
   new URL("../components/AuthUserControl.tsx", import.meta.url),
   "utf8",
 );
+const accessGateSource = readFileSync(
+  new URL("../components/AccessGate.tsx", import.meta.url),
+  "utf8",
+);
 
 describe("sidebar account footer layout", () => {
   it("offers sign out without nesting a dev-user or Clerk account dropdown", () => {
@@ -27,11 +31,20 @@ describe("sidebar account footer layout", () => {
       authUserControlSource.indexOf("const signOut = async"),
       authUserControlSource.indexOf("\n\n  return ("),
     );
-    expect(signOutBody).toContain("void purgeAllDictationDrafts().catch");
-    expect(signOutBody).not.toContain("await purgeAllDictationDrafts");
-    expect(signOutBody.indexOf("purgeAllDictationDrafts")).toBeLessThan(
+    expect(signOutBody).toContain("await purgeDictationDraftsBeforeSignOut()");
+    expect(signOutBody.indexOf("purgeDictationDraftsBeforeSignOut")).toBeLessThan(
       signOutBody.indexOf("clerk.signOut"),
     );
+  });
+
+  it("purges private dictation custody before every authoritative AccessGate sign-out", () => {
+    const signOutBody = accessGateSource.slice(
+      accessGateSource.indexOf("const signOut = useCallback"),
+      accessGateSource.indexOf("\n\n  const check"),
+    );
+    expect(signOutBody).toContain("await purgeDictationDraftsBeforeSignOut()");
+    expect(signOutBody.indexOf("purgeDictationDraftsBeforeSignOut")).toBeLessThan(signOutBody.indexOf("clerk.signOut"));
+    expect(signOutBody.indexOf("purgeDictationDraftsBeforeSignOut")).toBeLessThan(signOutBody.indexOf('/api/dev/logout'));
   });
 
   it("places notifications after the account control on the right", () => {
