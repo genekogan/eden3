@@ -442,7 +442,7 @@ export interface ChatRoutesOptions {
   voiceKernel?: VoiceKernel;
 }
 
-type AutomaticDirectVoiceKernel = Pick<VoiceKernel, 'directVoiceNote'>;
+type AutomaticDirectVoiceKernel = Pick<VoiceKernel, 'processAutomaticDirectVoice'>;
 
 export type AutomaticDirectVoiceResult = 'disabled' | 'attached' | 'not_enabled' | 'failed';
 
@@ -461,13 +461,7 @@ export async function attachAutomaticDirectVoiceNote(input: {
 }): Promise<AutomaticDirectVoiceResult> {
   if (!input.voiceKernel) return 'disabled';
   try {
-    await input.voiceKernel.directVoiceNote(
-      input.ownerAccountId,
-      input.sessionId,
-      input.assistantMessageId,
-      `direct-voice:${input.assistantMessageId}`,
-      'always',
-    );
+    await input.voiceKernel.processAutomaticDirectVoice(input.assistantMessageId);
     input.publishChanged();
     return 'attached';
   } catch (error) {
@@ -602,6 +596,14 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
             registry: app.turnRegistry,
             historySync: app.historySync,
             ...(opts.providerEvidenceDb ? { db: opts.providerEvidenceDb } : {}),
+            ...(opts.voiceKernel ? {
+              afterAssistantPersist: async (tx, assistant) => {
+                await opts.voiceKernel!.enqueueAutomaticDirectVoice(tx, {
+                  ...assistant,
+                  text: assistant.content,
+                });
+              },
+            } : {}),
             onError: safeRequestErrorCallback(req.log, {}, 'chat turn side-error'),
           },
           {

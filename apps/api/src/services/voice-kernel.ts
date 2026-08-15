@@ -71,6 +71,21 @@ interface ExecutionRow {
   output_sha256?: string | null;
 }
 
+interface DirectVoiceJobRow {
+  message_id: string;
+  owner_account_id: string;
+  session_id: string;
+  agent_account_id: string | null;
+  voice_id: string;
+  text_sha256: string;
+  mode: 'on_demand' | 'always';
+  status: 'queued' | 'generating' | 'attachment_pending' | 'completed' | 'failed';
+  generation: number;
+  execution_id: string | null;
+  last_error_code: string | null;
+  updated_at: Date | string;
+}
+
 interface ClipMeta {
   object_id: string;
   mime: 'audio/wav' | 'audio/mpeg';
@@ -138,6 +153,10 @@ function shouldRefundVoiceFailure(status: VoiceExecutionDto['status']): boolean 
 
 function providerCloneName(id: string): string {
   return `eden3-clone-${id}`;
+}
+
+function directVoiceExecutionKey(messageId: string, generation: number): string {
+  return `direct-voice:${messageId}:generation:${generation}`;
 }
 
 function ambiguousCloneAbsenceDisposition(
@@ -363,6 +382,8 @@ export class VoiceKernel {
     sessionId?: string;
     messageId?: string;
     channelTurnId?: string;
+    /** Direct chat owns settlement until its message attachment commits. */
+    deferSettlement?: boolean;
   }): Promise<VoiceExecutionDto> {
     const transcript = exactTranscript(input.text, input.operation);
     const requestSha256 = executionRequestHash({ ...input, textSha256: transcript.sha256 });
@@ -457,6 +478,28 @@ export class VoiceKernel {
       }
       const completed = await this.dbc.transaction(async (tx) => {
         await this.resolveAuthorizedVoiceTx(tx, input.ownerAccountId, admission.voice.voiceId, input.operation);
+        if (input.deferSettlement) {
+          const pending = await tx.execute(sql`
+            update voice_executions set output_url=${stored.url},output_sha256=${stored.sha256},
+              output_local_path=${stored.localPath},output_mime=${stored.mime},output_size_bytes=${stored.sizeBytes},output_duration_ms=${output.durationMs},
+              waveform=${output.waveform},updated_at=statement_timestamp(),last_error_code=null
+            where id=${admission.executionId} and status='transcoding' returning *
+          `);
+          const row = rows<ExecutionRow>(pending)[0];
+          if (!row) throw new Error('voice execution lost direct attachment custody');
+          await tx.execute(sql`
+            update usage_events set metadata=coalesce(metadata,'{}'::jsonb)||${JSON.stringify({
+              providerRequestId: generated.requestId,
+              billedCharacters: generated.billedCharacters,
+              outputSha256: stored.sha256,
+              outputBytes: stored.sizeBytes,
+              durationMs: output.durationMs,
+              attachmentPending: true,
+            })}::jsonb
+            where event_type='voice_generation' and turn_id=${admission.executionId} and status='provider_admitted'
+          `);
+          return executionDto(row, false);
+        }
         const updated = await tx.execute(sql`
           update voice_executions set status='completed',output_url=${stored.url},output_sha256=${stored.sha256},
             output_local_path=${stored.localPath},output_mime=${stored.mime},output_size_bytes=${stored.sizeBytes},output_duration_ms=${output.durationMs},
@@ -539,9 +582,14 @@ export class VoiceKernel {
   /** Conservative crash recovery: indeterminate work is never replayed and never charged without output. */
   async reconcileStaleExecutions(cutoff = new Date(this.now().getTime() - 15 * 60_000)): Promise<number> {
     const result = await this.dbc.execute(sql`
-      select id from voice_executions
-      where status in ('provider_started','transcoding','refund_pending','artifact_cleanup_pending') and updated_at<${cutoff.toISOString()}
-      order by updated_at,id limit 100
+      select v.id from voice_executions v
+      where v.status in ('provider_started','transcoding','refund_pending','artifact_cleanup_pending') and v.updated_at<${cutoff.toISOString()}
+        and not exists (
+          select 1 from direct_voice_jobs j where j.message_id=v.message_id
+            and j.status in ('queued','generating','attachment_pending')
+            and v.idempotency_key=('direct-voice:'||j.message_id::text||':generation:'||j.generation::text)
+        )
+      order by v.updated_at,v.id limit 100
     `);
     for (const row of rows<{ id: string }>(result)) {
       await this.failExecution(row.id, `voice:${row.id}`, 'voice_execution_recovered_indeterminate');
@@ -573,45 +621,280 @@ export class VoiceKernel {
     if (rows(result).length === 0) throw new VoiceKernelError(404, 'voice_assignment_not_found', 'Voice assignment not found');
   }
 
+  /** Insert `always` work inside the assistant-message terminal transaction. */
+  async enqueueAutomaticDirectVoice(
+    tx: DbHandle,
+    input: { ownerAccountId: string; sessionId: string; messageId: string; agentAccountId: string; text: string },
+  ): Promise<boolean> {
+    let transcript: ReturnType<typeof exactTranscript>;
+    try { transcript = exactTranscript(input.text, 'chat'); }
+    catch (error) {
+      if (error instanceof VoiceKernelError) return false;
+      throw error;
+    }
+    const assignmentResult = await tx.execute(sql`
+      select av.voice_id from agent_voice_assignments av join agents g on g.account_id=av.agent_account_id
+      where av.agent_account_id=${input.agentAccountId} and av.chat_mode='always'
+        and (g.owner_id=${input.ownerAccountId} or exists (
+          select 1 from session_agents sa where sa.session_id=${input.sessionId} and sa.agent_account_id=${input.agentAccountId}
+        ))
+    `);
+    const assignment = rows<{ voice_id: string }>(assignmentResult)[0];
+    if (!assignment) return false;
+    await tx.execute(sql`
+      insert into direct_voice_jobs (message_id,owner_account_id,session_id,agent_account_id,voice_id,text_sha256,mode,status)
+      values (${input.messageId},${input.ownerAccountId},${input.sessionId},${input.agentAccountId},${assignment.voice_id},${transcript.sha256},'always','queued')
+      on conflict (message_id) do nothing
+    `);
+    return true;
+  }
+
+  private async loadDirectVoiceResult(tx: DbHandle, job: DirectVoiceJobRow): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
+    if (!job.execution_id) throw new VoiceKernelError(409, 'voice_execution_in_progress', 'Voice note is still being prepared');
+    const executionResult = await tx.execute(sql`select * from voice_executions where id=${job.execution_id} and owner_account_id=${job.owner_account_id}`);
+    const execution = rows<ExecutionRow>(executionResult)[0];
+    const messageResult = await tx.execute(sql`
+      select id,external_id,session_id,sender_id,role,content,attachments,tool_calls,reactions,reply_to_external_id,created_at
+      from messages where id=${job.message_id} and session_id=${job.session_id}
+    `);
+    const message = rows<Record<string, unknown>>(messageResult)[0];
+    if (!execution || !message) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+    return { execution: executionDto(execution, true), message: directVoiceMessageDto(message) };
+  }
+
+  private async settleDirectVoiceAttachment(messageId: string): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
+    try {
+      return await this.dbc.transaction(async (tx) => {
+      const jobResult = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
+      const job = rows<DirectVoiceJobRow>(jobResult)[0];
+      if (!job) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+      if (job.status === 'completed') return await this.loadDirectVoiceResult(tx, job);
+      if (job.status !== 'attachment_pending' || !job.execution_id) {
+        throw new VoiceKernelError(409, 'voice_execution_in_progress', 'Voice note is still being prepared');
+      }
+      const executionResult = await tx.execute(sql`select * from voice_executions where id=${job.execution_id} and owner_account_id=${job.owner_account_id} for update`);
+      const execution = rows<ExecutionRow>(executionResult)[0];
+      if (!execution || execution.status !== 'transcoding' || !execution.output_url || !execution.output_mime || !execution.output_duration_ms) {
+        throw new Error('direct voice attachment lost playable output custody');
+      }
+      const attachment = [{
+        url: execution.output_url,
+        mime: execution.output_mime,
+        durationMs: execution.output_duration_ms,
+        voiceExecutionId: execution.id,
+      }];
+      const messageResult = await tx.execute(sql`
+        update messages set attachments=case when exists (
+          select 1 from jsonb_array_elements(coalesce(attachments,'[]'::jsonb)) item where item->>'voiceExecutionId'=${execution.id}
+        ) then coalesce(attachments,'[]'::jsonb) else coalesce(attachments,'[]'::jsonb)||${JSON.stringify(attachment)}::jsonb end
+        where id=${job.message_id} and session_id=${job.session_id} and role='assistant'
+        returning id,external_id,session_id,sender_id,role,content,attachments,tool_calls,reactions,reply_to_external_id,created_at
+      `);
+      const message = rows<Record<string, unknown>>(messageResult)[0];
+      if (!message) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+      const completedResult = await tx.execute(sql`
+        update voice_executions set status='completed',completed_at=statement_timestamp(),updated_at=statement_timestamp(),last_error_code=null
+        where id=${execution.id} and status='transcoding' returning *
+      `);
+      const completed = rows<ExecutionRow>(completedResult)[0];
+      if (!completed) throw new Error('direct voice settlement lost execution custody');
+      const usageResult = await tx.execute(sql`
+        update usage_events set status='completed',cost_usd=(select cost_usd from voice_executions where id=${execution.id}),
+          metadata=coalesce(metadata,'{}'::jsonb)||${JSON.stringify({ directAttachmentCommitted: true })}::jsonb
+        where event_type='voice_generation' and turn_id=${execution.id} and status='provider_admitted'
+        returning id
+      `);
+      if (rows(usageResult).length !== 1) throw new Error('direct voice settlement lost usage custody');
+      const jobCompleted = await tx.execute(sql`
+        update direct_voice_jobs set status='completed',completed_at=statement_timestamp(),updated_at=statement_timestamp(),last_error_code=null
+        where message_id=${job.message_id} and status='attachment_pending'
+        returning message_id
+      `);
+      if (rows(jobCompleted).length !== 1) throw new Error('direct voice settlement lost job custody');
+        return { execution: executionDto(completed, false), message: directVoiceMessageDto(message) };
+      });
+    } catch (error) {
+      if (error instanceof VoiceKernelError && error.code === 'voice_message_not_eligible') {
+        const jobResult = await this.dbc.execute(sql`select execution_id from direct_voice_jobs where message_id=${messageId}`);
+        const executionId = rows<{ execution_id: string | null }>(jobResult)[0]?.execution_id;
+        if (executionId) {
+          await this.failExecution(executionId, `voice:${executionId}`, 'voice_message_not_eligible');
+          await this.cleanupFailedArtifact(executionId);
+        }
+        await this.dbc.execute(sql`
+          update direct_voice_jobs set status='failed',execution_id=null,last_error_code='voice_message_not_eligible',updated_at=statement_timestamp()
+          where message_id=${messageId} and status='attachment_pending'
+        `);
+      }
+      throw error;
+    }
+  }
+
+  private async processDirectVoiceJob(messageId: string): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
+    const claim = await this.dbc.transaction(async (tx) => {
+      const result = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
+      const job = rows<DirectVoiceJobRow>(result)[0];
+      if (!job) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+      if (job.status === 'completed') return { result: await this.loadDirectVoiceResult(tx, job), job: null } as const;
+      if (job.status === 'attachment_pending') return { result: null, job } as const;
+      if (job.status !== 'queued') throw new VoiceKernelError(409, 'voice_execution_in_progress', 'Voice note is already being prepared');
+      await tx.execute(sql`update direct_voice_jobs set status='generating',updated_at=statement_timestamp(),last_error_code=null where message_id=${messageId} and status='queued'`);
+      const messageResult = await tx.execute(sql`select content from messages where id=${job.message_id} and session_id=${job.session_id} and role='assistant'`);
+      const message = rows<{ content: string | null }>(messageResult)[0];
+      let currentSha256: string | null = null;
+      try { if (message?.content) currentSha256 = exactTranscript(message.content, 'chat').sha256; }
+      catch (error) { if (!(error instanceof VoiceKernelError)) throw error; }
+      if (!message?.content || currentSha256 !== job.text_sha256) {
+        await tx.execute(sql`
+          update direct_voice_jobs set status='failed',last_error_code='voice_message_changed',updated_at=statement_timestamp()
+          where message_id=${messageId} and status='generating'
+        `);
+        return { result: null, job: null, invalid: true } as const;
+      }
+      return { result: null, job: { ...job, status: 'generating' as const }, text: message.content } as const;
+    });
+    if (claim.result) return claim.result;
+    if ('invalid' in claim && claim.invalid) {
+      throw new VoiceKernelError(409, 'voice_message_changed', 'Assistant message changed before voice delivery');
+    }
+    if (!claim.job) throw new Error('direct voice claim missing');
+    if (claim.job.status === 'attachment_pending') return await this.settleDirectVoiceAttachment(messageId);
+    const job = claim.job;
+    const text = claim.text!;
+    const stableKey = directVoiceExecutionKey(job.message_id, job.generation);
+    try {
+      const quote = await this.quote(job.owner_account_id, 'chat', job.voice_id, text);
+      const execution = await this.synthesize({
+        ownerAccountId: job.owner_account_id,
+        operation: 'chat',
+        voiceId: job.voice_id,
+        quoteId: quote.quoteId,
+        text,
+        idempotencyKey: stableKey,
+        agentAccountId: job.agent_account_id ?? undefined,
+        sessionId: job.session_id,
+        messageId: job.message_id,
+        deferSettlement: true,
+      });
+      const bound = await this.dbc.execute(sql`
+        update direct_voice_jobs set status='attachment_pending',execution_id=${execution.id},updated_at=statement_timestamp()
+        where message_id=${job.message_id} and status='generating' and generation=${job.generation}
+        returning message_id
+      `);
+      if (rows(bound).length !== 1) {
+        await this.failExecution(execution.id, `voice:${execution.id}`, 'voice_delivery_claim_lost');
+        await this.cleanupFailedArtifact(execution.id);
+        throw new VoiceKernelError(409, 'voice_execution_terminal', 'Voice delivery claim was lost and refunded');
+      }
+      return await this.settleDirectVoiceAttachment(job.message_id);
+    } catch (error) {
+      const code = error instanceof VoiceKernelError ? error.code : 'voice_execution_failed';
+      await this.dbc.execute(sql`
+        update direct_voice_jobs set status='failed',last_error_code=${code},updated_at=statement_timestamp()
+        where message_id=${job.message_id} and status='generating' and generation=${job.generation}
+      `);
+      throw error;
+    }
+  }
+
+  async processAutomaticDirectVoice(messageId: string): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
+    return await this.processDirectVoiceJob(messageId);
+  }
+
   async directVoiceNote(
     ownerAccountId: string,
     sessionId: string,
     messageId: string,
-    idempotencyKey: string,
+    _clientIdempotencyKey: string,
     requiredMode?: 'always',
   ): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
-    const result = await this.dbc.execute(sql`
-      select m.content,m.sender_id agent_account_id,av.voice_id
-      from messages m join sessions s on s.id=m.session_id
-      join agents g on g.account_id=m.sender_id
-      join agent_voice_assignments av on av.agent_account_id=m.sender_id and av.chat_mode in ('on_demand','always')
-      where s.id=${sessionId} and m.id=${messageId} and m.session_id=s.id and m.role='assistant'
-        and s.deleted=false and s.visible is distinct from false and s.channel_connection_id is null
-        and (s.owner_id=${ownerAccountId} or exists (select 1 from session_users su where su.session_id=s.id and su.user_account_id=${ownerAccountId}))
-        and (g.owner_id=${ownerAccountId} or exists (select 1 from session_agents sa where sa.session_id=s.id and sa.agent_account_id=g.account_id))
-        and (${requiredMode ?? null}::text is null or av.chat_mode=${requiredMode ?? null})
-    `);
-    const row = rows<{ content: string | null; agent_account_id: string; voice_id: string }>(result)[0];
-    if (!row?.content) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
-    const quote = await this.quote(ownerAccountId, 'chat', row.voice_id, row.content);
-    const execution = await this.synthesize({ ownerAccountId, operation: 'chat', voiceId: row.voice_id, quoteId: quote.quoteId, text: row.content, idempotencyKey, agentAccountId: row.agent_account_id, sessionId, messageId });
-    const messageResult = await this.dbc.execute(sql`
-      update messages set attachments=coalesce(attachments,'[]'::jsonb)||${JSON.stringify([{ url: execution.url, mime: execution.mime, durationMs: execution.durationMs, voiceExecutionId: execution.id }])}::jsonb
-      where id=${messageId} and session_id=${sessionId} and not exists (
-        select 1 from jsonb_array_elements(coalesce(attachments,'[]'::jsonb)) item
-        where item->>'voiceExecutionId'=${execution.id}
-      ) returning id,external_id,session_id,sender_id,role,content,attachments,tool_calls,reactions,reply_to_external_id,created_at
-    `);
-    let message = rows<Record<string, unknown>>(messageResult)[0];
-    if (!message) {
-      const replayResult = await this.dbc.execute(sql`
-        select id,external_id,session_id,sender_id,role,content,attachments,tool_calls,reactions,reply_to_external_id,created_at
-        from messages where id=${messageId} and session_id=${sessionId}
+    const disposition = await this.dbc.transaction(async (tx) => {
+      let result = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
+      let job = rows<DirectVoiceJobRow>(result)[0];
+      if (job) {
+        if (job.owner_account_id !== ownerAccountId || job.session_id !== sessionId || (requiredMode === 'always' && job.mode !== 'always')) {
+          throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+        }
+        if (job.status === 'completed') return { completed: await this.loadDirectVoiceResult(tx, job) } as const;
+        if (job.status === 'failed') {
+          result = await tx.execute(sql`
+            update direct_voice_jobs set status='queued',generation=generation+1,execution_id=null,last_error_code=null,completed_at=null,updated_at=statement_timestamp()
+            where message_id=${messageId} and status='failed' and generation<100 returning *
+          `);
+          job = rows<DirectVoiceJobRow>(result)[0];
+          if (!job) throw new VoiceKernelError(409, 'voice_execution_terminal', 'Voice note retry limit reached');
+        }
+        return { completed: null } as const;
+      }
+      const eligibleResult = await tx.execute(sql`
+        select m.content,m.sender_id agent_account_id,av.voice_id,av.chat_mode
+        from messages m join sessions s on s.id=m.session_id join agents g on g.account_id=m.sender_id
+        join agent_voice_assignments av on av.agent_account_id=m.sender_id and av.chat_mode in ('on_demand','always')
+        where s.id=${sessionId} and m.id=${messageId} and m.role='assistant' and s.deleted=false
+          and s.visible is distinct from false and s.channel_connection_id is null
+          and (s.owner_id=${ownerAccountId} or exists (select 1 from session_users su where su.session_id=s.id and su.user_account_id=${ownerAccountId}))
+          and (g.owner_id=${ownerAccountId} or exists (select 1 from session_agents sa where sa.session_id=s.id and sa.agent_account_id=g.account_id))
+          and (${requiredMode ?? null}::text is null or av.chat_mode=${requiredMode ?? null})
       `);
-      message = rows<Record<string, unknown>>(replayResult)[0];
+      const eligible = rows<{ content: string | null; agent_account_id: string; voice_id: string; chat_mode: 'on_demand' | 'always' }>(eligibleResult)[0];
+      if (!eligible?.content) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+      const transcript = exactTranscript(eligible.content, 'chat');
+      await this.resolveAuthorizedVoiceTx(tx, ownerAccountId, eligible.voice_id, 'chat');
+      await tx.execute(sql`
+        insert into direct_voice_jobs (message_id,owner_account_id,session_id,agent_account_id,voice_id,text_sha256,mode,status)
+        values (${messageId},${ownerAccountId},${sessionId},${eligible.agent_account_id},${eligible.voice_id},${transcript.sha256},${eligible.chat_mode},'queued')
+      `);
+      return { completed: null } as const;
+    });
+    if (disposition.completed) return disposition.completed;
+    return await this.processDirectVoiceJob(messageId);
+  }
+
+  /** Durable outbox recovery; safe to run repeatedly and across processes. */
+  async reconcileDirectVoiceJobs(cutoff = new Date(this.now().getTime() - 15 * 60_000)): Promise<number> {
+    const result = await this.dbc.execute(sql`
+      select message_id,status,generation,execution_id from direct_voice_jobs
+      where status in ('queued','attachment_pending') or (status='generating' and updated_at<${cutoff.toISOString()})
+      order by updated_at,message_id limit 100
+    `);
+    for (const pending of rows<Pick<DirectVoiceJobRow, 'message_id' | 'status' | 'generation' | 'execution_id'>>(result)) {
+      try {
+        if (pending.status === 'attachment_pending' && pending.execution_id) {
+          const terminalResult = await this.dbc.execute(sql`select status from voice_executions where id=${pending.execution_id}`);
+          const terminal = rows<{ status: string }>(terminalResult)[0];
+          if (!terminal || terminal.status === 'failed' || terminal.status === 'artifact_cleanup_pending') {
+            if (terminal?.status === 'artifact_cleanup_pending') await this.cleanupFailedArtifact(pending.execution_id);
+            await this.dbc.execute(sql`update direct_voice_jobs set status='failed',execution_id=null,last_error_code='voice_execution_recovered_indeterminate',updated_at=statement_timestamp() where message_id=${pending.message_id} and status='attachment_pending'`);
+            continue;
+          }
+        }
+        if (pending.status === 'generating') {
+          const stableKey = directVoiceExecutionKey(pending.message_id, pending.generation);
+          const executionResult = await this.dbc.execute(sql`
+            select id,status,output_url from voice_executions where purpose='chat' and message_id=${pending.message_id} and idempotency_key=${stableKey}
+          `);
+          const execution = rows<{ id: string; status: string; output_url: string | null }>(executionResult)[0];
+          if (execution?.status === 'transcoding' && execution.output_url) {
+            await this.dbc.execute(sql`update direct_voice_jobs set status='attachment_pending',execution_id=${execution.id},updated_at=statement_timestamp() where message_id=${pending.message_id} and status='generating'`);
+          } else if (execution?.status === 'failed' || execution?.status === 'artifact_cleanup_pending') {
+            await this.cleanupFailedArtifact(execution.id);
+            await this.dbc.execute(sql`update direct_voice_jobs set status='failed',execution_id=null,last_error_code='voice_execution_recovered_indeterminate',updated_at=statement_timestamp() where message_id=${pending.message_id} and status in ('generating','attachment_pending')`);
+            continue;
+          } else if (execution) {
+            await this.failExecution(execution.id, `voice:${execution.id}`, 'voice_execution_recovered_indeterminate');
+            await this.cleanupFailedArtifact(execution.id);
+            await this.dbc.execute(sql`update direct_voice_jobs set status='failed',last_error_code='voice_execution_recovered_indeterminate',updated_at=statement_timestamp() where message_id=${pending.message_id} and status='generating'`);
+            continue;
+          } else {
+            await this.dbc.execute(sql`update direct_voice_jobs set status='queued',updated_at=statement_timestamp() where message_id=${pending.message_id} and status='generating'`);
+          }
+        }
+        await this.processDirectVoiceJob(pending.message_id);
+      } catch {
+        // A failed job carries its durable error; another healthy job must continue.
+      }
     }
-    if (!message) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
-    return { execution, message: directVoiceMessageDto(message) };
+    return rows(result).length;
   }
 
   async channelVoiceNote(input: { turnId: string; text: string; idempotencyKey: string; connectionId: string; bindingId?: string }): Promise<VoiceExecutionDto & { waveform: string | null }> {
@@ -994,5 +1277,6 @@ export const voiceKernelInternals = {
   shouldRefundVoiceFailure,
   providerCloneName,
   ambiguousCloneAbsenceDisposition,
+  directVoiceExecutionKey,
   TEXT_LIMITS,
 };

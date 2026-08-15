@@ -88,6 +88,19 @@ describe('PostgresAccountErasureStore transaction boundary', () => {
     expect(source).toContain("'erasure_work_in_flight'");
   });
 
+  it('blocks active direct voice and deletes every terminal job before message scrubbing', () => {
+    expect(source).toContain("from direct_voice_jobs v join principals p on p.id in (v.owner_account_id,v.agent_account_id)");
+    expect(source.match(/where v\.status in \('queued','generating','attachment_pending'\)/g)).toHaveLength(2);
+    const deletion = source.indexOf('delete from direct_voice_jobs v');
+    const scrub = source.indexOf('), scrub_messages as (');
+    const executionDeletion = source.indexOf("delete from voice_executions where status<>'completed'");
+    expect(deletion).toBeGreaterThan(0);
+    expect(deletion).toBeLessThan(scrub);
+    expect(deletion).toBeLessThan(executionDeletion);
+    expect(source.slice(deletion, deletion + 400)).toContain('v.owner_account_id in (select id from principals)');
+    expect(source.slice(deletion, deletion + 400)).toContain('v.agent_account_id in (select id from principals)');
+  });
+
   it('rejects malformed foreign contributor arrays before privacy mutation', () => {
     expect(source).toContain("jsonb_typeof(c.contributors)<>'array' or exists");
     expect(source).toContain("where jsonb_typeof(item.value)<>'string'");

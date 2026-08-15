@@ -39,7 +39,6 @@ import { Skeleton } from "@/components/skeleton";
 import {
   describeSendError,
   directVoiceNoteIdempotencyKey,
-  directVoiceNoteRetryKey,
   fetchSessionPage,
   sessionAgents,
   sessionTitle,
@@ -151,7 +150,6 @@ export function SessionConversation({
   const adoptedPumpRef = useRef<string | null>(null);
   const localTurnsRef = useRef<Set<string>>(new Set());
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const voiceRequestKeysRef = useRef<Map<string, string>>(new Map());
 
   // Scroll management (used inside callbacks defined below).
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -193,22 +191,11 @@ export function SessionConversation({
   const requestVoiceNote = useCallback(async (messageId: string) => {
     setVoiceStatus((current) => ({ ...current, [messageId]: "generating" }));
     try {
-      let key = voiceRequestKeysRef.current.get(messageId) ?? directVoiceNoteIdempotencyKey(messageId);
-      try {
-        await api.sessions.voiceNote(canonicalIdRef.current, messageId, key);
-      } catch (error) {
-        const body = error instanceof ApiError && error.body && typeof error.body === "object"
-          ? error.body as { error?: { code?: unknown }; code?: unknown }
-          : null;
-        const code = body?.error?.code ?? body?.code;
-        if (code !== "voice_execution_terminal") throw error;
-        // A known terminal attempt is refunded and cannot replay. Only this
-        // authoritative response permits a fresh key; network ambiguity and
-        // in-progress responses always retain the existing identity.
-        key = directVoiceNoteRetryKey(messageId, crypto.randomUUID());
-        voiceRequestKeysRef.current.set(messageId, key);
-        await api.sessions.voiceNote(canonicalIdRef.current, messageId, key);
-      }
+      await api.sessions.voiceNote(
+        canonicalIdRef.current,
+        messageId,
+        directVoiceNoteIdempotencyKey(messageId),
+      );
       await refreshHistory();
       setVoiceStatus((current) => ({ ...current, [messageId]: "idle" }));
     } catch (error) {

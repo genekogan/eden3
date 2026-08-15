@@ -282,6 +282,29 @@ beforeAll(async () => {
       has_table_privilege(session_user,'public.agent_avatar_assets','update') as can_update,
       has_table_privilege(session_user,'public.agent_avatar_assets','delete') as can_delete`
   ).resolves.toEqual([{ can_select: true, can_insert: true, can_update: true, can_delete: true }]);
+  for (const table of [
+    'agent_voice_assignments', 'voice_clones', 'voice_clone_clips',
+    'voice_quotes', 'voice_executions', 'direct_voice_jobs',
+  ]) {
+    await expect(operatorPg`
+      select
+        has_table_privilege(session_user,${`public.${table}`}::text,'select') as can_select,
+        has_table_privilege(session_user,${`public.${table}`}::text,'insert') as can_insert,
+        has_table_privilege(session_user,${`public.${table}`}::text,'update') as can_update,
+        has_table_privilege(session_user,${`public.${table}`}::text,'delete') as can_delete`
+    ).resolves.toEqual([{
+      can_select: true, can_insert: true, can_update: true, can_delete: true,
+    }]);
+    await expect(ordinaryPg`
+      select
+        has_table_privilege(session_user,${`public.${table}`}::text,'select') as can_select,
+        has_table_privilege(session_user,${`public.${table}`}::text,'insert') as can_insert,
+        has_table_privilege(session_user,${`public.${table}`}::text,'update') as can_update,
+        has_table_privilege(session_user,${`public.${table}`}::text,'delete') as can_delete`
+    ).resolves.toEqual([{
+      can_select: false, can_insert: false, can_update: false, can_delete: false,
+    }]);
+  }
   ordinaryDb = drizzle(ordinaryPg) as DbHandle;
   ERASURE_DB_BOUNDARY = await attestAccountErasureDatabaseBoundary({
     operatorClient: operatorPg as never,
@@ -334,6 +357,106 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
       select has_table_privilege(session_user,'account_erasure_jobs','select') permitted`
     ).resolves.toEqual([{ permitted: true }]);
   });
+
+  it('deletes terminal direct-voice receipts and rejects queued delivery before privacy mutation', async () => {
+    const human = randomUUID();
+    const agent = randomUUID();
+    const foreign = randomUUID();
+    const activeHuman = randomUUID();
+    const humanSession = randomUUID();
+    const agentSession = randomUUID();
+    const foreignSession = randomUUID();
+    const activeSession = randomUUID();
+    const humanMessage = randomUUID();
+    const agentMessage = randomUUID();
+    const foreignMessage = randomUUID();
+    const activeMessage = randomUUID();
+    const executionId = randomUUID();
+    const humanUsername = `voice_erase_${human.slice(0, 8)}`;
+    const activeUsername = `voice_active_${activeHuman.slice(0, 8)}`;
+    await pg`
+      insert into accounts(id,type,username) values
+        (${human},'user',${humanUsername}),
+        (${agent},'agent',${`voice_agent_${agent.slice(0, 8)}`}),
+        (${foreign},'user',${`voice_foreign_${foreign.slice(0, 8)}`}),
+        (${activeHuman},'user',${activeUsername})`;
+    await pg`
+      insert into agents(account_id,owner_id,name,public)
+      values (${agent},${human},'direct voice erasure agent',false)`;
+    await pg`
+      insert into sessions(id,owner_id,title) values
+        (${humanSession},${human},'human voice receipt'),
+        (${agentSession},${foreign},'owned agent voice receipt'),
+        (${foreignSession},${foreign},'foreign voice receipt'),
+        (${activeSession},${activeHuman},'active voice delivery')`;
+    await pg`
+      insert into messages(id,session_id,sender_id,content) values
+        (${humanMessage},${humanSession},${human},'human terminal voice'),
+        (${agentMessage},${agentSession},${agent},'owned agent terminal voice'),
+        (${foreignMessage},${foreignSession},${foreign},'foreign terminal voice'),
+        (${activeMessage},${activeSession},${activeHuman},'active queued voice')`;
+    await pg`
+      insert into voice_executions(
+        id,owner_account_id,session_id,message_id,purpose,voice_id,text_sha256,
+        request_sha256,idempotency_key,character_count,provider,model,status,
+        reserved_manna,reserved_subscription_manna,cost_usd,table_version,
+        output_url,output_local_path,output_sha256,output_mime,output_size_bytes,
+        output_duration_ms,completed_at
+      ) values (
+        ${executionId},${human},${humanSession},${humanMessage},'chat','deepinfra:kokoro:test:v1',
+        ${sha('human terminal voice')},${sha('human terminal voice request')},
+        ${`voice-erasure-${executionId}`},20,'mock','mock-voice','completed',0,0,0,'test-v1',
+        '/media/voice-erasure.mp3','/tmp/voice-erasure.mp3',${sha('voice output')},
+        'audio/mpeg',10,1000,statement_timestamp()
+      )`;
+    await pg`
+      insert into direct_voice_jobs(
+        message_id,owner_account_id,session_id,agent_account_id,voice_id,text_sha256,
+        mode,status,execution_id,completed_at
+      ) values
+        (${humanMessage},${human},${humanSession},null,'deepinfra:kokoro:test:v1',
+          ${sha('human terminal voice')},'on_demand','completed',${executionId},statement_timestamp()),
+        (${agentMessage},${foreign},${agentSession},${agent},'deepinfra:kokoro:test:v1',
+          ${sha('owned agent terminal voice')},'always','failed',null,null),
+        (${foreignMessage},${foreign},${foreignSession},null,'deepinfra:kokoro:test:v1',
+          ${sha('foreign terminal voice')},'on_demand','failed',null,null),
+        (${activeMessage},${activeHuman},${activeSession},null,'deepinfra:kokoro:test:v1',
+          ${sha('active queued voice')},'on_demand','queued',null,null)`;
+
+    const result = await requestAccountErasure({
+      actorAccountId: human,
+      actorUsername: humanUsername,
+      actorIsAdmin: false,
+      confirmUsername: humanUsername,
+    }, erasureStore(), ledger(), recoverySink());
+    expect(result.status).toBe('pending');
+    const receipts = await pg<{ message_id: string }[]>`
+      select message_id from direct_voice_jobs
+      where message_id in (${humanMessage},${agentMessage},${foreignMessage})
+      order by message_id`;
+    expect(receipts).toEqual([{ message_id: foreignMessage }]);
+
+    await expect(requestAccountErasure({
+      actorAccountId: activeHuman,
+      actorUsername: activeUsername,
+      actorIsAdmin: false,
+      confirmUsername: activeUsername,
+    }, erasureStore(), ledger(), recoverySink())).rejects.toMatchObject({
+      code: 'erasure_work_in_flight',
+    });
+    const [unmutated] = await pg<{
+      deleted: boolean; content: string; jobs: number;
+    }[]>`
+      select a.deleted,m.content,
+        (select count(*)::int from account_erasure_jobs where account_id=${activeHuman}) jobs
+      from accounts a join messages m on m.id=${activeMessage}
+      where a.id=${activeHuman}`;
+    expect(unmutated).toEqual({
+      deleted: false,
+      content: 'active queued voice',
+      jobs: 0,
+    });
+  }, 30_000);
 
   it('serializes runtime projection with owner erasure admission in both lock orders', async () => {
     const dataDir = join(tmpdir(), 'eden3-runtime-erasure-fence');

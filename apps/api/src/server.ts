@@ -915,18 +915,23 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   if (voice) await app.register(voiceRoutes, voice);
   if (voice?.autoStartReconciler) {
     let voiceTimer: ReturnType<typeof setInterval> | undefined;
+    const voiceFlight: VoiceReconcilerFlight = { running: false };
+    const reconcileVoice = () => startVoiceReconciliation(
+      voiceFlight,
+      async () => await settleVoiceReconciliationTasks([
+        () => voice.kernel.reconcileStaleExecutions(),
+        () => voice.kernel.reconcileDirectVoiceJobs(),
+        () => voice.kernel.reconcileAmbiguousClones(),
+      ]),
+      () => { app.log.error({ component: 'voice-reconciler' }, 'voice reconciliation failed'); },
+    );
     app.addHook('onReady', async () => {
-      await voice.kernel.reconcileStaleExecutions();
-      void voice.kernel.reconcileAmbiguousClones().catch(() => {
-        app.log.error({ component: 'voice-reconciler' }, 'voice clone reconciliation failed');
-      });
+      // Provider reconciliation is intentionally detached from readiness: an
+      // outage/backlog must not prevent the API from starting and serving
+      // health/authenticated recovery surfaces.
+      reconcileVoice();
       voiceTimer = setInterval(() => {
-        void Promise.all([
-          voice.kernel.reconcileStaleExecutions(),
-          voice.kernel.reconcileAmbiguousClones(),
-        ]).catch(() => {
-          app.log.error({ component: 'voice-reconciler' }, 'voice reconciliation failed');
-        });
+        reconcileVoice();
       }, 60_000);
       voiceTimer.unref?.();
     });
@@ -1080,4 +1085,26 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   }
 
   return app;
+}
+
+export interface VoiceReconcilerFlight { running: boolean }
+
+export async function settleVoiceReconciliationTasks(
+  tasks: ReadonlyArray<() => Promise<unknown>>,
+): Promise<void> {
+  const results = await Promise.allSettled(tasks.map((task) => task()));
+  const failures = results.filter((result) => result.status === 'rejected').length;
+  if (failures > 0) throw new Error(`${failures} voice reconciliation task(s) failed`);
+}
+
+/** Starts provider-capable recovery without blocking readiness or overlapping. */
+export function startVoiceReconciliation(
+  flight: VoiceReconcilerFlight,
+  task: () => Promise<unknown>,
+  onError: (error: unknown) => void,
+): boolean {
+  if (flight.running) return false;
+  flight.running = true;
+  void task().catch(onError).finally(() => { flight.running = false; });
+  return true;
 }

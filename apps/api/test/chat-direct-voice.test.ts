@@ -14,12 +14,12 @@ describe('automatic direct-chat voice after a committed turn', () => {
   it('attaches exactly once with the stable message key and publishes only after custody', async () => {
     let resolveAttachment!: (value: unknown) => void;
     const attachment = new Promise((resolve) => { resolveAttachment = resolve; });
-    const directVoiceNote = vi.fn(() => attachment);
+    const processAutomaticDirectVoice = vi.fn(() => attachment);
     const publishChanged = vi.fn();
     const onError = vi.fn();
 
     const result = attachAutomaticDirectVoiceNote({
-      voiceKernel: { directVoiceNote } as never,
+      voiceKernel: { processAutomaticDirectVoice } as never,
       ownerAccountId: OWNER,
       sessionId: SESSION,
       assistantMessageId: MESSAGE,
@@ -27,14 +27,8 @@ describe('automatic direct-chat voice after a committed turn', () => {
       onError,
     });
 
-    expect(directVoiceNote).toHaveBeenCalledTimes(1);
-    expect(directVoiceNote).toHaveBeenCalledWith(
-      OWNER,
-      SESSION,
-      MESSAGE,
-      `direct-voice:${MESSAGE}`,
-      'always',
-    );
+    expect(processAutomaticDirectVoice).toHaveBeenCalledTimes(1);
+    expect(processAutomaticDirectVoice).toHaveBeenCalledWith(MESSAGE);
     expect(publishChanged).not.toHaveBeenCalled();
 
     resolveAttachment({ execution: {}, message: { id: MESSAGE } });
@@ -44,40 +38,40 @@ describe('automatic direct-chat voice after a committed turn', () => {
   });
 
   it('treats off/on-demand eligibility as a quiet no-op', async () => {
-    const directVoiceNote = vi.fn(async () => {
+    const processAutomaticDirectVoice = vi.fn(async () => {
       throw codedError('voice_message_not_eligible');
     });
     const publishChanged = vi.fn();
     const onError = vi.fn();
 
     await expect(attachAutomaticDirectVoiceNote({
-      voiceKernel: { directVoiceNote } as never,
+      voiceKernel: { processAutomaticDirectVoice } as never,
       ownerAccountId: OWNER,
       sessionId: SESSION,
       assistantMessageId: MESSAGE,
       publishChanged,
       onError,
     })).resolves.toBe('not_enabled');
-    expect(directVoiceNote).toHaveBeenCalledTimes(1);
+    expect(processAutomaticDirectVoice).toHaveBeenCalledTimes(1);
     expect(publishChanged).not.toHaveBeenCalled();
     expect(onError).not.toHaveBeenCalled();
   });
 
   it('contains provider failures so the committed chat cannot fail or duplicate', async () => {
     const failure = codedError('voice_provider_unavailable');
-    const directVoiceNote = vi.fn(async () => { throw failure; });
+    const processAutomaticDirectVoice = vi.fn(async () => { throw failure; });
     const publishChanged = vi.fn();
     const onError = vi.fn();
 
     await expect(attachAutomaticDirectVoiceNote({
-      voiceKernel: { directVoiceNote } as never,
+      voiceKernel: { processAutomaticDirectVoice } as never,
       ownerAccountId: OWNER,
       sessionId: SESSION,
       assistantMessageId: MESSAGE,
       publishChanged,
       onError,
     })).resolves.toBe('failed');
-    expect(directVoiceNote).toHaveBeenCalledTimes(1);
+    expect(processAutomaticDirectVoice).toHaveBeenCalledTimes(1);
     expect(publishChanged).not.toHaveBeenCalled();
     expect(onError).toHaveBeenCalledOnce();
     expect(onError).toHaveBeenCalledWith(failure);

@@ -82,11 +82,16 @@ describe('voice contract invariants', () => {
     expect(kernelSource).toContain("row.provider_request_id?.startsWith('absence:') === true");
   });
 
-  it('runs always-mode direct voice after the assistant row commits with a stable key', () => {
+  it('durably enqueues always-mode voice in the assistant transaction with a server generation key', () => {
     expect(chatRouteSource).toContain('if (outcome.assistantMessageId)');
     expect(chatRouteSource).toContain('void attachAutomaticDirectVoiceNote({');
-    expect(chatRouteSource).toContain('`direct-voice:${input.assistantMessageId}`');
-    expect(chatRouteSource).toContain("'always',");
-    expect(kernelSource).toContain("and (${requiredMode ?? null}::text is null or av.chat_mode=${requiredMode ?? null})");
+    expect(chatRouteSource).toContain('afterAssistantPersist: async (tx, assistant)');
+    expect(chatRouteSource).toContain('enqueueAutomaticDirectVoice(tx');
+    expect(voiceKernelInternals.directVoiceExecutionKey('m', 0)).toBe('direct-voice:m:generation:0');
+    expect(voiceKernelInternals.directVoiceExecutionKey('m', 1)).toBe('direct-voice:m:generation:1');
+    expect(kernelSource).toContain("insert into direct_voice_jobs");
+    expect(kernelSource).toContain("update messages set attachments=case when exists");
+    expect(kernelSource).toContain("update voice_executions set status='completed'");
+    expect(kernelSource).toContain("update direct_voice_jobs set status='completed'");
   });
 });

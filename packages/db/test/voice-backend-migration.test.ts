@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 const migrationPath = fileURLToPath(new URL('../migrations/0047_voice_backend.sql', import.meta.url));
 const boundsMigrationPath = fileURLToPath(new URL('../migrations/0048_voice_clone_clip_bounds.sql', import.meta.url));
+const deliveryMigrationPath = fileURLToPath(new URL('../migrations/0049_direct_voice_delivery_saga.sql', import.meta.url));
 const journalPath = fileURLToPath(new URL('../migrations/meta/_journal.json', import.meta.url));
 
 describe('0047 voice backend custody', () => {
@@ -36,6 +37,26 @@ describe('0047 voice backend custody', () => {
     expect(migration).toContain('"size_bytes" between 1 and 20971520');
     expect(migration).toContain('DROP CONSTRAINT "voice_clone_clips_duration_chk"');
     expect(migration).toContain('"duration_ms" between 100 and 30000');
+  });
+
+  it('adds a message-owned direct voice outbox and blocks erasure around active delivery', async () => {
+    const migration = await readFile(deliveryMigrationPath, 'utf8');
+    expect(migration).toContain('CREATE TABLE "direct_voice_jobs"');
+    expect(migration).toContain('"message_id" uuid PRIMARY KEY');
+    expect(migration).toContain("'queued','generating','attachment_pending'");
+    expect(migration).toContain('direct_voice_jobs_reconcile_idx');
+    expect(migration).toContain("TG_TABLE_NAME IN ('voice_quotes','direct_voice_jobs')");
+    expect(migration).toContain("TG_TABLE_NAME='direct_voice_jobs' AND public.account_erasure_job_claim_tuple_matches(v_owner)");
+    expect(migration).toContain("v.status IN ('queued','generating','attachment_pending')");
+    expect(migration).toContain('GRANT SELECT,INSERT,UPDATE,DELETE ON TABLE');
+    for (const table of [
+      'agent_voice_assignments', 'voice_clones', 'voice_clone_clips',
+      'voice_quotes', 'voice_executions', 'direct_voice_jobs',
+    ]) {
+      expect(migration).toContain(table);
+    }
+    expect(migration).toContain('TO eden3_erasure_operator');
+    expect(migration).not.toContain('TO eden3_erasure_terminal_writer');
   });
 
   it('keeps migration timestamps strictly increasing so 0047 cannot be skipped after 0046', async () => {
