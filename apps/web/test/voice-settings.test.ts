@@ -40,6 +40,15 @@ describe("voice settings", () => {
     expect(voiceSource).not.toContain("ELEVENLABS_API_KEY");
     expect(voiceSource).not.toContain("CARTESIA_API_KEY");
     expect(voiceSource).not.toContain("DEEPINFRA_API_KEY");
+    expect(voiceSource).toContain("previewKeys.current.get(voiceId)");
+    expect(voiceSource).toContain("uploadId: slot.uploadId");
+    expect(voiceSource).toContain("idempotencyKey: attempt.key");
+    expect(voiceSource).toContain("setConsentFingerprint(null)");
+    expect(voiceSource).toContain("consentFingerprint === cloneRequestFingerprint");
+    expect(voiceSource).toContain("voiceRequest<VoiceClone>");
+    expect(voiceSource).toContain(
+      "voiceRequest<VoiceClone>(`/voices/clones/${encodeURIComponent(clone.id)}`)",
+    );
   });
 
   it("removes the ambiguous legacy free-text voice field from Identity", () => {

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   DurableDictationSession,
+  DictationTransportError,
   MAX_DICTATION_MS,
   type DictationTransport,
 } from "../lib/dictation-session";
@@ -65,6 +66,7 @@ describe("durable dictation session", () => {
       }),
     });
     const session = await DurableDictationSession.create({
+      ownerId: "account-1",
       store: store as never,
       transport: remote,
       sleep: async () => {},
@@ -88,6 +90,7 @@ describe("durable dictation session", () => {
   it("keeps failed finalization recoverable instead of discarding audio state", async () => {
     const store = new MemoryDraftStore();
     const session = await DurableDictationSession.create({
+      ownerId: "account-1",
       store: store as never,
       transport: transport({ finalize: vi.fn(async () => { throw new Error("provider down"); }) }),
     });
@@ -100,6 +103,7 @@ describe("durable dictation session", () => {
     const store = new MemoryDraftStore();
     const remote = transport();
     const session = await DurableDictationSession.create({
+      ownerId: "account-1",
       store: store as never,
       transport: remote,
     });
@@ -111,9 +115,52 @@ describe("durable dictation session", () => {
   it("refuses audio beyond the ten-minute client guard", async () => {
     const store = new MemoryDraftStore();
     const session = await DurableDictationSession.create({
+      ownerId: "account-1",
       store: store as never,
       transport: transport(),
     });
     await expect(session.append(new Blob(["audio"]), MAX_DICTATION_MS + 1)).rejects.toThrow(/10 minutes/);
+  });
+
+  it("does not retry permanent authorization or protocol failures", async () => {
+    const store = new MemoryDraftStore();
+    const uploadChunk = vi.fn(async () => {
+      throw new DictationTransportError("Sign in again.", false, 401, "unauthorized");
+    });
+    const session = await DurableDictationSession.create({
+      ownerId: "account-1",
+      store: store as never,
+      transport: transport({ uploadChunk }),
+      sleep: async () => {},
+    });
+    await session.append(new Blob(["audio"]), 1_000);
+    await expect(session.finish()).rejects.toThrow("Sign in again");
+    expect(uploadChunk).toHaveBeenCalledTimes(1);
+  });
+
+  it("cannot resurrect or finalize a draft cancelled during an in-flight upload", async () => {
+    const store = new MemoryDraftStore();
+    let releaseUpload!: () => void;
+    const blocked = new Promise<void>((resolve) => { releaseUpload = resolve; });
+    const finalize = vi.fn(async () => ({ transcript: "must not happen" }));
+    const session = await DurableDictationSession.create({
+      ownerId: "account-1",
+      store: store as never,
+      transport: transport({
+        uploadChunk: vi.fn(async ({ index }) => {
+          await blocked;
+          return { acknowledgedThrough: index };
+        }),
+        finalize,
+      }),
+    });
+    await session.append(new Blob(["audio"]), 1_000);
+    const finishing = session.finish();
+    const cancelling = session.cancel();
+    releaseUpload();
+    await cancelling;
+    await expect(finishing).rejects.toThrow(/cancelled/);
+    expect(finalize).not.toHaveBeenCalled();
+    expect(store.draft).toBeNull();
   });
 });

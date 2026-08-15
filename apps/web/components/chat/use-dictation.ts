@@ -42,11 +42,13 @@ export function formatDictationTime(milliseconds: number): string {
 }
 
 interface UseDictationOptions {
+  ownerId: string | null;
   onTranscript: (transcript: string) => void;
   transport?: DictationTransport;
 }
 
 export function useDictation({
+  ownerId,
   onTranscript,
   transport = DEFAULT_DICTATION_TRANSPORT,
 }: UseDictationOptions) {
@@ -139,11 +141,16 @@ export function useDictation({
     cancelRef.current = true;
     const recorder = recorderRef.current;
     if (recorder) await recorder.stop();
+    await sessionRef.current?.cancel();
     if (sessionRef.current) await settleRecorder();
   }, [settleRecorder]);
 
   const start = useCallback(async () => {
     if (state.phase !== "idle" && state.phase !== "error") return;
+    if (!ownerId) {
+      setState({ phase: "error", elapsedMs: 0, message: "Sign in before using dictation." });
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || !PcmRecorder.supported()) {
       setState({
         phase: "error",
@@ -165,6 +172,7 @@ export function useDictation({
       });
       streamRef.current = stream;
       const session = await DurableDictationSession.create({
+          ownerId,
           store: store(),
           transport,
           onNetworkPhase: (phase) => {
@@ -227,7 +235,7 @@ export function useDictation({
             : "Eden could not start dictation.",
       });
     }
-  }, [releaseStream, state.phase, stop, store, transport]);
+  }, [ownerId, releaseStream, state.phase, stop, store, transport]);
 
   // A refresh cannot keep the physical microphone open, but every completed
   // short PCM chunk is durable. On return, finish the interrupted recording
@@ -245,10 +253,14 @@ export function useDictation({
         // sequence. A hard refresh kills that instance; the durable draft is
         // still here when this short grace period ends.
         await new Promise((resolve) => setTimeout(resolve, 1_250));
-        const [draft] = await store().recoverableDrafts();
+        if (!ownerId) {
+          await store().purgeAll();
+          return;
+        }
+        const [draft] = await store().recoverableDrafts(ownerId);
         if (!draft || disposed || sessionRef.current) return;
         setState({ phase: "recovering", elapsedMs: draft.durationMs, message: "Recovering your recording…" });
-        const recovered = DurableDictationSession.recover(draft, { store: store(), transport });
+        const recovered = DurableDictationSession.recover(draft, { ownerId, store: store(), transport });
         sessionRef.current = recovered;
         const transcript = await recovered.finish();
         if (!disposed) {
@@ -277,7 +289,7 @@ export function useDictation({
       }
       clearTimer();
     };
-  }, [clearTimer, onTranscript, settleRecorder, store, transport]);
+  }, [clearTimer, onTranscript, ownerId, settleRecorder, store, transport]);
 
   return {
     state,

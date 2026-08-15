@@ -6,6 +6,7 @@ import {
   emitMannaUpdate,
 } from "@/lib/api";
 import { loadClerk, selectAuthMode } from "@/lib/clerk";
+import { purgeAllDictationDrafts } from "@/lib/dictation-storage";
 
 export function AuthUserControl({
   variant = "footer",
@@ -17,6 +18,7 @@ export function AuthUserControl({
   const signOut = async () => {
     setBusy(true);
     try {
+      await purgeAllDictationDrafts();
       if (selectAuthMode() === "clerk") {
         const clerk = await loadClerk();
         await clerk.signOut?.();

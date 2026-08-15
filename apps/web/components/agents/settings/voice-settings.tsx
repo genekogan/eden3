@@ -54,6 +54,13 @@ type VoiceQuote = {
   expiresAt: string;
 };
 
+type VoiceClipSelection = { file: File; sha256: string };
+type CloneAttempt = {
+  requestFingerprint: string;
+  key: string;
+  uploads: Array<{ uploadId?: string; objectId?: string }>;
+};
+
 const DEFAULT_DELIVERY: VoiceDelivery = {
   chat: "on_demand",
   discord: "off",
@@ -122,6 +129,13 @@ function statusLabel(status: VoiceClone["status"]): string {
   } as const)[status];
 }
 
+async function fileSha256(file: File): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 export function VoiceSettings({ username }: { username: string }) {
   const { agent, refresh } = useSelectedAgent();
   const [catalog, setCatalog] = useState<VoiceCatalogItem[] | null>(null);
@@ -132,11 +146,12 @@ export function VoiceSettings({ username }: { username: string }) {
   const [note, setNote] = useState<string | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewQuote, setPreviewQuote] = useState<{ voiceId: string; quote: VoiceQuote } | null>(null);
-  const [clips, setClips] = useState<File[]>([]);
+  const [clips, setClips] = useState<VoiceClipSelection[]>([]);
   const [cloneName, setCloneName] = useState("");
-  const [consented, setConsented] = useState(false);
+  const [consentFingerprint, setConsentFingerprint] = useState<string | null>(null);
   const [clone, setClone] = useState<VoiceClone | null>(null);
-  const cloneKey = useRef(crypto.randomUUID());
+  const cloneAttempt = useRef<CloneAttempt | null>(null);
+  const previewKeys = useRef(new Map<string, string>());
   const uploader = useMemo(() => new ResumableUploader({
     apiBaseUrl: "/api",
     getAuthToken: getClerkToken,
@@ -220,14 +235,17 @@ export function VoiceSettings({ username }: { username: string }) {
     setNote(null);
     setPreviewUrl(null);
     try {
+      const idempotencyKey = previewKeys.current.get(voiceId) ?? crypto.randomUUID();
+      previewKeys.current.set(voiceId, idempotencyKey);
       const result = await voiceRequest<unknown>("/voices/previews", {
         method: "POST",
-        body: JSON.stringify({ voiceId, text: PREVIEW_TEXT, idempotencyKey: crypto.randomUUID() }),
+        body: JSON.stringify({ voiceId, text: PREVIEW_TEXT, idempotencyKey }),
       });
       const url = executionAudioUrl(result);
       if (!url) throw new Error("The preview completed without playable audio.");
       setPreviewUrl(url);
       setPreviewQuote(null);
+      previewKeys.current.delete(voiceId);
     } catch (error) {
       setNote(error instanceof Error ? error.message : "Could not create the preview.");
     } finally {
@@ -259,7 +277,7 @@ export function VoiceSettings({ username }: { username: string }) {
     }
   };
 
-  const chooseClips = (event: ChangeEvent<HTMLInputElement>) => {
+  const chooseClips = async (event: ChangeEvent<HTMLInputElement>) => {
     const chosen = [...(event.target.files ?? [])].slice(0, 5);
     event.target.value = "";
     const problem = chosen.find((file) => !CLIP_TYPES.has(file.type) || file.size <= 0 || file.size > MAX_CLIP_BYTES);
@@ -267,20 +285,51 @@ export function VoiceSettings({ username }: { username: string }) {
       setNote(`${problem.name}: use a non-empty WAV or MP3 file up to 20 MiB.`);
       return;
     }
-    setClips(chosen);
+    setBusy("hashing");
     setNote(null);
-    cloneKey.current = crypto.randomUUID();
+    try {
+      const selected = [] as VoiceClipSelection[];
+      for (const file of chosen) selected.push({ file, sha256: await fileSha256(file) });
+      setClips(selected);
+      setConsentFingerprint(null);
+      cloneAttempt.current = null;
+    } catch {
+      setNote("Eden could not verify those voice clips.");
+    } finally {
+      setBusy(null);
+    }
   };
+
+  const cloneRequestFingerprint = `${cloneName.trim()}\n${clips.map((clip) => clip.sha256).join("\n")}`;
+  const consented = Boolean(cloneRequestFingerprint && consentFingerprint === cloneRequestFingerprint);
 
   const createClone = async () => {
     if (busy || !consented || !cloneName.trim() || clips.length < 1) return;
     setBusy("clone");
     setNote(null);
     try {
+      let attempt = cloneAttempt.current;
+      if (!attempt || attempt.requestFingerprint !== cloneRequestFingerprint) {
+        attempt = {
+          requestFingerprint: cloneRequestFingerprint,
+          key: crypto.randomUUID(),
+          uploads: clips.map(() => ({})),
+        };
+        cloneAttempt.current = attempt;
+      }
       const uploaded = [] as string[];
-      for (const file of clips) {
-        const result = await uploader.uploadFile(file, { purpose: "voice-clip" });
-        uploaded.push(result.objectId);
+      for (const [index, clip] of clips.entries()) {
+        const slot = attempt.uploads[index] ?? {};
+        attempt.uploads[index] = slot;
+        if (!slot.objectId) {
+          const result = await uploader.uploadFile(clip.file, {
+            purpose: "voice-clip",
+            uploadId: slot.uploadId,
+            onSession: ({ uploadId }) => { slot.uploadId = uploadId; },
+          });
+          slot.objectId = result.objectId;
+        }
+        uploaded.push(slot.objectId);
       }
       await voiceRequest("/voices/clones/quote", {
         method: "POST",
@@ -291,13 +340,14 @@ export function VoiceSettings({ username }: { username: string }) {
         body: JSON.stringify({
           name: cloneName.trim(),
           clipObjectIds: uploaded,
-          idempotencyKey: cloneKey.current,
+          idempotencyKey: attempt.key,
           consent: { version: "voice-clone-consent-v1", attested: true },
         }),
       });
       setClone(result.clone);
       setClips([]);
-      setConsented(false);
+      setConsentFingerprint(null);
+      cloneAttempt.current = null;
       setNote("Your voice sample is being validated privately.");
     } catch (error) {
       setNote(error instanceof Error ? error.message : "Could not create the custom voice.");
@@ -309,8 +359,8 @@ export function VoiceSettings({ username }: { username: string }) {
   useEffect(() => {
     if (!clone || !["pending_validation", "cloning", "moderation"].includes(clone.status)) return;
     const timer = setInterval(() => {
-      void voiceRequest<{ clone: VoiceClone }>(`/voices/clones/${encodeURIComponent(clone.id)}`)
-        .then(({ clone: next }) => {
+      void voiceRequest<VoiceClone>(`/voices/clones/${encodeURIComponent(clone.id)}`)
+        .then((next) => {
           setClone(next);
           if (next.status === "ready") void load();
         })
@@ -408,16 +458,17 @@ export function VoiceSettings({ username }: { username: string }) {
           <p className="mt-1 text-sm text-muted">Use 5–30 seconds of clear speech you own or have permission to clone. Clips stay private and are deleted with the custom voice.</p>
         </div>
         <label className="block space-y-1 text-xs text-muted">Voice name
-          <input value={cloneName} onChange={(event) => setCloneName(event.target.value)} maxLength={80} placeholder="Warm narrator" className="block w-full rounded-lg border border-edge bg-surface px-3 py-2 text-sm text-foreground" />
+          <input value={cloneName} onChange={(event) => { setCloneName(event.target.value); setConsentFingerprint(null); cloneAttempt.current = null; }} maxLength={80} placeholder="Warm narrator" className="block w-full rounded-lg border border-edge bg-surface px-3 py-2 text-sm text-foreground" />
         </label>
         <label className="block rounded-xl border border-dashed border-edge bg-surface px-4 py-5 text-center text-sm text-muted">
           <span className="font-medium text-foreground">Choose 1–5 WAV or MP3 clips</span>
           <span className="mt-1 block text-xs text-faint">20 MiB each; 5–30 seconds total</span>
-          <input type="file" multiple accept="audio/wav,audio/mpeg" onChange={chooseClips} className="sr-only" />
+          <input type="file" multiple accept="audio/wav,audio/mpeg" onChange={(event) => void chooseClips(event)} className="sr-only" />
         </label>
-        {clips.length ? <ul className="space-y-1 text-xs text-muted">{clips.map((file) => <li key={`${file.name}:${file.size}`} className="truncate">{file.name} · {(file.size / 1024 / 1024).toFixed(1)} MiB</li>)}</ul> : null}
+        {busy === "hashing" ? <p className="text-xs text-muted">Verifying clips…</p> : null}
+        {clips.length ? <ul className="space-y-1 text-xs text-muted">{clips.map(({ file, sha256 }) => <li key={sha256} className="truncate">{file.name} · {(file.size / 1024 / 1024).toFixed(1)} MiB · {sha256.slice(0, 10)}</li>)}</ul> : null}
         <label className="flex items-start gap-2 text-sm text-muted">
-          <input type="checkbox" checked={consented} onChange={(event) => setConsented(event.target.checked)} className="mt-1" />
+          <input type="checkbox" checked={consented} onChange={(event) => setConsentFingerprint(event.target.checked ? cloneRequestFingerprint : null)} className="mt-1" />
           <span>I own this voice or have explicit permission to clone it, and I consent to creating this custom voice.</span>
         </label>
         <button type="button" onClick={() => void createClone()} disabled={busy !== null || !consented || !cloneName.trim() || clips.length < 1} className={primaryButtonClass}>

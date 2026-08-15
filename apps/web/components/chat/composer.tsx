@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, DragEvent, KeyboardEvent, ReactNode } from "react";
 import { getClerkToken } from "@/lib/clerk";
 import { ResumableUploader } from "@/lib/resumable-upload";
+import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 import type { MessageAttachment } from "@/lib/types";
 import {
   appendTranscript,
@@ -116,11 +117,12 @@ export function Composer({
     getAuthToken: getClerkToken,
     refreshCredentials: async () => { await getClerkToken(); },
   }), []);
+  const { viewer } = useSelectedAgent();
   const receiveTranscript = useCallback((transcript: string) => {
     setValue((current) => appendTranscript(current, transcript));
     queueMicrotask(() => textareaRef.current?.focus());
   }, []);
-  const dictation = useDictation({ onTranscript: receiveTranscript });
+  const dictation = useDictation({ ownerId: viewer?.id ?? null, onTranscript: receiveTranscript });
   const dictationBusy = !["idle", "error"].includes(dictation.state.phase);
   const dictationRecording =
     dictation.state.phase === "recording" || dictation.state.phase === "retrying";

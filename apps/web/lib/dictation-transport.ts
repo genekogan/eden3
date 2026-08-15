@@ -3,34 +3,48 @@ import type {
   DictationRemoteSession,
   DictationTransport,
 } from "./dictation-session";
+import { DictationTransportError } from "./dictation-session";
 
 const BASE_PATH = "/api/transcriptions";
 
 async function request(path: string, init: RequestInit): Promise<Response> {
   const token = await getClerkToken();
-  const response = await fetch(path, {
-    cache: "no-store",
-    credentials: "include",
-    ...init,
-    headers: {
-      accept: "application/json",
-      ...(token ? { authorization: `Bearer ${token}` } : {}),
-      ...init.headers,
-    },
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      cache: "no-store",
+      credentials: "include",
+      ...init,
+      headers: {
+        accept: "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...init.headers,
+      },
+    });
+  } catch {
+    throw new DictationTransportError(
+      "Connection interrupted — the recording remains safe on this device.",
+      true,
+    );
+  }
   if (!response.ok) {
     let message = "Dictation is temporarily unavailable.";
+    let code: string | null = null;
     try {
       const body = (await response.json()) as {
+        code?: unknown;
         message?: unknown;
-        error?: { message?: unknown };
+        error?: { code?: unknown; message?: unknown };
       };
       const detail = body.message ?? body.error?.message;
+      const bodyCode = body.code ?? body.error?.code;
       if (typeof detail === "string" && detail.trim()) message = detail.trim();
+      if (typeof bodyCode === "string" && bodyCode.trim()) code = bodyCode.trim();
     } catch {
       // Never expose provider or infrastructure response bodies to the UI.
     }
-    throw new Error(message);
+    const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+    throw new DictationTransportError(message, retryable, response.status, code);
   }
   return response;
 }

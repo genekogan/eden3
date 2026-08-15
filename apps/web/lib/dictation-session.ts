@@ -27,9 +27,22 @@ export interface DictationTransport {
   cancel(sessionId: string): Promise<void>;
 }
 
+export class DictationTransportError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+    readonly status: number | null = null,
+    readonly code: string | null = null,
+  ) {
+    super(message);
+    this.name = "DictationTransportError";
+  }
+}
+
 export type DictationNetworkPhase = "online" | "retrying";
 
 interface DurableDictationOptions {
+  ownerId: string;
   store: DictationDraftStore;
   transport: DictationTransport;
   onNetworkPhase?: (phase: DictationNetworkPhase) => void;
@@ -53,6 +66,8 @@ export class DurableDictationSession {
   private flushPromise: Promise<void> | null = null;
   private closed = false;
   private cancelled = false;
+  private finishPromise: Promise<string> | null = null;
+  private cancelPromise: Promise<void> | null = null;
   private networkPhase: DictationNetworkPhase | null = null;
 
   private constructor(
@@ -70,6 +85,7 @@ export class DurableDictationSession {
     const now = Date.now();
     const draft: DictationDraftRecord = {
       id: crypto.randomUUID(),
+      ownerId: options.ownerId,
       remoteId: remote.id,
       finalizeKey: crypto.randomUUID(),
       mimeType: "audio/pcm;rate=16000;channels=1",
@@ -98,6 +114,12 @@ export class DurableDictationSession {
     if (this.networkPhase === phase) return;
     this.networkPhase = phase;
     this.options.onNetworkPhase?.(phase);
+  }
+
+  private async ensureActive(): Promise<void> {
+    if (!this.cancelled) return;
+    await this.options.store.deleteDraft(this.draft.id);
+    throw new Error("Dictation was cancelled.");
   }
 
   async append(audio: Blob, durationMs: number): Promise<void> {
@@ -135,7 +157,13 @@ export class DurableDictationSession {
         );
         retry = 0;
         this.reportNetworkPhase("online");
-      } catch {
+      } catch (error) {
+        if (
+          error instanceof DictationTransportError &&
+          !error.retryable
+        ) {
+          throw error;
+        }
         this.reportNetworkPhase("retrying");
         const delay = Math.min(MAX_RETRY_DELAY_MS, 250 * 2 ** retry);
         retry = Math.min(retry + 1, 5);
@@ -154,26 +182,41 @@ export class DurableDictationSession {
   }
 
   async finish(): Promise<string> {
-    if (this.cancelled) throw new Error("Dictation was cancelled.");
+    if (this.finishPromise) return this.finishPromise;
+    this.finishPromise = this.finishInternal();
+    return this.finishPromise;
+  }
+
+  private async finishInternal(): Promise<string> {
+    await this.ensureActive();
     if (this.draft.phase === "complete") {
       this.closed = true;
       return this.draft.transcript?.trim() ?? "";
     }
     if (this.closed) throw new Error("Dictation is already complete.");
     this.draft = await this.options.store.updatePhase(this.draft, "uploading");
+    await this.ensureActive();
     await this.flush();
+    await this.ensureActive();
     this.draft = await this.options.store.updatePhase(this.draft, "finalizing");
+    await this.ensureActive();
     try {
       const result = await this.options.transport.finalize({
         sessionId: this.draft.remoteId,
         finalChunkNumber: this.draft.nextChunkIndex - 1,
         idempotencyKey: this.draft.finalizeKey,
       });
+      await this.ensureActive();
       const transcript = result.transcript.trim();
       this.draft = await this.options.store.complete(this.draft, transcript);
+      await this.ensureActive();
       this.closed = true;
       return transcript;
     } catch (error) {
+      if (this.cancelled) {
+        await this.options.store.deleteDraft(this.draft.id);
+        throw error;
+      }
       this.draft = await this.options.store.updatePhase(this.draft, "failed");
       throw error;
     }
@@ -186,13 +229,17 @@ export class DurableDictationSession {
   }
 
   async cancel(): Promise<void> {
+    if (this.cancelPromise) return this.cancelPromise;
     if (this.closed || this.cancelled) return;
     this.cancelled = true;
-    try {
-      await this.options.transport.cancel(this.draft.remoteId);
-    } finally {
-      await this.options.store.deleteDraft(this.draft.id);
-      this.closed = true;
-    }
+    this.cancelPromise = (async () => {
+      try {
+        await this.options.transport.cancel(this.draft.remoteId);
+      } finally {
+        await this.options.store.deleteDraft(this.draft.id);
+        this.closed = true;
+      }
+    })();
+    return this.cancelPromise;
   }
 }
