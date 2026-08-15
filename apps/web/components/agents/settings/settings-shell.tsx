@@ -4,7 +4,8 @@
  * Agent Settings chrome: the sub-nav (desktop secondary rail / mobile tab
  * row) plus the owner gate every settings page shares. Sections:
  *
- *   Identity — name, description, avatar, greeting, voice
+ *   Identity — name, description, avatar, greeting
+ *   Voice    — roster voice, delivery policy, previews, voice cloning
  *   Persona  — SOUL.md (the workspace file IS the source of truth)
  *   Tools    — tool groups + Advanced (model tier, thinking level)
  *   Skills   — per-agent allowlist over the skill catalog
@@ -21,6 +22,7 @@ import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 
 const SECTIONS = [
   { sub: "identity", label: "Identity" },
+  { sub: "voice", label: "Voice" },
   { sub: "persona", label: "Persona" },
   { sub: "tools", label: "Tools" },
   { sub: "skills", label: "Skills" },
@@ -86,7 +88,7 @@ export function SettingsShell({
       <aside className="shrink-0 border-b border-edge bg-surface/60 md:w-56 md:border-b-0 md:border-r">
         <SectionHeader
           title="Settings"
-          help="Configure this agent's identity, persona, tools, skills, memory, and reusable visual concepts."
+          help="Configure this agent's identity, voice, persona, tools, skills, memory, and reusable visual concepts."
         />
         <SettingsNav username={username} />
       </aside>

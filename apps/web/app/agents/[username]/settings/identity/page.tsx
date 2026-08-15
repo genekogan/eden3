@@ -15,7 +15,7 @@ export default async function AgentIdentitySettingsPage({
     <SettingsShell
       username={decoded}
       title="Identity"
-      hint="The agent's public face — avatar, name, description, greeting, voice. Changes are hot: they shape the very next message."
+      hint="The agent's public face — avatar, name, description, and greeting. Changes are hot: they shape the very next message."
     >
       <IdentityForm username={decoded} />
     </SettingsShell>

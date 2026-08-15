@@ -31,6 +31,7 @@ export type AgentSectionKey =
 
 export type AgentSettingsPanelKey =
   | "identity"
+  | "voice"
   | "persona"
   | "tools"
   | "skills"
@@ -286,8 +287,14 @@ const SETTINGS_PANELS = [
   {
     panel: "identity",
     label: "Settings · Identity",
-    description: "Change name, description, avatar, greeting, and voice.",
-    keywords: ["profile", "name", "avatar", "greeting", "voice"],
+    description: "Change name, description, avatar, and greeting.",
+    keywords: ["profile", "name", "avatar", "greeting"],
+  },
+  {
+    panel: "voice",
+    label: "Settings · Voice",
+    description: "Choose, preview, and manage the selected agent's voice.",
+    keywords: ["speech", "tts", "audio", "clone", "discord", "telegram"],
   },
   {
     panel: "persona",

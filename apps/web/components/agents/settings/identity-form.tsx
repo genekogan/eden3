@@ -2,7 +2,7 @@
 
 /**
  * Settings › Identity — the agent's public face: avatar, name, description,
- * greeting, voice. (Persona lives in its own section; runtime knobs in
+ * and greeting. Voice selection lives in its own section; runtime knobs in
  * Tools.) PATCHes only dirty fields; avatar changes apply immediately.
  */
 
@@ -26,13 +26,12 @@ import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 import { useAgentPatch } from "./use-agent-patch";
 import { useSettingsUnsavedChanges } from "./unsaved-changes";
 
-type Fields = { name: string; description: string; greeting: string; voice: string };
+type Fields = { name: string; description: string; greeting: string };
 
 const fieldsOf = (agent: AgentDto): Fields => ({
   name: agent.name ?? "",
   description: agent.description ?? "",
   greeting: agent.greeting ?? "",
-  voice: agent.voice ?? "",
 });
 
 export function IdentityForm({ username }: { username: string }) {
@@ -202,16 +201,6 @@ export function IdentityForm({ username }: { username: string }) {
         rows={2}
         disabled={saving}
         hint="The agent's opening line in a fresh chat."
-      />
-
-      <TextField
-        id="identity-voice"
-        label="Voice"
-        value={fields.voice}
-        onChange={setField("voice")}
-        disabled={saving}
-        maxLength={200}
-        hint="Tone note or external voice id."
       />
 
       {saveError ? (

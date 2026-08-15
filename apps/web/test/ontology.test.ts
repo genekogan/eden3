@@ -39,6 +39,7 @@ const COCKPIT_ROUTE_INVENTORY = [
   "/agents/:agentUsername/settings/persona",
   "/agents/:agentUsername/settings/skills",
   "/agents/:agentUsername/settings/tools",
+  "/agents/:agentUsername/settings/voice",
   "/agents/:agentUsername/workspace",
   "/agents/builder",
   "/agents/new",
@@ -191,7 +192,7 @@ describe("cockpit ontology registry", () => {
       isAgentOwner: true,
       isAdmin: true,
     });
-    expect(ownerAdmin.filter((entry) => entry.kind === "settings-panel")).toHaveLength(6);
+    expect(ownerAdmin.filter((entry) => entry.kind === "settings-panel")).toHaveLength(7);
     expect(ownerAdmin.some((entry) => entry.id === "page.operator")).toBe(true);
   });
 
@@ -245,6 +246,7 @@ describe("cockpit ontology registry", () => {
       "persona",
       "skills",
       "tools",
+      "voice",
     ]);
     expect(diff.actionsWithoutHandlers).toEqual(["account.export"]);
     expect(isEmptyOntologyInventoryDiff(diff)).toBe(false);
