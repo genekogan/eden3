@@ -11,6 +11,7 @@
  *   paths, idempotency keys, soft-delete flags) are NOT part of the contract.
  */
 import { z } from 'zod';
+import { voiceAssignmentDto, voiceIdSchema } from './voice';
 
 // ---------------------------------------------------------------------------
 // Primitives
@@ -117,6 +118,9 @@ export const agentDto = z.object({
   persona: z.string().nullable(),
   greeting: z.string().nullable(),
   voice: z.string().nullable(),
+  /** Stable catalog/clone identity; legacy `voice` remains wire-compatible. */
+  voiceId: voiceIdSchema.nullable().optional(),
+  voiceAssignment: voiceAssignmentDto.nullable().optional(),
   model: agentModelSchema,
   /** Effective model-scoped OpenClaw runtime; never a per-agent override. */
   agentRuntime: agentRuntimeSchema,
@@ -218,6 +222,8 @@ export const messageAttachmentDto = z.object({
   creationId: uuidSchema.nullish(),
   width: z.number().int().positive().nullish(),
   height: z.number().int().positive().nullish(),
+  durationMs: z.number().int().positive().nullish(),
+  voiceExecutionId: uuidSchema.nullish(),
 });
 export type MessageAttachment = z.infer<typeof messageAttachmentDto>;
 

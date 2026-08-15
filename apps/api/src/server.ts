@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
 
-import { getEnv } from '@eden3/core';
+import { getEnv, LocalMediaStore } from '@eden3/core';
 import { db, pg, type SchemaReadiness } from '@eden3/db';
 import { OpenClawCompatClient, OpenClawToolsClient } from '@eden3/gateway';
 import fastifyCors from '@fastify/cors';
@@ -99,6 +99,7 @@ import { triggersRoutes } from './routes/triggers';
 import { usageRoutes } from './routes/usage';
 import { workspaceRoutes } from './routes/workspace';
 import { uploadsRoutes } from './routes/uploads';
+import { voiceRoutes, type VoiceRoutesOptions } from './routes/voices';
 import {
   createStorageRuntime,
   storageCleanupIntervalMs,
@@ -107,6 +108,13 @@ import {
 } from './services/storage-runtime';
 import type { MultipartCleanupTickResult } from './services/upload-multipart-cleanup';
 import type { PolicyEventTickResult } from './services/upload-policy-events';
+import { FfmpegVoiceAudioProcessor } from './services/voice-audio';
+import { VoiceKernel } from './services/voice-kernel';
+import {
+  CartesiaVoiceClient,
+  DeepInfraKokoroClient,
+  ElevenLabsVoiceClient,
+} from './services/voice-provider';
 import {
   isShareCapabilityRequest,
   registerShareCapabilityResponseBoundary,
@@ -157,6 +165,8 @@ export interface BuildServerOptions {
   };
   billing?: BillingRoutesOptions;
   channels?: ChannelsRoutesOptions;
+  /** Voice backend override; null disables only in narrowly scoped tests. */
+  voice?: VoiceRoutesOptions | null;
   health?: {
     /** Production schema gate; tests may inject deterministic readiness. */
     schemaReadiness?: () => Promise<SchemaReadiness>;
@@ -818,6 +828,30 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       ? await createStorageRuntime({ mediaDir: env.MEDIA_DIR, logger: app.log })
       : null);
 
+  const voiceMediaStore = new LocalMediaStore();
+  const voice = opts.voice === null
+    ? null
+    : opts.voice ?? {
+        kernel: new VoiceKernel({
+          mediaStore: voiceMediaStore,
+          ...(storageRuntime ? { mediaResolver: storageRuntime.mediaResolver } : {}),
+          audio: new FfmpegVoiceAudioProcessor(),
+          providers: {
+            ...(process.env.DEEPINFRA_API_KEY
+              ? { deepinfra: new DeepInfraKokoroClient(process.env.DEEPINFRA_API_KEY) }
+              : {}),
+            ...(process.env.CARTESIA_API_KEY
+              ? { cartesia: new CartesiaVoiceClient(process.env.CARTESIA_API_KEY) }
+              : {}),
+            ...(process.env.ELEVENLABS_API_KEY
+              ? { elevenlabs: new ElevenLabsVoiceClient(process.env.ELEVENLABS_API_KEY) }
+              : {}),
+          },
+          cleanupArtifact: (sha256, mime) => voiceMediaStore.deleteByDigest(sha256, mime),
+        }),
+        autoStartReconciler: process.env.NODE_ENV === 'production',
+      };
+
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
   await app.register(chatRoutes, {
     prefix: '/sessions',
@@ -863,6 +897,20 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       ? { providerEvidenceDb: opts.accountErasure.providerEvidenceDb }
       : {}),
   });
+  if (voice) await app.register(voiceRoutes, voice);
+  if (voice?.autoStartReconciler) {
+    let voiceTimer: ReturnType<typeof setInterval> | undefined;
+    app.addHook('onReady', async () => {
+      await voice.kernel.reconcileStaleExecutions();
+      voiceTimer = setInterval(() => {
+        void voice.kernel.reconcileStaleExecutions().catch(() => {
+          app.log.error({ component: 'voice-reconciler' }, 'voice execution reconciliation failed');
+        });
+      }, 60_000);
+      voiceTimer.unref?.();
+    });
+    app.addHook('onClose', async () => { if (voiceTimer) clearInterval(voiceTimer); });
+  }
   // Gateway-only fail-closed media authorization callbacks. These exact POST
   // routes authenticate the gateway bearer before any allowlist bypass.
   await app.register(mediaRuntimeRoutes, {

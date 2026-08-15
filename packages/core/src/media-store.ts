@@ -11,6 +11,7 @@ import {
   readdir,
   realpath,
   stat,
+  unlink,
   writeFile,
 } from 'node:fs/promises';
 import path from 'node:path';
@@ -290,6 +291,16 @@ export class LocalMediaStore implements MediaStore {
       sizeBytes,
       ...(dims ? { width: dims.width, height: dims.height } : {}),
     };
+  }
+
+  /** Idempotently removes one exact content address; callers must elect shared-reference custody first. */
+  async deleteByDigest(sha256: string, mime: string): Promise<void> {
+    const ext = extensionForMime(mime);
+    if (!/^[0-9a-f]{64}$/.test(sha256) || !ext) throw new Error('invalid media digest deletion');
+    const candidate = path.join(this.mediaDir, `${sha256}${ext}`);
+    if (path.dirname(candidate) !== this.mediaDir) throw new Error('media digest deletion escaped root');
+    try { await unlink(candidate); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   }
 }
 

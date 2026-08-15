@@ -189,7 +189,7 @@ describe('account erasure background runtime', () => {
       ledger: { writeAndConfirm: vi.fn() },
       recoveryManifestSink: { encryptWriteAndConfirm: vi.fn() },
       targetStore,
-      targetExecutor: { erase: vi.fn() },
+      targetExecutor: { voiceCloneCustody: true, erase: vi.fn() },
       ledgerCustodyId: 'erasure-ledger-worm',
       recoveryManifestCustodyId: 'erasure-recovery-encrypted',
     });
@@ -223,7 +223,7 @@ describe('account erasure background runtime', () => {
       ledger: { writeAndConfirm: vi.fn() },
       recoveryManifestSink: { encryptWriteAndConfirm: vi.fn() },
       targetStore,
-      targetExecutor: { erase: vi.fn() },
+      targetExecutor: { voiceCloneCustody: true, erase: vi.fn() },
       ledgerCustodyId: 'same-custody',
       recoveryManifestCustodyId: 'same-custody',
     })).toThrow('distinct custody identities');
@@ -245,7 +245,7 @@ describe('account erasure background runtime', () => {
       ledger: { writeAndConfirm: vi.fn() },
       recoveryManifestSink: { encryptWriteAndConfirm: vi.fn() },
       targetStore: { ...targetStore, databaseBoundary: mismatchedBoundary },
-      targetExecutor: { erase: vi.fn() },
+      targetExecutor: { voiceCloneCustody: true, erase: vi.fn() },
       ledgerCustodyId: 'erasure-ledger-worm',
       recoveryManifestCustodyId: 'erasure-recovery-encrypted',
     })).toThrow('one attested operator database boundary');

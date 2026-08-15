@@ -79,6 +79,21 @@ describe('resource DTOs', () => {
       updatedAt: now,
     };
     expect(agentDto.parse(agent)).toEqual(agent);
+    expect(agentDto.parse({
+      ...agent,
+      voice: 'Warm, slightly husky persona prose retained for legacy identity rendering.',
+      voiceId: 'deepinfra:kokoro:af_bella:v1',
+      voiceAssignment: {
+        voiceId: 'deepinfra:kokoro:af_bella:v1',
+        chatMode: 'on_demand',
+        discordMode: 'off',
+        telegramMode: 'always',
+        updatedAt: now,
+      },
+    })).toMatchObject({
+      voice: 'Warm, slightly husky persona prose retained for legacy identity rendering.',
+      voiceId: 'deepinfra:kokoro:af_bella:v1',
+    });
     expect(
       agentDto.safeParse({ ...agent, provisionStatus: 'exploded' }).success,
     ).toBe(false);

@@ -62,6 +62,7 @@ const PUBLIC_ROUTES: readonly PathMethods[] = [
   ['/studio/quote', ['POST']],
   ['/studio/tools', ['GET', 'HEAD']],
   ['/users/:username/collections', ['GET', 'HEAD']],
+  ['/voices/catalog', ['GET', 'HEAD']],
 ];
 
 const AUTHENTICATED_ROUTES: readonly PathMethods[] = [
@@ -113,6 +114,7 @@ const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/agents/:username/workspace/download', ['GET', 'HEAD']],
   ['/agents/:username/workspace/export', ['GET', 'HEAD']],
   ['/agents/:username/workspace/file', ['GET', 'HEAD', 'PUT']],
+  ['/agents/:username/voice-assignment', ['DELETE', 'PUT']],
   ['/channels/connections', ['GET', 'HEAD', 'POST']],
   ['/channels/connections/:id', ['DELETE']],
   ['/channels/connections/:id/activate', ['POST']],
@@ -139,6 +141,7 @@ const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/sessions/:id', ['DELETE', 'GET', 'HEAD', 'PATCH']],
   ['/sessions/:id/events', ['GET', 'HEAD']],
   ['/sessions/:idOrNew/messages', ['POST']],
+  ['/sessions/:sessionId/messages/:messageId/voice-note', ['POST']],
   ['/sessions/:sessionId/shares', ['GET', 'HEAD', 'POST']],
   ['/sessions/:sessionId/shares/:shareId', ['DELETE']],
   ['/tasks', ['GET', 'HEAD', 'POST']],
@@ -150,6 +153,12 @@ const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/uploads/:uploadId/complete', ['POST']],
   ['/uploads/:uploadId/parts/:partNumber', ['POST']],
   ['/uploads/:uploadId/parts/:partNumber/complete', ['POST']],
+  ['/voices/clones', ['GET', 'HEAD', 'POST']],
+  ['/voices/clones/quote', ['POST']],
+  ['/voices/clones/:id', ['DELETE', 'GET', 'HEAD']],
+  ['/voices/clones/:id/revoke', ['POST']],
+  ['/voices/previews', ['POST']],
+  ['/voices/quotes', ['POST']],
 ];
 
 const OPERATOR_ROUTES: readonly PathMethods[] = [
@@ -179,6 +188,10 @@ const CHANNEL_RUNTIME_SERVICE_ROUTES: readonly PathMethods[] = [
   ['/channels/runtime/turns/:turnId/refund', ['POST']],
   ['/channels/runtime/turns/:turnId/settle', ['POST']],
   ['/channels/runtime/turns/reserve', ['POST']],
+];
+
+const VOICE_RUNTIME_SERVICE_ROUTES: readonly PathMethods[] = [
+  ['/channels/runtime/turns/:turnId/voice-note', ['POST']],
 ];
 
 const MEDIA_RUNTIME_SERVICE_ROUTES: readonly PathMethods[] = [
@@ -243,6 +256,11 @@ export const ROUTE_AUTH_INVENTORY: readonly RouteAuthManifestEntry[] = [
     'service-authenticated',
     ['root-service:media-runtime'],
     MEDIA_RUNTIME_SERVICE_ROUTES,
+  ),
+  ...entries(
+    'service-authenticated',
+    ['root-service:voice-runtime'],
+    VOICE_RUNTIME_SERVICE_ROUTES,
   ),
   ...entries(
     'service-authenticated',

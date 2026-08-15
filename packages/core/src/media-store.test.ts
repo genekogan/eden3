@@ -127,6 +127,17 @@ describe('LocalMediaStore', () => {
     expect((await stat(result.localPath)).size).toBe(png.length);
   });
 
+  it('deletes only an exact elected digest and is idempotent', async () => {
+    const dir = await freshDir();
+    const store = new LocalMediaStore({ mediaDir: dir, baseUrl: '/media' });
+    const bytes = Buffer.from('voice artifact');
+    const stored = await store.put(bytes, { mime: 'audio/ogg' });
+    await expect(store.deleteByDigest(stored.sha256, stored.mime)).resolves.toBeUndefined();
+    await expect(store.deleteByDigest(stored.sha256, stored.mime)).resolves.toBeUndefined();
+    await expect(stat(stored.localPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(store.deleteByDigest('../escape', 'audio/ogg')).rejects.toThrow(/invalid/);
+  });
+
   it('is idempotent: same content stored once, no temp litter', async () => {
     const dir = await freshDir();
     const store = new LocalMediaStore({ mediaDir: dir, baseUrl: 'http://media.test' });
