@@ -1275,7 +1275,10 @@ export class VoiceKernel {
       }
     }
     clone = await this.dbc.transaction(async (tx) => {
-      assertVoiceReconciliationActive(signal);
+      // Once private-object cleanup starts, the row lock is the generation
+      // fence. Finish physical+DB custody atomically even if the scheduler's
+      // wall-clock deadline expires; a newer pass will block and then replay
+      // the terminal row instead of overlapping this irreversible section.
       const currentResult = await tx.execute(sql`
         select * from voice_clones where id=${id} and owner_account_id=${ownerAccountId}
           and status in ('revoked','provider_delete_pending','provider_delete_failed') for update
@@ -1306,7 +1309,6 @@ export class VoiceKernel {
         throw new VoiceKernelError(503, 'voice_storage_unavailable', 'Voice clip deletion storage is unavailable');
       }
       for (const clip of removable) {
-        assertVoiceReconciliationActive(signal);
         if (!clip.verified_sha256 || clip.verified_size_bytes === null || !clip.verified_mime || clip.backing_store === 'legacy') {
           throw new VoiceKernelError(409, 'clone_delete_pending', 'Voice clip deletion metadata is incomplete');
         }
@@ -1320,7 +1322,6 @@ export class VoiceKernel {
             sizeBytes: Number(clip.verified_size_bytes),
             mime: clip.verified_mime,
           });
-          assertVoiceReconciliationActive(signal);
         } catch {
           throw new VoiceKernelError(503, 'clone_clip_cleanup_pending', 'Voice clip deletion requires retry');
         }
