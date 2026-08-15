@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AccountErasureTargetWorker,
   attestAccountErasureLegacyMediaBoundary,
+  CartesiaVoiceCloneErasureExecutor,
   LocalLegacyErasureExecutor,
   type AccountErasureTargetClaim,
   type AccountErasureTargetStore,
@@ -98,6 +99,26 @@ describe('AccountErasureTargetWorker', () => {
   it('rejects unsafe lease, attempt, batch, and timeout geometry', () => {
     expect(() => new AccountErasureTargetWorker(storeWith(null), { erase: vi.fn() }, 0)).toThrow();
     expect(() => new AccountErasureTargetWorker(storeWith(null), { erase: vi.fn() }, 1, 999)).toThrow();
+  });
+
+  it('confirms Cartesia clone absence and never clears an ambiguous create without identity', async () => {
+    const deleteClone = vi.fn(async () => undefined);
+    const fallback = { erase: vi.fn(async () => ({ confirmedAbsent: true as const })) };
+    const executor = new CartesiaVoiceCloneErasureExecutor({
+      provider: 'cartesia',
+      synthesize: vi.fn(),
+      deleteClone,
+    }, fallback);
+    await expect(executor.erase({
+      ...claim, kind: 'voice_clone', signal: new AbortController().signal,
+      locator: JSON.stringify({ kind: 'voice_clone', provider: 'cartesia', providerVoiceId: 'voice_123', status: 'ready' }),
+    })).resolves.toEqual({ confirmedAbsent: true });
+    expect(deleteClone).toHaveBeenCalledOnce();
+    await expect(executor.erase({
+      ...claim, kind: 'voice_clone', signal: new AbortController().signal,
+      locator: JSON.stringify({ kind: 'voice_clone', provider: 'cartesia', providerVoiceId: null, status: 'provider_create_ambiguous' }),
+    })).rejects.toThrow(/reconciliation/);
+    expect(fallback.erase).not.toHaveBeenCalled();
   });
 
   it('unlinks only canonical regular content-addressed files and rejects symlinks/escapes', async () => {

@@ -21,6 +21,7 @@ import {
   agentToolGroupsSchema,
   feedQuerySchema,
   type AgentModel,
+  type VoiceAssignmentDto,
 } from '@eden3/shared';
 import { eq, sql } from 'drizzle-orm';
 import type { FastifyPluginAsync } from 'fastify';
@@ -36,6 +37,8 @@ import {
   isUniqueViolation,
   nextCursorFrom,
   parseCursorParam,
+  pgToIso,
+  type AgentDtoOptions,
   type AgentRow,
   type CreationRow,
 } from '../route-helpers';
@@ -215,7 +218,29 @@ const agentRowColumns = () => pg`
   g.name, g.description, g.persona, g.is_persona_public, g.greeting, g.voice,
   g.model, g.thinking_level, g.tool_groups, g.public, g.owner_id, g.is_pilot,
   g.is_synthetic, g.provision_status
+  ,(select av.voice_id from agent_voice_assignments av where av.agent_account_id=a.id) as voice_id
+  ,(select av.chat_mode from agent_voice_assignments av where av.agent_account_id=a.id) as voice_chat_mode
+  ,(select av.discord_mode from agent_voice_assignments av where av.agent_account_id=a.id) as voice_discord_mode
+  ,(select av.telegram_mode from agent_voice_assignments av where av.agent_account_id=a.id) as voice_telegram_mode
+  ,(select av.updated_at from agent_voice_assignments av where av.agent_account_id=a.id) as voice_assignment_updated_at
 `;
+
+async function agentDtoWithVoice(account: Account, agent: Agent, opts: AgentDtoOptions) {
+  const [row] = await pg<{
+    voice_id: string; chat_mode: VoiceAssignmentDto['chatMode'];
+    discord_mode: VoiceAssignmentDto['discordMode']; telegram_mode: VoiceAssignmentDto['telegramMode'];
+    updated_at: string;
+  }[]>`select voice_id,chat_mode,discord_mode,telegram_mode,updated_at
+    from agent_voice_assignments where agent_account_id=${account.id}`;
+  const voiceAssignment = row ? {
+    voiceId: row.voice_id,
+    chatMode: row.chat_mode,
+    discordMode: row.discord_mode,
+    telegramMode: row.telegram_mode,
+    updatedAt: pgToIso(row.updated_at),
+  } satisfies VoiceAssignmentDto : null;
+  return agentDtoFromEntities(account, agent, { ...opts, voiceAssignment });
+}
 
 interface DirectoryRow extends AgentRow {
   creation_count: number;
@@ -471,7 +496,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     `;
 
     return {
-      agent: agentDtoFromEntities(account, agent, {
+      agent: await agentDtoWithVoice(account, agent, {
         includePersona: agent.isPersonaPublic || manager,
         likeCount: interaction.like_count,
         viewerHasLiked: interaction.viewer_has_liked,
@@ -867,7 +892,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     `;
     const interaction = await agentInteraction(account.id, req.account);
     return {
-      agent: agentDtoFromEntities(account, agent, {
+      agent: await agentDtoWithVoice(account, agent, {
         includePersona: agent.isPersonaPublic || manager,
         likeCount: interaction.like_count,
         viewerHasLiked: interaction.viewer_has_liked,
@@ -894,7 +919,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     `;
     const interaction = await agentInteraction(account.id, req.account);
     return {
-      agent: agentDtoFromEntities(account, agent, {
+      agent: await agentDtoWithVoice(account, agent, {
         includePersona: agent.isPersonaPublic || manager,
         likeCount: interaction.like_count,
         viewerHasLiked: interaction.viewer_has_liked,
@@ -984,7 +1009,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
 
     app.agentProvisioningWorker.wake();
     return reply.code(201).send({
-      agent: agentDtoFromEntities(created.account, created.agent, {
+      agent: await agentDtoWithVoice(created.account, created.agent, {
         includePersona: true,
         agentRuntime,
       }),
@@ -1099,7 +1124,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       .returning();
 
     return reply.code(201).send({
-      agent: agentDtoFromEntities(created.account, updatedAgent ?? created.agent, {
+      agent: await agentDtoWithVoice(created.account, updatedAgent ?? created.agent, {
         includePersona: true,
         agentRuntime: await runtimeForModel((updatedAgent ?? created.agent).model),
       }),
@@ -1217,7 +1242,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     }
 
     return {
-      agent: agentDtoFromEntities(updatedAgent.account, updatedAgent.agent, {
+      agent: await agentDtoWithVoice(updatedAgent.account, updatedAgent.agent, {
         includePersona: true,
         agentRuntime: await runtimeForModel(updatedAgent.agent.model),
       }),
@@ -1325,7 +1350,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
       });
 
       return {
-        agent: agentDtoFromEntities({ ...account, userImage: stored.url }, agent, {
+        agent: await agentDtoWithVoice({ ...account, userImage: stored.url }, agent, {
           includePersona: true,
           agentRuntime: await runtimeForModel(agent.model),
         }),
@@ -1383,7 +1408,7 @@ export const agentsRoutes: FastifyPluginAsync<AgentsRoutesOptions> = async (app,
     });
 
     return {
-      agent: agentDtoFromEntities({ ...account, userImage: null }, agent, {
+      agent: await agentDtoWithVoice({ ...account, userImage: null }, agent, {
         includePersona: true,
         agentRuntime: await runtimeForModel(agent.model),
       }),

@@ -8,6 +8,7 @@ export * from './refs';
 export * from './auth';
 export * from './manna';
 export * from './metering';
+export * from './voice-catalog';
 export * from './media-store';
 export * from './object-lifecycle-rehearsal';
 export * from './permalinks';

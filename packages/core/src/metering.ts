@@ -6,7 +6,7 @@
  * snapshot and should be reconciled against provider invoices/pricing updates.
  */
 
-export const COST_TABLE_VERSION = '2026-08-15.stt-v1';
+export const COST_TABLE_VERSION = '2026-08-15.voice-stt-v1';
 
 export const DEFAULT_MANNA_PER_USD = 1_000;
 export const DEFAULT_MARKUP = 0.35;
@@ -14,6 +14,7 @@ export const DEFAULT_MARKUP = 0.35;
 export type CostProvider =
   | 'anthropic'
   | 'cartesia'
+  | 'deepinfra'
   | 'elevenlabs'
   | 'fal'
   | 'google'
@@ -313,6 +314,39 @@ export const COST_TABLE: readonly CostTableEntry[] = [
     effectiveDate: '2026-07-06',
     source: RATE_SOURCE,
     estimated: true,
+  },
+  {
+    provider: 'elevenlabs',
+    model: 'tts',
+    unit: 'audio_character',
+    usdPerUnit: 0.00005,
+    effectiveDate: '2026-08-15',
+    source: 'ElevenLabs API pricing: Flash/Turbo pay-as-you-go $0.05 per 1,000 characters',
+  },
+  {
+    provider: 'deepinfra',
+    model: 'hexgrad/Kokoro-82M',
+    unit: 'audio_character',
+    usdPerUnit: 0.00000062,
+    effectiveDate: '2026-08-15',
+    source: 'DeepInfra Kokoro-82M model page: $0.62 per 1M input characters',
+  },
+  {
+    provider: 'cartesia',
+    model: 'sonic-3.5-2026-05-04',
+    unit: 'audio_character',
+    usdPerUnit: 0.00005,
+    effectiveDate: '2026-08-15',
+    source: 'Cartesia Pro allocation: $5 per 100,000 credits; TTS is one credit per character',
+    estimated: true,
+  },
+  {
+    provider: 'elevenlabs',
+    model: 'eleven_flash_v2_5',
+    unit: 'audio_character',
+    usdPerUnit: 0.00005,
+    effectiveDate: '2026-08-15',
+    source: 'ElevenLabs API pricing: Flash/Turbo pay-as-you-go $0.05 per 1,000 characters',
   },
   {
     provider: 'runway',

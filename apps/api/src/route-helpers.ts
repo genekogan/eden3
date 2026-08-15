@@ -21,6 +21,7 @@ import {
   type MannaTransactionDto,
   type ProvisionStatus,
   type TriggerDto,
+  type VoiceAssignmentDto,
 } from '@eden3/shared';
 
 import { ApiError } from './errors';
@@ -182,6 +183,11 @@ export interface AgentRow {
   is_pilot: boolean;
   is_synthetic: boolean;
   provision_status: string;
+  voice_id?: string | null;
+  voice_chat_mode?: 'off' | 'on_demand' | 'always' | null;
+  voice_discord_mode?: 'off' | 'on_demand' | 'always' | null;
+  voice_telegram_mode?: 'off' | 'on_demand' | 'always' | null;
+  voice_assignment_updated_at?: string | null;
   like_count?: number;
   viewer_has_liked?: boolean;
 }
@@ -193,6 +199,8 @@ export interface AgentDtoOptions {
   viewerHasLiked?: boolean;
   /** Effective config-derived runtime; defaults to the static catalog value. */
   agentRuntime?: AgentRuntime;
+  /** Canonical stable voice assignment; null means deliberately unassigned. */
+  voiceAssignment?: VoiceAssignmentDto | null;
 }
 
 function coerceAgentModel(value: string | null | undefined): AgentDto['model'] {
@@ -221,6 +229,21 @@ export function agentDtoFromRow(row: AgentRow, opts: AgentDtoOptions): AgentDto 
     persona: opts.includePersona ? row.persona : null,
     greeting: row.greeting,
     voice: row.voice,
+    ...(row.voice_id !== undefined
+      ? {
+          voiceId: row.voice_id,
+          voiceAssignment:
+            row.voice_id && row.voice_chat_mode && row.voice_discord_mode && row.voice_telegram_mode && row.voice_assignment_updated_at
+              ? {
+                  voiceId: row.voice_id,
+                  chatMode: row.voice_chat_mode,
+                  discordMode: row.voice_discord_mode,
+                  telegramMode: row.voice_telegram_mode,
+                  updatedAt: pgToIso(row.voice_assignment_updated_at),
+                }
+              : null,
+        }
+      : {}),
     model,
     agentRuntime: opts.agentRuntime ?? defaultAgentRuntimeForModel(model),
     thinkingLevel: coerceThinkingLevel(row.thinking_level),
@@ -253,6 +276,9 @@ export function agentDtoFromEntities(
     persona: opts.includePersona ? agent.persona : null,
     greeting: agent.greeting,
     voice: agent.voice,
+    ...(opts.voiceAssignment !== undefined
+      ? { voiceId: opts.voiceAssignment?.voiceId ?? null, voiceAssignment: opts.voiceAssignment }
+      : {}),
     model,
     agentRuntime: opts.agentRuntime ?? defaultAgentRuntimeForModel(model),
     thinkingLevel: coerceThinkingLevel(agent.thinkingLevel),

@@ -5,6 +5,7 @@ import {
   boolean,
   check,
   customType,
+  date,
   foreignKey,
   index,
   integer,
@@ -1687,6 +1688,116 @@ export const storageObjects = pgTable(
   ],
 );
 
+export const agentVoiceAssignments = pgTable('agent_voice_assignments', {
+  agentAccountId: uuid('agent_account_id').primaryKey().references(() => agents.accountId, { onDelete: 'restrict' }),
+  voiceId: text('voice_id').notNull(),
+  chatMode: text('chat_mode').$type<'off' | 'on_demand' | 'always'>().notNull().default('on_demand'),
+  discordMode: text('discord_mode').$type<'off' | 'on_demand' | 'always'>().notNull().default('off'),
+  telegramMode: text('telegram_mode').$type<'off' | 'on_demand' | 'always'>().notNull().default('off'),
+  createdAt: timestamptz('created_at').notNull().defaultNow(),
+  updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+});
+
+export const voiceClones = pgTable('voice_clones', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  ownerAccountId: uuid('owner_account_id').notNull().references(() => accounts.id, { onDelete: 'restrict' }),
+  voiceId: text('voice_id').generatedAlwaysAs(sql`'clone:' || "id"::text`),
+  name: text('name').notNull(),
+  provider: text('provider').$type<'cartesia'>().notNull(),
+  providerVoiceId: text('provider_voice_id'),
+  providerRequestId: text('provider_request_id'),
+  status: text('status').notNull().default('pending_validation'),
+  consentVersion: text('consent_version').notNull(),
+  consentAttestedAt: timestamptz('consent_attested_at').notNull(),
+  clipManifestSha256: text('clip_manifest_sha256').notNull(),
+  requestSha256: text('request_sha256').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  quarantineCode: text('quarantine_code'),
+  failureCode: text('failure_code'),
+  consentRevokedAt: timestamptz('consent_revoked_at'),
+  revokedAt: timestamptz('revoked_at'),
+  providerDeletedAt: timestamptz('provider_deleted_at'),
+  deletedAt: timestamptz('deleted_at'),
+  createdAt: timestamptz('created_at').notNull().defaultNow(),
+  updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex('voice_clones_voice_id_uq').on(t.voiceId),
+  uniqueIndex('voice_clones_owner_idempotency_uq').on(t.ownerAccountId, t.idempotencyKey),
+  index('voice_clones_owner_status_idx').on(t.ownerAccountId, t.status, t.createdAt),
+]);
+
+export const voiceCloneClips = pgTable('voice_clone_clips', {
+  cloneId: uuid('clone_id').notNull().references(() => voiceClones.id, { onDelete: 'cascade' }),
+  objectId: uuid('object_id').notNull().references(() => storageObjects.id, { onDelete: 'restrict' }),
+  position: integer('position').notNull(),
+  sha256: text('sha256').notNull(),
+  mime: text('mime').$type<'audio/wav' | 'audio/mpeg'>().notNull(),
+  sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
+  durationMs: integer('duration_ms').notNull(),
+  createdAt: timestamptz('created_at').notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ name: 'voice_clone_clips_pk', columns: [t.cloneId, t.objectId] }),
+  uniqueIndex('voice_clone_clips_position_uq').on(t.cloneId, t.position),
+]);
+
+export const voiceQuotes = pgTable('voice_quotes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  ownerAccountId: uuid('owner_account_id').notNull().references(() => accounts.id, { onDelete: 'restrict' }),
+  operation: text('operation').$type<'preview' | 'chat' | 'discord' | 'telegram'>().notNull(),
+  voiceId: text('voice_id').notNull(),
+  textSha256: text('text_sha256').notNull(),
+  characterCount: integer('character_count').notNull(),
+  provider: text('provider').notNull(),
+  model: text('model').notNull(),
+  costUsd: numeric('cost_usd', { precision: 20, scale: 10 }).notNull(),
+  manna: numeric('manna', { precision: 20, scale: 4 }).notNull(),
+  tableVersion: text('table_version').notNull(),
+  pricingEffectiveDate: date('pricing_effective_date', { mode: 'string' }).notNull(),
+  expiresAt: timestamptz('expires_at').notNull(),
+  consumedAt: timestamptz('consumed_at'),
+  createdAt: timestamptz('created_at').notNull().defaultNow(),
+}, (t) => [index('voice_quotes_owner_expiry_idx').on(t.ownerAccountId, t.expiresAt)]);
+
+export const voiceExecutions = pgTable('voice_executions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  ownerAccountId: uuid('owner_account_id').notNull().references(() => accounts.id, { onDelete: 'restrict' }),
+  agentAccountId: uuid('agent_account_id').references(() => accounts.id, { onDelete: 'set null' }),
+  sessionId: uuid('session_id').references(() => sessions.id, { onDelete: 'set null' }),
+  messageId: uuid('message_id').references(() => messages.id, { onDelete: 'set null' }),
+  channelTurnId: uuid('channel_turn_id').references(() => channelTurns.turnId, { onDelete: 'set null' }),
+  purpose: text('purpose').$type<'preview' | 'chat' | 'discord' | 'telegram'>().notNull(),
+  voiceId: text('voice_id').notNull(),
+  textSha256: text('text_sha256').notNull(),
+  requestSha256: text('request_sha256').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  characterCount: integer('character_count').notNull(),
+  billedCharacterCount: integer('billed_character_count'),
+  provider: text('provider').notNull(),
+  model: text('model').notNull(),
+  providerRequestId: text('provider_request_id'),
+  status: text('status').notNull().default('pending'),
+  reservedManna: numeric('reserved_manna', { precision: 20, scale: 4 }).notNull(),
+  reservedSubscriptionManna: numeric('reserved_subscription_manna', { precision: 20, scale: 4 }).notNull(),
+  costUsd: numeric('cost_usd', { precision: 20, scale: 10 }).notNull(),
+  tableVersion: text('table_version').notNull(),
+  outputUrl: text('output_url'),
+  outputLocalPath: text('output_local_path'),
+  outputSha256: text('output_sha256'),
+  outputMime: text('output_mime'),
+  outputSizeBytes: bigint('output_size_bytes', { mode: 'number' }),
+  outputDurationMs: integer('output_duration_ms'),
+  waveform: text('waveform'),
+  attemptCount: integer('attempt_count').notNull().default(0),
+  lastErrorCode: text('last_error_code'),
+  createdAt: timestamptz('created_at').notNull().defaultNow(),
+  updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+  completedAt: timestamptz('completed_at'),
+}, (t) => [
+  uniqueIndex('voice_executions_owner_idempotency_uq').on(t.ownerAccountId, t.purpose, t.idempotencyKey),
+  uniqueIndex('voice_executions_channel_turn_uq').on(t.channelTurnId).where(sql`${t.channelTurnId} is not null`),
+  index('voice_executions_owner_created_idx').on(t.ownerAccountId, t.createdAt),
+]);
+
 // ---------------------------------------------------------------------------
 // storage_uploads — a durable resumable multipart session. The composite FK
 // binds its redundant owner to the object's owner at the database boundary.
@@ -2319,6 +2430,16 @@ export type MediaAsset = typeof mediaAssets.$inferSelect;
 export type NewMediaAsset = typeof mediaAssets.$inferInsert;
 export type StorageObject = typeof storageObjects.$inferSelect;
 export type NewStorageObject = typeof storageObjects.$inferInsert;
+export type AgentVoiceAssignment = typeof agentVoiceAssignments.$inferSelect;
+export type NewAgentVoiceAssignment = typeof agentVoiceAssignments.$inferInsert;
+export type VoiceClone = typeof voiceClones.$inferSelect;
+export type NewVoiceClone = typeof voiceClones.$inferInsert;
+export type VoiceCloneClip = typeof voiceCloneClips.$inferSelect;
+export type NewVoiceCloneClip = typeof voiceCloneClips.$inferInsert;
+export type VoiceQuote = typeof voiceQuotes.$inferSelect;
+export type NewVoiceQuote = typeof voiceQuotes.$inferInsert;
+export type VoiceExecution = typeof voiceExecutions.$inferSelect;
+export type NewVoiceExecution = typeof voiceExecutions.$inferInsert;
 export type StorageUpload = typeof storageUploads.$inferSelect;
 export type NewStorageUpload = typeof storageUploads.$inferInsert;
 export type StorageUploadPart = typeof storageUploadParts.$inferSelect;

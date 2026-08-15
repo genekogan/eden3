@@ -8,6 +8,7 @@ import { getEnv, type DbHandle } from '@eden3/core';
 import { sql } from 'drizzle-orm';
 
 import { ApiError } from '../errors';
+import type { VoiceProviderClient } from './voice-provider';
 import { DEFAULT_EVE_USERNAME } from './default-assistant';
 import { PrivateTranscriptionAudioStore } from './transcription-audio-custody';
 import {
@@ -34,6 +35,8 @@ type ErasureKind =
   | 'legacy_media_asset'
   | 'legacy_concept_asset'
   | 'legacy_avatar_asset'
+  | 'voice_output'
+  | 'voice_clone'
   | 'agent_runtime'
   | 'channel_runtime'
   | 'clerk_identity'
@@ -524,6 +527,18 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           state: 'intent_pending',
         };
       }
+      const [openVoice] = await tx<{ open: boolean }[]>`
+        with principals as (select ${input.accountId}::uuid id union all
+          select account_id from agents where owner_id=${input.accountId})
+        select exists(
+          select 1 from voice_executions v join principals p on p.id in (v.owner_account_id,v.agent_account_id)
+            where v.status in ('pending','provider_started','transcoding','refund_pending','artifact_cleanup_pending')
+          union all select 1 from voice_clones v join principals p on p.id=v.owner_account_id
+            where v.status in ('pending_validation','cloning','provider_create_ambiguous','provider_delete_pending','provider_delete_failed')
+        ) open`;
+      if (openVoice?.open) {
+        throw new ApiError(409, 'erasure_work_in_flight', 'Voice work requires provider-free reconciliation before erasure');
+      }
       await tx`select set_config('eden3.erasure_job_id', ${jobId}, true)`;
       await tx`select set_config('eden3.erasure_inventory_mode', 'accept_intent', true)`;
       const [created] = await tx<JobRow[]>`
@@ -605,6 +620,10 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
             where c.status in ('reserving','reserved','settling','refunding','delivery_pending','error')
           union all select u.id::text from usage_events u join principals p on p.id in (u.user_id,u.agent_id)
             where u.status in ('pending','provider_admitted','running','refund_pending')
+          union all select v.id::text from voice_executions v join principals p on p.id in (v.owner_account_id,v.agent_account_id)
+            where v.status in ('pending','provider_started','transcoding','refund_pending','artifact_cleanup_pending')
+          union all select v.id::text from voice_clones v join principals p on p.id=v.owner_account_id
+            where v.status in ('pending_validation','cloning','provider_create_ambiguous','provider_delete_pending','provider_delete_failed')
           union all select r.id::text from memory_dream_runs r join principals p on p.id=r.agent_account_id
             where r.status in ('running','recovery_pending') or r.provider_status in ('started','indeterminate')
           union all select q.agent_account_id::text from agent_provision_jobs q join principals p on p.id=q.agent_account_id where q.state in ('pending','running')
@@ -684,6 +703,39 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
           localPath: row.local_path,
           url: row.url,
           sha256: row.sha256,
+        }),
+      })));
+      const voiceClones = await tx<{
+        id: string; provider: string; provider_voice_id: string | null; status: string;
+        clip_manifest_sha256: string;
+      }[]>`
+        select id,provider,provider_voice_id,status,clip_manifest_sha256
+        from voice_clones where owner_account_id=${input.accountId}
+        order by id for update`;
+      targets.push(...voiceClones.map((row) => ({
+        kind: 'voice_clone' as const,
+        resourceId: row.id,
+        locator: JSON.stringify({
+          kind: 'voice_clone', provider: row.provider, providerVoiceId: row.provider_voice_id,
+          status: row.status, clipManifestSha256: row.clip_manifest_sha256,
+        }),
+      })));
+      const voiceOutputs = await tx<{
+        id: string; output_local_path: string; output_url: string; output_sha256: string; delete_physical: boolean;
+      }[]>`
+        select ve.id,ve.output_local_path,ve.output_url,ve.output_sha256,
+          not exists(select 1 from voice_executions other where other.id<>ve.id
+            and other.status='completed' and other.output_sha256=ve.output_sha256
+            and other.owner_account_id<>${input.accountId}) delete_physical
+        from voice_executions ve where ve.owner_account_id=${input.accountId} and ve.status='completed'
+          and ve.output_local_path is not null and ve.output_url is not null and ve.output_sha256 is not null
+        order by id for update`;
+      targets.push(...voiceOutputs.map((row) => ({
+        kind: 'voice_output' as const,
+        resourceId: row.id,
+        locator: JSON.stringify({
+          kind: 'voice_output', localPath: row.output_local_path,
+          url: row.output_url, sha256: row.output_sha256, deletePhysical: row.delete_physical,
         }),
       })));
       const agents = await tx<{ account_id: string; openclaw_id: string | null; workspace_path: string | null }[]>`
@@ -820,6 +872,15 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
         update agents set name=null,description=null,persona=null,is_persona_public=false,
           greeting=null,voice=null,tool_groups='[]'::jsonb,public=false
         where owner_id=${input.accountId}`;
+      await tx`
+        delete from agent_voice_assignments where agent_account_id in (
+          select account_id from agents where owner_id=${input.accountId}
+        )`;
+      await tx`
+        with principals as (select ${input.accountId}::uuid id union all select account_id from agents where owner_id=${input.accountId})
+        delete from voice_executions where status<>'completed'
+          and (owner_account_id in (select id from principals) or agent_account_id in (select id from principals))`;
+      await tx`delete from voice_quotes where owner_account_id=${input.accountId}`;
       await tx`
         with principals as (select ${input.accountId}::uuid id union all select account_id from agents where owner_id=${input.accountId})
         delete from content_reports where reporter_id in (select id from principals)
@@ -1654,6 +1715,44 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
         externalDisposition: election.elected && disposition.kind === 'external',
       });
     }
+    if (target.kind === 'voice_clone') {
+      const [row] = await tx<{
+        provider: string; provider_voice_id: string | null; status: string; clip_manifest_sha256: string;
+      }[]>`
+        select provider,provider_voice_id,status,clip_manifest_sha256
+        from voice_clones where id=${target.resource_id} for update`;
+      return row ? JSON.stringify({
+        kind: 'voice_clone', provider: row.provider, providerVoiceId: row.provider_voice_id,
+        status: row.status, clipManifestSha256: row.clip_manifest_sha256,
+      }) : null;
+    }
+    if (target.kind === 'voice_output') {
+      const [row] = await tx<{
+        output_local_path: string | null; output_url: string | null; output_sha256: string | null;
+      }[]>`
+        select output_local_path,output_url,output_sha256 from voice_executions
+        where id=${target.resource_id} and status='completed' for update`;
+      if (!row?.output_local_path || !row.output_url || !row.output_sha256) return null;
+      await tx`select pg_advisory_xact_lock(hashtextextended('voice-output:'||${row.output_sha256},0))`;
+      const [election] = await tx<{ foreign_shared: boolean; elected_target_id: string | null }[]>`
+        with matching as materialized (
+          select ve.id,coalesce(array(select t.id::text from account_erasure_targets t
+            join account_erasure_jobs j on j.id=t.job_id
+            where t.kind='voice_output' and t.resource_id=ve.id
+              and t.state<>'succeeded' and j.state<>'succeeded'),array[]::text[]) active_target_ids
+          from voice_executions ve
+          where ve.status='completed' and ve.output_sha256=${row.output_sha256}
+        ), target_ids as (
+          select distinct unnest(active_target_ids) id from matching
+        )
+        select exists(select 1 from matching where cardinality(active_target_ids)=0) foreign_shared,
+          (select min(id) from target_ids) elected_target_id`;
+      return JSON.stringify({
+        kind: 'voice_output', localPath: row.output_local_path, url: row.output_url,
+        sha256: row.output_sha256,
+        deletePhysical: election?.foreign_shared === false && election.elected_target_id === target.id,
+      });
+    }
     if (target.kind === 'agent_runtime') {
       const [row] = await tx<{ openclaw_id: string | null; workspace_path: string | null }[]>`
         select openclaw_id,workspace_path from agents where account_id=${target.resource_id} for update`;
@@ -1762,7 +1861,8 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
             select 1 from storage_uploads u
             where u.object_id=t.resource_id and u.cleanup_state='failed'
           )
-        order by t.next_attempt_at,t.id limit 1`;
+        order by case when t.kind in ('voice_clone','voice_output') then 0 when t.kind='storage_object' then 2 else 1 end,
+          t.next_attempt_at,t.id limit 1`;
       if (failedStorageCandidate) {
         const failedTarget = await this.lockTargetHierarchy(tx, failedStorageCandidate);
         if (failedTarget) {
@@ -1809,7 +1909,7 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
       if (!claimed) return null;
       let resolvedLocator = await this.resolveLocator(tx, target);
       if (!resolvedLocator && [
-        'storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'legacy_avatar_asset', 'agent_runtime',
+        'storage_object', 'legacy_media_asset', 'legacy_concept_asset', 'legacy_avatar_asset', 'voice_output', 'voice_clone', 'agent_runtime',
         'channel_runtime', 'clerk_identity', 'stripe_customer',
       ].includes(target.kind)) {
         const [sealed] = await tx<{ recovery_manifest_sha256: string | null }[]>`
@@ -1890,6 +1990,12 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
       } else if (claim.kind === 'legacy_avatar_asset') {
         await tx`select set_config('eden3.erasure_external_absence_id', ${claim.resourceId}, true)`;
         await tx`delete from agent_avatar_assets where id=${claim.resourceId}`;
+      } else if (claim.kind === 'voice_clone') {
+        await tx`delete from agent_voice_assignments where voice_id='clone:'||${claim.resourceId}::text`;
+        await tx`delete from voice_clones where id=${claim.resourceId}`;
+      } else if (claim.kind === 'voice_output') {
+        await tx`select set_config('eden3.erasure_external_absence_id', ${claim.resourceId}, true)`;
+        await tx`delete from voice_executions where id=${claim.resourceId}`;
       } else if (claim.kind === 'agent_runtime') {
         await tx`update agents set openclaw_id=null,workspace_path=null where account_id=${claim.resourceId}`;
       } else if (claim.kind === 'channel_runtime') {
@@ -1948,6 +2054,7 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
 
 export interface AccountErasureTargetExecutor {
   readonly legacyMediaBoundary?: AccountErasureLegacyMediaBoundary;
+  readonly voiceCloneCustody?: true;
   erase(input: Pick<AccountErasureTargetClaim, 'targetId' | 'jobId' | 'kind' | 'resourceId' | 'locator'> & {
     signal: AbortSignal;
   }): Promise<{ confirmedAbsent: true }>;
@@ -1960,6 +2067,7 @@ export interface AccountErasureTargetExecutor {
  */
 export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor {
   readonly legacyMediaBoundary: AccountErasureLegacyMediaBoundary;
+  readonly voiceCloneCustody: true | undefined;
 
   constructor(
     boundary: AccountErasureLegacyMediaBoundary,
@@ -1969,6 +2077,7 @@ export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor 
       throw new Error('Local legacy erasure requires an attested media boundary');
     }
     this.legacyMediaBoundary = boundary;
+    this.voiceCloneCustody = external.voiceCloneCustody;
     this.mediaRoot = boundary.root;
   }
 
@@ -1976,7 +2085,7 @@ export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor 
 
   async erase(input: Parameters<AccountErasureTargetExecutor['erase']>[0]): Promise<{ confirmedAbsent: true }> {
     if (input.kind !== 'legacy_media_asset' && input.kind !== 'legacy_concept_asset' &&
-        input.kind !== 'legacy_avatar_asset') {
+        input.kind !== 'legacy_avatar_asset' && input.kind !== 'voice_output') {
       return await this.external.erase(input);
     }
     let parsed: unknown;
@@ -2017,6 +2126,46 @@ export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor 
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
+    return { confirmedAbsent: true };
+  }
+}
+
+/** Confirms Cartesia clone absence before the erasure worker may delete custody rows. */
+export class CartesiaVoiceCloneErasureExecutor implements AccountErasureTargetExecutor {
+  readonly legacyMediaBoundary: AccountErasureLegacyMediaBoundary | undefined;
+  readonly voiceCloneCustody = true as const;
+
+  constructor(
+    private readonly cartesia: VoiceProviderClient,
+    private readonly fallback: AccountErasureTargetExecutor,
+  ) {
+    if (cartesia.provider !== 'cartesia' || !cartesia.deleteClone) {
+      throw new Error('Cartesia clone erasure requires a delete-capable Cartesia provider');
+    }
+    this.legacyMediaBoundary = fallback.legacyMediaBoundary;
+  }
+
+  async erase(input: Parameters<AccountErasureTargetExecutor['erase']>[0]): Promise<{ confirmedAbsent: true }> {
+    if (input.kind !== 'voice_clone') return await this.fallback.erase(input);
+    let value: unknown;
+    try { value = JSON.parse(input.locator); } catch { throw new Error('voice clone erasure locator is invalid'); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('voice clone erasure locator is invalid');
+    }
+    const locator = value as Record<string, unknown>;
+    if (locator.kind !== 'voice_clone' || locator.provider !== 'cartesia') {
+      throw new Error('voice clone erasure locator is invalid');
+    }
+    if (locator.providerVoiceId === null) {
+      if (locator.status === 'provider_create_ambiguous') {
+        throw new Error('voice clone provider absence requires reconciliation');
+      }
+      return { confirmedAbsent: true };
+    }
+    if (typeof locator.providerVoiceId !== 'string' || !/^[A-Za-z0-9_-]{1,255}$/.test(locator.providerVoiceId)) {
+      throw new Error('voice clone erasure locator is invalid');
+    }
+    await this.cartesia.deleteClone!(locator.providerVoiceId);
     return { confirmedAbsent: true };
   }
 }

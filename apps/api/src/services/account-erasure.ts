@@ -51,7 +51,9 @@ export interface AccountErasureRecoveryLocator {
     | 'storage_object'
     | 'legacy_media_asset'
     | 'legacy_concept_asset'
-    | 'legacy_avatar_asset';
+    | 'legacy_avatar_asset'
+    | 'voice_output'
+    | 'voice_clone';
   resourceId: string;
   /** Ephemeral plaintext passed only to the dedicated encrypting sink. */
   locator: string;

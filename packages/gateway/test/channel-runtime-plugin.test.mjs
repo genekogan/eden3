@@ -219,6 +219,10 @@ function memoryPairingCallbackOutbox(initial = []) {
 function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) {
   const calls = [];
   const client = {
+    mediaUrl(relativePath) {
+      if (!/^\/media\/[0-9a-f]{64}\.ogg$/.test(relativePath)) throw new Error('invalid media path');
+      return `http://host.docker.internal:4312${relativePath}`;
+    },
     post: vi.fn(async (path, body, options) => {
       calls.push({ path, body: structuredClone(body), options });
       if (handlers[path]) return handlers[path](body, options);
@@ -244,6 +248,10 @@ function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) 
           agentRuntime: mapping.agentRuntime,
           pricingBasis: mapping.agentRuntime === 'claude-cli' ? 'notional-subscription' : 'provider-api',
         };
+      }
+      if (path.endsWith('/voice-note')) {
+        if (handlers.voiceNote) return handlers.voiceNote(body, options, path);
+        throw new ChannelRuntimeClientError('channel_voice_not_enabled', 409);
       }
       return { ok: true };
     }),
@@ -500,6 +508,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       '/channels/runtime/messages',
       '/channels/runtime/turns/reserve',
       `/channels/runtime/turns/${RUN_A}/settle`,
+      `/channels/runtime/turns/${RUN_A}/voice-note`,
       '/channels/runtime/messages',
     ]);
     expect(businessCalls[1].options).toEqual({ timeoutMs: 20_000 });
@@ -534,6 +543,11 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(businessCalls[2].options).toEqual({ timeoutMs: 20_000 });
     expect(businessCalls[3].body).toMatchObject({
       connectionId: CONNECTION_A,
+      text: 'assistant answer',
+    });
+    expect(businessCalls[3].options).toEqual({ timeoutMs: 30_000 });
+    expect(businessCalls[4].body).toMatchObject({
+      connectionId: CONNECTION_A,
       runtimeAccountId: 'account-a',
       gatewaySessionKey: SESSION_A,
       peerId: PEER_A,
@@ -541,6 +555,55 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       content: 'assistant answer',
       externalMessageId: `eden-channel-assistant:${RUN_A}`,
     });
+  });
+
+  it.each([
+    ['discord', hostedConfig(), receiveA, SESSION_A],
+    ['telegram', telegramHostedConfig(), receiveTelegramA, TELEGRAM_SESSION_A],
+  ])('emits one exact native %s voice payload without a second LLM settlement', async (channel, config, receive, sessionKey) => {
+    const { bridge, calls } = mockBridge(config, {
+      voiceNote(body) {
+        return {
+          ok: true,
+          voiceOperationId: body.voiceOperationId,
+          execution: { purpose: channel },
+          attachment: {
+            url: `/media/${'a'.repeat(64)}.ogg`,
+            mime: 'audio/ogg',
+            durationSecs: 1.25,
+            waveform: channel === 'discord' ? 'AQID' : null,
+          },
+          native: channel === 'discord'
+            ? { channel: 'discord', flags: 1 << 13, content: null, attachmentCount: 1, enforceNonce: true }
+            : { channel: 'telegram', method: 'sendVoice', multipart: true },
+        };
+      },
+    });
+    receive(bridge);
+    await bridge.onBeforeAgentRun(
+      { accountId: 'account-a', senderId: PEER_A, prompt: 'hello', messages: [] },
+      { runId: RUN_A, sessionKey, messageProvider: channel, agentId: 'agent-a' },
+    );
+    const payload = { text: 'spoken answer' };
+    await expect(bridge.onReplyPayloadSending(
+      {
+        kind: 'final', runId: RUN_A, payload,
+        usageState: { usage: { input: 3, output: 2, total: 5 }, provider: 'claude-cli', model: 'claude-sonnet-4-6' },
+      },
+      { runId: RUN_A, sessionKey, channelId: channel, accountId: 'account-a', messageId: channel === 'discord' ? '1532630091471786166' : '42' },
+    )).resolves.toBeUndefined();
+
+    const expectedMediaUrl = `http://host.docker.internal:4312/media/${'a'.repeat(64)}.ogg`;
+    expect(payload).toMatchObject({
+      text: '', spokenText: '', mediaUrl: expectedMediaUrl,
+      mediaUrls: [expectedMediaUrl], audioAsVoice: true,
+    });
+    expect(payload.content).toBeUndefined();
+    expect(payload).not.toHaveProperty('asVoice');
+    expect(payload).not.toHaveProperty('sendMethod');
+    expect(calls.filter((call) => call.path.endsWith('/settle'))).toHaveLength(1);
+    expect(calls.filter((call) => call.path.endsWith('/voice-note'))).toHaveLength(1);
+    expect(calls.find((call) => call.path === '/channels/runtime/messages' && call.body.role === 'assistant').body.content).toBe('spoken answer');
   });
 
   it('keeps two bot accounts isolated and ignores caller-supplied connection metadata', async () => {

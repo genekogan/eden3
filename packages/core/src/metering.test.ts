@@ -269,7 +269,7 @@ describe('CostTable', () => {
     });
 
     expect(falImage.totalCostUsd).toBe(0.05);
-    expect(elevenTts.totalCostUsd).toBeCloseTo(0.20004, 10);
+    expect(elevenTts.totalCostUsd).toBeCloseTo(0.06, 10);
     expect(runwayVideo.totalCostUsd).toBe(0.5);
     expect(geminiImage.totalCostUsd).toBe(0.134);
     expect(lyriaClip.totalCostUsd).toBe(0.04);
