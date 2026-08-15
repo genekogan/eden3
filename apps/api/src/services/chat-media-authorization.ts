@@ -531,8 +531,25 @@ export async function reserveChatMedia(options: {
         and s.deleted = false
         and owner_account.deleted = false and owner_account.type = 'user'
         and agent_account.deleted = false and agent_account.type = 'agent'
-        and s.session_type is distinct from 'channel' and s.channel_connection_id is null
         and a.openclaw_id = ${agentId}
+        and (
+          (
+            s.session_type is distinct from 'channel'
+            and s.channel_connection_id is null
+          )
+          or exists (
+            select 1
+            from channel_connections connection
+            where s.session_type = 'channel'
+              and s.channel_connection_id is not null
+              and connection.id = s.channel_connection_id
+              and connection.account_id = s.owner_id
+              and connection.agent_id = a.account_id
+              and a.owner_id = connection.account_id
+              and connection.channel in ('discord', 'telegram')
+              and connection.desired_state = 'active'
+          )
+        )
       order by a.account_id
       limit 2
     `)) as unknown as Array<{ session_id: string; account_id: string; agent_account_id: string }>;

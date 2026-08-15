@@ -23,6 +23,11 @@ describe('media runtime UI lifecycle events', () => {
         new Error('chat-media-authorization: media action already pending for session'),
       ),
     ).toBe('media_already_pending');
+    expect(
+      mediaAuthorizationFailureCode(
+        new Error('chat-media-authorization: session/agent binding unavailable'),
+      ),
+    ).toBe('session_agent_binding');
     expect(mediaAuthorizationFailureCode(new Error('database host detail'))).toBe('unknown');
   });
 
@@ -107,6 +112,14 @@ describe('media runtime UI lifecycle events', () => {
     expect(failed).toContain(
       'publishChatMediaFailed(app.eventsBus, context, body.errorCode)',
     );
+    const denied = source.slice(
+      source.indexOf("'chat media authorization denied'"),
+      source.indexOf("app.post<{ Params: { authorizationId: string } }>")
+    );
+    expect(denied).toContain(
+      "new ApiError(409, failureCode, 'Media generation could not be authorized')",
+    );
+    expect(denied).not.toContain("new ApiError(409, 'media_authorization_denied'");
   });
 
   it('never invents media activity from a silent chat completion', () => {
@@ -120,5 +133,29 @@ describe('media runtime UI lifecycle events', () => {
     );
     expect(turnsSource).toContain('DIRECT_CHAT_EMPTY_REPLY');
     expect(turnsSource).toContain('hasCurrentTurnMediaAuthorization');
+  });
+
+  it('authorizes channel media only through the exact live owner and agent binding', () => {
+    const source = readFileSync(
+      resolve(import.meta.dirname, '../src/services/chat-media-authorization.ts'),
+      'utf8',
+    );
+    const targetQuery = source.slice(
+      source.indexOf('select s.id as session_id'),
+      source.indexOf('order by a.account_id'),
+    );
+    expect(targetQuery).toContain("s.session_type is distinct from 'channel'");
+    expect(targetQuery).toContain('s.channel_connection_id is null');
+    expect(targetQuery).toContain('from channel_connections connection');
+    expect(targetQuery).toContain("s.session_type = 'channel'");
+    expect(targetQuery).toContain('connection.id = s.channel_connection_id');
+    expect(targetQuery).toContain('connection.account_id = s.owner_id');
+    expect(targetQuery).toContain('connection.agent_id = a.account_id');
+    expect(targetQuery).toContain('a.owner_id = connection.account_id');
+    expect(targetQuery).toContain("connection.channel in ('discord', 'telegram')");
+    expect(targetQuery).toContain("connection.desired_state = 'active'");
+    expect(source).not.toContain(
+      "and s.session_type is distinct from 'channel' and s.channel_connection_id is null",
+    );
   });
 });

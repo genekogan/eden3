@@ -29,6 +29,7 @@ const mediaDir = mkdtempSync(path.join(tmpdir(), 'eden3-fg-chat-media-store-'));
 const sourceDir = mkdtempSync(path.join(tmpdir(), 'eden3-fg-chat-media-src-'));
 const ownedAccounts: string[] = [];
 const ownedSessions: string[] = [];
+const ownedConnections: string[] = [];
 
 function retainFencedFixture(fixture: { userId: string; agentId: string; sessionId: string }): void {
   for (const accountId of [fixture.userId, fixture.agentId]) {
@@ -60,6 +61,26 @@ async function fixture(fund: number) {
   return { userId: user!.id, agentId: agent!.id, openclawId, sessionId, sessionKey };
 }
 
+async function channelFixture(fund: number) {
+  const result = await fixture(fund);
+  const [connection] = await pg<{ id: string }[]>`
+    insert into channel_connections (
+      account_id, agent_id, channel, runtime_account_id, desired_state,
+      observed_state, token_ciphertext, token_iv, token_auth_tag, token_sha256
+    ) values (
+      ${result.userId}, ${result.agentId}, 'discord', ${`${marker}-discord-${randomUUID().slice(0, 8)}`},
+      'active', 'live', 'ciphertext', 'iv', 'tag', ${randomUUID().replaceAll('-', '').repeat(2)}
+    ) returning id
+  `;
+  await pg`
+    update sessions
+    set session_type = 'channel', platform = 'discord', channel_connection_id = ${connection!.id}
+    where id = ${result.sessionId}
+  `;
+  ownedConnections.push(connection!.id);
+  return { ...result, connectionId: connection!.id };
+}
+
 function request(
   f: Awaited<ReturnType<typeof fixture>>,
   tool: 'image_generate' | 'video_generate' | 'music_generate' | 'tts',
@@ -89,6 +110,7 @@ afterAll(async () => {
   await pg`delete from session_agents where session_id = any(${ownedSessions})`;
   await pg`delete from session_users where session_id = any(${ownedSessions})`;
   await pg`delete from sessions where id = any(${ownedSessions})`;
+  await pg`delete from channel_connections where id = any(${ownedConnections})`;
   await pg`delete from manna_transactions where manna_account_id in
            (select id from manna_accounts where account_id = any(${ownedAccounts}))`;
   await pg`delete from manna_accounts where account_id = any(${ownedAccounts})`;
@@ -260,6 +282,28 @@ describe('FG-ECON in-chat media authorization', () => {
         where user_id = ${f.userId} and event_type = ${CHAT_MEDIA_EVENT_TYPE}`;
       expect(rows).toHaveLength(0);
     }
+  });
+
+  it('authorizes an active, exactly-bound Discord mirror and refuses it after deactivation', async () => {
+    const quote = quoteChatMediaTool('image_generate', { prompt: 'channel bunny' });
+    const f = await channelFixture(quote.manna * 2);
+    const admitted = await reserveChatMedia({
+      request: request(f, 'image_generate', { prompt: 'channel bunny' }),
+      dailyCap: 100_000,
+    });
+    expect(admitted).toMatchObject({
+      sessionId: f.sessionId,
+      accountId: f.userId,
+      agentAccountId: f.agentId,
+    });
+
+    await pg`update channel_connections set desired_state = 'inactive' where id = ${f.connectionId}`;
+    await expect(
+      reserveChatMedia({
+        request: request(f, 'image_generate', { prompt: 'channel puppy' }),
+        dailyCap: 100_000,
+      }),
+    ).rejects.toThrow('session/agent binding unavailable');
   });
 
   it('fails closed for deferred in-chat TTS before debit', async () => {

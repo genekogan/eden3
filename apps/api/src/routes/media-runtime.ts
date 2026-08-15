@@ -168,13 +168,14 @@ export const mediaRuntimeRoutes: FastifyPluginAsync<MediaRuntimeRoutesOptions> =
           providerArgs,
         };
       } catch (err) {
+        const failureCode = mediaAuthorizationFailureCode(err);
         logSafeRequestWarning(
           req.log,
           err,
-          { failureCode: mediaAuthorizationFailureCode(err) },
+          { failureCode },
           'chat media authorization denied',
         );
-        throw new ApiError(409, 'media_authorization_denied', 'Media generation is unavailable');
+        throw new ApiError(409, failureCode, 'Media generation could not be authorized');
       }
     },
   );
