@@ -64,6 +64,23 @@ export const envSchema = z.object({
    * production. Set this to the CDN origin when serving media off a CDN.
    */
   MEDIA_BASE_URL: z.string().min(1).default('/media'),
+  /** Private transient STT audio root. It must not be inside the public media tree. */
+  TRANSCRIPTION_AUDIO_DIR: z
+    .string()
+    .min(1)
+    .default(() => path.resolve('var', 'transcriptions')),
+  /** Trusted-server Cartesia credential; never exposed to a browser or response. */
+  CARTESIA_API_KEY: z.string().min(1).optional(),
+  /** Active resumable recordings per user. */
+  TRANSCRIPTION_MAX_ACTIVE_PER_USER: positiveIntSchema.default(2),
+  /** New transcription sessions per user per UTC day. */
+  TRANSCRIPTION_MAX_CREATED_PER_USER_PER_DAY: positiveIntSchema.default(100),
+  /** STT-specific authenticated request window. */
+  TRANSCRIPTION_RATE_LIMIT_WINDOW_MS: positiveIntSchema.default(60_000),
+  /** STT-specific requests per authenticated user per window. */
+  TRANSCRIPTION_RATE_LIMIT_MAX: positiveIntSchema.default(120),
+  /** Durable transcription worker polling interval. */
+  TRANSCRIPTION_WORKER_INTERVAL_MS: positiveIntSchema.default(1_000),
   API_PORT: portSchema.default(4301),
   WEB_PORT: portSchema.default(4300),
   /** Comma-separated dev/operator admin usernames. */
@@ -199,6 +216,16 @@ export const envSchema = z.object({
       code: z.ZodIssueCode.custom,
       path: ['STRIPE_MANNA_TOPUP_PRICE_ID'],
       message: 'Stripe *_PRICE_ID values must be unique',
+    });
+  }
+  const mediaRoot = path.resolve(env.MEDIA_DIR);
+  const transcriptionRoot = path.resolve(env.TRANSCRIPTION_AUDIO_DIR);
+  const mediaPrefix = mediaRoot.endsWith(path.sep) ? mediaRoot : `${mediaRoot}${path.sep}`;
+  if (transcriptionRoot === mediaRoot || transcriptionRoot.startsWith(mediaPrefix)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['TRANSCRIPTION_AUDIO_DIR'],
+      message: 'must be outside MEDIA_DIR so dictation audio can never be served by the CDN/media route',
     });
   }
   return {
