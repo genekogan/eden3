@@ -50,7 +50,7 @@ import {
   initialConversationState,
 } from "./conversation-state";
 import type { LocalItem } from "./conversation-state";
-import { Composer, ComposerNotice } from "./composer";
+import { Composer, ComposerNotice, retryComposerDraftAfterTurnAcceptance } from "./composer";
 import type { ComposerAttachment } from "./composer";
 import { SessionShareDialog } from "./session-share-dialog";
 import {
@@ -126,7 +126,7 @@ export function SessionConversation({
   const [fallbackAgent, setFallbackAgent] = useState<AccountSummary | null>(
     null,
   );
-  const { agent: selectedAgent } = useSelectedAgent();
+  const { agent: selectedAgent, viewer } = useSelectedAgent();
   const [voiceStatus, setVoiceStatus] = useState<Record<string, "idle" | "generating" | "error">>({});
 
   // The uuid to talk to the API with (route may carry a legacy 24-hex id).
@@ -364,9 +364,11 @@ export function SessionConversation({
   const retryFromError = useCallback(
     (item: { clientId: string }, content: string) => {
       dispatch({ type: "error/dismiss", clientId: item.clientId });
-      void send(content);
+      void retryComposerDraftAfterTurnAcceptance(
+        send(content), viewer?.id, `session:${session?.id ?? routeId}`,
+      );
     },
-    [send],
+    [routeId, send, session, viewer],
   );
 
   // -------------------------------------------------------------------------
@@ -553,7 +555,9 @@ export function SessionConversation({
           onClick={() => {
             const content = notice.retryContent ?? "";
             setNotice(null);
-            void send(content);
+            void retryComposerDraftAfterTurnAcceptance(
+              send(content), viewer?.id, `session:${session?.id ?? routeId}`,
+            );
           }}
           className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"
         >

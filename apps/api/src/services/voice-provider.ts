@@ -73,9 +73,13 @@ function safeHeader(response: Response, name: string): string | null {
 async function boundedBytes(response: Response, maximum = MAX_PROVIDER_BYTES, signal?: AbortSignal): Promise<Buffer> {
   const declared = Number(response.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > maximum) {
+    abortProviderResponse(response);
     throw new VoiceProviderError('provider_response_too_large', true);
   }
-  if (!response.body) throw new VoiceProviderError('provider_response_invalid', true);
+  if (!response.body) {
+    abortProviderResponse(response);
+    throw new VoiceProviderError('provider_response_invalid', true);
+  }
   const reader = response.body.getReader();
   const custody = responseCustody.get(response);
   // Direct test/helper callers still receive a bounded body read. Provider
@@ -117,8 +121,21 @@ async function fetchAtMostOnce(
 ): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-  const abort = () => controller.abort();
+  const abort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) {
+    clearTimeout(timer);
+    controller.abort(signal.reason);
+    throw new VoiceProviderError('provider_unavailable', false);
+  }
   signal?.addEventListener('abort', abort, { once: true });
+  // Abort can race the first check and listener registration. No provider
+  // side effect is admitted after the caller has withdrawn the lease.
+  if (signal?.aborted) {
+    clearTimeout(timer);
+    signal.removeEventListener('abort', abort);
+    controller.abort(signal.reason);
+    throw new VoiceProviderError('provider_unavailable', false);
+  }
   let started = false;
   try {
     started = true;
@@ -278,7 +295,8 @@ export class CartesiaVoiceClient implements VoiceProviderClient {
     try {
       if (response.status !== 204 && response.status !== 404) assertOk(response);
     } finally {
-      releaseProviderResponse(response);
+      // DELETE success/absence has no response payload worth retaining.
+      abortProviderResponse(response);
     }
   }
 

@@ -156,4 +156,80 @@ describe('voice providers are bounded and provider-free under test', () => {
     expect(signals.every((signal) => signal.aborted)).toBe(true);
     expect(cancels.every((cancel) => cancel.mock.calls.length === 1)).toBe(true);
   });
+
+  it('aborts and cancels an accepted clone-absence response with a never-ending body', async () => {
+    let requestSignal: AbortSignal | undefined;
+    const cancel = vi.fn();
+    const fetchFn = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      requestSignal = init?.signal as AbortSignal;
+      return new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined),
+        cancel,
+      }), { status: 404 });
+    });
+    const client = new CartesiaVoiceClient('test-token', fetchFn as typeof fetch);
+    await expect(client.deleteClone('already-gone')).resolves.toBeUndefined();
+    await Promise.resolve();
+    expect(requestSignal?.aborted).toBe(true);
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('releases provider custody on boundedBytes early rejection', async () => {
+    const oversized = new Response(new Uint8Array([1]), {
+      headers: { 'content-length': String(voiceProviderInternals.MAX_PROVIDER_BYTES + 1) },
+    });
+    await expect(voiceProviderInternals.boundedBytes(oversized)).rejects.toMatchObject({
+      code: 'provider_response_too_large',
+    });
+    expect(oversized.bodyUsed).toBe(true);
+  });
+
+  it('aborts the absolute request deadline on oversized and missing response bodies', async () => {
+    const signals: AbortSignal[] = [];
+    const oversizedCancel = vi.fn();
+    const responses = [
+      new Response(new ReadableStream<Uint8Array>({
+        pull: () => new Promise<void>(() => undefined),
+        cancel: oversizedCancel,
+      }), { headers: { 'content-length': String(voiceProviderInternals.MAX_PROVIDER_BYTES + 1) } }),
+      new Response(null, { status: 200 }),
+    ];
+    const fetchFn = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      signals.push(init?.signal as AbortSignal);
+      return responses.shift()!;
+    });
+    const client = new DeepInfraKokoroClient('test-token', fetchFn as typeof fetch);
+    await expect(client.synthesize({
+      model: 'hexgrad/Kokoro-82M', providerVoiceId: 'af_bella', text: 'too large',
+    })).rejects.toMatchObject({ code: 'provider_response_too_large' });
+    await expect(client.synthesize({
+      model: 'hexgrad/Kokoro-82M', providerVoiceId: 'af_bella', text: 'missing body',
+    })).rejects.toMatchObject({ code: 'provider_response_invalid' });
+    await Promise.resolve();
+    expect(signals).toHaveLength(2);
+    expect(signals.every((signal) => signal.aborted)).toBe(true);
+    expect(oversizedCancel).toHaveBeenCalledOnce();
+  });
+
+  it('never admits a provider request after its caller lease is already aborted', async () => {
+    const fetchFn = vi.fn(async () => new Response(new Uint8Array([1])));
+    const preAborted = new AbortController();
+    preAborted.abort(new DOMException('lease expired', 'AbortError'));
+    const client = new DeepInfraKokoroClient('test-token', fetchFn as typeof fetch);
+    await expect(client.synthesize({
+      model: 'hexgrad/Kokoro-82M', providerVoiceId: 'af_bella', text: 'do not send', signal: preAborted.signal,
+    })).rejects.toMatchObject({ code: 'provider_unavailable', mayHaveReachedProvider: false });
+    expect(fetchFn).not.toHaveBeenCalled();
+
+    const boundary = new AbortController();
+    const originalAdd = boundary.signal.addEventListener.bind(boundary.signal);
+    vi.spyOn(boundary.signal, 'addEventListener').mockImplementation(((type: any, listener: any, options?: any) => {
+      originalAdd(type, listener, options);
+      boundary.abort(new DOMException('boundary lease expired', 'AbortError'));
+    }) as typeof boundary.signal.addEventListener);
+    await expect(client.synthesize({
+      model: 'hexgrad/Kokoro-82M', providerVoiceId: 'af_bella', text: 'still do not send', signal: boundary.signal,
+    })).rejects.toMatchObject({ code: 'provider_unavailable', mayHaveReachedProvider: false });
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
 });

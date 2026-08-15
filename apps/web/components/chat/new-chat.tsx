@@ -18,6 +18,7 @@ import type { AgentDto, CreationDto } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
 import { MediaThumb } from "@/components/media";
+import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 import { Skeleton } from "@/components/skeleton";
 import {
   describeSendError,
@@ -26,7 +27,7 @@ import {
 } from "./chat-api";
 import { startNewSessionTurn } from "./turn-pump";
 import type { TurnPump } from "./turn-pump";
-import { Composer, ComposerNotice } from "./composer";
+import { Composer, ComposerNotice, retryComposerDraftAfterTurnAcceptance } from "./composer";
 import type { ComposerAttachment } from "./composer";
 import { Markdown } from "./markdown";
 
@@ -63,6 +64,7 @@ function NewSessionComposer({
   sessionHref?: (id: string) => string;
 }) {
   const router = useRouter();
+  const { viewer } = useSelectedAgent();
   const [agent, setAgent] = useState<AgentDto | null>(null);
   const [recent, setRecent] = useState<CreationDto[]>([]);
   const [phase, setPhase] = useState<"loading" | "ready" | "missing" | "error">(
@@ -197,7 +199,9 @@ function NewSessionComposer({
           onClick={() => {
             const content = notice.retryContent ?? "";
             setNotice(null);
-            void send(content);
+            void retryComposerDraftAfterTurnAcceptance(
+              send(content), viewer?.id, `new:${username}`,
+            );
           }}
           className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"
         >

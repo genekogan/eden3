@@ -17,9 +17,11 @@ import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 import {
   clearDictationComposerDraft,
   commitDictationTranscriptToComposer,
+  currentDictationCustodyEpoch,
   loadDictationComposerDraft,
   persistDictationComposerDraft,
 } from "@/lib/dictation-storage";
+import type { DictationPurgeFenceStore } from "@/lib/dictation-storage";
 import type { MessageAttachment } from "@/lib/types";
 import {
   formatDictationTime,
@@ -57,15 +59,55 @@ export function attachmentError(file: File): string | null {
 
 export async function clearComposerDraftAfterTurnAcceptance(
   acceptance: boolean | Promise<boolean>,
-  clear: () => void,
+  clear: () => void | Promise<void>,
 ): Promise<boolean> {
   try {
     const accepted = await acceptance;
-    if (accepted) clear();
+    if (accepted) await clear();
     return accepted;
   } catch {
     return false;
   }
+}
+
+export function retryComposerDraftAfterTurnAcceptance(
+  acceptance: boolean | Promise<boolean>,
+  ownerId: string | null | undefined,
+  contextKey: string,
+  options?: { indexedDB?: IDBFactory; purgeFenceStore?: DictationPurgeFenceStore },
+): Promise<boolean> {
+  const expectedEpoch = currentDictationCustodyEpoch(options?.purgeFenceStore);
+  return clearComposerDraftAfterTurnAcceptance(acceptance, () => {
+    if (ownerId) return clearDictationComposerDraft(ownerId, contextKey, options, expectedEpoch);
+  });
+}
+
+export function composerDraftIdentity(ownerId: string, contextKey: string): string {
+  return `${ownerId.length}:${ownerId}:${contextKey}`;
+}
+
+export function shouldApplyComposerHydration(
+  expectedIdentity: string,
+  currentIdentity: string | null,
+  revisionAtStart: number,
+  currentRevision: number,
+): boolean {
+  return expectedIdentity === currentIdentity && revisionAtStart === currentRevision;
+}
+
+export async function resolveComposerDraftIdentity(
+  ownerId: string,
+  contextKey: string,
+  previousIdentity: string | null,
+  options?: { indexedDB?: IDBFactory; purgeFenceStore?: DictationPurgeFenceStore },
+): Promise<{ identity: string; changed: boolean; value: string }> {
+  const identity = composerDraftIdentity(ownerId, contextKey);
+  if (identity === previousIdentity) return { identity, changed: false, value: "" };
+  return {
+    identity,
+    changed: true,
+    value: await loadDictationComposerDraft(ownerId, contextKey, options) ?? "",
+  };
 }
 
 function SendIcon() {
@@ -128,6 +170,9 @@ export function Composer({
 }) {
   const [value, setValue] = useState("");
   const valueRef = useRef("");
+  const draftIdentityRef = useRef<string | null>(null);
+  const editRevisionRef = useRef(0);
+  const persistChainRef = useRef<Promise<unknown>>(Promise.resolve());
   const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -140,12 +185,14 @@ export function Composer({
     refreshCredentials: async () => { await getClerkToken(); },
   }), []);
   const { viewer, viewerPhase } = useSelectedAgent();
-  const receiveTranscript = useCallback((transcript: string, deliveryId: string) => {
+  const receiveTranscript = useCallback(async (transcript: string, deliveryId: string) => {
     if (viewerPhase !== "ready" || !viewer) return false;
-    // This synchronous localStorage commit is the durable handoff. IndexedDB
-    // audio/transcript custody is acknowledged only after it succeeds.
-    const committed = commitDictationTranscriptToComposer(viewer.id, draftKey, deliveryId, transcript);
+    // Serialize same-tab edits before the transactional cross-tab handoff.
+    await persistChainRef.current.catch(() => undefined);
+    const committed = await commitDictationTranscriptToComposer(viewer.id, draftKey, deliveryId, transcript);
     if (committed === null) return false;
+    if (draftIdentityRef.current !== composerDraftIdentity(viewer.id, draftKey)) return true;
+    editRevisionRef.current += 1;
     valueRef.current = committed;
     setValue(committed);
     queueMicrotask(() => textareaRef.current?.focus());
@@ -161,19 +208,31 @@ export function Composer({
     dictation.state.phase === "recording" || dictation.state.phase === "retrying";
 
   useEffect(() => {
+    let cancelled = false;
     if (viewerPhase === "signed_out") {
+      draftIdentityRef.current = null;
+      editRevisionRef.current += 1;
+      persistChainRef.current = Promise.resolve();
       valueRef.current = "";
       setValue("");
-      return;
+      return () => { cancelled = true; };
     }
-    if (viewerPhase !== "ready" || !viewer) return;
-    const restored = loadDictationComposerDraft(viewer.id, draftKey);
-    if (restored === null) {
-      if (valueRef.current) persistDictationComposerDraft(viewer.id, draftKey, valueRef.current);
-      return;
-    }
-    valueRef.current = restored;
-    setValue(restored);
+    if (viewerPhase !== "ready" || !viewer) return () => { cancelled = true; };
+    const identity = composerDraftIdentity(viewer.id, draftKey);
+    if (draftIdentityRef.current === identity) return () => { cancelled = true; };
+    draftIdentityRef.current = identity;
+    const hydrationRevision = editRevisionRef.current;
+    persistChainRef.current = Promise.resolve();
+    valueRef.current = "";
+    setValue("");
+    void resolveComposerDraftIdentity(viewer.id, draftKey, null).then((next) => {
+      if (cancelled || !shouldApplyComposerHydration(
+        next.identity, draftIdentityRef.current, hydrationRevision, editRevisionRef.current,
+      )) return;
+      valueRef.current = next.value;
+      setValue(next.value);
+    });
+    return () => { cancelled = true; };
   }, [draftKey, viewer, viewerPhase]);
 
   useEffect(() => () => {
@@ -278,10 +337,13 @@ export function Composer({
       URL.revokeObjectURL(item.previewUrl);
       previewUrls.current.delete(item.previewUrl);
     }
-    void clearComposerDraftAfterTurnAcceptance(onSend(content, ready), () => {
-      // Keep the durable dictation handoff through network ambiguity. Only a
-      // server turn.started acknowledgement permits erasing its retry copy.
-      if (viewer) clearDictationComposerDraft(viewer.id, draftKey);
+    const expectedEpoch = currentDictationCustodyEpoch();
+    // Keep the durable dictation handoff through network ambiguity. Only a
+    // server turn.started acknowledgement in this exact auth epoch may erase
+    // it, after every already-admitted local edit has drained.
+    void clearComposerDraftAfterTurnAcceptance(onSend(content, ready), async () => {
+      await persistChainRef.current.catch(() => undefined);
+      if (viewer) await clearDictationComposerDraft(viewer.id, draftKey, undefined, expectedEpoch);
     });
   }, [value, attachments, streaming, disabled, dictationBusy, uploadPending, uploadFailed, onSend, viewer, draftKey]);
 
@@ -432,10 +494,13 @@ export function Composer({
           value={value}
           onChange={(event) => {
             const next = event.target.value;
+            editRevisionRef.current += 1;
             valueRef.current = next;
             setValue(next);
             if (viewerPhase === "ready" && viewer) {
-              persistDictationComposerDraft(viewer.id, draftKey, next);
+              persistChainRef.current = persistChainRef.current
+                .catch(() => undefined)
+                .then(() => persistDictationComposerDraft(viewer.id, draftKey, next));
             }
           }}
           onKeyDown={onKeyDown}
