@@ -90,7 +90,9 @@ describe('voice contract invariants', () => {
     expect(voiceKernelInternals.directVoiceExecutionKey('m', 0)).toBe('direct-voice:m:generation:0');
     expect(voiceKernelInternals.directVoiceExecutionKey('m', 1)).toBe('direct-voice:m:generation:1');
     expect(kernelSource).toContain("insert into direct_voice_jobs");
-    expect(kernelSource).toContain("update messages set attachments=case when exists");
+    expect(kernelSource).toContain('update messages set attachments=(');
+    expect(kernelSource).toContain("case when jsonb_typeof(attachments)='array'");
+    expect(kernelSource).toContain('with ordinality as existing(item,ord)');
     expect(kernelSource).toContain("update voice_executions set status='completed'");
     expect(kernelSource).toContain("update direct_voice_jobs set status='completed'");
   });
