@@ -14,7 +14,8 @@ import {
   type StoredObject,
 } from '@eden3/core';
 import { db, pg } from '@eden3/db';
-import type { VoiceAssignmentDto, VoiceCatalogEntryDto, VoiceCloneDto, VoiceExecutionDto, VoiceQuoteDto } from '@eden3/shared';
+import { messageAttachmentDto } from '@eden3/shared';
+import type { MessageDto, VoiceAssignmentDto, VoiceCatalogEntryDto, VoiceCloneDto, VoiceExecutionDto, VoiceQuoteDto } from '@eden3/shared';
 import { sql } from 'drizzle-orm';
 
 import type { MediaObjectResolver } from './media-object-repository';
@@ -129,6 +130,25 @@ function executionRequestHash(input: {
   });
 }
 
+function shouldRefundVoiceFailure(status: VoiceExecutionDto['status']): boolean {
+  // A reservation settles only when a playable, durable attachment exists.
+  // Provider admission/cost is Eden's operational loss, never the user's.
+  return status !== 'completed';
+}
+
+function providerCloneName(id: string): string {
+  return `eden3-clone-${id}`;
+}
+
+function ambiguousCloneAbsenceDisposition(
+  providerRequestId: string | null,
+  finalizeConfirmedAbsence: boolean,
+): 'observe' | 'pending' | 'confirm' {
+  const priorAbsenceObserved = providerRequestId?.startsWith('absence:') === true;
+  if (!priorAbsenceObserved) return 'observe';
+  return finalizeConfirmedAbsence ? 'confirm' : 'pending';
+}
+
 function iso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
 }
@@ -166,6 +186,30 @@ function cloneDto(row: Record<string, unknown>): VoiceCloneDto {
       ? null
       : iso((row.consent_revoked_at ?? row.revoked_at) as Date | string),
     deletedAt: row.deleted_at === null ? null : iso(row.deleted_at as Date | string),
+  };
+}
+
+function directVoiceMessageDto(row: Record<string, unknown>): MessageDto {
+  const rawAttachments = Array.isArray(row.attachments) ? row.attachments : [];
+  const attachments = rawAttachments.flatMap((item) => {
+    const candidate = typeof item === 'string' ? { url: item } : item;
+    const parsed = messageAttachmentDto.safeParse(candidate);
+    return parsed.success ? [parsed.data] : [];
+  });
+  return {
+    id: String(row.id),
+    externalId: row.external_id === null ? null : String(row.external_id),
+    sessionId: String(row.session_id),
+    senderId: row.sender_id === null ? null : String(row.sender_id),
+    role: row.role === null ? null : String(row.role),
+    content: row.content === null ? null : String(row.content),
+    attachments,
+    toolCalls: Array.isArray(row.tool_calls) ? row.tool_calls as Array<Record<string, unknown>> : null,
+    reactions: row.reactions && typeof row.reactions === 'object' && !Array.isArray(row.reactions)
+      ? row.reactions as Record<string, unknown>
+      : null,
+    replyToExternalId: row.reply_to_external_id === null ? null : String(row.reply_to_external_id),
+    createdAt: iso(row.created_at as Date | string),
   };
 }
 
@@ -373,7 +417,7 @@ export class VoiceKernel {
 
     const provider = this.options.providers[admission.voice.provider];
     if (!provider || provider.provider !== admission.voice.provider) {
-      await this.failExecution(admission.executionId, admission.reservationKey, 'voice_provider_unavailable', true);
+      await this.failExecution(admission.executionId, admission.reservationKey, 'voice_provider_unavailable');
       throw new VoiceKernelError(503, 'voice_provider_unavailable', 'Voice provider is unavailable');
     }
 
@@ -430,7 +474,6 @@ export class VoiceKernel {
       });
       return completed;
     } catch (error) {
-      const preProvider = error instanceof VoiceProviderError && !error.mayHaveReachedProvider;
       const code = error instanceof VoiceProviderError
         ? error.code
         : error instanceof VoiceAudioError
@@ -438,7 +481,7 @@ export class VoiceKernel {
           : error instanceof VoiceKernelError
             ? error.code
             : 'voice_execution_failed';
-      await this.failExecution(admission.executionId, admission.reservationKey, code, preProvider);
+      await this.failExecution(admission.executionId, admission.reservationKey, code);
       await this.cleanupFailedArtifact(admission.executionId);
       if (error instanceof VoiceKernelError) throw error;
       if (error instanceof VoiceProviderError && error.code === 'provider_result_indeterminate') {
@@ -448,11 +491,12 @@ export class VoiceKernel {
     }
   }
 
-  private async failExecution(executionId: string, reservationKey: string, code: string, refund: boolean): Promise<void> {
+  private async failExecution(executionId: string, reservationKey: string, code: string): Promise<void> {
     await this.dbc.transaction(async (tx) => {
       const result = await tx.execute(sql`select reserved_subscription_manna,status,output_sha256 from voice_executions where id=${executionId} for update`);
       const row = rows<{ reserved_subscription_manna: string | number; status: string; output_sha256: string | null }>(result)[0];
       if (!row || row.status === 'completed' || row.status === 'failed') return;
+      const refund = shouldRefundVoiceFailure(row.status as VoiceExecutionDto['status']);
       if (refund) {
         await reverseReservation({ reservationKey, reservedSubscriptionManna: Number(row.reserved_subscription_manna), type: 'refund:voice', db: tx });
       }
@@ -492,7 +536,7 @@ export class VoiceKernel {
     });
   }
 
-  /** Conservative crash recovery: provider-started work is charged/terminal and never replayed. */
+  /** Conservative crash recovery: indeterminate work is never replayed and never charged without output. */
   async reconcileStaleExecutions(cutoff = new Date(this.now().getTime() - 15 * 60_000)): Promise<number> {
     const result = await this.dbc.execute(sql`
       select id from voice_executions
@@ -500,7 +544,7 @@ export class VoiceKernel {
       order by updated_at,id limit 100
     `);
     for (const row of rows<{ id: string }>(result)) {
-      await this.failExecution(row.id, `voice:${row.id}`, 'voice_execution_recovered_indeterminate', false);
+      await this.failExecution(row.id, `voice:${row.id}`, 'voice_execution_recovered_indeterminate');
       await this.cleanupFailedArtifact(row.id);
     }
     return rows(result).length;
@@ -529,7 +573,13 @@ export class VoiceKernel {
     if (rows(result).length === 0) throw new VoiceKernelError(404, 'voice_assignment_not_found', 'Voice assignment not found');
   }
 
-  async directVoiceNote(ownerAccountId: string, sessionId: string, messageId: string, idempotencyKey: string): Promise<VoiceExecutionDto> {
+  async directVoiceNote(
+    ownerAccountId: string,
+    sessionId: string,
+    messageId: string,
+    idempotencyKey: string,
+    requiredMode?: 'always',
+  ): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
     const result = await this.dbc.execute(sql`
       select m.content,m.sender_id agent_account_id,av.voice_id
       from messages m join sessions s on s.id=m.session_id
@@ -539,19 +589,29 @@ export class VoiceKernel {
         and s.deleted=false and s.visible is distinct from false and s.channel_connection_id is null
         and (s.owner_id=${ownerAccountId} or exists (select 1 from session_users su where su.session_id=s.id and su.user_account_id=${ownerAccountId}))
         and (g.owner_id=${ownerAccountId} or exists (select 1 from session_agents sa where sa.session_id=s.id and sa.agent_account_id=g.account_id))
+        and (${requiredMode ?? null}::text is null or av.chat_mode=${requiredMode ?? null})
     `);
     const row = rows<{ content: string | null; agent_account_id: string; voice_id: string }>(result)[0];
     if (!row?.content) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
     const quote = await this.quote(ownerAccountId, 'chat', row.voice_id, row.content);
     const execution = await this.synthesize({ ownerAccountId, operation: 'chat', voiceId: row.voice_id, quoteId: quote.quoteId, text: row.content, idempotencyKey, agentAccountId: row.agent_account_id, sessionId, messageId });
-    await this.dbc.execute(sql`
+    const messageResult = await this.dbc.execute(sql`
       update messages set attachments=coalesce(attachments,'[]'::jsonb)||${JSON.stringify([{ url: execution.url, mime: execution.mime, durationMs: execution.durationMs, voiceExecutionId: execution.id }])}::jsonb
       where id=${messageId} and session_id=${sessionId} and not exists (
         select 1 from jsonb_array_elements(coalesce(attachments,'[]'::jsonb)) item
         where item->>'voiceExecutionId'=${execution.id}
-      )
+      ) returning id,external_id,session_id,sender_id,role,content,attachments,tool_calls,reactions,reply_to_external_id,created_at
     `);
-    return execution;
+    let message = rows<Record<string, unknown>>(messageResult)[0];
+    if (!message) {
+      const replayResult = await this.dbc.execute(sql`
+        select id,external_id,session_id,sender_id,role,content,attachments,tool_calls,reactions,reply_to_external_id,created_at
+        from messages where id=${messageId} and session_id=${sessionId}
+      `);
+      message = rows<Record<string, unknown>>(replayResult)[0];
+    }
+    if (!message) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+    return { execution, message: directVoiceMessageDto(message) };
   }
 
   async channelVoiceNote(input: { turnId: string; text: string; idempotencyKey: string; connectionId: string; bindingId?: string }): Promise<VoiceExecutionDto & { waveform: string | null }> {
@@ -646,7 +706,14 @@ export class VoiceKernel {
       throw new VoiceKernelError(503, 'voice_provider_unavailable', 'Clone provider is unavailable');
     }
     try {
-      const result = await provider.clone({ name: input.name, clip: combined.bytes, mime: combined.mime });
+      // The provider-facing marker is immutable, globally unique, and not the
+      // mutable user display name. It is the only safe locator after a POST
+      // response is lost and Cartesia may already have created the clone.
+      const result = await provider.clone({
+        name: providerCloneName(String(clone.row.id)),
+        clip: combined.bytes,
+        mime: combined.mime,
+      });
       const updated = await this.dbc.transaction(async (tx) => {
         const current = await tx.execute(sql`select status from voice_clones where id=${String(clone.row.id)} and owner_account_id=${input.ownerAccountId} for update`);
         const status = rows<{ status: string }>(current)[0]?.status;
@@ -748,12 +815,96 @@ export class VoiceKernel {
     return cloneDto(result);
   }
 
+  private async reconcileAmbiguousClone(
+    ownerAccountId: string,
+    id: string,
+    finalizeConfirmedAbsence: boolean,
+  ): Promise<'resolved' | 'pending'> {
+    const currentResult = await this.dbc.execute(sql`
+      select id,status,provider_request_id from voice_clones
+      where id=${id} and owner_account_id=${ownerAccountId}
+    `);
+    const current = rows<{ id: string; status: string; provider_request_id: string | null }>(currentResult)[0];
+    if (!current || current.status !== 'provider_create_ambiguous') return 'resolved';
+    const provider = this.options.providers.cartesia;
+    if (!provider?.findOwnedCloneByName) return 'pending';
+    const found = await provider.findOwnedCloneByName(providerCloneName(id));
+    if (found) {
+      await this.dbc.execute(sql`
+        update voice_clones set status='provider_delete_pending',provider_voice_id=${found.providerVoiceId},
+          consent_revoked_at=coalesce(consent_revoked_at,statement_timestamp()),
+          revoked_at=coalesce(revoked_at,statement_timestamp()),failure_code='provider_create_reconciled',
+          updated_at=statement_timestamp()
+        where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
+      `);
+      return 'resolved';
+    }
+    const absence = ambiguousCloneAbsenceDisposition(
+      current.provider_request_id,
+      finalizeConfirmedAbsence,
+    );
+    if (absence === 'observe') {
+      // Revocation alone is not evidence of provider absence. Persist the
+      // first authoritative lookup result in the request locator; only a
+      // second time-separated lookup may close local custody.
+      await this.dbc.execute(sql`
+        update voice_clones set consent_revoked_at=coalesce(consent_revoked_at,statement_timestamp()),
+          provider_request_id=coalesce(provider_request_id,${`absence:${this.now().toISOString()}`}),
+          failure_code='provider_create_absence_observed',updated_at=statement_timestamp()
+        where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
+          and provider_request_id is null
+      `);
+      return 'pending';
+    }
+    if (absence === 'pending') return 'pending';
+    await this.dbc.execute(sql`
+      update voice_clones set status='revoked',revoked_at=coalesce(revoked_at,statement_timestamp()),
+        failure_code='provider_create_absence_confirmed',updated_at=statement_timestamp()
+      where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
+        and consent_revoked_at is not null
+    `);
+    return 'resolved';
+  }
+
+  /**
+   * Resolve lost clone-create responses without replaying POST. Positive exact
+   * matches are deleted; absence requires two authoritative observations at
+   * least thirty minutes apart before local clip custody is released.
+   */
+  async reconcileAmbiguousClones(
+    cutoff = new Date(this.now().getTime() - 30 * 60_000),
+  ): Promise<number> {
+    const result = await this.dbc.execute(sql`
+      select id,owner_account_id,provider_request_id from voice_clones
+      where status='provider_create_ambiguous' and updated_at<${cutoff.toISOString()}
+      order by updated_at,id limit 100
+    `);
+    let processed = 0;
+    for (const row of rows<{ id: string; owner_account_id: string; provider_request_id: string | null }>(result)) {
+      try {
+        const resolved = await this.reconcileAmbiguousClone(
+          row.owner_account_id,
+          row.id,
+          row.provider_request_id?.startsWith('absence:') === true,
+        );
+        if (resolved === 'resolved') await this.deleteClone(row.owner_account_id, row.id);
+        processed += 1;
+      } catch {
+        // Keep the durable locator/status for the next bounded pass. One
+        // provider outage or storage cleanup failure cannot orphan the row.
+      }
+    }
+    return processed;
+  }
+
   async deleteClone(ownerAccountId: string, id: string): Promise<VoiceCloneDto> {
     let clone = await this.revokeClone(ownerAccountId, id);
     const detail = await this.dbc.execute(sql`select provider_voice_id,status from voice_clones where id=${id} and owner_account_id=${ownerAccountId}`);
     const row = rows<{ provider_voice_id: string | null; status: string }>(detail)[0]!;
     if (row.status === 'deleted') return clone;
     if (row.status === 'provider_create_ambiguous') {
+      const reconciled = await this.reconcileAmbiguousClone(ownerAccountId, id, false);
+      if (reconciled === 'resolved') return await this.deleteClone(ownerAccountId, id);
       throw new VoiceKernelError(409, 'clone_reconciliation_required', 'Provider clone absence must be reconciled before deletion');
     }
     if (row.provider_voice_id) {
@@ -836,4 +987,12 @@ export class VoiceKernel {
   }
 }
 
-export const voiceKernelInternals = { exactTranscript, requestHash, executionRequestHash, TEXT_LIMITS };
+export const voiceKernelInternals = {
+  exactTranscript,
+  requestHash,
+  executionRequestHash,
+  shouldRefundVoiceFailure,
+  providerCloneName,
+  ambiguousCloneAbsenceDisposition,
+  TEXT_LIMITS,
+};

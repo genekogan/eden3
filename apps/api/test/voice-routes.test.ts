@@ -76,7 +76,7 @@ async function harness() {
     synthesize: vi.fn(async () => execution),
     assignment: vi.fn(async (_owner, _username, value) => ({ ...value, updatedAt: '2026-08-15T12:00:00.000Z' })),
     deleteAssignment: vi.fn(),
-    directVoiceNote: vi.fn(),
+    directVoiceNote: vi.fn(async () => ({ execution, message: { id: '77777777-7777-4777-8777-777777777777' } })),
     cloneQuote: vi.fn(async () => ({ provider: 'cartesia', kind: 'instant', manna: 0, costUsd: 0, expiresAt: quote.expiresAt })),
     createClone: vi.fn(async () => clone),
     listClones: vi.fn(async () => []),
@@ -171,5 +171,36 @@ describe('voice HTTP contract', () => {
       consentAttested: true,
       idempotencyKey: 'clone-key-123',
     });
+  });
+
+  it('returns the frozen direct-chat voice-note envelope and creation/replay status', async () => {
+    const { app, kernel, execution } = await harness();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/sessions/77777777-7777-4777-8777-777777777777/messages/88888888-8888-4888-8888-888888888888/voice-note',
+      headers: { 'x-test-owner': OWNER },
+      payload: { idempotencyKey: 'voice-note-message-88888888' },
+    });
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toMatchObject({ execution, message: { id: '77777777-7777-4777-8777-777777777777' } });
+    expect(kernel.directVoiceNote).toHaveBeenCalledWith(
+      OWNER,
+      '77777777-7777-4777-8777-777777777777',
+      '88888888-8888-4888-8888-888888888888',
+      'voice-note-message-88888888',
+    );
+
+    kernel.directVoiceNote.mockResolvedValueOnce({
+      execution: { ...execution, replayed: true },
+      message: { id: '77777777-7777-4777-8777-777777777777' },
+    });
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/sessions/77777777-7777-4777-8777-777777777777/messages/88888888-8888-4888-8888-888888888888/voice-note',
+      headers: { 'x-test-owner': OWNER },
+      payload: { idempotencyKey: 'voice-note-message-88888888' },
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toHaveProperty('execution.replayed', true);
   });
 });

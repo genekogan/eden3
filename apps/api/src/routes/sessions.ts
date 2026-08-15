@@ -195,6 +195,10 @@ export function toAttachments(raw: unknown): MessageAttachment[] {
           ...(typeof record.creationId === 'string' ? { creationId: record.creationId } : {}),
           ...(typeof record.width === 'number' && record.width > 0 ? { width: record.width } : {}),
           ...(typeof record.height === 'number' && record.height > 0 ? { height: record.height } : {}),
+          ...(typeof record.durationMs === 'number' && record.durationMs > 0 ? { durationMs: record.durationMs } : {}),
+          ...(typeof record.voiceExecutionId === 'string' && isUuid(record.voiceExecutionId)
+            ? { voiceExecutionId: record.voiceExecutionId }
+            : {}),
         });
       }
     }

@@ -60,6 +60,16 @@ export interface NewSessionStream {
   events: AsyncGenerator<SessionEvent, void, undefined>;
 }
 
+/** Stable across refresh/retry; the server binds it to exact message+voice+text. */
+export function directVoiceNoteIdempotencyKey(messageId: string): string {
+  return `direct-voice:${messageId}`;
+}
+
+/** Minted only after the server authoritatively reports the prior attempt terminal. */
+export function directVoiceNoteRetryKey(messageId: string, nonce: string): string {
+  return `direct-voice:${messageId}:retry:${nonce}`;
+}
+
 /**
  * POST /api/sessions/new/messages {content, agentUsername} -> SSE stream.
  * Throws ApiError on a non-2xx response (402 = insufficient manna).

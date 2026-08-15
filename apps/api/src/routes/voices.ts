@@ -110,12 +110,12 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
     return reply.code(204).send();
   });
 
-  app.post('/sessions/:sessionId/messages/:messageId/voice-note', { preHandler: app.requireAuth }, async (request) => {
+  app.post('/sessions/:sessionId/messages/:messageId/voice-note', { preHandler: app.requireAuth }, async (request, reply) => {
     const params = messageParams.parse(request.params);
     const body = idempotencySchema.parse(request.body);
-    const execution = await boundary(() => kernel.directVoiceNote(request.account!.accountId, params.sessionId, params.messageId, body.idempotencyKey));
+    const result = await boundary(() => kernel.directVoiceNote(request.account!.accountId, params.sessionId, params.messageId, body.idempotencyKey));
     app.eventsBus.publish(params.sessionId, { type: 'session.messages.changed', sessionId: params.sessionId, messageId: params.messageId });
-    return execution;
+    return reply.code(result.execution.replayed ? 200 : 201).send(result);
   });
 
   app.post('/voices/clones/quote', { preHandler: app.requireAuth }, async (request) => {

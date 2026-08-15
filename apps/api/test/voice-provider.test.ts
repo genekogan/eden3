@@ -42,6 +42,31 @@ describe('voice providers are bounded and provider-free under test', () => {
     await expect(bad.clone({ name: 'Nope', clip: Buffer.from('wav'), mime: 'audio/wav' })).rejects.toMatchObject({ code: 'provider_response_invalid', mayHaveReachedProvider: true });
   });
 
+  it('recovers only one exact private owned Cartesia clone marker', async () => {
+    let requestedUrl = '';
+    let page = 0;
+    const fetchFn = vi.fn(async (input: string | URL | Request) => {
+      requestedUrl = String(input);
+      page += 1;
+      return new Response(JSON.stringify({ data: page === 1 ? [
+        { id: 'wrong-name', name: 'human name', access: 'private', is_owner: true, visibility: 'owner' },
+        { id: 'owned-private', name: 'eden3-clone-id', access: 'private', is_owner: true, visibility: 'owner' },
+      ] : [] }), { status: 200 });
+    });
+    const client = new CartesiaVoiceClient('test-token', fetchFn as typeof fetch);
+    await expect(client.findOwnedCloneByName('eden3-clone-id')).resolves.toEqual({ providerVoiceId: 'owned-private' });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(requestedUrl).toContain('starting_after=owned-private');
+
+    const unsafeFetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [
+        { id: 'public', name: 'eden3-clone-id', access: 'public', is_owner: true, visibility: 'all' },
+      ] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [] }), { status: 200 }));
+    const unsafe = new CartesiaVoiceClient('test-token', unsafeFetch as typeof fetch);
+    await expect(unsafe.findOwnedCloneByName('eden3-clone-id')).rejects.toMatchObject({ code: 'provider_response_invalid' });
+  });
+
   it('never retries an ambiguous network request and caps chunked responses', async () => {
     const fetchFn = vi.fn(async () => { throw new Error('timeout'); });
     const client = new DeepInfraKokoroClient('test-token', fetchFn as typeof fetch);

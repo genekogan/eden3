@@ -58,6 +58,14 @@ describe('toAttachments', () => {
     ).toEqual([{ url: 'http://localhost:4301/media/x.png', mime: 'image/png', width: 10, height: 20 }]);
   });
 
+  it('preserves direct voice-note custody metadata for idempotent rendering', () => {
+    expect(toAttachments([{ url: '/media/voice.mp3', mime: 'audio/mpeg', durationMs: 1234,
+      voiceExecutionId: '66666666-6666-4666-8666-666666666666' }])).toEqual([{
+      url: '/media/voice.mp3', mime: 'audio/mpeg', durationMs: 1234,
+      voiceExecutionId: '66666666-6666-4666-8666-666666666666',
+    }]);
+  });
+
   it('returns [] for null / non-array jsonb', () => {
     expect(toAttachments(null)).toEqual([]);
     expect(toAttachments({ url: 'x' })).toEqual([]);

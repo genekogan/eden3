@@ -46,6 +46,7 @@ import {
   recentAssistantImageReferences,
 } from '../services/chat-attachments';
 import type { MediaObjectResolver } from '../services/media-object-repository';
+import type { VoiceKernel } from '../services/voice-kernel';
 
 /**
  * POST /sessions/:idOrNew/messages — the chat turn endpoint.
@@ -438,6 +439,45 @@ function openSseSink(reply: FastifyReply, sessionId: string): TurnSink {
 export interface ChatRoutesOptions {
   providerEvidenceDb?: DbHandle;
   mediaResolver?: MediaObjectResolver;
+  voiceKernel?: VoiceKernel;
+}
+
+type AutomaticDirectVoiceKernel = Pick<VoiceKernel, 'directVoiceNote'>;
+
+export type AutomaticDirectVoiceResult = 'disabled' | 'attached' | 'not_enabled' | 'failed';
+
+/**
+ * Best-effort post-commit side effect for `chat: always`. The assistant row is
+ * already durable before this function is called, so neither an ineligible
+ * assignment nor a provider/storage failure may reject or replay the turn.
+ */
+export async function attachAutomaticDirectVoiceNote(input: {
+  voiceKernel?: AutomaticDirectVoiceKernel;
+  ownerAccountId: string;
+  sessionId: string;
+  assistantMessageId: string;
+  publishChanged(): void;
+  onError(error: unknown): void;
+}): Promise<AutomaticDirectVoiceResult> {
+  if (!input.voiceKernel) return 'disabled';
+  try {
+    await input.voiceKernel.directVoiceNote(
+      input.ownerAccountId,
+      input.sessionId,
+      input.assistantMessageId,
+      `direct-voice:${input.assistantMessageId}`,
+      'always',
+    );
+    input.publishChanged();
+    return 'attached';
+  } catch (error) {
+    // This is the authoritative off/on-demand path, not an operational error.
+    if (error instanceof Error && 'code' in error && error.code === 'voice_message_not_eligible') {
+      return 'not_enabled';
+    }
+    input.onError(error);
+    return 'failed';
+  }
 }
 
 export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opts) => {
@@ -555,7 +595,7 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
       reply.header('x-eden3-turn-queue-ms', String(admission.queueWaitMs));
 
       try {
-        await runTurn(
+        const outcome = await runTurn(
           {
             compat: app.gatewayCompat,
             bus: app.eventsBus,
@@ -579,6 +619,28 @@ export const chatRoutes: FastifyPluginAsync<ChatRoutesOptions> = async (app, opt
             beginStream: () => openSseSink(reply, target.session.id),
           },
         );
+        if (outcome.assistantMessageId) {
+          const voiceLogContext = { sessionId: target.session.id, messageId: outcome.assistantMessageId };
+          void attachAutomaticDirectVoiceNote({
+            voiceKernel: opts.voiceKernel,
+            ownerAccountId: account.accountId,
+            sessionId: target.session.id,
+            assistantMessageId: outcome.assistantMessageId,
+            publishChanged: () => {
+              app.eventsBus.publish(target.session.id, {
+                type: 'session.messages.changed',
+                sessionId: target.session.id,
+                messageId: outcome.assistantMessageId!,
+              });
+            },
+            onError: safeRequestErrorCallback(
+              req.log,
+              voiceLogContext,
+              'automatic direct voice note failed',
+              'warn',
+            ),
+          });
+        }
         const memoryLogContext = { accountId: target.agent.accountId };
         void enqueueAutomaticMemoryRetryForAgent(
           target.agent.accountId,
