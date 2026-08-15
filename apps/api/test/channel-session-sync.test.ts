@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 import { describe, expect, it, vi } from 'vitest';
 
@@ -39,6 +41,13 @@ function vault(): SecretVaultLike {
 }
 
 describe('ChannelSessionSync', () => {
+  it('wires committed channel messages to the shared session event bus', () => {
+    const source = readFileSync(resolve(import.meta.dirname, '../src/routes/channels.ts'), 'utf8');
+    expect(source).toMatch(
+      /new ChannelSessionSync\(\s*new PostgresChannelSessionSyncStore\(\),\s*vault,\s*app\.eventsBus\s*\)/,
+    );
+  });
+
   it('compiles only the canonical persisted provider group allowlist', () => {
     expect(
       configuredChannelGroups('discord', {
@@ -76,6 +85,7 @@ describe('ChannelSessionSync', () => {
   });
 
   it('projects safe, read-only session metadata with exact attribution', async () => {
+    const publish = vi.fn();
     let persisted: Parameters<ChannelSessionSyncStoreLike['persistMessage']>[0] | undefined;
     const persistMessage: ChannelSessionSyncStoreLike['persistMessage'] = vi.fn(async (input) => {
       persisted = input;
@@ -93,7 +103,7 @@ describe('ChannelSessionSync', () => {
       getLiveConnection: vi.fn(async () => connection),
       persistMessage,
     };
-    const service = new ChannelSessionSync(store, vault());
+    const service = new ChannelSessionSync(store, vault(), { publish });
     const createdAt = new Date('2026-07-31T05:10:03.000Z');
 
     const result = await service.syncMessage({
@@ -110,6 +120,12 @@ describe('ChannelSessionSync', () => {
     });
 
     expect(result.inserted).toBe(true);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledWith(result.sessionId, {
+      type: 'session.messages.changed',
+      sessionId: result.sessionId,
+      messageId: result.messageId,
+    });
     const input = persisted!;
     expect(input.connection).toEqual(connection);
     expect(input.event.createdAt).toEqual(createdAt);
@@ -134,6 +150,41 @@ describe('ChannelSessionSync', () => {
     expect(JSON.stringify({ event: input.event, metadata: input.safeChannelMetadata })).not.toContain(
       '1234567890',
     );
+  });
+
+  it('does not publish a duplicate channel message as new activity', async () => {
+    const publish = vi.fn();
+    const sessionId = randomUUID();
+    const messageId = randomUUID();
+    const service = new ChannelSessionSync(
+      {
+        getLiveConnection: vi.fn(async () => connection),
+        persistMessage: vi.fn(async () => ({
+          sessionId,
+          messageId,
+          inserted: false,
+          memoryContext: {
+            linkState: 'pseudonymous' as const,
+            relativePath: 'memory/users/channel-peer-test.md',
+          },
+        })),
+      },
+      vault(),
+      { publish },
+    );
+
+    await service.syncMessage({
+      connectionId: connection.id,
+      runtimeAccountId: connection.runtimeAccountId,
+      gatewaySessionKey: 'agent:one:discord:eden-connection-one:direct:peer',
+      peerId: '1234567890',
+      externalMessageId: 'discord:message:duplicate',
+      role: 'user',
+      content: 'duplicate delivery',
+      createdAt: new Date('2026-07-31T05:10:03.000Z'),
+    });
+
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it('rejects stale or cross-agent callbacks after a runtime binding is published', async () => {

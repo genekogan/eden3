@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 
 import { ApiError } from '../src/errors';
 import {
+  assertSessionArchiveAllowed,
   decodeMessagesCursor,
   decodeSessionListCursor,
   encodeCursor,
@@ -64,12 +65,24 @@ describe('toAttachments', () => {
 });
 
 describe('conversation management route contract', () => {
+  it('refuses archiving a channel mirror while allowing recovery by unarchive', () => {
+    const channel = { sessionType: 'channel', channelConnectionId: null };
+    expect(() => assertSessionArchiveAllowed(channel, true)).toThrowError(
+      expect.objectContaining({ statusCode: 409, code: 'channel_session_read_only' }),
+    );
+    expect(() => assertSessionArchiveAllowed(channel, false)).not.toThrow();
+    expect(() =>
+      assertSessionArchiveAllowed({ sessionType: 'web', channelConnectionId: null }, true),
+    ).not.toThrow();
+  });
+
   it('keeps archive separate from legacy visibility and deletion owner-only/soft', () => {
     const source = readFileSync(resolve(import.meta.dirname, '../src/routes/sessions.ts'), 'utf8');
     expect(source).toContain("archived: z.enum(['active', 'archived'])");
     expect(source).toContain('sql`${sessions.archivedAt} is not null`');
     expect(source).toContain('sql`${sessions.archivedAt} is null`');
     expect(source).toContain('session.ownerId !== account.accountId');
+    expect(source).toContain('assertSessionArchiveAllowed(session, body.archived)');
     expect(source).toContain(".set({ deleted: true, pinned: false, updatedAt: new Date() })");
     expect(source).toContain('coalesce(${sessions.pinned}, false) desc');
   });

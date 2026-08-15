@@ -156,6 +156,23 @@ export function toSessionDto(
   };
 }
 
+/** Channel mirrors follow provider retention and cannot be archived in Eden. */
+export function assertSessionArchiveAllowed(
+  session: Pick<Session, 'sessionType' | 'channelConnectionId'>,
+  archived: boolean | undefined,
+): void {
+  if (
+    archived === true &&
+    (session.sessionType === 'channel' || session.channelConnectionId !== null)
+  ) {
+    throw new ApiError(
+      409,
+      'channel_session_read_only',
+      'Channel conversations cannot be archived',
+    );
+  }
+}
+
 /**
  * Normalize the `attachments` jsonb column. Migrated eden1 rows store an
  * array of URL STRINGS (verified against live data); eden3-native rows store
@@ -398,6 +415,7 @@ export const sessionsRoutes: FastifyPluginAsync = async (app) => {
       if (!account.isAdmin && session.ownerId !== account.accountId) {
         throw new ApiError(403, 'forbidden', 'Only the conversation owner can manage it');
       }
+      assertSessionArchiveAllowed(session, body.archived);
 
       const changes: Partial<typeof sessions.$inferInsert> = { updatedAt: new Date() };
       if (body.title !== undefined) changes.title = body.title;

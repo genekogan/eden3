@@ -68,6 +68,14 @@ function isChannelSession(session: SessionDto): boolean {
   return session.sessionType === "channel" || session.channelConnectionId !== null;
 }
 
+export function sessionArchiveAction(
+  session: SessionDto,
+  archivedView: boolean,
+): "archive" | "unarchive" | null {
+  if (isChannelSession(session)) return archivedView ? "unarchive" : null;
+  return archivedView ? "unarchive" : "archive";
+}
+
 type ChannelFilter = "all" | "direct" | "channels";
 const SESSION_TITLE_POLL_LIMIT = 20;
 
@@ -140,6 +148,7 @@ export function SessionRailItem({
 
   const menuItem =
     "flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-[13px] text-foreground transition-colors hover:bg-foreground/[0.06] disabled:opacity-50";
+  const archiveAction = sessionArchiveAction(session, archivedView);
 
   return (
     <div ref={menuRef} className="group relative">
@@ -218,15 +227,20 @@ export function SessionRailItem({
           >
             <span aria-hidden>⌖</span> {session.pinned ? "Unpin" : "Pin conversation"}
           </button>
-          <button
-            type="button"
-            role="menuitem"
-            disabled={busy !== null}
-            className={menuItem}
-            onClick={() => void update("archive", { archived: !archivedView })}
-          >
-            <span aria-hidden>▣</span> {archivedView ? "Unarchive" : "Archive"}
-          </button>
+          {archiveAction ? (
+            <button
+              type="button"
+              role="menuitem"
+              disabled={busy !== null}
+              className={menuItem}
+              onClick={() =>
+                void update(archiveAction, { archived: archiveAction === "archive" })
+              }
+            >
+              <span aria-hidden>▣</span>{" "}
+              {archiveAction === "unarchive" ? "Unarchive" : "Archive"}
+            </button>
+          ) : null}
           <div className="my-1 border-t border-edge" />
           {error ? <p role="alert" className="px-2.5 py-1 text-[11px] text-danger-soft">{error}</p> : null}
           <button

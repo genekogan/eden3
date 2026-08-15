@@ -838,7 +838,8 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     return withChannelLifecycleLease(id, () => handler(req, reply));
   };
   const sessionSync =
-    opts.sessionSync ?? new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault);
+    opts.sessionSync ??
+    new ChannelSessionSync(new PostgresChannelSessionSyncStore(), vault, app.eventsBus);
   const turnMetering = opts.turnMetering ?? new ChannelTurnMeteringService(
     new PostgresChannelTurnStore(undefined, opts.providerEvidenceDb),
     opts.providerEvidenceDb,

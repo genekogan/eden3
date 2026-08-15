@@ -146,7 +146,6 @@ export function SessionConversation({
   const adoptedPumpRef = useRef<string | null>(null);
   const localTurnsRef = useRef<Set<string>>(new Set());
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const channelOpenedRef = useRef(false);
 
   // Scroll management (used inside callbacks defined below).
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -395,11 +394,16 @@ export function SessionConversation({
   const channelReady = loadPhase === "ready";
   useEffect(() => {
     if (!channelReady) return;
-    channelOpenedRef.current = false;
     const unsubscribe = api.sessions.subscribe(
       canonicalId,
       (event) => {
         dispatch({ type: "channel/event", event, at: nowIso() });
+        if (event.type === "session.messages.changed") {
+          // Channel ingestion commits outside the browser turn stream. Its
+          // tiny per-session signal carries no message body; re-read the
+          // durable page once so DMs/groups appear without polling.
+          scheduleHistoryRefresh();
+        }
         if (
           event.type === "turn.completed" &&
           !localTurnsRef.current.has(event.turnId)
@@ -410,13 +414,12 @@ export function SessionConversation({
       },
       {
         onOpen: () => {
-          const resumed = channelOpenedRef.current;
-          channelOpenedRef.current = true;
           setChannelUp(true);
-          // EventsBus is intentionally live-only. If EventSource reconnects,
-          // reconcile durable rows so mobile suspension or an API restart
-          // cannot leave completed media/turns invisible until a manual reload.
-          if (resumed) scheduleHistoryRefresh();
+          // EventsBus is intentionally live-only. Reconcile durable rows on
+          // both the first open and reconnect: this closes the small gap
+          // between the initial history read and stream establishment, as
+          // well as mobile suspension or an API restart.
+          scheduleHistoryRefresh();
         },
         onConnectionError: () => setChannelUp(false),
       },

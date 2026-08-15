@@ -13,13 +13,15 @@ function resumeContract(source: string): boolean {
   if (start < 0 || end <= start) return false;
   const block = source.slice(start, end);
 
-  const openedRef = block.indexOf("channelOpenedRef.current");
-  const openCallback = block.indexOf("onOpen:", openedRef);
+  const messageChanged = block.indexOf('event.type === "session.messages.changed"');
+  const messageRefresh = block.indexOf("scheduleHistoryRefresh();", messageChanged);
+
+  const openCallback = block.indexOf("onOpen:");
   const openCallbackEnd = block.indexOf("onConnectionError:", openCallback);
-  const reconcileAfterReconnect = block.indexOf("scheduleHistoryRefresh", openCallback);
+  const reconcileAfterOpen = block.indexOf("scheduleHistoryRefresh", openCallback);
   const visibilityListener = block.indexOf(
     'document.addEventListener("visibilitychange"',
-    reconcileAfterReconnect,
+    reconcileAfterOpen,
   );
   const onlineListener = block.indexOf(
     'window.addEventListener("online"',
@@ -44,17 +46,18 @@ function resumeContract(source: string): boolean {
 
   return [
     start,
-    openedRef,
+    messageChanged,
+    messageRefresh,
     openCallback,
     openCallbackEnd,
-    reconcileAfterReconnect,
+    reconcileAfterOpen,
     visibilityListener,
     onlineListener,
     pageShowListener,
     removeVisibility,
     removeOnline,
     removePageShow,
-  ].every((index) => index >= 0) && reconcileAfterReconnect < openCallbackEnd;
+  ].every((index) => index >= 0) && reconcileAfterOpen < openCallbackEnd;
 }
 
 describe("conversation mobile/background resume", () => {
@@ -63,7 +66,11 @@ describe("conversation mobile/background resume", () => {
   });
 
   it.each([
-    ["reconnect reconciliation", /scheduleHistoryRefresh\(\);/],
+    ["channel-message reconciliation", /event\.type === "session\.messages\.changed"/],
+    [
+      "SSE-open reconciliation",
+      /onOpen: \(\) => \{[\s\S]*?scheduleHistoryRefresh\(\);[\s\S]*?\},/,
+    ],
     ["visibility resume", /document\.addEventListener\("visibilitychange"[^;]+;/],
     ["online resume", /window\.addEventListener\("online"[^;]+;/],
     ["bfcache resume", /window\.addEventListener\("pageshow"[^;]+;/],

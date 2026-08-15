@@ -103,6 +103,14 @@ export const mannaUpdatedEventSchema = z.object({
 });
 export type MannaUpdatedEvent = z.infer<typeof mannaUpdatedEventSchema>;
 
+/** A durable message was committed outside the browser chat turn stream. */
+export const sessionMessagesChangedEventSchema = z.object({
+  type: z.literal('session.messages.changed'),
+  sessionId: uuid,
+  messageId: uuid,
+});
+export type SessionMessagesChangedEvent = z.infer<typeof sessionMessagesChangedEventSchema>;
+
 /** Something failed; if turn-scoped, `turnId` is set (debit already refunded). */
 export const errorEventSchema = z.object({
   type: z.literal('error'),
@@ -139,6 +147,7 @@ export const sessionEventSchema = z.discriminatedUnion('type', [
   mediaAttachedEventSchema,
   mediaFailedEventSchema,
   mannaUpdatedEventSchema,
+  sessionMessagesChangedEventSchema,
   notificationCreatedEventSchema,
   notificationChangedEventSchema,
   errorEventSchema,
@@ -154,6 +163,7 @@ export const SESSION_EVENT_TYPES = [
   'media.attached',
   'media.failed',
   'manna.updated',
+  'session.messages.changed',
   'notification.created',
   'notification.changed',
   'error',

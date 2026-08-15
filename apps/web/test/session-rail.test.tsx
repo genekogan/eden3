@@ -4,7 +4,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { SessionRailItem } from "../components/chat/session-rail";
+import { SessionRailItem, sessionArchiveAction } from "../components/chat/session-rail";
 import { sessionTitle } from "../components/chat/chat-api";
 import type { SessionDto } from "../lib/types";
 
@@ -97,8 +97,21 @@ describe("agent-scoped conversation rail", () => {
     expect(source).toContain("<SessionShareDialog");
     expect(source).toContain('api.sessions.update(session.id, body)');
     expect(source).toContain('pinned: !session.pinned');
-    expect(source).toContain('archived: !archivedView');
+    expect(source).toContain('archived: archiveAction === "archive"');
     expect(source).toContain('api.sessions.remove(session.id)');
     expect(source).toContain('Existing share links will stop working.');
+  });
+
+  it("never offers archive for an active channel mirror, but permits legacy unarchive", () => {
+    const channel = {
+      ...session,
+      sessionType: "channel",
+      platform: "telegram",
+      channelConnectionId: "00000000-0000-4000-8000-000000000004",
+      readOnly: true,
+    };
+    expect(sessionArchiveAction(channel, false)).toBeNull();
+    expect(sessionArchiveAction(channel, true)).toBe("unarchive");
+    expect(sessionArchiveAction(session, false)).toBe("archive");
   });
 });

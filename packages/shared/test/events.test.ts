@@ -51,6 +51,7 @@ const fixtures: SessionEvent[] = [
     height: 768,
   },
   { type: 'manna.updated', accountId: ids.account, balance: 42.5 },
+  { type: 'session.messages.changed', sessionId: ids.session, messageId: ids.message },
   {
     type: 'notification.created',
     notificationId: ids.message,

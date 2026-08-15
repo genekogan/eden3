@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
 import { pg } from '@eden3/db';
+import type { SessionEvent } from '@eden3/shared';
 
 import { memoryUserRelativePath } from './memory-paths';
 import { channelPeerSecretContext, type SecretVaultLike } from './secret-vault';
@@ -86,6 +87,10 @@ export interface ChannelMessageSyncResult {
 export interface ChannelSessionSyncStoreLike {
   getLiveConnection(connectionId: string): Promise<ChannelSyncConnection | null>;
   persistMessage(input: ChannelMessagePersistence): Promise<ChannelMessageSyncResult>;
+}
+
+export interface ChannelSessionEventPublisher {
+  publish(sessionId: string, event: SessionEvent): unknown;
 }
 
 interface ConnectionRow {
@@ -537,6 +542,7 @@ export class ChannelSessionSync {
   constructor(
     private readonly store: ChannelSessionSyncStoreLike,
     private readonly vault: SecretVaultLike,
+    private readonly publisher?: ChannelSessionEventPublisher,
   ) {}
 
   async syncMessage(event: ChannelMessageEvent): Promise<ChannelMessageSyncResult> {
@@ -565,7 +571,7 @@ export class ChannelSessionSync {
       event.conversationId ?? event.peerId,
     );
     const { peerId: _peerId, conversationId: _conversationId, guildId: _guildId, ...persistedEvent } = event;
-    return this.store.persistMessage({
+    const result = await this.store.persistMessage({
       connection,
       event: persistedEvent,
       authorization: {
@@ -594,5 +600,13 @@ export class ChannelSessionSync {
         readOnly: true,
       },
     });
+    if (result.inserted) {
+      this.publisher?.publish(result.sessionId, {
+        type: 'session.messages.changed',
+        sessionId: result.sessionId,
+        messageId: result.messageId,
+      });
+    }
+    return result;
   }
 }
