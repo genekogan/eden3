@@ -135,7 +135,17 @@ export function postgresRepository(
                (select count(*)::int from usage_events) as "usageCount",
                (select count(*)::int from turn_provider_runs) as "providerRunCount",
                (select count(*)::int from manna_accounts) as "mannaAccountCount",
-               (select count(*)::int from manna_transactions) as "mannaTransactionCount"
+               (select count(*)::int from manna_transactions) as "mannaTransactionCount",
+               (select count(*)::int from agent_voice_assignments) as "agentVoiceAssignmentCount",
+               (select count(*)::int from voice_clones) as "voiceCloneCount",
+               (select count(*)::int from voice_clone_clips) as "voiceCloneClipCount",
+               (select count(*)::int from voice_quotes) as "voiceQuoteCount",
+               (select count(*)::int from voice_executions) as "voiceExecutionCount",
+               (select count(*)::int from direct_voice_jobs) as "directVoiceJobCount",
+               (select count(*)::int from transcription_sessions) as "transcriptionSessionCount",
+               (select count(*)::int from transcription_chunks) as "transcriptionChunkCount",
+               (select count(*)::int from storage_uploads) as "storageUploadCount",
+               (select count(*)::int from storage_objects) as "storageObjectCount"
       `;
       if (!counts) throw new Error('scratch fixture side-effect inventory was empty');
       return counts;

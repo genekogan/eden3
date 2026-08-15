@@ -1,3 +1,6 @@
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -18,6 +21,18 @@ import {
 
 const databaseName = 'eden3_runtime_e2e_20260808t210520z';
 const databaseUrl = `postgres://eden3:eden3@127.0.0.1:5433/${databaseName}`;
+const custodyCountKeys = [
+  'agentVoiceAssignmentCount',
+  'voiceCloneCount',
+  'voiceCloneClipCount',
+  'voiceQuoteCount',
+  'voiceExecutionCount',
+  'directVoiceJobCount',
+  'transcriptionSessionCount',
+  'transcriptionChunkCount',
+  'storageUploadCount',
+  'storageObjectCount',
+] as const;
 
 const seedBaseline = (): E2EScratchSideEffects => ({
   accountCount: 1,
@@ -27,6 +42,16 @@ const seedBaseline = (): E2EScratchSideEffects => ({
   providerRunCount: 0,
   mannaAccountCount: 0,
   mannaTransactionCount: 0,
+  agentVoiceAssignmentCount: 0,
+  voiceCloneCount: 0,
+  voiceCloneClipCount: 0,
+  voiceQuoteCount: 0,
+  voiceExecutionCount: 0,
+  directVoiceJobCount: 0,
+  transcriptionSessionCount: 0,
+  transcriptionChunkCount: 0,
+  storageUploadCount: 0,
+  storageObjectCount: 0,
 });
 
 const runtimeBaseline = (): E2EScratchSideEffects => ({
@@ -216,15 +241,7 @@ describe('isolated E2E scratch user fixture', () => {
       }),
       readSideEffects: vi.fn(async () => {
         calls.push('side-effects');
-        return {
-          accountCount: 2,
-          agentCount: 1,
-          sessionCount: 0,
-          usageCount: 0,
-          providerRunCount: 0,
-          mannaAccountCount: 0,
-          mannaTransactionCount: 0,
-        };
+        return runtimeBaseline();
       }),
     });
     expect(result).toEqual(fixture);
@@ -233,15 +250,7 @@ describe('isolated E2E scratch user fixture', () => {
 
   it('fails closed on an absent/ambiguous user or any pre-Playwright side effect', async () => {
     const fixture = e2eScratchUser(databaseName);
-    const readSideEffects = vi.fn(async () => ({
-      accountCount: 2,
-      agentCount: 1,
-      sessionCount: 0,
-      usageCount: 0,
-      providerRunCount: 0,
-      mannaAccountCount: 0,
-      mannaTransactionCount: 0,
-    }));
+    const readSideEffects = vi.fn(async () => runtimeBaseline());
     await expect(
       verifyE2EScratchPreflight({
         fixture,
@@ -267,6 +276,23 @@ describe('isolated E2E scratch user fixture', () => {
     expect(() =>
       assertNoE2EScratchSideEffects({ ...runtimeBaseline(), accountCount: 3 }),
     ).toThrow(/side effects/);
+  });
+
+  it.each(custodyCountKeys)('refuses a stale %s row before Gate 3 starts', (key) => {
+    const baseline = runtimeBaseline();
+    expect(() =>
+      assertNoE2EScratchSideEffects({ ...baseline, [key]: 1 }),
+    ).toThrow(/side effects/);
+  });
+
+  it('queries every private voice, transcription, upload, and object custody table', async () => {
+    const cli = await readFile(
+      fileURLToPath(new URL('../src/testing/e2e-scratch-fixture-cli.ts', import.meta.url)),
+      'utf8',
+    );
+    for (const key of custodyCountKeys) {
+      expect([...cli.matchAll(new RegExp(`as "${key}"`, 'g'))]).toHaveLength(1);
+    }
   });
 
   it('executes seed, HTTP+DB preflight, exact cleanup, and idempotent cleanup', async () => {
