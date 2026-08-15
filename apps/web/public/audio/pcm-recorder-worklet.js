@@ -1,4 +1,4 @@
-/* Eden dictation capture: mono PCM16LE at 16 kHz, emitted every 100 ms. */
+/* Eden dictation capture: mono PCM16LE at 16 kHz, emitted every second. */
 class EdenPcmRecorderProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -9,7 +9,10 @@ class EdenPcmRecorderProcessor extends AudioWorkletProcessor {
     this.previous = 0;
     this.hasPrevious = false;
     this.output = [];
-    this.outputChunkSamples = 1600;
+    // One 32 KiB browser→Eden chunk per second avoids thousands of HTTP
+    // requests during a long dictation. The backend can replay the bytes to
+    // its provider adapter in smaller realtime frames.
+    this.outputChunkSamples = 16000;
     this.port.onmessage = (event) => {
       if (event.data === "flush") {
         this.emit(true);

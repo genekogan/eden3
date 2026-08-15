@@ -1,4 +1,5 @@
 const PCM_SAMPLE_RATE = 16_000;
+export const PCM_UPLOAD_CHUNK_SAMPLES = 16_000;
 
 export interface PcmChunk {
   audio: Blob;
