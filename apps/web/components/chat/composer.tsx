@@ -117,12 +117,16 @@ export function Composer({
     getAuthToken: getClerkToken,
     refreshCredentials: async () => { await getClerkToken(); },
   }), []);
-  const { viewer } = useSelectedAgent();
+  const { viewer, viewerPhase } = useSelectedAgent();
   const receiveTranscript = useCallback((transcript: string) => {
     setValue((current) => appendTranscript(current, transcript));
     queueMicrotask(() => textareaRef.current?.focus());
   }, []);
-  const dictation = useDictation({ ownerId: viewer?.id ?? null, onTranscript: receiveTranscript });
+  const dictation = useDictation({
+    ownerId: viewer?.id ?? null,
+    ownerPhase: viewerPhase,
+    onTranscript: receiveTranscript,
+  });
   const dictationBusy = !["idle", "error"].includes(dictation.state.phase);
   const dictationRecording =
     dictation.state.phase === "recording" || dictation.state.phase === "retrying";

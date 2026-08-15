@@ -9,6 +9,7 @@ import {
 import { DictationDraftStore } from "@/lib/dictation-storage";
 import { edenDictationTransport } from "@/lib/dictation-transport";
 import { PcmRecorder } from "@/lib/pcm-recorder";
+import type { ViewerPhase } from "@/components/shell/selected-agent-context";
 
 const DEFAULT_DICTATION_TRANSPORT = edenDictationTransport();
 
@@ -41,14 +42,25 @@ export function formatDictationTime(milliseconds: number): string {
   return `${minutes}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
+export function dictationRecoveryDisposition(
+  ownerPhase: ViewerPhase,
+  ownerId: string | null,
+): "recover" | "purge" | "wait" {
+  if (ownerPhase === "signed_out") return "purge";
+  if (ownerPhase === "ready" && ownerId) return "recover";
+  return "wait";
+}
+
 interface UseDictationOptions {
   ownerId: string | null;
+  ownerPhase: ViewerPhase;
   onTranscript: (transcript: string) => void;
   transport?: DictationTransport;
 }
 
 export function useDictation({
   ownerId,
+  ownerPhase,
   onTranscript,
   transport = DEFAULT_DICTATION_TRANSPORT,
 }: UseDictationOptions) {
@@ -147,7 +159,7 @@ export function useDictation({
 
   const start = useCallback(async () => {
     if (state.phase !== "idle" && state.phase !== "error") return;
-    if (!ownerId) {
+    if (ownerPhase !== "ready" || !ownerId) {
       setState({ phase: "error", elapsedMs: 0, message: "Sign in before using dictation." });
       return;
     }
@@ -235,7 +247,7 @@ export function useDictation({
             : "Eden could not start dictation.",
       });
     }
-  }, [ownerId, releaseStream, state.phase, stop, store, transport]);
+  }, [ownerId, ownerPhase, releaseStream, state.phase, stop, store, transport]);
 
   // A refresh cannot keep the physical microphone open, but every completed
   // short PCM chunk is durable. On return, finish the interrupted recording
@@ -253,10 +265,12 @@ export function useDictation({
         // sequence. A hard refresh kills that instance; the durable draft is
         // still here when this short grace period ends.
         await new Promise((resolve) => setTimeout(resolve, 1_250));
-        if (!ownerId) {
+        const disposition = dictationRecoveryDisposition(ownerPhase, ownerId);
+        if (disposition === "purge") {
           await store().purgeAll();
           return;
         }
+        if (disposition !== "recover" || !ownerId) return;
         const [draft] = await store().recoverableDrafts(ownerId);
         if (!draft || disposed || sessionRef.current) return;
         setState({ phase: "recovering", elapsedMs: draft.durationMs, message: "Recovering your recording…" });
@@ -289,7 +303,7 @@ export function useDictation({
       }
       clearTimer();
     };
-  }, [clearTimer, onTranscript, ownerId, settleRecorder, store, transport]);
+  }, [clearTimer, onTranscript, ownerId, ownerPhase, settleRecorder, store, transport]);
 
   return {
     state,

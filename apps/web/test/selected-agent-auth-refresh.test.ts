@@ -12,7 +12,7 @@ describe("selected-agent authentication refresh", () => {
       'onAgentInventoryChange,\n  onDevUserChange,\n} from "@/lib/api"',
     );
     expect(source).toMatch(
-      /onDevUserChange\(\(user\) => \{\s*setViewer\(user\);\s*setViewerResolved\(true\);\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,
+      /onDevUserChange\(\(user\) => \{\s*setViewer\(user\);\s*setViewerResolved\(true\);\s*setViewerPhase\(user \? "ready" : "signed_out"\);\s*setMyAgentsPhase\("loading"\);\s*setMyAgentsNonce\(\(nonce\) => nonce \+ 1\);/,
     );
 
     expect(source.match(/onDevUserChange\(/g)).toHaveLength(1);
@@ -21,6 +21,14 @@ describe("selected-agent authentication refresh", () => {
       /if \(selectAuthMode\(\) !== "clerk"\) return;[\s\S]*const imageUrl = clerk\.user\?\.imageUrl;[\s\S]*api\.account\.syncIdentityAvatar\(imageUrl\)/,
     );
     expect(source).toContain("const [viewerResolved, setViewerResolved] = useState(false);");
+    expect(source).toContain('const [viewerPhase, setViewerPhase] = useState<ViewerPhase>("loading");');
+    const viewerFetch = source.slice(
+      source.indexOf("// ---- viewer"),
+      source.indexOf("// ---- selected agent"),
+    );
+    const viewerError = viewerFetch.slice(viewerFetch.indexOf(".catch(() =>"));
+    expect(viewerError).toContain('setViewerPhase("error")');
+    expect(viewerError).not.toContain("setViewer(null)");
     expect(source).toMatch(
       /if \(!viewerResolved\) return;\s*if \(viewer === null\) \{\s*setMyAgents\(\[\]\);\s*setMyAgentsPhase\("ready"\);\s*return;\s*\}\s*let cancelled = false;\s*void \(async \(\) => \{\s*try \{\s*const page = await api\.agents\.list\(\{ scope: "mine" \}\);/,
     );

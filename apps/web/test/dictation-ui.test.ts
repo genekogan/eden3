@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   appendTranscript,
+  dictationRecoveryDisposition,
   formatDictationTime,
 } from "../components/chat/use-dictation";
 import { PCM_UPLOAD_CHUNK_SAMPLES } from "../lib/pcm-recorder";
@@ -33,6 +34,13 @@ describe("dictation UI helpers", () => {
     expect(formatDictationTime(0)).toBe("0:00");
     expect(formatDictationTime(65_999)).toBe("1:05");
     expect(formatDictationTime(10 * 60_000)).toBe("10:00");
+  });
+
+  it("purges only after authoritative sign-out, never while auth is unresolved", () => {
+    expect(dictationRecoveryDisposition("loading", null)).toBe("wait");
+    expect(dictationRecoveryDisposition("error", null)).toBe("wait");
+    expect(dictationRecoveryDisposition("ready", "account-1")).toBe("recover");
+    expect(dictationRecoveryDisposition("signed_out", null)).toBe("purge");
   });
 
   it("batches 16 kHz PCM into one-second durable upload chunks", () => {

@@ -23,6 +23,15 @@ describe("sidebar account footer layout", () => {
     expect(authUserControlSource).toContain('fetch("/api/dev/logout"');
     expect(authUserControlSource).not.toContain("DevUserSwitcher");
     expect(authUserControlSource).not.toContain("mountUserButton");
+    const signOutBody = authUserControlSource.slice(
+      authUserControlSource.indexOf("const signOut = async"),
+      authUserControlSource.indexOf("\n\n  return ("),
+    );
+    expect(signOutBody).toContain("void purgeAllDictationDrafts().catch");
+    expect(signOutBody).not.toContain("await purgeAllDictationDrafts");
+    expect(signOutBody.indexOf("purgeAllDictationDrafts")).toBeLessThan(
+      signOutBody.indexOf("clerk.signOut"),
+    );
   });
 
   it("places notifications after the account control on the right", () => {

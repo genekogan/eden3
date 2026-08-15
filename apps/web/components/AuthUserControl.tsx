@@ -17,8 +17,10 @@ export function AuthUserControl({
 
   const signOut = async () => {
     setBusy(true);
+    // Browser audio cleanup is important, but IndexedDB can be blocked by a
+    // stale tab. It must never prevent the authoritative auth transition.
+    void purgeAllDictationDrafts().catch(() => undefined);
     try {
-      await purgeAllDictationDrafts();
       if (selectAuthMode() === "clerk") {
         const clerk = await loadClerk();
         await clerk.signOut?.();

@@ -40,6 +40,7 @@ export function agentUsernameFromPathname(pathname: string): string | null {
 }
 
 export type SelectedAgentPhase = "idle" | "loading" | "ready" | "missing" | "error";
+export type ViewerPhase = "loading" | "ready" | "signed_out" | "error";
 
 interface SelectedAgentState {
   /** Username from the URL, or null outside /agents/[username]/… */
@@ -48,6 +49,8 @@ interface SelectedAgentState {
   phase: SelectedAgentPhase;
   /** The signed-in (or impersonated) viewer; null until loaded / signed out. */
   viewer: DevUser | null;
+  /** Distinguishes authoritative sign-out from unresolved/transient auth failures. */
+  viewerPhase: ViewerPhase;
   /** Viewer owns the selected agent, or is an admin. False until both load. */
   canManage: boolean;
   refresh: () => void;
@@ -64,6 +67,7 @@ const SelectedAgentContext = createContext<SelectedAgentState>({
   agent: null,
   phase: "idle",
   viewer: null,
+  viewerPhase: "loading",
   canManage: false,
   refresh: () => {},
 });
@@ -107,6 +111,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const [myAgentsNonce, setMyAgentsNonce] = useState(0);
   const [viewer, setViewer] = useState<DevUser | null>(null);
   const [viewerResolved, setViewerResolved] = useState(false);
+  const [viewerPhase, setViewerPhase] = useState<ViewerPhase>("loading");
 
   // Clerk copies Google/OAuth profile photos into user.imageUrl. Import that
   // first-party identity image once per shell boot; the API preserves any
@@ -135,6 +140,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     return onDevUserChange((user) => {
       setViewer(user);
       setViewerResolved(true);
+      setViewerPhase(user ? "ready" : "signed_out");
       setMyAgentsPhase("loading");
       setMyAgentsNonce((nonce) => nonce + 1);
     });
@@ -159,12 +165,15 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
         if (!cancelled) {
           setViewer(user);
           setViewerResolved(true);
+          setViewerPhase(user ? "ready" : "signed_out");
         }
       })
       .catch(() => {
         if (!cancelled) {
-          setViewer(null);
-          setViewerResolved(true);
+          // A transport/API failure is not evidence of sign-out. Preserve the
+          // last known identity for private browser custody, while server
+          // authorization remains authoritative for every request.
+          setViewerPhase("error");
         }
       });
     return () => {
@@ -262,8 +271,8 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     ((agent.ownerId !== null && agent.ownerId === viewer.id) || Boolean(viewer.isAdmin));
 
   const selected = useMemo<SelectedAgentState>(
-    () => ({ username, agent, phase, viewer, canManage, refresh: refreshAgent }),
-    [username, agent, phase, viewer, canManage, refreshAgent],
+    () => ({ username, agent, phase, viewer, viewerPhase, canManage, refresh: refreshAgent }),
+    [username, agent, phase, viewer, viewerPhase, canManage, refreshAgent],
   );
   const mine = useMemo<MyAgentsState>(
     () => ({ agents: myAgents, phase: myAgentsPhase, refresh: refreshMyAgents }),
