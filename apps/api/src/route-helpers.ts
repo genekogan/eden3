@@ -236,9 +236,11 @@ export function agentDtoFromRow(row: AgentRow, opts: AgentDtoOptions): AgentDto 
             row.voice_id && row.voice_chat_mode && row.voice_discord_mode && row.voice_telegram_mode && row.voice_assignment_updated_at
               ? {
                   voiceId: row.voice_id,
-                  chatMode: row.voice_chat_mode,
-                  discordMode: row.voice_discord_mode,
-                  telegramMode: row.voice_telegram_mode,
+                  delivery: {
+                    chat: row.voice_chat_mode,
+                    discord: row.voice_discord_mode === 'always' ? 'always' : 'off',
+                    telegram: row.voice_telegram_mode === 'always' ? 'always' : 'off',
+                  },
                   updatedAt: pgToIso(row.voice_assignment_updated_at),
                 }
               : null,

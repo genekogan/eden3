@@ -316,14 +316,6 @@ export const COST_TABLE: readonly CostTableEntry[] = [
     estimated: true,
   },
   {
-    provider: 'elevenlabs',
-    model: 'tts',
-    unit: 'audio_character',
-    usdPerUnit: 0.00005,
-    effectiveDate: '2026-08-15',
-    source: 'ElevenLabs API pricing: Flash/Turbo pay-as-you-go $0.05 per 1,000 characters',
-  },
-  {
     provider: 'deepinfra',
     model: 'hexgrad/Kokoro-82M',
     unit: 'audio_character',

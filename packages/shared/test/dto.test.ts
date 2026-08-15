@@ -85,9 +85,7 @@ describe('resource DTOs', () => {
       voiceId: 'deepinfra:kokoro:af_bella:v1',
       voiceAssignment: {
         voiceId: 'deepinfra:kokoro:af_bella:v1',
-        chatMode: 'on_demand',
-        discordMode: 'off',
-        telegramMode: 'always',
+        delivery: { chat: 'on_demand', discord: 'off', telegram: 'always' },
         updatedAt: now,
       },
     })).toMatchObject({

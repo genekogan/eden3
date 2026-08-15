@@ -227,16 +227,14 @@ const agentRowColumns = () => pg`
 
 async function agentDtoWithVoice(account: Account, agent: Agent, opts: AgentDtoOptions) {
   const [row] = await pg<{
-    voice_id: string; chat_mode: VoiceAssignmentDto['chatMode'];
-    discord_mode: VoiceAssignmentDto['discordMode']; telegram_mode: VoiceAssignmentDto['telegramMode'];
+    voice_id: string; chat_mode: VoiceAssignmentDto['delivery']['chat'];
+    discord_mode: VoiceAssignmentDto['delivery']['discord']; telegram_mode: VoiceAssignmentDto['delivery']['telegram'];
     updated_at: string;
   }[]>`select voice_id,chat_mode,discord_mode,telegram_mode,updated_at
     from agent_voice_assignments where agent_account_id=${account.id}`;
   const voiceAssignment = row ? {
     voiceId: row.voice_id,
-    chatMode: row.chat_mode,
-    discordMode: row.discord_mode,
-    telegramMode: row.telegram_mode,
+    delivery: { chat: row.chat_mode, discord: row.discord_mode, telegram: row.telegram_mode },
     updatedAt: pgToIso(row.updated_at),
   } satisfies VoiceAssignmentDto : null;
   return agentDtoFromEntities(account, agent, { ...opts, voiceAssignment });

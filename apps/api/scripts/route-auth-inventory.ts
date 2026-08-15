@@ -62,7 +62,6 @@ const PUBLIC_ROUTES: readonly PathMethods[] = [
   ['/studio/quote', ['POST']],
   ['/studio/tools', ['GET', 'HEAD']],
   ['/users/:username/collections', ['GET', 'HEAD']],
-  ['/voices/catalog', ['GET', 'HEAD']],
 ];
 
 const AUTHENTICATED_ROUTES: readonly PathMethods[] = [
@@ -157,6 +156,7 @@ const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/uploads/:uploadId/complete', ['POST']],
   ['/uploads/:uploadId/parts/:partNumber', ['POST']],
   ['/uploads/:uploadId/parts/:partNumber/complete', ['POST']],
+  ['/voices/catalog', ['GET', 'HEAD']],
   ['/voices/clones', ['GET', 'HEAD', 'POST']],
   ['/voices/clones/quote', ['POST']],
   ['/voices/clones/:id', ['DELETE', 'GET', 'HEAD']],

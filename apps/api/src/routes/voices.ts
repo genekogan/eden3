@@ -15,29 +15,33 @@ export interface VoiceRoutesOptions {
 }
 
 const quoteSchema = z.object({
-  operation: z.enum(['preview', 'chat', 'discord', 'telegram']),
+  purpose: z.enum(['preview', 'chat', 'discord', 'telegram']),
   voiceId: voiceIdSchema,
   text: z.string().min(1).max(4_000),
 }).strict();
 
 const previewSchema = z.object({
-  quoteId: z.string().uuid(),
+  voiceId: voiceIdSchema,
   text: z.string().min(1).max(500),
   idempotencyKey: z.string().min(8).max(200),
 }).strict();
 
 const assignmentSchema = z.object({
   voiceId: voiceIdSchema,
-  chatMode: voiceAssignmentModeSchema.default('on_demand'),
-  discordMode: voiceAssignmentModeSchema.default('off'),
-  telegramMode: voiceAssignmentModeSchema.default('off'),
+  delivery: z.object({
+    chat: voiceAssignmentModeSchema.default('on_demand'),
+    discord: z.enum(['off', 'always']).default('off'),
+    telegram: z.enum(['off', 'always']).default('off'),
+  }).strict(),
 }).strict();
 
 const cloneSchema = z.object({
   name: z.string().trim().min(1).max(120),
-  storageObjectId: z.string().uuid(),
-  consentVersion: z.literal('eden-voice-consent-v1'),
-  consentAttested: z.literal(true),
+  clipObjectIds: z.array(z.string().uuid()).min(1).max(5),
+  consent: z.object({
+    version: z.literal('voice-clone-consent-v1'),
+    attested: z.literal(true),
+  }).strict(),
   idempotencyKey: z.string().min(8).max(200),
 }).strict();
 
@@ -70,22 +74,27 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
     }
   };
 
-  app.get('/voices/catalog', async () => kernel.catalog());
+  app.get('/voices/catalog', { preHandler: app.requireAuth }, async (request) => {
+    return await boundary(() => kernel.catalog(request.account!.accountId));
+  });
 
   app.post('/voices/quotes', { preHandler: app.requireAuth }, async (request) => {
     const body = quoteSchema.parse(request.body);
-    return await boundary(() => kernel.quote(request.account!.accountId, body.operation, body.voiceId, body.text));
+    const quote = await boundary(() => kernel.quote(request.account!.accountId, body.purpose, body.voiceId, body.text));
+    return { ...quote, characters: quote.characterCount };
   });
 
-  app.post('/voices/previews', { preHandler: app.requireAuth }, async (request) => {
+  app.post('/voices/previews', { preHandler: app.requireAuth }, async (request, reply) => {
     const body = previewSchema.parse(request.body);
-    return await boundary(() => kernel.synthesize({
+    const quote = await boundary(() => kernel.quote(request.account!.accountId, 'preview', body.voiceId, body.text));
+    const execution = await boundary(() => kernel.synthesize({
       ownerAccountId: request.account!.accountId,
       operation: 'preview',
-      quoteId: body.quoteId,
+      quoteId: quote.quoteId,
       text: body.text,
       idempotencyKey: body.idempotencyKey,
     }));
+    return reply.code(execution.replayed ? 200 : 201).send({ execution });
   });
 
   app.put('/agents/:username/voice-assignment', { preHandler: app.requireAuth }, async (request) => {
@@ -109,14 +118,21 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
   });
 
   app.post('/voices/clones/quote', { preHandler: app.requireAuth }, async (request) => {
-    const body = z.object({ storageObjectId: z.string().uuid() }).strict().parse(request.body);
-    return await boundary(() => kernel.cloneQuote(request.account!.accountId, body.storageObjectId));
+    const body = z.object({ clipObjectIds: z.array(z.string().uuid()).min(1).max(5) }).strict().parse(request.body);
+    return await boundary(() => kernel.cloneQuote(request.account!.accountId, body.clipObjectIds));
   });
 
   app.post('/voices/clones', { preHandler: app.requireAuth }, async (request, reply) => {
     const body = cloneSchema.parse(request.body);
-    const clone = await boundary(() => kernel.createClone({ ownerAccountId: request.account!.accountId, ...body }));
-    return reply.code(clone.status === 'ready' ? 201 : 202).send(clone);
+    const clone = await boundary(() => kernel.createClone({
+      ownerAccountId: request.account!.accountId,
+      name: body.name,
+      clipObjectIds: body.clipObjectIds,
+      consentVersion: body.consent.version,
+      consentAttested: body.consent.attested,
+      idempotencyKey: body.idempotencyKey,
+    }));
+    return reply.code(clone.status === 'ready' ? 201 : 202).send({ clone });
   });
 
   app.get('/voices/clones', { preHandler: app.requireAuth }, async (request) => ({ items: await kernel.listClones(request.account!.accountId) }));

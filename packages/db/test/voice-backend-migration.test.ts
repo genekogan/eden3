@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const migrationPath = fileURLToPath(new URL('../migrations/0047_voice_backend.sql', import.meta.url));
+const journalPath = fileURLToPath(new URL('../migrations/meta/_journal.json', import.meta.url));
 
 describe('0047 voice backend custody', () => {
   it('binds assignments, quotes, executions, consent clips, and erasure targets durably', async () => {
@@ -23,7 +24,19 @@ describe('0047 voice backend custody', () => {
     expect(migration).toContain('account_erasure_unclaimed_seal_matches(v_owner)');
     expect(migration).toContain('"attempt_count" between 0 and 1');
     expect(migration).toContain('"duration_ms" between 3000 and 10000');
+    expect(migration).toContain('"size_bytes" between 1 and 20971520');
     expect(migration).toContain('account_erasure_assert_no_open_work');
     expect(migration).toContain("v.status IN ('pending_validation','cloning','provider_create_ambiguous','provider_delete_pending','provider_delete_failed')");
+  });
+
+  it('keeps migration timestamps strictly increasing so 0047 cannot be skipped after 0046', async () => {
+    const journal = JSON.parse(await readFile(journalPath, 'utf8')) as {
+      entries: Array<{ idx: number; when: number; tag: string }>;
+    };
+    const entries = [...journal.entries].sort((a, b) => a.idx - b.idx);
+    for (let index = 1; index < entries.length; index += 1) {
+      expect(entries[index]!.when, `${entries[index]!.tag} must follow ${entries[index - 1]!.tag}`)
+        .toBeGreaterThan(entries[index - 1]!.when);
+    }
   });
 });

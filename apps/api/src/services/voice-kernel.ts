@@ -13,7 +13,7 @@ import {
   type MediaStore,
 } from '@eden3/core';
 import { db, pg } from '@eden3/db';
-import type { VoiceAssignmentDto, VoiceCloneDto, VoiceExecutionDto, VoiceQuoteDto } from '@eden3/shared';
+import type { VoiceAssignmentDto, VoiceCatalogEntryDto, VoiceCloneDto, VoiceExecutionDto, VoiceQuoteDto } from '@eden3/shared';
 import { sql } from 'drizzle-orm';
 
 import type { MediaObjectResolver } from './media-object-repository';
@@ -155,11 +155,43 @@ export class VoiceKernel {
     this.now = options.now ?? (() => new Date());
   }
 
-  catalog() {
+  async catalog(ownerAccountId: string) {
+    const owned = await this.dbc.execute(sql`
+      select id,voice_id,name from voice_clones
+      where owner_account_id=${ownerAccountId} and status='ready' and consent_revoked_at is null
+      order by created_at,id
+    `);
+    const items: VoiceCatalogEntryDto[] = VOICE_CATALOG.map((voice) => {
+      const pricing = costFromParams({ provider: voice.provider, model: voice.model, units: { audio_character: 1 } });
+      return {
+        id: voice.id,
+        provider: voice.provider,
+        model: voice.model,
+        name: voice.name,
+        language: voice.locale,
+        kind: 'roster',
+        preview: { available: voice.previewable },
+        pricing: { unit: 'character', usdPerUnit: pricing.totalCostUsd, tableVersion: pricing.tableVersion },
+        capabilities: { preview: voice.previewable, chat: true, discord: true, telegram: true },
+      };
+    });
+    for (const clone of rows<{ id: string; voice_id: string; name: string }>(owned)) {
+      const pricing = costFromParams({ provider: 'cartesia', model: 'sonic-3.5-2026-05-04', units: { audio_character: 1 } });
+      items.push({
+        id: clone.voice_id,
+        provider: 'cartesia',
+        model: 'sonic-3.5-2026-05-04',
+        name: clone.name,
+        language: 'en',
+        kind: 'clone',
+        preview: { available: true },
+        pricing: { unit: 'character', usdPerUnit: pricing.totalCostUsd, tableVersion: pricing.tableVersion },
+        capabilities: { preview: true, chat: true, discord: true, telegram: true },
+      });
+    }
     return {
       version: '2026-08-15.kokoro-v1',
-      defaultVoiceId: 'deepinfra:kokoro:af_bella:v1',
-      voices: VOICE_CATALOG.map(({ providerVoiceId: _providerVoiceId, ...voice }) => voice),
+      items,
     };
   }
 
@@ -462,13 +494,13 @@ export class VoiceKernel {
       await this.resolveAuthorizedVoiceTx(tx, ownerAccountId, value.voiceId, 'chat');
       const result = await tx.execute(sql`
         insert into agent_voice_assignments (agent_account_id,voice_id,chat_mode,discord_mode,telegram_mode)
-        values (${agent.id},${value.voiceId},${value.chatMode},${value.discordMode},${value.telegramMode})
+        values (${agent.id},${value.voiceId},${value.delivery.chat},${value.delivery.discord},${value.delivery.telegram})
         on conflict (agent_account_id) do update set voice_id=excluded.voice_id,chat_mode=excluded.chat_mode,
           discord_mode=excluded.discord_mode,telegram_mode=excluded.telegram_mode,updated_at=statement_timestamp()
         returning voice_id,chat_mode,discord_mode,telegram_mode,updated_at
       `);
-      const row = rows<{ voice_id: string; chat_mode: VoiceAssignmentDto['chatMode']; discord_mode: VoiceAssignmentDto['discordMode']; telegram_mode: VoiceAssignmentDto['telegramMode']; updated_at: Date | string }>(result)[0]!;
-      return { voiceId: row.voice_id, chatMode: row.chat_mode, discordMode: row.discord_mode, telegramMode: row.telegram_mode, updatedAt: iso(row.updated_at) };
+      const row = rows<{ voice_id: string; chat_mode: VoiceAssignmentDto['delivery']['chat']; discord_mode: VoiceAssignmentDto['delivery']['discord']; telegram_mode: VoiceAssignmentDto['delivery']['telegram']; updated_at: Date | string }>(result)[0]!;
+      return { voiceId: row.voice_id, delivery: { chat: row.chat_mode, discord: row.discord_mode, telegram: row.telegram_mode }, updatedAt: iso(row.updated_at) };
     });
   }
 
@@ -520,33 +552,50 @@ export class VoiceKernel {
     return { ...execution, waveform: rows<{ waveform: string | null }>(waveformResult)[0]?.waveform ?? null };
   }
 
-  async createClone(input: { ownerAccountId: string; name: string; storageObjectId: string; consentVersion: string; consentAttested: true; idempotencyKey: string }): Promise<VoiceCloneDto> {
-    if (!input.consentAttested || input.consentVersion !== 'eden-voice-consent-v1') throw new VoiceKernelError(422, 'clone_consent_invalid', 'Current voice consent is required');
+  async createClone(input: { ownerAccountId: string; name: string; clipObjectIds: string[]; consentVersion: string; consentAttested: true; idempotencyKey: string }): Promise<VoiceCloneDto> {
+    if (!input.consentAttested || input.consentVersion !== 'voice-clone-consent-v1') throw new VoiceKernelError(422, 'voice_consent_required', 'Current voice consent is required');
     if (!this.options.mediaResolver) throw new VoiceKernelError(503, 'voice_storage_unavailable', 'Voice clip storage is unavailable');
+    if (input.clipObjectIds.length < 1 || input.clipObjectIds.length > 5 || new Set(input.clipObjectIds).size !== input.clipObjectIds.length) {
+      throw new VoiceKernelError(422, 'voice_clip_not_ready', 'Choose between one and five distinct voice clips');
+    }
     const metaResult = await this.dbc.execute(sql`
       select id object_id,verified_mime mime,verified_size_bytes size_bytes,verified_sha256 sha256
-      from storage_objects where id=${input.storageObjectId} and owner_account_id=${input.ownerAccountId}
+      from storage_objects where id in (${sql.join(input.clipObjectIds.map((id) => sql`${id}`), sql`, `)}) and owner_account_id=${input.ownerAccountId}
         and purpose='voice-clip' and state='available' and verified_mime in ('audio/wav','audio/mpeg')
-        and verified_size_bytes between 1 and 16777216 and verified_sha256 ~ '^[0-9a-f]{64}$'
+        and verified_size_bytes between 1 and 20971520 and verified_sha256 ~ '^[0-9a-f]{64}$'
     `);
-    const meta = rows<ClipMeta>(metaResult)[0];
-    if (!meta) throw new VoiceKernelError(422, 'clone_clip_invalid', 'Voice clip must be an owned verified voice-clip WAV or MP3');
-    const resolved = await this.options.mediaResolver.resolve(input.storageObjectId, input.ownerAccountId);
-    const hydrated = await this.options.mediaResolver.hydrator.hydrate(resolved.storedObject);
-    let clip: Buffer;
-    try { clip = await readFile(hydrated.localPath); } finally { await hydrated.release(); }
-    if (clip.length !== Number(meta.size_bytes) || createHash('sha256').update(clip).digest('hex') !== meta.sha256) {
-      throw new VoiceKernelError(422, 'clone_clip_hash_mismatch', 'Voice clip hash did not match verified storage');
+    const byId = new Map(rows<ClipMeta>(metaResult).map((meta) => [meta.object_id, meta]));
+    const metas = input.clipObjectIds.map((id) => byId.get(id)).filter((meta): meta is ClipMeta => Boolean(meta));
+    if (metas.length !== input.clipObjectIds.length || metas.reduce((total, meta) => total + Number(meta.size_bytes), 0) > 40 * 1024 * 1024) {
+      throw new VoiceKernelError(422, 'voice_clip_not_ready', 'Voice clips must be owned verified voice-clip WAV or MP3 objects under the aggregate limit');
     }
-    let durationMs: number;
-    try { durationMs = (await this.options.audio.inspectClip(clip, meta.mime)).durationMs; }
-    catch (error) {
-      await this.dbc.execute(sql`update storage_objects set state='quarantined',quarantine_reason='voice_clip_decode_invalid',updated_at=statement_timestamp() where id=${meta.object_id} and owner_account_id=${input.ownerAccountId} and state='available'`);
-      throw error instanceof VoiceAudioError
-        ? new VoiceKernelError(422, error.code, 'Voice clip failed decoded validation')
-        : error;
+    const hydratedClips: Array<{ meta: ClipMeta; bytes: Buffer; durationMs: number }> = [];
+    for (const meta of metas) {
+      const resolved = await this.options.mediaResolver.resolve(meta.object_id, input.ownerAccountId);
+      const hydrated = await this.options.mediaResolver.hydrator.hydrate(resolved.storedObject);
+      let bytes: Buffer;
+      try { bytes = await readFile(hydrated.localPath); } finally { await hydrated.release(); }
+      if (bytes.length !== Number(meta.size_bytes) || createHash('sha256').update(bytes).digest('hex') !== meta.sha256) {
+        throw new VoiceKernelError(409, 'voice_clip_hash_mismatch', 'Voice clip hash did not match verified storage');
+      }
+      try {
+        hydratedClips.push({ meta, bytes, durationMs: (await this.options.audio.inspectClip(bytes, meta.mime)).durationMs });
+      } catch (error) {
+        await this.dbc.execute(sql`update storage_objects set state='quarantined',quarantine_reason='voice_clip_decode_invalid',updated_at=statement_timestamp() where id=${meta.object_id} and owner_account_id=${input.ownerAccountId} and state='available'`);
+        throw error instanceof VoiceAudioError
+          ? new VoiceKernelError(422, 'voice_clip_duration_invalid', 'Voice clip failed decoded validation')
+          : error;
+      }
     }
-    const manifest = requestHash([{ objectId: meta.object_id, sha256: meta.sha256, mime: meta.mime, sizeBytes: Number(meta.size_bytes), durationMs }]);
+    const totalDurationMs = hydratedClips.reduce((total, clip) => total + clip.durationMs, 0);
+    if (totalDurationMs < 5_000 || totalDurationMs > 30_000) {
+      throw new VoiceKernelError(422, 'voice_clip_duration_invalid', 'Voice clips must total between 5 and 30 seconds');
+    }
+    const combined = await this.options.audio.combineCloneClips(hydratedClips.map(({ bytes, meta }) => ({ bytes, mime: meta.mime })));
+    const manifestItems = hydratedClips.map(({ meta, durationMs }) => ({
+      objectId: meta.object_id, sha256: meta.sha256, mime: meta.mime, sizeBytes: Number(meta.size_bytes), durationMs,
+    }));
+    const manifest = requestHash(manifestItems);
     const requestSha256 = requestHash({ name: input.name, manifest, consentVersion: input.consentVersion, provider: 'cartesia' });
     const clone = await this.dbc.transaction(async (tx) => {
       const priorResult = await tx.execute(sql`select * from voice_clones where owner_account_id=${input.ownerAccountId} and idempotency_key=${input.idempotencyKey} for update`);
@@ -555,15 +604,19 @@ export class VoiceKernel {
         if (prior.request_sha256 !== requestSha256) throw new VoiceKernelError(409, 'idempotency_conflict', 'Idempotency key was used for another clone');
         return { row: prior, replay: true };
       }
-      const lockedResult = await tx.execute(sql`select id,verified_sha256,state from storage_objects where id=${meta.object_id} and owner_account_id=${input.ownerAccountId} and purpose='voice-clip' for update`);
-      const locked = rows<{ id: string; verified_sha256: string | null; state: string }>(lockedResult)[0];
-      if (!locked || locked.state !== 'available' || locked.verified_sha256 !== meta.sha256) throw new VoiceKernelError(409, 'clone_clip_changed', 'Voice clip changed before clone admission');
+      const lockedResult = await tx.execute(sql`select id,verified_sha256,state from storage_objects where id in (${sql.join(input.clipObjectIds.map((id) => sql`${id}`), sql`, `)}) and owner_account_id=${input.ownerAccountId} and purpose='voice-clip' for update`);
+      const locked = new Map(rows<{ id: string; verified_sha256: string | null; state: string }>(lockedResult).map((row) => [row.id, row]));
+      if (metas.some((meta) => locked.get(meta.object_id)?.state !== 'available' || locked.get(meta.object_id)?.verified_sha256 !== meta.sha256)) {
+        throw new VoiceKernelError(409, 'voice_clip_hash_mismatch', 'Voice clip changed before clone admission');
+      }
       const id = randomUUID();
       const inserted = await tx.execute(sql`
         insert into voice_clones (id,owner_account_id,name,provider,status,consent_version,consent_attested_at,clip_manifest_sha256,request_sha256,idempotency_key)
         values (${id},${input.ownerAccountId},${input.name},'cartesia','cloning',${input.consentVersion},statement_timestamp(),${manifest},${requestSha256},${input.idempotencyKey}) returning *
       `);
-      await tx.execute(sql`insert into voice_clone_clips (clone_id,object_id,position,sha256,mime,size_bytes,duration_ms) values (${id},${meta.object_id},0,${meta.sha256},${meta.mime},${Number(meta.size_bytes)},${durationMs})`);
+      for (const [position, item] of manifestItems.entries()) {
+        await tx.execute(sql`insert into voice_clone_clips (clone_id,object_id,position,sha256,mime,size_bytes,duration_ms) values (${id},${item.objectId},${position},${item.sha256},${item.mime},${item.sizeBytes},${item.durationMs})`);
+      }
       return { row: rows<Record<string, unknown>>(inserted)[0]!, replay: false };
     });
     if (clone.replay) return cloneDto(clone.row);
@@ -573,7 +626,7 @@ export class VoiceKernel {
       throw new VoiceKernelError(503, 'voice_provider_unavailable', 'Clone provider is unavailable');
     }
     try {
-      const result = await provider.clone({ name: input.name, clip, mime: meta.mime });
+      const result = await provider.clone({ name: input.name, clip: combined.bytes, mime: combined.mime });
       const updated = await this.dbc.transaction(async (tx) => {
         const current = await tx.execute(sql`select status from voice_clones where id=${String(clone.row.id)} and owner_account_id=${input.ownerAccountId} for update`);
         const status = rows<{ status: string }>(current)[0]?.status;
@@ -612,27 +665,30 @@ export class VoiceKernel {
     }
   }
 
-  async cloneQuote(ownerAccountId: string, storageObjectId: string) {
+  async cloneQuote(ownerAccountId: string, clipObjectIds: string[]) {
+    if (clipObjectIds.length < 1 || clipObjectIds.length > 5 || new Set(clipObjectIds).size !== clipObjectIds.length) {
+      throw new VoiceKernelError(422, 'voice_clip_not_ready', 'Choose between one and five distinct voice clips');
+    }
     const result = await this.dbc.execute(sql`
-      select verified_mime,verified_size_bytes from storage_objects
-      where id=${storageObjectId} and owner_account_id=${ownerAccountId}
+      select id,verified_mime,verified_size_bytes from storage_objects
+      where id in (${sql.join(clipObjectIds.map((id) => sql`${id}`), sql`, `)}) and owner_account_id=${ownerAccountId}
         and purpose='voice-clip' and state='available'
         and verified_mime in ('audio/wav','audio/mpeg')
-        and verified_size_bytes between 1 and 16777216
+        and verified_size_bytes between 1 and 20971520
         and verified_sha256 ~ '^[0-9a-f]{64}$'
         and not exists (select 1 from account_erasure_jobs j
           where j.account_id=${ownerAccountId} and j.state<>'succeeded')
     `);
-    if (rows(result).length === 0) {
-      throw new VoiceKernelError(422, 'clone_clip_invalid', 'Voice clip must be an owned verified voice-clip WAV or MP3');
+    const clips = rows<{ id: string; verified_size_bytes: string | number }>(result);
+    if (clips.length !== clipObjectIds.length || clips.reduce((sum, clip) => sum + Number(clip.verified_size_bytes), 0) > 40 * 1024 * 1024) {
+      throw new VoiceKernelError(422, 'voice_clip_not_ready', 'Voice clips must be owned verified voice-clip WAV or MP3 objects under the aggregate limit');
     }
     return {
       provider: 'cartesia' as const,
-      operation: 'instant_clone' as const,
+      kind: 'instant' as const,
       costUsd: 0,
       manna: 0,
-      pricingBasis: 'plan_included' as const,
-      constraints: { acceptedMime: ['audio/wav', 'audio/mpeg'] as const, minimumDurationMs: 3_000, maximumDurationMs: 10_000, maximumBytes: 16_777_216 },
+      expiresAt: new Date(this.now().getTime() + 5 * 60_000).toISOString(),
     };
   }
 

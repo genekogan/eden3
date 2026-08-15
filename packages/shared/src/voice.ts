@@ -11,9 +11,11 @@ export const voiceIdSchema = z
 
 export const voiceAssignmentDto = z.object({
   voiceId: voiceIdSchema,
-  chatMode: voiceAssignmentModeSchema,
-  discordMode: voiceAssignmentModeSchema,
-  telegramMode: voiceAssignmentModeSchema,
+  delivery: z.object({
+    chat: voiceAssignmentModeSchema,
+    discord: z.enum(['off', 'always']),
+    telegram: z.enum(['off', 'always']),
+  }),
   updatedAt: z.string().datetime(),
 });
 export type VoiceAssignmentDto = z.infer<typeof voiceAssignmentDto>;
@@ -23,10 +25,20 @@ export const voiceCatalogEntryDto = z.object({
   provider: z.enum(['deepinfra', 'cartesia', 'elevenlabs']),
   model: z.string().min(1).max(200),
   name: z.string().min(1).max(120),
-  locale: z.string().min(2).max(35),
-  gender: z.enum(['feminine', 'masculine', 'neutral']),
-  previewable: z.boolean(),
-  clonable: z.boolean(),
+  language: z.string().min(2).max(35),
+  kind: z.enum(['roster', 'clone']),
+  preview: z.object({ available: z.boolean() }),
+  pricing: z.object({
+    unit: z.literal('character'),
+    usdPerUnit: z.number().nonnegative(),
+    tableVersion: z.string().min(1),
+  }),
+  capabilities: z.object({
+    preview: z.boolean(),
+    chat: z.boolean(),
+    discord: z.boolean(),
+    telegram: z.boolean(),
+  }),
 });
 export type VoiceCatalogEntryDto = z.infer<typeof voiceCatalogEntryDto>;
 

@@ -20,6 +20,11 @@ export interface ProcessedVoiceAudio {
 
 export interface VoiceAudioProcessor {
   inspectClip(input: Buffer, mime: 'audio/wav' | 'audio/mpeg'): Promise<{ durationMs: number }>;
+  combineCloneClips(inputs: ReadonlyArray<{ bytes: Buffer; mime: 'audio/wav' | 'audio/mpeg' }>): Promise<{
+    bytes: Buffer;
+    mime: 'audio/wav';
+    durationMs: number;
+  }>;
   process(input: Buffer, mime: string, purpose: 'preview' | 'chat' | 'discord' | 'telegram'): Promise<ProcessedVoiceAudio>;
 }
 
@@ -142,6 +147,41 @@ export class FfmpegVoiceAudioProcessor implements VoiceAudioProcessor {
       if (rms < 100 || clipped / samples > 0.01) throw new VoiceAudioError('audio_invalid');
       return { durationMs: info.durationMs };
     });
+  }
+
+  async combineCloneClips(inputs: ReadonlyArray<{ bytes: Buffer; mime: 'audio/wav' | 'audio/mpeg' }>): Promise<{
+    bytes: Buffer;
+    mime: 'audio/wav';
+    durationMs: number;
+  }> {
+    if (inputs.length < 1 || inputs.length > 5) throw new VoiceAudioError('audio_invalid');
+    const dir = path.join(this.root, randomUUID());
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    try {
+      const inputPaths: string[] = [];
+      for (const [index, input] of inputs.entries()) {
+        if (input.bytes.length === 0 || input.bytes.length > 20 * 1024 * 1024) throw new VoiceAudioError('audio_invalid');
+        const inputPath = path.join(dir, `clip-${index}${input.mime === 'audio/wav' ? '.wav' : '.mp3'}`);
+        await writeFile(inputPath, input.bytes, { mode: 0o600 });
+        inputPaths.push(inputPath);
+      }
+      const outputPath = path.join(dir, 'combined.wav');
+      const inputArgs = inputPaths.flatMap((inputPath) => ['-i', inputPath]);
+      const streams = inputPaths.map((_, index) => `[${index}:a:0]`).join('');
+      await run([
+        'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error', ...inputArgs,
+        '-filter_complex', `${streams}concat=n=${inputPaths.length}:v=0:a=1[out]`,
+        '-map', '[out]', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', '-f', 'wav', outputPath,
+      ], 20_000);
+      const bytes = await readFile(outputPath);
+      const info = await probe(outputPath);
+      if (info.durationMs < 5_000 || info.durationMs > 30_000 || bytes.length > 40 * 1024 * 1024) {
+        throw new VoiceAudioError('duration_exceeded');
+      }
+      return { bytes, mime: 'audio/wav', durationMs: info.durationMs };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
 
   async process(input: Buffer, mime: string, purpose: keyof typeof LIMITS): Promise<ProcessedVoiceAudio> {
