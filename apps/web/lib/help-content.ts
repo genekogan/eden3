@@ -91,20 +91,20 @@ export const HELP_ARTICLES: readonly HelpArticle[] = [
   },
   {
     id: "library-files",
-    title: "Upload and find a Library object",
-    summary: "Upload private files and find this agent's creations or all creations you own.",
+    title: "Attach files and browse creations",
+    summary: "Attach private files to a chat, or browse media made by this agent and your other agents.",
     keywords: ["file", "media", "image", "upload", "64 mib", "creation", "private"],
     steps: [
-      "Confirm the selected agent, then open Library.",
-      "Drop files into Upload files or use Choose files. The current browser path supports multiple files up to 64 MiB each.",
-      "Leave the page open until each item reports completion. Pause and resume are available for an in-progress upload.",
-      "Use This agent for its creations or All mine for creations you own, including Studio output.",
+      "To attach a file, open Chat and use the paperclip beside the message box, or drag files onto the composer. Up to eight attachments can be staged, with a 20 MiB total composer limit and stricter per-file limits.",
+      "Wait until every attachment says Ready before sending the message.",
+      "Open Library to browse media made by the selected agent.",
+      "Switch to All agents to browse creations from every agent you own, including Studio output.",
     ],
     notes: [
       "Uploads are private while they are verified. A file that is pending, rejected, quarantined, or not available will not resolve as public media.",
       "Supported file types are limited by the current picker and server verification. An extension alone does not prove the file type.",
     ],
-    action: { kind: "agent", target: "library", label: "Open Library" },
+    action: { kind: "agent", target: "new-chat", label: "Open Chat" },
   },
   {
     id: "connect-channel",

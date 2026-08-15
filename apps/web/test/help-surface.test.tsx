@@ -109,8 +109,8 @@ describe("authenticated help surface", () => {
       ).toEqual({ href: "/agents", label: "Choose an agent first" });
     }
 
-    const library = HELP_ARTICLES.find((article) => article.id === "library-files")!;
-    expect(resolveHelpAction(library, loadedAccessible).href).toBe("/agents/gene_1/library");
+    const attachments = HELP_ARTICLES.find((article) => article.id === "library-files")!;
+    expect(resolveHelpAction(attachments, loadedAccessible).href).toBe("/agents/gene_1/chats/new");
 
     const gateway = HELP_ARTICLES.find((article) => article.id === "connect-channel")!;
     expect(resolveHelpAction(gateway, loadedAccessible)).toEqual({
@@ -196,7 +196,7 @@ describe("authenticated help surface", () => {
     expect(html).toMatch(/no public signup/i);
     expect(html).toMatch(/test-mode instruments/i);
     expect(html).toMatch(/not money, stored value, or cryptocurrency/i);
-    expect(html).toMatch(/64 MiB each/);
+    expect(html).toMatch(/20 MiB total composer limit/);
     expect(html).toMatch(/Discord/);
     expect(html).toMatch(/Telegram, follow the Managed Bots ownership flow/);
     expect(html).toMatch(/separate X owner-publishing section/);
