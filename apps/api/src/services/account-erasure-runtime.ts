@@ -88,6 +88,10 @@ export function createAccountErasureRuntimeBundle(input: {
       input.targetStore.legacyMediaBoundary !== input.targetExecutor.legacyMediaBoundary) {
     throw new Error('Account erasure target store and executor require one attested legacy media root');
   }
+  if (input.targetStore.voiceOutputBoundary !== undefined &&
+      input.targetStore.voiceOutputBoundary !== input.targetExecutor.voiceOutputBoundary) {
+    throw new Error('Account erasure target store and executor require one attested voice output root');
+  }
   if (input.targetExecutor.voiceCloneCustody !== true) {
     throw new Error('Account erasure requires confirmed Cartesia voice-clone absence custody');
   }

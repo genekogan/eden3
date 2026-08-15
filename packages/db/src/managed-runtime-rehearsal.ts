@@ -20,6 +20,7 @@ export interface ManagedRuntimeRehearsalEvidence {
   tlsMode: 'verify-full';
   serverVersionNum: number;
   maxConnections: number;
+  voiceOutputFence: boolean;
   steadyWorkers: 10;
   burstRequests: 50;
   queryCount: 250;
@@ -65,6 +66,7 @@ async function runtimeIdentity(sql: postgres.Sql): Promise<{
   backendPid: number;
   serverVersionNum: number;
   maxConnections: number;
+  voiceOutputFence: boolean;
 }> {
   const [row] = await sql<{
     databaseName: string;
@@ -72,12 +74,14 @@ async function runtimeIdentity(sql: postgres.Sql): Promise<{
     backendPid: number;
     serverVersionNum: string;
     maxConnections: string;
+    voiceOutputFence: boolean;
   }[]>`
     select current_database()::text as "databaseName",
            current_user::text as "roleName",
            pg_backend_pid()::int as "backendPid",
            current_setting('server_version_num')::text as "serverVersionNum",
-           current_setting('max_connections')::text as "maxConnections"
+           current_setting('max_connections')::text as "maxConnections",
+           has_function_privilege(current_user,'public.account_erasure_assert_voice_output_writable(text)','EXECUTE') as "voiceOutputFence"
   `;
   const serverVersionNum = Number(row?.serverVersionNum);
   const maxConnections = Number(row?.maxConnections);
@@ -85,7 +89,7 @@ async function runtimeIdentity(sql: postgres.Sql): Promise<{
     !row ||
     !Number.isSafeInteger(row.backendPid) || row.backendPid < 1 ||
     !Number.isSafeInteger(serverVersionNum) || serverVersionNum < 160000 ||
-    !Number.isSafeInteger(maxConnections) || maxConnections < STEADY_WORKERS
+    !Number.isSafeInteger(maxConnections) || maxConnections < STEADY_WORKERS || !row.voiceOutputFence
   ) {
     throw new Error('managed runtime identity did not meet the rehearsal contract');
   }
@@ -194,6 +198,7 @@ export async function runManagedRuntimeRehearsal(
     tlsMode: authority.tlsMode,
     serverVersionNum: identity.serverVersionNum,
     maxConnections: identity.maxConnections,
+    voiceOutputFence: identity.voiceOutputFence,
     steadyWorkers: STEADY_WORKERS,
     burstRequests: BURST_REQUESTS,
     queryCount: 250,

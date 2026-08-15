@@ -35,4 +35,17 @@ describe('legacy media visibility gate', () => {
       `/media/nested/${'a'.repeat(64)}.png`,
     )).resolves.toBe(false);
   });
+
+  it('classifies every voice digest as known without making voice a public reference', async () => {
+    let statement = '';
+    const client = (async (strings: TemplateStringsArray) => {
+      statement = strings.join('?').replace(/\s+/g, ' ');
+      return [{ known: true, live: false, erasing: false }];
+    }) as unknown as PgClient;
+    await expect(legacyMediaIsPubliclyReachable(client, path)).resolves.toBe(false);
+    expect(statement).toContain('matching_voice');
+    expect(statement).toContain('v.output_sha256=?');
+    const liveClause = statement.slice(statement.indexOf('as live,'));
+    expect(liveClause).not.toContain('matching_voice');
+  });
 });

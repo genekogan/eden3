@@ -1,8 +1,21 @@
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 
 import { managedRuntimeBootstrapStatements } from '../src/managed-runtime-bootstrap';
 
 describe('managed PostgreSQL runtime role bootstrap', () => {
+  it('keeps existing-role upgrade on one transaction and validates least privilege', () => {
+    const source = readFileSync(new URL('../src/managed-runtime-bootstrap.ts', import.meta.url), 'utf8');
+    const signature = source.slice(source.indexOf('export async function upgradeManagedRuntimeVoicePrivilege'));
+    expect(signature).toContain('sql: postgres.TransactionSql');
+    expect(signature).toContain("SET LOCAL ROLE eden3_erasure_guard");
+    expect(signature).toContain("pg_has_role(rolname,'eden3_erasure_operator','member')");
+    expect(signature).toContain("pg_has_role(rolname,'eden3_erasure_guard','member')");
+    expect(signature).toContain("pg_has_role(rolname,'eden3_erasure_terminal_writer','member')");
+    expect(signature).toContain("has_schema_privilege(rolname,'public','CREATE')");
+    expect(signature).not.toContain('sql: postgres.Sql | postgres.TransactionSql');
+  });
   it('creates a bounded non-inheriting runtime role with exact data-plane authority', () => {
     const statements = managedRuntimeBootstrapStatements({
       databaseName: 'eden3_managed_rehearsal',
@@ -10,7 +23,7 @@ describe('managed PostgreSQL runtime role bootstrap', () => {
       password: 'synthetic_credential_material_1234567890',
     });
     const sql = statements.join(';\n');
-    expect(statements).toHaveLength(16);
+    expect(statements).toHaveLength(17);
     expect(sql).toContain('NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS');
     expect(sql).toContain('GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public');
     expect(sql).toContain('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public');
@@ -21,6 +34,9 @@ describe('managed PostgreSQL runtime role bootstrap', () => {
     expect(sql).toContain(
       'GRANT EXECUTE ON FUNCTION public.account_erasure_lock_legacy_content(text,text,text,text,text,text,text,text,text,text)',
     );
+    expect(sql).toContain(
+      'GRANT EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text)',
+    );
     expect(sql.indexOf('SET ROLE eden3_erasure_guard')).toBeLessThan(
       sql.indexOf('GRANT EXECUTE ON FUNCTION public.account_erasure_assert_account_writable(uuid)'),
     );
@@ -28,6 +44,9 @@ describe('managed PostgreSQL runtime role bootstrap', () => {
       sql.indexOf('RESET ROLE'),
     );
     expect(sql.indexOf('GRANT EXECUTE ON FUNCTION public.account_erasure_lock_legacy_content(text,text,text,text,text,text,text,text,text,text)')).toBeLessThan(
+      sql.indexOf('RESET ROLE'),
+    );
+    expect(sql.indexOf('GRANT EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text)')).toBeLessThan(
       sql.indexOf('RESET ROLE'),
     );
     expect(sql).toContain("SET statement_timeout = '30s'");

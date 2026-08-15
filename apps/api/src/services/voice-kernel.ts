@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, open, readFile, readdir, realpath, unlink } from 'node:fs/promises';
+import path from 'node:path';
 
 import {
   COST_TABLE_VERSION,
@@ -69,6 +71,10 @@ interface ExecutionRow {
   reserved_manna: string | number;
   request_sha256: string;
   output_sha256?: string | null;
+  output_local_path?: string | null;
+  text_sha256?: string;
+  idempotency_key?: string;
+  channel_turn_id?: string | null;
 }
 
 interface DirectVoiceJobRow {
@@ -103,8 +109,17 @@ export interface VoiceKernelOptions {
   now?: () => Date;
   dailyMannaCap?: number;
   cleanupArtifact: (sha256: string, mime: string) => Promise<void>;
+  /** Exact LocalMediaStore root; voice bytes may never be read outside it. */
+  voiceOutputRoot?: string;
   /** Idempotently removes one unshared, private voice-clip object and cache entry. */
   deletePrivateClip?: (object: StoredObject, signal?: AbortSignal) => Promise<void>;
+}
+
+export interface VoiceOutputBytes {
+  bytes: Buffer;
+  mime: string;
+  sizeBytes: number;
+  sha256: string;
 }
 
 function rows<T>(result: unknown): T[] {
@@ -193,6 +208,10 @@ function executionDto(row: ExecutionRow, replayed: boolean): VoiceExecutionDto {
   };
 }
 
+function ownerVoiceOutputPath(executionId: string): string {
+  return `/media/voice/${executionId}`;
+}
+
 function cloneDto(row: Record<string, unknown>): VoiceCloneDto {
   return {
     id: String(row.id),
@@ -240,10 +259,23 @@ function directVoiceMessageDto(row: Record<string, unknown>): MessageDto {
 export class VoiceKernel {
   private readonly dbc: DbHandle;
   private readonly now: () => Date;
+  private privateOutputDirty = true;
+  private privateOutputScanFlight: Promise<number> | null = null;
+  private privateOutputCustodyTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: VoiceKernelOptions) {
     this.dbc = options.db ?? db;
     this.now = options.now ?? (() => new Date());
+  }
+
+  private async assertOwnerWritableTx(tx: DbHandle, ownerAccountId: string): Promise<void> {
+    const owner = await tx.execute(sql`
+      select id from accounts where id=${ownerAccountId} and deleted=false for key share
+    `);
+    if (rows(owner).length !== 1) {
+      throw new VoiceKernelError(409, 'account_erasure_active', 'Account deletion is in progress');
+    }
+    await tx.execute(sql`select account_erasure_assert_account_writable(${ownerAccountId})`);
   }
 
   async catalog(ownerAccountId: string) {
@@ -345,6 +377,7 @@ export class VoiceKernel {
   async quote(ownerAccountId: string, operation: VoiceOperation, voiceId: string, rawText: string) {
     const transcript = exactTranscript(rawText, operation);
     return await this.dbc.transaction(async (tx) => {
+      await this.assertOwnerWritableTx(tx, ownerAccountId);
       const voice = await this.resolveAuthorizedVoiceTx(tx, ownerAccountId, voiceId, operation);
       const estimate = costFromParams({ provider: voice.provider, model: voice.model, units: { audio_character: transcript.characterCount } });
       const manna = mannaForEstimate(estimate);
@@ -392,11 +425,27 @@ export class VoiceKernel {
     /** Reconciler-only deadline fence; interactive calls omit it. */
     signal?: AbortSignal;
   }): Promise<VoiceExecutionDto> {
+    if (this.privateOutputScanFlight) await this.privateOutputScanFlight;
+    if (this.privateOutputDirty) {
+      await this.reconcileOrphanedOutputs(input.signal);
+    }
     assertVoiceReconciliationActive(input.signal);
     const transcript = exactTranscript(input.text, input.operation);
     const requestSha256 = executionRequestHash({ ...input, textSha256: transcript.sha256 });
 
     const admission = await this.dbc.transaction(async (tx) => {
+      const owner = await tx.execute(sql`
+        select id from accounts where id=${input.ownerAccountId} and deleted=false for key share
+      `);
+      if (rows(owner).length !== 1) {
+        throw new VoiceKernelError(409, 'account_erasure_active', 'Account deletion is in progress');
+      }
+      await tx.execute(sql`select account_erasure_assert_account_writable(${input.ownerAccountId})`);
+      // Missing-row SELECT ... FOR UPDATE does not serialize two first-time
+      // callers. Lock the canonical idempotency coordinate before looking for
+      // the row so only one request may reserve manna/admit provider work.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(
+        'eden3-voice-execution:'||${input.ownerAccountId}::text||':'||${input.operation}||':'||${input.idempotencyKey},0))`);
       const priorResult = await tx.execute(sql`
         select * from voice_executions where owner_account_id=${input.ownerAccountId}
           and purpose=${input.operation} and idempotency_key=${input.idempotencyKey} for update
@@ -477,29 +526,55 @@ export class VoiceKernel {
         model: admission.voice.model,
         units: { audio_character: billedCharacters },
       });
-      await this.dbc.transaction(async (tx) => {
-        assertVoiceReconciliationActive(input.signal);
-        await this.resolveAuthorizedVoiceTx(tx, input.ownerAccountId, admission.voice.voiceId, input.operation);
-        assertVoiceReconciliationActive(input.signal);
-        await tx.execute(sql`
-          update voice_executions set output_sha256=${outputSha256},output_mime=${output.mime},
-            output_size_bytes=${output.bytes.length},output_duration_ms=${output.durationMs},
-            billed_character_count=${billedCharacters},cost_usd=${actual.totalCostUsd},updated_at=statement_timestamp()
-          where id=${admission.executionId} and status='transcoding'
-        `);
+      const protectedOutputUrl = ownerVoiceOutputPath(admission.executionId);
+      let stored: Awaited<ReturnType<VoiceKernelOptions['mediaStore']['put']>>;
+      stored = await this.withPrivateOutputCustody(async () => {
+        // Another admitted request may have failed publication before this
+        // request reached the serialized publication boundary.
+        if (this.privateOutputDirty) await this.scanOrphanedOutputs(input.signal);
+        try {
+          return await this.dbc.transaction(async (tx) => {
+            assertVoiceReconciliationActive(input.signal);
+            const owner = await tx.execute(sql`
+              select id from accounts where id=${input.ownerAccountId} and deleted=false for key share
+            `);
+            if (rows(owner).length !== 1) {
+              throw new VoiceKernelError(409, 'account_erasure_active', 'Account deletion is in progress');
+            }
+            await tx.execute(sql`select account_erasure_assert_account_writable(${input.ownerAccountId})`);
+            await this.resolveAuthorizedVoiceTx(tx, input.ownerAccountId, admission.voice.voiceId, input.operation);
+            assertVoiceReconciliationActive(input.signal);
+            // The digest lock, byte publication, and first authoritative output
+            // reference share one transaction. An erasure election therefore sees
+            // either the durable voice reference or no newly published bytes.
+            await tx.execute(sql`select account_erasure_assert_voice_output_writable(${outputSha256})`);
+            const next = await this.options.mediaStore.put(output.bytes, { mime: output.mime });
+            assertVoiceReconciliationActive(input.signal);
+            if (next.sha256 !== outputSha256 || next.mime !== output.mime || next.sizeBytes !== output.bytes.length) {
+              throw new VoiceAudioError('audio_invalid');
+            }
+            const published = await tx.execute(sql`
+              update voice_executions set output_url=${protectedOutputUrl},output_sha256=${next.sha256},
+                output_local_path=${next.localPath},output_mime=${next.mime},output_size_bytes=${next.sizeBytes},output_duration_ms=${output.durationMs},
+                waveform=${output.waveform},
+                billed_character_count=${billedCharacters},cost_usd=${actual.totalCostUsd},updated_at=statement_timestamp()
+              where id=${admission.executionId} and status='transcoding' returning id
+            `);
+            if (rows(published).length !== 1) throw new Error('voice execution lost output publication custody');
+            return next;
+          });
+        } catch (error) {
+          this.privateOutputDirty = true;
+          throw error;
+        }
       });
-      const stored = await this.options.mediaStore.put(output.bytes, { mime: output.mime });
-      assertVoiceReconciliationActive(input.signal);
-      if (stored.sha256 !== outputSha256 || stored.mime !== output.mime || stored.sizeBytes !== output.bytes.length) {
-        throw new VoiceAudioError('audio_invalid');
-      }
       const completed = await this.dbc.transaction(async (tx) => {
         assertVoiceReconciliationActive(input.signal);
         await this.resolveAuthorizedVoiceTx(tx, input.ownerAccountId, admission.voice.voiceId, input.operation);
         assertVoiceReconciliationActive(input.signal);
         if (input.deferSettlement) {
           const pending = await tx.execute(sql`
-            update voice_executions set output_url=${stored.url},output_sha256=${stored.sha256},
+            update voice_executions set output_url=${protectedOutputUrl},output_sha256=${stored.sha256},
               output_local_path=${stored.localPath},output_mime=${stored.mime},output_size_bytes=${stored.sizeBytes},output_duration_ms=${output.durationMs},
               waveform=${output.waveform},updated_at=statement_timestamp(),last_error_code=null
             where id=${admission.executionId} and status='transcoding' returning *
@@ -520,7 +595,7 @@ export class VoiceKernel {
           return executionDto(row, false);
         }
         const updated = await tx.execute(sql`
-          update voice_executions set status='completed',output_url=${stored.url},output_sha256=${stored.sha256},
+          update voice_executions set status='completed',output_url=${protectedOutputUrl},output_sha256=${stored.sha256},
             output_local_path=${stored.localPath},output_mime=${stored.mime},output_size_bytes=${stored.sizeBytes},output_duration_ms=${output.durationMs},
             waveform=${output.waveform},completed_at=statement_timestamp(),updated_at=statement_timestamp(),last_error_code=null
           where id=${admission.executionId} and status='transcoding' returning *
@@ -543,13 +618,50 @@ export class VoiceKernel {
           : error instanceof VoiceKernelError
             ? error.code
             : 'voice_execution_failed';
-      await this.failExecution(admission.executionId, admission.reservationKey, code);
-      await this.cleanupFailedArtifact(admission.executionId);
+      await this.recoverFailedExecution(admission.executionId, admission.reservationKey, code, input.signal);
       if (error instanceof VoiceKernelError) throw error;
       if (error instanceof VoiceProviderError && error.code === 'provider_result_indeterminate') {
         throw new VoiceKernelError(502, 'voice_provider_result_indeterminate', 'Voice provider result is indeterminate and will not be retried');
       }
       throw new VoiceKernelError(error instanceof VoiceAudioError ? 422 : 502, code, 'Voice execution failed');
+    }
+  }
+
+  private async recoverFailedExecution(
+    executionId: string,
+    reservationKey: string,
+    code: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    try {
+      await this.failExecution(executionId, reservationKey, code);
+    } catch {
+      // Stale reconciliation owns the durable refund/status repair. Do not
+      // let a database outage skip private filesystem custody below.
+    }
+    try {
+      await this.cleanupFailedArtifact(executionId);
+    } catch {
+      // The orphan/reference scanner is independent and must still run.
+    }
+    try {
+      await this.reconcileOrphanedOutputs(signal);
+    } catch {
+      // The original request still receives its bounded execution error.
+      // Every later admission scans again, so this failure cannot be masked
+      // by another writer succeeding in the meantime.
+    }
+  }
+
+  private async withPrivateOutputCustody<T>(work: () => Promise<T>): Promise<T> {
+    const predecessor = this.privateOutputCustodyTail;
+    let release!: () => void;
+    this.privateOutputCustodyTail = new Promise<void>((resolve) => { release = resolve; });
+    await predecessor;
+    try {
+      return await work();
+    } finally {
+      release();
     }
   }
 
@@ -577,16 +689,12 @@ export class VoiceKernel {
       `);
       const row = rows<{ output_sha256: string; output_mime: string }>(result)[0];
       if (!row) return;
-      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('voice-output:'||${row.output_sha256},0))`);
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('eden3-erasure-voice:sha:'||${row.output_sha256},0))`);
       const referenceResult = await tx.execute(sql`
         select
           exists(select 1 from voice_executions live where live.id<>${executionId}
             and live.output_sha256=${row.output_sha256}
-            and live.status not in ('failed','artifact_cleanup_pending'))
-          or exists(select 1 from media_assets m where m.sha256=${row.output_sha256})
-          or exists(select 1 from concept_images i where i.sha256=${row.output_sha256})
-          or exists(select 1 from agent_avatar_assets a where a.sha256=${row.output_sha256})
-          or exists(select 1 from creations c where c.url like ${`%/${row.output_sha256}.%`} or c.thumbnail_url like ${`%/${row.output_sha256}.%`}) shared,
+            and live.status not in ('failed','artifact_cleanup_pending')) shared,
           (select min(id)::text from voice_executions queued where queued.output_sha256=${row.output_sha256}
             and queued.status='artifact_cleanup_pending') elected_id
       `);
@@ -594,8 +702,112 @@ export class VoiceKernel {
       if (reference?.shared === false && reference.elected_id === executionId) {
         await this.options.cleanupArtifact(row.output_sha256, row.output_mime);
       }
-      await tx.execute(sql`update voice_executions set status='failed',updated_at=statement_timestamp() where id=${executionId} and status='artifact_cleanup_pending'`);
+      await tx.execute(sql`
+        update voice_executions set status='failed',output_url=null,output_local_path=null,
+          output_mime=null,output_size_bytes=null,output_duration_ms=null,waveform=null,
+          updated_at=statement_timestamp()
+        where id=${executionId} and status='artifact_cleanup_pending'
+      `);
     });
+  }
+
+  /**
+   * Remove crash-orphaned private voice files before admission and periodically.
+   * Unknown filesystem state is deliberately fatal: this root is private and
+   * should contain only LocalMediaStore canonical or crash-temp names.
+   */
+  async reconcileOrphanedOutputs(signal?: AbortSignal): Promise<number> {
+    if (this.privateOutputScanFlight) return await this.privateOutputScanFlight;
+    // Startup begins dirty, and every failed publication marks dirty. A clean
+    // periodic tick must not enumerate a lifetime of retained private audio or
+    // stall new publications behind an O(history) global scan.
+    if (!this.privateOutputDirty) return 0;
+    const flight = this.withPrivateOutputCustody(async () => await this.scanOrphanedOutputs(signal));
+    this.privateOutputScanFlight = flight;
+    try {
+      return await flight;
+    } finally {
+      if (this.privateOutputScanFlight === flight) this.privateOutputScanFlight = null;
+    }
+  }
+
+  private async scanOrphanedOutputs(signal?: AbortSignal): Promise<number> {
+    this.privateOutputDirty = true;
+    const root = this.options.voiceOutputRoot;
+    if (!root) {
+      this.privateOutputDirty = false;
+      return 0;
+    }
+    const canonicalRoot = await realpath(root);
+    const entries = await readdir(canonicalRoot, { withFileTypes: true });
+    const referenceResult = entries.length === 0
+      ? []
+      : await this.dbc.execute(sql`
+          select output_local_path,output_sha256,output_mime from voice_executions
+          where output_local_path is not null and status<>'failed'
+        `);
+    const references = new Map(rows<{
+      output_local_path: string;
+      output_sha256: string | null;
+      output_mime: string | null;
+    }>(referenceResult).map((reference) => [reference.output_local_path, reference]));
+    let removed = 0;
+    for (const entry of entries) {
+      assertVoiceReconciliationActive(signal);
+      if (!entry.isFile() || entry.isSymbolicLink()) {
+        throw new Error('private voice output root contains an unsupported filesystem entry');
+      }
+      const canonical = /^([0-9a-f]{64})\.(ogg|mp3)$/.exec(entry.name);
+      const temporary = /^\.([0-9a-f]{64})\.(ogg|mp3)\.[0-9]+\.[0-9a-f-]{36}\.tmp$/.exec(entry.name);
+      const match = canonical ?? temporary;
+      if (!match) throw new Error('private voice output root contains an unknown file');
+      const sha256 = match[1]!;
+      const candidate = path.join(canonicalRoot, entry.name);
+      const snapshottedReference = references.get(candidate);
+      if (temporary && snapshottedReference) {
+        throw new Error('voice execution references a crash-temp output path');
+      }
+      if (canonical && snapshottedReference) {
+        const expectedMime = match[2] === 'ogg' ? 'audio/ogg' : 'audio/mpeg';
+        if (snapshottedReference.output_sha256 !== sha256 || snapshottedReference.output_mime !== expectedMime) {
+          throw new Error('voice execution output metadata does not match its private file');
+        }
+        continue;
+      }
+      const didRemove = await this.dbc.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('eden3-erasure-voice:sha:'||${sha256},0))`);
+        const references = temporary
+          ? await tx.execute(sql`select exists(select 1 from voice_executions
+              where output_local_path=${candidate} and status<>'failed') referenced`)
+          : await tx.execute(sql`select exists(select 1 from voice_executions
+              where output_local_path=${candidate} and output_sha256=${sha256}
+                and output_mime=${match[2] === 'ogg' ? 'audio/ogg' : 'audio/mpeg'}
+                and status<>'failed') referenced`);
+        if (rows<{ referenced: boolean }>(references)[0]?.referenced) {
+          if (temporary) throw new Error('voice execution references a crash-temp output path');
+          return false;
+        }
+        let handle: Awaited<ReturnType<typeof open>> | undefined;
+        try {
+          handle = await open(candidate, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+          const stat = await handle.stat();
+          const lexical = await lstat(candidate);
+          if (!stat.isFile() || !lexical.isFile() || lexical.isSymbolicLink()) {
+            throw new Error('private voice output orphan is not a regular file');
+          }
+          await unlink(candidate);
+          return true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+          throw error;
+        } finally {
+          await handle?.close().catch(() => undefined);
+        }
+      });
+      if (didRemove) removed += 1;
+    }
+    this.privateOutputDirty = false;
+    return removed;
   }
 
   /** Conservative crash recovery: indeterminate work is never replayed and never charged without output. */
@@ -605,7 +817,8 @@ export class VoiceKernel {
   ): Promise<number> {
     assertVoiceReconciliationActive(signal);
     const result = await this.dbc.execute(sql`
-      select v.id from voice_executions v
+      select v.id,v.status,v.output_url,v.channel_turn_id,ct.status channel_status from voice_executions v
+      left join channel_turns ct on ct.turn_id=v.channel_turn_id
       where v.status in ('provider_started','transcoding','refund_pending','artifact_cleanup_pending') and v.updated_at<${cutoff.toISOString()}
         and not exists (
           select 1 from direct_voice_jobs j where j.message_id=v.message_id
@@ -614,8 +827,22 @@ export class VoiceKernel {
         )
       order by v.updated_at,v.id limit 100
     `);
-    for (const row of rows<{ id: string }>(result)) {
+    for (const row of rows<{ id: string; status: string; output_url: string | null; channel_turn_id: string | null; channel_status: string | null }>(result)) {
       assertVoiceReconciliationActive(signal);
+      if (row.channel_turn_id && row.status === 'transcoding' && row.output_url) {
+        if (row.channel_status === 'delivered') {
+          await this.settleChannelVoiceDelivery(row.channel_turn_id);
+          continue;
+        }
+        if (row.channel_status === 'refunded') {
+          await this.refundChannelVoiceDelivery(row.channel_turn_id, 'channel_delivery_failed');
+          continue;
+        }
+        // A delivery acknowledgement may still rescue a claimed compensation
+        // until its ledger reversal commits. Never decide voice custody while
+        // the channel turn is delivery-pending or refunding.
+        if (row.channel_status === 'delivery_pending' || row.channel_status === 'refunding') continue;
+      }
       await this.failExecution(row.id, `voice:${row.id}`, 'voice_execution_recovered_indeterminate');
       assertVoiceReconciliationActive(signal);
       await this.cleanupFailedArtifact(row.id);
@@ -625,6 +852,7 @@ export class VoiceKernel {
 
   async assignment(ownerAccountId: string, username: string, value: Omit<VoiceAssignmentDto, 'updatedAt'>): Promise<VoiceAssignmentDto> {
     return await this.dbc.transaction(async (tx) => {
+      await this.assertOwnerWritableTx(tx, ownerAccountId);
       const agentResult = await tx.execute(sql`select a.id from accounts a join agents g on g.account_id=a.id where a.username=${username} and g.owner_id=${ownerAccountId} and a.deleted=false for update of g`);
       const agent = rows<{ id: string }>(agentResult)[0];
       if (!agent) throw new VoiceKernelError(404, 'agent_not_found', 'Agent not found');
@@ -642,7 +870,10 @@ export class VoiceKernel {
   }
 
   async deleteAssignment(ownerAccountId: string, username: string): Promise<void> {
-    const result = await this.dbc.execute(sql`delete from agent_voice_assignments av using agents g,accounts a where av.agent_account_id=g.account_id and g.account_id=a.id and a.username=${username} and g.owner_id=${ownerAccountId} returning av.agent_account_id`);
+    const result = await this.dbc.transaction(async (tx) => {
+      await this.assertOwnerWritableTx(tx, ownerAccountId);
+      return await tx.execute(sql`delete from agent_voice_assignments av using agents g,accounts a where av.agent_account_id=g.account_id and g.account_id=a.id and a.username=${username} and g.owner_id=${ownerAccountId} returning av.agent_account_id`);
+    });
     if (rows(result).length === 0) throw new VoiceKernelError(404, 'voice_assignment_not_found', 'Voice assignment not found');
   }
 
@@ -853,6 +1084,13 @@ export class VoiceKernel {
     requiredMode?: 'always',
   ): Promise<{ execution: VoiceExecutionDto; message: MessageDto; refreshPending: boolean }> {
     const disposition = await this.dbc.transaction(async (tx) => {
+      const owner = await tx.execute(sql`
+        select id from accounts where id=${ownerAccountId} and deleted=false for key share
+      `);
+      if (rows(owner).length !== 1) {
+        throw new VoiceKernelError(409, 'account_erasure_active', 'Account deletion is in progress');
+      }
+      await tx.execute(sql`select account_erasure_assert_account_writable(${ownerAccountId})`);
       let result = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
       let job = rows<DirectVoiceJobRow>(result)[0];
       if (job) {
@@ -884,10 +1122,20 @@ export class VoiceKernel {
       if (!eligible?.content) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
       const transcript = exactTranscript(eligible.content, 'chat');
       await this.resolveAuthorizedVoiceTx(tx, ownerAccountId, eligible.voice_id, 'chat');
-      await tx.execute(sql`
+      const insertedJob = await tx.execute(sql`
         insert into direct_voice_jobs (message_id,owner_account_id,session_id,agent_account_id,voice_id,text_sha256,mode,status)
         values (${messageId},${ownerAccountId},${sessionId},${eligible.agent_account_id},${eligible.voice_id},${transcript.sha256},${eligible.chat_mode},'queued')
+        on conflict (message_id) do nothing returning *
       `);
+      if (rows(insertedJob).length === 0) {
+        result = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
+        job = rows<DirectVoiceJobRow>(result)[0];
+        if (!job || job.owner_account_id !== ownerAccountId || job.session_id !== sessionId ||
+            (requiredMode === 'always' && job.mode !== 'always')) {
+          throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+        }
+        if (job.status === 'completed') return { completed: await this.loadDirectVoiceResult(tx, job) } as const;
+      }
       return { completed: null } as const;
     });
     if (disposition.completed) {
@@ -981,18 +1229,187 @@ export class VoiceKernel {
     `);
     const row = rows<{ account_id: string; agent_id: string; session_id: string | null; channel: 'discord' | 'telegram'; voice_id: string; voice_mode: string }>(result)[0];
     if (!row || row.voice_mode !== 'always') throw new VoiceKernelError(409, 'channel_voice_not_enabled', 'Channel voice is not enabled');
+    const transcript = exactTranscript(input.text, row.channel);
+    const priorResult = await this.dbc.execute(sql`
+      select * from voice_executions where channel_turn_id=${input.turnId} and owner_account_id=${row.account_id}
+    `);
+    const prior = rows<ExecutionRow>(priorResult)[0];
+    if (prior) {
+      if (prior.idempotency_key !== input.idempotencyKey || prior.text_sha256 !== transcript.sha256) {
+        throw new VoiceKernelError(409, 'idempotency_conflict', 'Channel voice retry did not match the durable execution');
+      }
+      if ((prior.status === 'transcoding' || prior.status === 'completed') && prior.output_url && prior.output_mime && prior.output_duration_ms) {
+        const waveformResult = await this.dbc.execute(sql`select waveform from voice_executions where id=${prior.id}`);
+        return { ...executionDto(prior, true), waveform: rows<{ waveform: string | null }>(waveformResult)[0]?.waveform ?? null };
+      }
+      throw new VoiceKernelError(409, prior.status === 'failed' ? 'voice_execution_terminal' : 'voice_execution_in_progress', 'Channel voice execution is not deliverable');
+    }
     const quote = await this.quote(row.account_id, row.channel, row.voice_id, input.text);
-    const execution = await this.synthesize({ ownerAccountId: row.account_id, operation: row.channel, voiceId: row.voice_id, quoteId: quote.quoteId, text: input.text, idempotencyKey: input.idempotencyKey, agentAccountId: row.agent_id, sessionId: row.session_id ?? undefined, channelTurnId: input.turnId });
+    const execution = await this.synthesize({ ownerAccountId: row.account_id, operation: row.channel, voiceId: row.voice_id, quoteId: quote.quoteId, text: input.text, idempotencyKey: input.idempotencyKey, agentAccountId: row.agent_id, sessionId: row.session_id ?? undefined, channelTurnId: input.turnId, deferSettlement: true });
     const waveformResult = await this.dbc.execute(sql`select waveform from voice_executions where id=${execution.id}`);
     return { ...execution, waveform: rows<{ waveform: string | null }>(waveformResult)[0]?.waveform ?? null };
   }
 
+  private async readVerifiedVoiceOutput(row: ExecutionRow): Promise<VoiceOutputBytes> {
+    const root = this.options.voiceOutputRoot;
+    if (!root || !row.output_local_path || !row.output_sha256 || !row.output_mime || row.output_size_bytes === null) {
+      throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');
+    }
+    const sizeBytes = Number(row.output_size_bytes);
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes < 1 || sizeBytes > 8 * 1024 * 1024 ||
+        !/^[0-9a-f]{64}$/.test(row.output_sha256) || !['audio/ogg', 'audio/mpeg'].includes(row.output_mime)) {
+      throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');
+    }
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    try {
+      const [canonicalRoot, canonicalFile] = await Promise.all([realpath(root), realpath(row.output_local_path)]);
+      if (path.dirname(canonicalFile) !== canonicalRoot) {
+        throw new Error('voice output metadata mismatch');
+      }
+      handle = await open(canonicalFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const metadata = await handle.stat();
+      if (!metadata.isFile() || metadata.size !== sizeBytes) throw new Error('voice output metadata mismatch');
+      const bytes = await handle.readFile();
+      if (bytes.length !== sizeBytes || createHash('sha256').update(bytes).digest('hex') !== row.output_sha256) {
+        throw new Error('voice output digest mismatch');
+      }
+      return { bytes, mime: row.output_mime, sizeBytes, sha256: row.output_sha256 };
+    } catch {
+      throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
+
+  /** Browser voice is private: preview owner or an exact readable chat attachment. */
+  async ownerVoiceOutput(viewerAccountId: string, executionId: string): Promise<VoiceOutputBytes> {
+    const result = await this.dbc.execute(sql`
+      select v.* from voice_executions v
+      left join sessions s on s.id=v.session_id
+      left join messages m on m.id=v.message_id and m.session_id=v.session_id
+      where v.id=${executionId} and v.status='completed' and v.purpose in ('preview','chat')
+        and not exists (select 1 from account_erasure_jobs e where e.state<>'succeeded'
+          and e.account_id in (v.owner_account_id,v.agent_account_id))
+        and (
+          (v.purpose='preview' and v.owner_account_id=${viewerAccountId})
+          or (
+            v.purpose='chat' and s.deleted=false and s.visible is distinct from false
+            and (s.owner_id=${viewerAccountId} or exists (
+              select 1 from session_users su where su.session_id=s.id and su.user_account_id=${viewerAccountId}
+            ))
+            and exists (
+              select 1 from jsonb_array_elements(coalesce(m.attachments,'[]'::jsonb)) item
+              where item->>'voiceExecutionId'=v.id::text and item->>'url'=v.output_url
+            )
+          )
+        )
+    `);
+    const row = rows<ExecutionRow>(result)[0];
+    if (!row) throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');
+    return await this.readVerifiedVoiceOutput(row);
+  }
+
+  /** Docker-private capability resolution; the route verifies the HMAC first. */
+  async channelVoiceOutput(turnId: string, executionId: string, operationId: string): Promise<VoiceOutputBytes> {
+    const result = await this.dbc.execute(sql`
+      select v.* from voice_executions v
+      join channel_turns ct on ct.turn_id=v.channel_turn_id
+      join channel_connections cc on cc.id=ct.connection_id
+      where v.id=${executionId} and v.channel_turn_id=${turnId}
+        and v.idempotency_key=${`channel:${operationId}`}
+        and v.purpose in ('discord','telegram') and v.status in ('transcoding','completed')
+        and ct.status='delivery_pending'
+        and cc.desired_state='active' and cc.status='connected'
+        and not exists (select 1 from account_erasure_jobs e where e.state<>'succeeded'
+          and e.account_id in (v.owner_account_id,v.agent_account_id))
+    `);
+    const row = rows<ExecutionRow>(result)[0];
+    if (!row) throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');
+    return await this.readVerifiedVoiceOutput(row);
+  }
+
+  /** Charge channel voice only after the native provider has acknowledged delivery. */
+  async settleChannelVoiceDelivery(turnId: string): Promise<boolean> {
+    return await this.dbc.transaction(async (tx) => {
+      const result = await tx.execute(sql`
+        select v.* from voice_executions v join channel_turns ct on ct.turn_id=v.channel_turn_id
+        where v.channel_turn_id=${turnId} and ct.status='delivered' for update of v
+      `);
+      const execution = rows<ExecutionRow>(result)[0];
+      if (!execution) return false;
+      if (execution.status === 'completed') return false;
+      if (execution.status !== 'transcoding' || !execution.output_url || !execution.output_mime || !execution.output_duration_ms) {
+        throw new VoiceKernelError(409, 'voice_execution_in_progress', 'Channel voice output is not ready for settlement');
+      }
+      const completedResult = await tx.execute(sql`
+        update voice_executions set status='completed',completed_at=statement_timestamp(),updated_at=statement_timestamp(),last_error_code=null
+        where id=${execution.id} and status='transcoding' returning id
+      `);
+      if (rows(completedResult).length !== 1) throw new Error('channel voice settlement lost execution custody');
+      const usageResult = await tx.execute(sql`
+        update usage_events set status='completed',cost_usd=(select cost_usd from voice_executions where id=${execution.id}),
+          metadata=coalesce(metadata,'{}'::jsonb)||${JSON.stringify({ channelDeliveryCommitted: true })}::jsonb
+        where event_type='voice_generation' and turn_id=${execution.id} and status='provider_admitted' returning id
+      `);
+      if (rows(usageResult).length !== 1) throw new Error('channel voice settlement lost usage custody');
+      return true;
+    });
+  }
+
+  /** Reverse and remove an undelivered channel artifact exactly once. */
+  async refundChannelVoiceDelivery(turnId: string, code = 'channel_delivery_failed'): Promise<boolean> {
+    // Symmetric with settlement: the authoritative channel terminal state is
+    // revalidated under the execution row lock. A caller cannot refund voice
+    // merely by winning an HTTP race against a native delivery acknowledgement.
+    const result = await this.dbc.transaction(async (tx) => await tx.execute(sql`
+      select v.id,v.status from voice_executions v join channel_turns ct on ct.turn_id=v.channel_turn_id
+      where v.channel_turn_id=${turnId} and ct.status='refunded' for update of v
+    `));
+    const execution = rows<{ id: string; status: VoiceExecutionDto['status'] }>(result)[0];
+    if (!execution || execution.status === 'completed' || execution.status === 'failed') return false;
+    await this.failExecution(execution.id, `voice:${execution.id}`, code);
+    await this.cleanupFailedArtifact(execution.id);
+    return true;
+  }
+
   async createClone(input: { ownerAccountId: string; name: string; clipObjectIds: string[]; consentVersion: string; consentAttested: true; idempotencyKey: string }): Promise<VoiceCloneDto> {
     if (!input.consentAttested || input.consentVersion !== 'voice-clone-consent-v1') throw new VoiceKernelError(422, 'voice_consent_required', 'Current voice consent is required');
-    if (!this.options.mediaResolver) throw new VoiceKernelError(503, 'voice_storage_unavailable', 'Voice clip storage is unavailable');
     if (input.clipObjectIds.length < 1 || input.clipObjectIds.length > 5 || new Set(input.clipObjectIds).size !== input.clipObjectIds.length) {
       throw new VoiceKernelError(422, 'voice_clip_not_ready', 'Choose between one and five distinct voice clips');
     }
+    // Resolve durable replay before touching mutable clip/object/provider
+    // custody. A lost successful response must remain replayable after its
+    // source clips are quarantined or removed.
+    const priorClone = await this.dbc.transaction(async (tx) => {
+      const owner = await tx.execute(sql`
+        select id from accounts where id=${input.ownerAccountId} and deleted=false for key share
+      `);
+      if (rows(owner).length !== 1) {
+        throw new VoiceKernelError(409, 'account_erasure_active', 'Account deletion is in progress');
+      }
+      await tx.execute(sql`select account_erasure_assert_account_writable(${input.ownerAccountId})`);
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(
+        'eden3-voice-clone:'||${input.ownerAccountId}::text||':'||${input.idempotencyKey},0))`);
+      const priorResult = await tx.execute(sql`
+        select * from voice_clones where owner_account_id=${input.ownerAccountId}
+          and idempotency_key=${input.idempotencyKey} for update
+      `);
+      const prior = rows<Record<string, unknown>>(priorResult)[0];
+      if (!prior) return null;
+      const clipResult = await tx.execute(sql`
+        select object_id from voice_clone_clips where clone_id=${String(prior.id)} order by position
+      `);
+      const priorObjectIds = rows<{ object_id: string }>(clipResult).map((row) => row.object_id);
+      if (prior.name !== input.name || prior.provider !== 'cartesia' ||
+          prior.consent_version !== input.consentVersion ||
+          priorObjectIds.length !== input.clipObjectIds.length ||
+          priorObjectIds.some((id, index) => id !== input.clipObjectIds[index])) {
+        throw new VoiceKernelError(409, 'idempotency_conflict', 'Idempotency key was used for another clone');
+      }
+      return cloneDto(prior);
+    });
+    if (priorClone) return priorClone;
+    if (!this.options.mediaResolver) throw new VoiceKernelError(503, 'voice_storage_unavailable', 'Voice clip storage is unavailable');
     const metaResult = await this.dbc.execute(sql`
       select id object_id,verified_mime mime,verified_size_bytes size_bytes,verified_sha256 sha256
       from storage_objects where id in (${sql.join(input.clipObjectIds.map((id) => sql`${id}`), sql`, `)}) and owner_account_id=${input.ownerAccountId}
@@ -1033,6 +1450,15 @@ export class VoiceKernel {
     const manifest = requestHash(manifestItems);
     const requestSha256 = requestHash({ name: input.name, manifest, consentVersion: input.consentVersion, provider: 'cartesia' });
     const clone = await this.dbc.transaction(async (tx) => {
+      const owner = await tx.execute(sql`
+        select id from accounts where id=${input.ownerAccountId} and deleted=false for key share
+      `);
+      if (rows(owner).length !== 1) {
+        throw new VoiceKernelError(409, 'account_erasure_active', 'Account deletion is in progress');
+      }
+      await tx.execute(sql`select account_erasure_assert_account_writable(${input.ownerAccountId})`);
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(
+        'eden3-voice-clone:'||${input.ownerAccountId}::text||':'||${input.idempotencyKey},0))`);
       const priorResult = await tx.execute(sql`select * from voice_clones where owner_account_id=${input.ownerAccountId} and idempotency_key=${input.idempotencyKey} for update`);
       const prior = rows<Record<string, unknown>>(priorResult)[0];
       if (prior) {
@@ -1148,6 +1574,7 @@ export class VoiceKernel {
 
   async revokeClone(ownerAccountId: string, id: string): Promise<VoiceCloneDto> {
     const result = await this.dbc.transaction(async (tx) => {
+      await this.assertOwnerWritableTx(tx, ownerAccountId);
       const currentResult = await tx.execute(sql`select * from voice_clones where id=${id} and owner_account_id=${ownerAccountId} for update`);
       const current = rows<Record<string, unknown>>(currentResult)[0];
       if (!current) throw new VoiceKernelError(404, 'voice_clone_not_found', 'Voice clone not found');
@@ -1188,13 +1615,16 @@ export class VoiceKernel {
     const found = await provider.findOwnedCloneByName(providerCloneName(id), signal);
     assertVoiceReconciliationActive(signal);
     if (found) {
-      await this.dbc.execute(sql`
-        update voice_clones set status='provider_delete_pending',provider_voice_id=${found.providerVoiceId},
-          consent_revoked_at=coalesce(consent_revoked_at,statement_timestamp()),
-          revoked_at=coalesce(revoked_at,statement_timestamp()),failure_code='provider_create_reconciled',
-          updated_at=statement_timestamp()
-        where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
-      `);
+      await this.dbc.transaction(async (tx) => {
+        await this.assertOwnerWritableTx(tx, ownerAccountId);
+        await tx.execute(sql`
+          update voice_clones set status='provider_delete_pending',provider_voice_id=${found.providerVoiceId},
+            consent_revoked_at=coalesce(consent_revoked_at,statement_timestamp()),
+            revoked_at=coalesce(revoked_at,statement_timestamp()),failure_code='provider_create_reconciled',
+            updated_at=statement_timestamp()
+          where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
+        `);
+      });
       return 'resolved';
     }
     const absence = ambiguousCloneAbsenceDisposition(
@@ -1205,23 +1635,29 @@ export class VoiceKernel {
       // Revocation alone is not evidence of provider absence. Persist the
       // first authoritative lookup result in the request locator; only a
       // second time-separated lookup may close local custody.
-      await this.dbc.execute(sql`
-        update voice_clones set consent_revoked_at=coalesce(consent_revoked_at,statement_timestamp()),
-          provider_request_id=coalesce(provider_request_id,${`absence:${this.now().toISOString()}`}),
-          failure_code='provider_create_absence_observed',updated_at=statement_timestamp()
-        where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
-          and provider_request_id is null
-      `);
+      await this.dbc.transaction(async (tx) => {
+        await this.assertOwnerWritableTx(tx, ownerAccountId);
+        await tx.execute(sql`
+          update voice_clones set consent_revoked_at=coalesce(consent_revoked_at,statement_timestamp()),
+            provider_request_id=coalesce(provider_request_id,${`absence:${this.now().toISOString()}`}),
+            failure_code='provider_create_absence_observed',updated_at=statement_timestamp()
+          where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
+            and provider_request_id is null
+        `);
+      });
       return 'pending';
     }
     if (absence === 'pending') return 'pending';
     assertVoiceReconciliationActive(signal);
-    await this.dbc.execute(sql`
-      update voice_clones set status='revoked',revoked_at=coalesce(revoked_at,statement_timestamp()),
-        failure_code='provider_create_absence_confirmed',updated_at=statement_timestamp()
-      where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
-        and consent_revoked_at is not null
-    `);
+    await this.dbc.transaction(async (tx) => {
+      await this.assertOwnerWritableTx(tx, ownerAccountId);
+      await tx.execute(sql`
+        update voice_clones set status='revoked',revoked_at=coalesce(revoked_at,statement_timestamp()),
+          failure_code='provider_create_absence_confirmed',updated_at=statement_timestamp()
+        where id=${id} and owner_account_id=${ownerAccountId} and status='provider_create_ambiguous'
+          and consent_revoked_at is not null
+      `);
+    });
     return 'resolved';
   }
 
@@ -1279,7 +1715,10 @@ export class VoiceKernel {
       const provider = this.options.providers.cartesia;
       if (!provider?.deleteClone) throw new VoiceKernelError(503, 'voice_provider_unavailable', 'Clone deletion provider is unavailable');
       if (row.status === 'provider_delete_failed' || row.status === 'revoked') {
-        await this.dbc.execute(sql`update voice_clones set status='provider_delete_pending',updated_at=statement_timestamp() where id=${id} and owner_account_id=${ownerAccountId} and status=${row.status}`);
+        await this.dbc.transaction(async (tx) => {
+          await this.assertOwnerWritableTx(tx, ownerAccountId);
+          await tx.execute(sql`update voice_clones set status='provider_delete_pending',updated_at=statement_timestamp() where id=${id} and owner_account_id=${ownerAccountId} and status=${row.status}`);
+        });
       }
       try {
         await provider.deleteClone(row.provider_voice_id, signal);
@@ -1287,12 +1726,16 @@ export class VoiceKernel {
       }
       catch (error) {
         if (signal?.aborted) throw error;
-        await this.dbc.execute(sql`update voice_clones set status='provider_delete_failed',failure_code='provider_delete_failed',updated_at=statement_timestamp() where id=${id} and status='provider_delete_pending'`);
+        await this.dbc.transaction(async (tx) => {
+          await this.assertOwnerWritableTx(tx, ownerAccountId);
+          await tx.execute(sql`update voice_clones set status='provider_delete_failed',failure_code='provider_delete_failed',updated_at=statement_timestamp() where id=${id} and status='provider_delete_pending'`);
+        });
         throw new VoiceKernelError(502, 'clone_delete_pending', 'Clone deletion requires reconciliation');
       }
     }
     clone = await this.dbc.transaction(async (tx) => {
       assertVoiceReconciliationActive(signal);
+      await this.assertOwnerWritableTx(tx, ownerAccountId);
       // The row locks fence reference election while bounded storage deletion
       // runs. Abort propagates through the object backend so a stuck provider
       // cannot retain a database connection beyond the reconciliation lease;
@@ -1376,5 +1819,6 @@ export const voiceKernelInternals = {
   providerCloneName,
   ambiguousCloneAbsenceDisposition,
   directVoiceExecutionKey,
+  ownerVoiceOutputPath,
   TEXT_LIMITS,
 };

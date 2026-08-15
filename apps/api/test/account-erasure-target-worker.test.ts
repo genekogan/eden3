@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   AccountErasureTargetWorker,
   attestAccountErasureLegacyMediaBoundary,
+  attestAccountErasureVoiceOutputBoundary,
   CartesiaVoiceCloneErasureExecutor,
   LocalLegacyErasureExecutor,
   type AccountErasureTargetClaim,
@@ -123,14 +124,26 @@ describe('AccountErasureTargetWorker', () => {
 
   it('unlinks only canonical regular content-addressed files and rejects symlinks/escapes', async () => {
     const root = await mkdtemp(join(tmpdir(), 'eden3-erasure-media-'));
+    const voiceRoot = await mkdtemp(join(tmpdir(), 'eden3-erasure-voice-'));
     const sha256 = 'a'.repeat(64);
     const canonical = join(root, `${sha256}.png`);
     await writeFile(canonical, 'private bytes');
     const external = { erase: vi.fn(async () => ({ confirmedAbsent: true as const })) };
     const executor = new LocalLegacyErasureExecutor(
       attestAccountErasureLegacyMediaBoundary(root),
+      attestAccountErasureVoiceOutputBoundary(voiceRoot),
       external,
     );
+    const nestedVoice = join(root, 'nested-voice');
+    await mkdir(nestedVoice);
+    expect(() => new LocalLegacyErasureExecutor(
+      attestAccountErasureLegacyMediaBoundary(root),
+      attestAccountErasureVoiceOutputBoundary(nestedVoice),
+      external,
+    )).toThrow(/distinct attested voice output boundary/);
+    const voiceAlias = join(root, 'voice-alias');
+    await symlink(voiceRoot, voiceAlias);
+    expect(() => attestAccountErasureVoiceOutputBoundary(voiceAlias)).toThrow(/must not be a symlink/);
     const localClaim = {
       ...claim,
       kind: 'legacy_media_asset' as const,
@@ -166,6 +179,26 @@ describe('AccountErasureTargetWorker', () => {
     })).resolves.toEqual({ confirmedAbsent: true });
     await expect(readFile(avatar)).rejects.toMatchObject({ code: 'ENOENT' });
 
+    const voiceSha = 'f'.repeat(64);
+    const voice = join(voiceRoot, `${voiceSha}.ogg`);
+    await writeFile(voice, 'private voice bytes');
+    await expect(executor.erase({
+      ...localClaim,
+      kind: 'voice_output',
+      signal: new AbortController().signal,
+      locator: JSON.stringify({ localPath: voice, sha256: voiceSha, deletePhysical: true }),
+    })).resolves.toEqual({ confirmedAbsent: true });
+    await expect(readFile(voice)).rejects.toMatchObject({ code: 'ENOENT' });
+    const wrongRootVoice = join(root, `${voiceSha}.ogg`);
+    await writeFile(wrongRootVoice, 'must survive');
+    await expect(executor.erase({
+      ...localClaim,
+      kind: 'voice_output',
+      signal: new AbortController().signal,
+      locator: JSON.stringify({ localPath: wrongRootVoice, sha256: voiceSha, deletePhysical: true }),
+    })).rejects.toThrow(/flat media root/);
+    expect(await readFile(wrongRootVoice, 'utf8')).toBe('must survive');
+
     await expect(executor.erase({
       ...localClaim,
       signal: new AbortController().signal,
@@ -198,9 +231,10 @@ describe('AccountErasureTargetWorker', () => {
     })).rejects.toThrow(/regular file|escaped/);
     expect(await readFile(outside, 'utf8')).toBe('foreign bytes');
     await rm(root, { recursive: true, force: true });
+    await rm(voiceRoot, { recursive: true, force: true });
     await rm(outsideRoot, { recursive: true, force: true });
   });
 });
-import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

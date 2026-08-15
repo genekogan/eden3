@@ -94,4 +94,16 @@ describe('voice contract invariants', () => {
     expect(kernelSource).toContain("update voice_executions set status='completed'");
     expect(kernelSource).toContain("update direct_voice_jobs set status='completed'");
   });
+
+  it('serializes first-time idempotency admission and publishes bytes behind owner then digest custody', () => {
+    expect(kernelSource).toContain("'eden3-voice-execution:'||${input.ownerAccountId}::text");
+    expect(kernelSource).toContain("'eden3-voice-clone:'||${input.ownerAccountId}::text");
+    expect(kernelSource).toContain('select id from accounts where id=${input.ownerAccountId} and deleted=false for key share');
+    expect(kernelSource).toContain('select account_erasure_assert_account_writable(${input.ownerAccountId})');
+    expect(kernelSource).toContain('select account_erasure_assert_voice_output_writable(${outputSha256})');
+    expect(kernelSource.indexOf('select account_erasure_assert_voice_output_writable(${outputSha256})'))
+      .toBeLessThan(kernelSource.indexOf('this.options.mediaStore.put(output.bytes'));
+    expect(kernelSource).toContain('on conflict (message_id) do nothing returning *');
+    expect(kernelSource).not.toContain('eden3-direct-voice-message:');
+  });
 });

@@ -15,6 +15,7 @@
     "migrate": "tsx src/migrate.ts",
     "managed:preflight": "tsx src/managed-preflight-cli.ts",
     "managed:bootstrap-runtime": "tsx src/managed-runtime-bootstrap-cli.ts",
+    "managed:upgrade-runtime-voice": "tsx src/managed-runtime-voice-upgrade-cli.ts",
     "managed:runtime-rehearsal": "tsx src/managed-runtime-rehearsal-cli.ts",
     "studio": "drizzle-kit studio",
     "ping": "tsx src/ping.ts",

@@ -59,12 +59,41 @@ END;
 $$;
 --> statement-breakpoint
 
+-- Serialize every private voice publication against an active voice-output
+-- erasure target using the same digest coordinate as target election. The
+-- function returns no data and uses a fixed search path, so granting execute
+-- to the runtime role does not broaden table visibility.
+CREATE OR REPLACE FUNCTION public.account_erasure_assert_voice_output_writable(p_sha text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public,pg_temp AS $$
+BEGIN
+	IF p_sha IS NULL OR p_sha !~ '^[0-9a-f]{64}$' THEN
+		RAISE EXCEPTION 'content digest is invalid' USING ERRCODE='22023';
+	END IF;
+	PERFORM pg_advisory_xact_lock(hashtextextended('eden3-erasure-voice:sha:'||p_sha,0));
+	IF EXISTS (
+		SELECT 1 FROM public.account_erasure_targets t
+		JOIN public.account_erasure_jobs j ON j.id=t.job_id
+		JOIN public.voice_executions ve ON t.kind='voice_output' AND ve.id=t.resource_id
+		WHERE t.state<>'succeeded' AND j.state<>'succeeded'
+			AND p_sha=ve.output_sha256
+	) THEN
+		RAISE EXCEPTION 'content digest is fenced by active erasure' USING ERRCODE='55000';
+	END IF;
+END;
+$$;
+--> statement-breakpoint
+REVOKE EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text) TO SESSION_USER;
+GRANT SELECT ON public.voice_executions TO eden3_erasure_guard;
+ALTER FUNCTION public.account_erasure_assert_voice_output_writable(text) OWNER TO eden3_erasure_guard;
+--> statement-breakpoint
+
 CREATE OR REPLACE FUNCTION public.voice_account_erasure_write_fence() RETURNS trigger
 LANGUAGE plpgsql SET search_path=pg_catalog,public,pg_temp AS $$
 DECLARE
 	v_old jsonb:=CASE WHEN TG_OP='INSERT' THEN '{}'::jsonb ELSE to_jsonb(OLD) END;
 	v_new jsonb:=CASE WHEN TG_OP='DELETE' THEN '{}'::jsonb ELSE to_jsonb(NEW) END;
-	v_owner uuid; v_clone uuid;
+	v_owner uuid; v_clone uuid; v_output_sha text;
 BEGIN
 	IF TG_TABLE_NAME='agent_voice_assignments' THEN
 		SELECT owner_id INTO v_owner FROM public.agents
@@ -80,6 +109,9 @@ BEGIN
 		v_owner:=COALESCE((v_old->>'owner_account_id')::uuid,(v_new->>'owner_account_id')::uuid);
 		IF TG_OP='DELETE' AND v_old->>'status'='completed'
 			AND public.account_erasure_target_claim_matches(v_owner,'voice_output',(v_old->>'id')::uuid) THEN RETURN OLD; END IF;
+		IF TG_OP<>'DELETE' THEN
+			v_output_sha:=NULLIF(v_new->>'output_sha256','');
+		END IF;
 	ELSIF TG_TABLE_NAME IN ('voice_quotes','direct_voice_jobs') THEN
 		v_owner:=COALESCE((v_old->>'owner_account_id')::uuid,(v_new->>'owner_account_id')::uuid);
 	END IF;
@@ -91,6 +123,9 @@ BEGIN
 		(TG_TABLE_NAME='voice_executions' AND v_old->>'status'<>'completed')
 	) THEN RETURN OLD; END IF;
 	PERFORM public.account_erasure_assert_account_writable(v_owner);
+	IF v_output_sha IS NOT NULL THEN
+		PERFORM public.account_erasure_assert_voice_output_writable(v_output_sha);
+	END IF;
 	IF TG_OP='DELETE' THEN RETURN OLD; END IF; RETURN NEW;
 END;
 $$;

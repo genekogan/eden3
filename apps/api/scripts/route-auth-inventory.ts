@@ -163,6 +163,7 @@ const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/voices/clones/:id/revoke', ['POST']],
   ['/voices/previews', ['POST']],
   ['/voices/quotes', ['POST']],
+  ['/media/voice/:executionId', ['GET', 'HEAD']],
 ];
 
 const OPERATOR_ROUTES: readonly PathMethods[] = [
@@ -211,6 +212,8 @@ const UUID_MEDIA_ROUTE =
   '/media/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
 const SHARE_MEDIA_ROUTE =
   '/media/share/:token/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
+const VOICE_RUNTIME_MEDIA_ROUTE =
+  '/media/runtime/voice/:turnId/:executionId/:operationId/:expires/:signature.ogg';
 
 export const ROUTE_AUTH_INVENTORY: readonly RouteAuthManifestEntry[] = [
   ...entries('public-exact', ['root:cohort-exact-policy'], PUBLIC_ROUTES),
@@ -232,6 +235,11 @@ export const ROUTE_AUTH_INVENTORY: readonly RouteAuthManifestEntry[] = [
       ['/shares/:token', ['GET', 'HEAD']],
       [SHARE_MEDIA_ROUTE, ['GET', 'HEAD']],
     ],
+  ),
+  ...entries(
+    'public-exact',
+    ['handler:voice-runtime-capability', 'response:private-capability'],
+    [[VOICE_RUNTIME_MEDIA_ROUTE, ['GET']]],
   ),
   ...entries(
     'public-exact',

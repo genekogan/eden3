@@ -64,6 +64,8 @@ const settle = vi.fn(async () => ({
 }));
 const refundDeliveryFailure = vi.fn(async () => {});
 const markDelivered = vi.fn(async () => {});
+const refundChannelVoiceDelivery = vi.fn(async () => true);
+const settleChannelVoiceDelivery = vi.fn(async () => true);
 
 beforeAll(async () => {
   const ownerId = await insertUserAccount(`${marker}_owner`);
@@ -111,6 +113,7 @@ beforeAll(async () => {
         refundDeliveryFailure,
         markDelivered,
       },
+      voiceDelivery: { refundChannelVoiceDelivery, settleChannelVoiceDelivery },
     },
   });
   await app.ready();
@@ -239,6 +242,7 @@ describe('private channel runtime routes', () => {
     });
     expect(accepted.statusCode).toBe(200);
     expect(refundDeliveryFailure).toHaveBeenCalledWith(turnId);
+    expect(refundChannelVoiceDelivery).toHaveBeenCalledWith(turnId, 'channel_delivery_failed');
   });
 
   it('finalizes successful outbound delivery only behind runtime auth', async () => {
@@ -257,5 +261,6 @@ describe('private channel runtime routes', () => {
     });
     expect(accepted.statusCode).toBe(200);
     expect(markDelivered).toHaveBeenCalledWith(turnId);
+    expect(settleChannelVoiceDelivery).toHaveBeenCalledWith(turnId);
   });
 });

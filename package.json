@@ -40,7 +40,8 @@
     "db:migrate": "pnpm --filter @eden3/db migrate",
     "db:managed-preflight": "pnpm --filter @eden3/db managed:preflight",
     "db:managed-bootstrap-runtime": "pnpm --filter @eden3/db managed:bootstrap-runtime",
-    "db:managed-runtime-rehearsal": "pnpm --filter @eden3/db managed:runtime-rehearsal"
+    "db:managed-runtime-rehearsal": "pnpm --filter @eden3/db managed:runtime-rehearsal",
+    "db:managed-upgrade-runtime-voice": "pnpm --filter @eden3/db managed:upgrade-runtime-voice"
   },
   "devDependencies": {
     "@playwright/test": "^1.53.2",

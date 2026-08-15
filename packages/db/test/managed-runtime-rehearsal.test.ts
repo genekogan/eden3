@@ -20,6 +20,7 @@ describe('managed PostgreSQL runtime connection rehearsal', () => {
     expect(source).toContain('recoveredPid === before.backendPid');
     expect(source).toContain("const RUNTIME_ROLE = /^eden3_runtime_");
     expect(source).toContain("ssl: 'verify-full'");
+    expect(source).toContain("has_function_privilege(current_user,'public.account_erasure_assert_voice_output_writable(text)','EXECUTE')");
     expect(cli).toContain("error: 'managed_runtime_rehearsal_failed'");
     expect(cli).not.toMatch(/console\.(?:log|error)\([^\n]*(?:databaseUrl|password|host)/);
   });
