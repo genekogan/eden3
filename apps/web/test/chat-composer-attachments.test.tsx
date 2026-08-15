@@ -15,6 +15,7 @@ describe('chat composer attachments', () => {
     expect(html).toContain('multiple=""');
     expect(html).toContain('image/png,image/jpeg,image/gif,image/webp,text/plain,application/json');
     expect(html).toContain('Add up to 8 images or text files');
+    expect(html).toContain('Dictation up to 10 minutes');
   });
 
   it('applies image/text type and byte limits before upload', () => {

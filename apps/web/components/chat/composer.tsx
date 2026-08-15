@@ -14,6 +14,11 @@ import type { ChangeEvent, DragEvent, KeyboardEvent, ReactNode } from "react";
 import { getClerkToken } from "@/lib/clerk";
 import { ResumableUploader } from "@/lib/resumable-upload";
 import type { MessageAttachment } from "@/lib/types";
+import {
+  appendTranscript,
+  formatDictationTime,
+  useDictation,
+} from "./use-dictation";
 
 const MAX_HEIGHT_PX = 220;
 const MAX_ATTACHMENTS = 8;
@@ -69,6 +74,15 @@ function StopIcon() {
   );
 }
 
+function MicrophoneIcon({ active = false }: { active?: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" aria-hidden className="size-4">
+      <rect x="9" y="3" width="6" height="11" rx="3" fill={active ? "currentColor" : "none"} />
+      <path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3M9 21h6" />
+    </svg>
+  );
+}
+
 export function Composer({
   onSend,
   onStop,
@@ -102,6 +116,14 @@ export function Composer({
     getAuthToken: getClerkToken,
     refreshCredentials: async () => { await getClerkToken(); },
   }), []);
+  const receiveTranscript = useCallback((transcript: string) => {
+    setValue((current) => appendTranscript(current, transcript));
+    queueMicrotask(() => textareaRef.current?.focus());
+  }, []);
+  const dictation = useDictation({ onTranscript: receiveTranscript });
+  const dictationBusy = !["idle", "error"].includes(dictation.state.phase);
+  const dictationRecording =
+    dictation.state.phase === "recording" || dictation.state.phase === "retrying";
 
   useEffect(() => () => {
     for (const url of previewUrls.current) URL.revokeObjectURL(url);
@@ -191,13 +213,13 @@ export function Composer({
 
   const uploadPending = attachments.some((item) => item.phase === "uploading");
   const uploadFailed = attachments.some((item) => item.phase === "error");
-  const canSend = !streaming && !disabled && !uploadPending && !uploadFailed &&
+  const canSend = !streaming && !disabled && !dictationBusy && !uploadPending && !uploadFailed &&
     (value.trim().length > 0 || attachments.some((item) => item.phase === "ready"));
 
   const submit = useCallback(() => {
     const content = value.trim();
     const ready = attachments.flatMap((item) => item.result ? [item.result] : []);
-    if ((!content && ready.length === 0) || streaming || disabled || uploadPending || uploadFailed) return;
+    if ((!content && ready.length === 0) || streaming || disabled || dictationBusy || uploadPending || uploadFailed) return;
     setValue("");
     setAttachments([]);
     for (const item of attachments) if (item.previewUrl) {
@@ -205,7 +227,7 @@ export function Composer({
       previewUrls.current.delete(item.previewUrl);
     }
     onSend(content, ready);
-  }, [value, attachments, streaming, disabled, uploadPending, uploadFailed, onSend]);
+  }, [value, attachments, streaming, disabled, dictationBusy, uploadPending, uploadFailed, onSend]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== "Enter" || event.shiftKey) return;
@@ -217,17 +239,72 @@ export function Composer({
   return (
     <div
       className="w-full"
-      onDragEnter={(event) => { event.preventDefault(); if (!disabled && !streaming) setDragging(true); }}
+      onDragEnter={(event) => { event.preventDefault(); if (!disabled && !streaming && !dictationBusy) setDragging(true); }}
       onDragOver={(event) => event.preventDefault()}
       onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }}
       onDrop={(event: DragEvent<HTMLDivElement>) => {
         event.preventDefault();
         setDragging(false);
-        if (!disabled && !streaming) void addFiles([...event.dataTransfer.files]);
+        if (!disabled && !streaming && !dictationBusy) void addFiles([...event.dataTransfer.files]);
       }}
     >
       {notice ? <div className="mb-2">{notice}</div> : null}
       {attachmentNotice ? <p role="alert" className="mb-2 text-xs text-danger-soft">{attachmentNotice}</p> : null}
+      {dictation.state.phase !== "idle" ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`mb-2 flex min-h-12 items-center gap-3 rounded-xl border px-3 py-2 text-xs ${
+            dictation.state.phase === "error"
+              ? "border-danger/25 bg-danger/[0.04] text-danger-soft"
+              : "border-edge bg-surface text-muted"
+          }`}
+        >
+          {dictationRecording ? (
+            <span className="relative flex size-3 shrink-0" aria-hidden>
+              <span className="absolute inline-flex size-full animate-ping rounded-full bg-danger/45" />
+              <span className="relative inline-flex size-3 rounded-full bg-danger" />
+            </span>
+          ) : (
+            <span className="flex gap-0.5" aria-hidden>
+              <span className="size-1 animate-pulse rounded-full bg-accent" />
+              <span className="size-1 animate-pulse rounded-full bg-accent [animation-delay:150ms]" />
+              <span className="size-1 animate-pulse rounded-full bg-accent [animation-delay:300ms]" />
+            </span>
+          )}
+          <span className="min-w-0 flex-1">
+            <span className="block font-medium text-foreground">
+              {dictationRecording
+                ? `Listening · ${formatDictationTime(dictation.state.elapsedMs)}`
+                : dictation.state.phase === "requesting"
+                  ? "Starting microphone…"
+                  : dictation.state.phase === "recovering"
+                    ? "Recovering your recording…"
+                    : dictation.state.phase === "transcribing"
+                      ? "Transcribing…"
+                      : dictation.state.phase === "error"
+                        ? "Dictation needs attention"
+                        : "Saving your recording…"}
+            </span>
+            {dictation.state.message ? <span className="block truncate text-faint">{dictation.state.message}</span> : null}
+          </span>
+          {dictationRecording ? (
+            <button type="button" onClick={dictation.stop} className="rounded-lg border border-edge px-2.5 py-1.5 text-foreground hover:bg-foreground/[0.04]">
+              Done
+            </button>
+          ) : null}
+          {dictationBusy ? (
+            <button type="button" onClick={dictation.cancel} className="rounded-lg px-2 py-1.5 text-faint hover:text-foreground">
+              Cancel
+            </button>
+          ) : null}
+          {dictation.state.phase === "error" ? (
+            <button type="button" onClick={() => void dictation.start()} className="rounded-lg border border-edge px-2.5 py-1.5 text-foreground hover:bg-foreground/[0.04]">
+              Try again
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       {attachments.length > 0 ? (
         <ul className="mb-2 flex flex-wrap gap-2" aria-label="Attached files">
           {attachments.map((item) => (
@@ -271,12 +348,28 @@ export function Composer({
           type="button"
           title="Attach files"
           aria-label="Attach files"
-          disabled={disabled || streaming || attachments.length >= MAX_ATTACHMENTS}
+          disabled={disabled || streaming || dictationBusy || attachments.length >= MAX_ATTACHMENTS}
           onClick={() => inputRef.current?.click()}
           className="mb-0.5 flex size-8 shrink-0 items-center justify-center rounded-full text-muted transition-colors hover:bg-foreground/[0.05] hover:text-foreground disabled:opacity-40"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" aria-hidden className="size-4"><path d="m9 17 7.8-7.8a3 3 0 0 0-4.2-4.2L4.8 12.8a5 5 0 0 0 7.1 7.1l7.4-7.4" /></svg>
         </button>
+        {dictation.supported ? (
+          <button
+            type="button"
+            title={dictationRecording ? "Finish dictation" : "Dictate a message"}
+            aria-label={dictationRecording ? "Finish dictation" : "Dictate a message"}
+            disabled={disabled || streaming || (dictationBusy && !dictationRecording)}
+            onClick={() => dictationRecording ? dictation.stop() : void dictation.start()}
+            className={`mb-0.5 flex size-8 shrink-0 items-center justify-center rounded-full transition-colors disabled:opacity-40 ${
+              dictationRecording
+                ? "bg-danger/10 text-danger hover:bg-danger/15"
+                : "text-muted hover:bg-foreground/[0.05] hover:text-foreground"
+            }`}
+          >
+            <MicrophoneIcon active={dictationRecording} />
+          </button>
+        ) : null}
         <textarea
           ref={textareaRef}
           rows={1}
@@ -284,7 +377,7 @@ export function Composer({
           onChange={(event) => setValue(event.target.value)}
           onKeyDown={onKeyDown}
           placeholder={streaming ? "Streaming…" : dragging ? "Drop files here…" : placeholder}
-          disabled={disabled || streaming}
+          disabled={disabled || streaming || dictationBusy}
           autoFocus={autoFocus}
           aria-label="Message"
           className="max-h-[220px] min-w-0 flex-1 resize-none bg-transparent text-[15px] leading-relaxed text-foreground outline-none placeholder:text-faint disabled:cursor-not-allowed"
@@ -317,7 +410,7 @@ export function Composer({
         )}
       </div>
       <p className="mt-1.5 px-1 text-right text-[10px] text-faint">
-        Add up to 8 images or text files · Enter to send · Shift+Enter for a new line
+        Add up to 8 images or text files · Dictation up to 10 minutes · Enter to send · Shift+Enter for a new line
       </p>
     </div>
   );
