@@ -7,6 +7,19 @@ import { DictationTransportError } from "./dictation-session";
 
 const BASE_PATH = "/api/transcriptions";
 
+/**
+ * Cartesia's reviewed STT adapter replays durable PCM at realtime speed. A
+ * maximum-length recording therefore needs ten minutes before provider
+ * finalization can even begin. Keep browser recovery alive beyond the
+ * server's twelve-minute provider deadline while spacing steady-state reads
+ * far enough apart that a long dictation never becomes a status poll storm.
+ */
+export const DICTATION_FINALIZE_POLL_TIMEOUT_MS = 13 * 60_000;
+
+export function dictationFinalizePollDelay(attempt: number): number {
+  return attempt < 4 ? 500 : 5_000;
+}
+
 async function request(path: string, init: RequestInit): Promise<Response> {
   const token = await getClerkToken();
   let response: Response;
@@ -117,14 +130,15 @@ export function edenDictationTransport(): DictationTransport {
       // The durable job continues server-side if this page refreshes. Polling
       // is bounded and carries no audio; recovery replays the same finalize
       // key and resumes from the authoritative server state.
-      for (let attempt = 0; attempt < 120; attempt += 1) {
+      const pollingStartedAt = Date.now();
+      for (let attempt = 0; Date.now() - pollingStartedAt < DICTATION_FINALIZE_POLL_TIMEOUT_MS; attempt += 1) {
         const response = await request(statusUrl, { method: "GET" });
         const status = (await response.json()) as TranscriptionStatus;
         if (status.status === "completed") return { transcript: status.transcript ?? "" };
         if (["failed", "expired", "deleted"].includes(status.status)) {
           throw new Error(status.error?.message ?? "Eden could not transcribe this recording.");
         }
-        await pause(attempt < 4 ? 500 : 1_000);
+        await pause(dictationFinalizePollDelay(attempt));
       }
       throw new Error("Transcription is taking longer than expected. Eden will resume it after refresh.");
     },

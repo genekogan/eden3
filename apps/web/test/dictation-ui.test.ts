@@ -9,9 +9,15 @@ import {
 import { PCM_UPLOAD_CHUNK_SAMPLES } from "../lib/pcm-recorder";
 import {
   DICTATION_DRAFT_TTL_MS,
+  DICTATION_SIGN_OUT_PURGE_DEADLINE_MS,
   partitionDictationDrafts,
+  purgeDictationDraftsBeforeSignOut,
   type DictationDraftRecord,
 } from "../lib/dictation-storage";
+import {
+  DICTATION_FINALIZE_POLL_TIMEOUT_MS,
+  dictationFinalizePollDelay,
+} from "../lib/dictation-transport";
 
 const workletSource = readFileSync(
   new URL("../public/audio/pcm-recorder-worklet.js", import.meta.url),
@@ -46,6 +52,27 @@ describe("dictation UI helpers", () => {
   it("batches 16 kHz PCM into one-second durable upload chunks", () => {
     expect(PCM_UPLOAD_CHUNK_SAMPLES).toBe(16_000);
     expect(workletSource).toContain("this.outputChunkSamples = 16000");
+  });
+
+  it("waits through a full ten-minute realtime replay without hammering status", () => {
+    expect(DICTATION_FINALIZE_POLL_TIMEOUT_MS).toBeGreaterThanOrEqual(13 * 60_000);
+    expect(dictationFinalizePollDelay(0)).toBe(500);
+    expect(dictationFinalizePollDelay(4)).toBeGreaterThanOrEqual(5_000);
+    expect(dictationFinalizePollDelay(500)).toBeGreaterThanOrEqual(5_000);
+  });
+
+  it("gives sign-out cleanup a bounded commit window without trapping auth", async () => {
+    expect(await purgeDictationDraftsBeforeSignOut(async () => undefined)).toBe("purged");
+    expect(await purgeDictationDraftsBeforeSignOut(async () => {
+      throw new Error("indexeddb failed");
+    })).toBe("failed");
+
+    const never = new Promise<void>(() => undefined);
+    expect(await purgeDictationDraftsBeforeSignOut(
+      () => never,
+      1,
+    )).toBe("timed_out");
+    expect(DICTATION_SIGN_OUT_PURGE_DEADLINE_MS).toBeLessThanOrEqual(500);
   });
 
   it("admits only fresh drafts owned by the current authenticated account", () => {

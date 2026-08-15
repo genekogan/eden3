@@ -12,6 +12,11 @@ import {
 const CARTESIA_TIMEOUT_MS = 12 * 60 * 1_000;
 const CARTESIA_CHUNK_BYTES = 3_200; // 100ms PCM16LE/16kHz mono
 const CARTESIA_MAX_MESSAGE_BYTES = 512_000;
+export const CARTESIA_CANCEL_CHECK_FRAMES = 50; // at most five seconds at realtime pacing
+
+export function shouldCheckTranscriptionCancellation(frameNumber: number): boolean {
+  return frameNumber % CARTESIA_CANCEL_CHECK_FRAMES === 0;
+}
 
 export function appendTranscriptDelta(transcript: string, delta: string): string {
   if (delta.length > TRANSCRIPTION_MAX_TRANSCRIPT_CHARS - transcript.length) {
@@ -146,14 +151,16 @@ export class CartesiaTranscriptionProvider implements TranscriptionProvider {
 
     await opened;
     const send = (async () => {
+      let frameNumber = 0;
       for (const durableChunk of input.chunks) {
         for (let offset = 0; offset < durableChunk.length; offset += CARTESIA_CHUNK_BYTES) {
           if (stopped) throw new TranscriptionProviderError('provider_unavailable');
-          if (await input.isCancelled()) {
+          if (shouldCheckTranscriptionCancellation(frameNumber) && await input.isCancelled()) {
             throw new TranscriptionProviderError('transcription_deleted');
           }
           const frame = durableChunk.subarray(offset, offset + CARTESIA_CHUNK_BYTES);
           ws.sendRaw(frame);
+          frameNumber += 1;
           await delay((frame.length / 32_000) * 1_000);
         }
       }
