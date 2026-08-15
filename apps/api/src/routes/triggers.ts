@@ -13,7 +13,12 @@ import { z } from 'zod';
 
 import { ApiError, logSafeRequestError, safeRequestErrorCallback, sendError } from '../errors';
 import type { GatewayGlue } from '../gateway-glue';
-import { triggerDtoFromEntity } from '../route-helpers';
+import { pgToIso, triggerDtoFromEntity } from '../route-helpers';
+import {
+  AUTOMATION_BUDGET_WINDOW_MS,
+  AUTOMATION_HOURLY_MANNA_CAP,
+  automationMannaSpendLastHour,
+} from '../services/automation-budget';
 import { concurrentTurnLimit } from '../services/chat-limits';
 import { isPlatformEve, isPlatformEveAccountId } from '../services/default-assistant';
 import { manualTaskOccurrence, runScheduledTask } from '../services/scheduled-tasks';
@@ -26,6 +31,7 @@ import { agentTaskLimitError, MAX_ENABLED_TASKS_PER_AGENT } from '../services/ta
  * /tasks prefix (the web contract):
  *
  *   GET   /tasks          — the signed-in user's triggers, newest first
+ *   GET   /tasks/:id/runs — recent metered outcomes + rolling allowance
  *   POST  /tasks          — {agentUsername, name, prompt, schedule{…}} -> row
  *                           with next_scheduled_run stamped
  *   POST  /tasks/:id/runs — fire one scheduled prompt now (metered run)
@@ -106,6 +112,9 @@ const patchBodySchema = z
 
 const idParamsSchema = z.object({ id: z.string().trim().min(1).max(200) });
 const runBodySchema = z.object({ requestId: z.string().uuid() }).strict();
+const runHistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+});
 const TASK_OWNER_LOCK_SEED = 84;
 
 /**
@@ -236,6 +245,7 @@ async function lastRunSessionIds(
       session_id
     from usage_events
     where user_id = ${userId}
+      and event_type = 'chat_turn'
       and session_id is not null
       and metadata->'source'->>'kind' = 'scheduled_task'
       and metadata->'source'->>'triggerId' = any(${triggerIds})
@@ -276,6 +286,65 @@ export const triggersRoutes: FastifyPluginAsync = async (app) => {
         triggerDtoFromEntity(row, { lastRunSessionId: sessions.get(row.id) ?? null }),
       ),
       nextCursor: null,
+    };
+  });
+
+  // ---- GET /tasks/:id/runs — recorded outcomes + rolling allowance --------
+  app.get('/:id/runs', { preHandler: app.requireAuth }, async (req, reply) => {
+    const viewer = req.account;
+    if (!viewer) return null;
+    const { id } = idParamsSchema.parse(req.params);
+    const { limit } = runHistoryQuerySchema.parse(req.query);
+    const existing = await findTrigger(id);
+    if (!existing || existing.deleted || existing.userId !== viewer.accountId) {
+      return sendError(reply, 404, 'task_not_found', 'Scheduled task not found');
+    }
+
+    const rows = await pg<
+      Array<{
+        id: string;
+        status: string;
+        session_id: string | null;
+        turn_id: string | null;
+        manna: number | null;
+        latency_ms: number | null;
+        error_code: string | null;
+        created_at: string | Date;
+      }>
+    >`
+      select id, status, session_id, turn_id, manna, latency_ms, error_code, created_at
+      from usage_events
+      where user_id = ${viewer.accountId}
+        and event_type = 'chat_turn'
+        and metadata->'source'->>'kind' = 'scheduled_task'
+        and metadata->'source'->>'triggerId' = ${existing.id}
+      order by created_at desc, id desc
+      limit ${limit}
+    `;
+
+    const spent = existing.agentId
+      ? await automationMannaSpendLastHour(existing.agentId)
+      : null;
+    return {
+      items: rows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        occurredAt: pgToIso(row.created_at),
+        sessionId: row.session_id,
+        turnId: row.turn_id,
+        manna: row.manna,
+        latencyMs: row.latency_ms,
+        errorCode: row.error_code,
+      })),
+      automationBudget:
+        spent === null
+          ? null
+          : {
+              spent,
+              cap: AUTOMATION_HOURLY_MANNA_CAP,
+              remaining: Math.max(0, AUTOMATION_HOURLY_MANNA_CAP - spent),
+              windowSeconds: Math.floor(AUTOMATION_BUDGET_WINDOW_MS / 1000),
+            },
     };
   });
 

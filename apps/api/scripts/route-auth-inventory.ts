@@ -142,7 +142,7 @@ const OWNER_MEMBER_ROUTES: readonly PathMethods[] = [
   ['/tasks', ['GET', 'HEAD', 'POST']],
   ['/tasks/', ['HEAD']],
   ['/tasks/:id', ['PATCH']],
-  ['/tasks/:id/runs', ['POST']],
+  ['/tasks/:id/runs', ['GET', 'HEAD', 'POST']],
   ['/uploads', ['POST']],
   ['/uploads/:uploadId', ['DELETE', 'GET', 'HEAD']],
   ['/uploads/:uploadId/complete', ['POST']],

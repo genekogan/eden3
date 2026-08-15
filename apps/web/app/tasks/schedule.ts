@@ -5,7 +5,7 @@
  * `cronScheduleDto` in @eden3/shared) or the one-time `{at: ISO}` shape.
  * Two directions:
  *   - describeSchedule(): render any stored schedule as a human line
- *     ("Weekly on Monday at 9:30 AM · UTC", "Once on Jul 11, 3:00 PM").
+ *     ("Weekly on Monday at 9:30 AM", "Once on Jul 11, 3:00 PM").
  *   - the modals build new schedules from once/hourly/daily/weekly inputs,
  *     sending day_of_week as an APScheduler/cron day name ("mon") so the
  *     0=Monday vs 0=Sunday ambiguity never enters the wire format.
@@ -86,21 +86,19 @@ export function describeSchedule(
   const minute = asInt(schedule.minute);
   const clock = hour != null ? formatClock(hour, minute ?? 0) : null;
   const at = clock ? ` at ${clock}` : "";
-  const tz = schedule.timezone ? ` · ${schedule.timezone}` : "";
-
   if (schedule.day_of_week !== undefined) {
-    return `Weekly on ${weekdayLabel(schedule.day_of_week)}${at}${tz}`;
+    return `Weekly on ${weekdayLabel(schedule.day_of_week)}${at}`;
   }
   if (schedule.day !== undefined) {
-    return `Monthly on day ${String(schedule.day)}${at}${tz}`;
+    return `Monthly on day ${String(schedule.day)}${at}`;
   }
-  if (clock) return `Daily${at}${tz}`;
-  if (minute != null) return `Hourly at :${String(minute).padStart(2, "0")}${tz}`;
+  if (clock) return `Daily${at}`;
+  if (minute != null) return `Hourly at :${String(minute).padStart(2, "0")}`;
 
   const parts = Object.entries(schedule)
     .filter(([key, value]) => value !== undefined && key !== "timezone")
     .map(([key, value]) => `${key}=${String(value)}`);
-  return parts.length > 0 ? `${parts.join(" ")}${tz}` : `Unscheduled${tz}`;
+  return parts.length > 0 ? parts.join(" ") : "Unscheduled";
 }
 
 /** The browser's IANA timezone, with a safe fallback. */
@@ -110,46 +108,6 @@ export function browserTimezone(): string {
   } catch {
     return "UTC";
   }
-}
-
-const FALLBACK_TIMEZONES = [
-  "UTC",
-  "America/Los_Angeles",
-  "America/Denver",
-  "America/Chicago",
-  "America/New_York",
-  "America/Sao_Paulo",
-  "Europe/London",
-  "Europe/Paris",
-  "Europe/Berlin",
-  "Europe/Madrid",
-  "Europe/Kyiv",
-  "Africa/Lagos",
-  "Asia/Dubai",
-  "Asia/Kolkata",
-  "Asia/Bangkok",
-  "Asia/Shanghai",
-  "Asia/Tokyo",
-  "Asia/Seoul",
-  "Australia/Sydney",
-  "Pacific/Auckland",
-];
-
-/**
- * Timezone options for the schedule builder: UTC + the current zone pinned
- * on top, then the full IANA list (or a curated fallback where
- * Intl.supportedValuesOf is unavailable).
- */
-export function timezoneOptions(current: string): string[] {
-  let zones: string[] = FALLBACK_TIMEZONES;
-  try {
-    if (typeof Intl.supportedValuesOf === "function") {
-      zones = Intl.supportedValuesOf("timeZone");
-    }
-  } catch {
-    /* keep fallback */
-  }
-  return [...new Set(["UTC", current, ...zones].filter(Boolean))];
 }
 
 /** Parse an `<input type="time">` value; null when unparsable. */

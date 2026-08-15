@@ -90,6 +90,7 @@ import type {
   StudioTool,
   TaskCreateInput,
   TaskRunInput,
+  TaskRunHistoryDto,
   TaskRunResult,
   TaskUpdateInput,
   TelegramManagedBotOnboardingStart,
@@ -1347,6 +1348,11 @@ export const api = {
         await post<unknown>(`/tasks/${enc(id)}/runs`, input),
         "run",
       );
+    },
+
+    /** GET /api/tasks/:id/runs — recent metered outcomes and allowance. */
+    async runs(id: string, limit = 20): Promise<TaskRunHistoryDto> {
+      return get<TaskRunHistoryDto>(`/tasks/${enc(id)}/runs${qs({ limit })}`);
     },
   },
 

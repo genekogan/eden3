@@ -16,7 +16,7 @@ export default async function AgentSchedulePage({
   const { username } = await params;
   const decoded = decodeURIComponent(username);
   return (
-    <div className="mx-auto w-full max-w-4xl px-6 py-10 md:px-10">
+    <div className="mx-auto w-full max-w-6xl px-6 py-10 md:px-10">
       <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
         @{decoded}
       </p>

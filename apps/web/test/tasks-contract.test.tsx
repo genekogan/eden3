@@ -56,4 +56,23 @@ describe("scheduled task primary UI contract", () => {
       /const run = await api\.tasks\.runNow[\s\S]*?runRequestIds\.current\.delete\(task\.id\)[\s\S]*?void load\(true\)/,
     );
   });
+
+  it("presents task details, allowance, and recorded outputs without raw scheduler errors", () => {
+    const client = source("app/tasks/tasks-client.tsx");
+    expect(client).toContain("api.tasks.runs(taskId)");
+    expect(client).toContain("Automation allowance");
+    expect(client).toContain("Run history");
+    expect(client).toContain("Open latest conversation");
+    expect(client).toContain("friendlyTaskIssue(selectedTask?.lastError)");
+    expect(client).not.toContain("title={task.lastError}");
+    expect(client).not.toMatch(/>\s*\{task\.lastError\}\s*</);
+  });
+
+  it("keeps timezone on the wire while hiding IANA implementation labels", () => {
+    const fields = source("app/tasks/schedule-fields.tsx");
+    const schedule = source("app/tasks/schedule.ts");
+    expect(fields).toContain("Times follow your system clock.");
+    expect(fields).not.toContain('aria-label="Timezone"');
+    expect(schedule).not.toContain(" · ${schedule.timezone}");
+  });
 });

@@ -366,6 +366,33 @@ export const triggerDto = z.object({
 });
 export type TriggerDto = z.infer<typeof triggerDto>;
 
+/** A metered scheduled-task run suitable for the owner-facing history UI. */
+export const taskRunHistoryItemDto = z.object({
+  id: uuidSchema,
+  status: z.string(),
+  occurredAt: isoDateTimeSchema,
+  sessionId: uuidSchema.nullable(),
+  turnId: uuidSchema.nullable(),
+  manna: z.number().int().nullable(),
+  latencyMs: z.number().int().nonnegative().nullable(),
+  errorCode: z.string().nullable(),
+});
+export type TaskRunHistoryItemDto = z.infer<typeof taskRunHistoryItemDto>;
+
+export const taskAutomationBudgetDto = z.object({
+  spent: z.number().int().nonnegative(),
+  cap: z.number().int().positive(),
+  remaining: z.number().int().nonnegative(),
+  windowSeconds: z.number().int().positive(),
+});
+export type TaskAutomationBudgetDto = z.infer<typeof taskAutomationBudgetDto>;
+
+export const taskRunHistoryDto = z.object({
+  items: z.array(taskRunHistoryItemDto),
+  automationBudget: taskAutomationBudgetDto.nullable(),
+});
+export type TaskRunHistoryDto = z.infer<typeof taskRunHistoryDto>;
+
 // ---------------------------------------------------------------------------
 // Chat (the web -> api seam that starts a streamed turn)
 // ---------------------------------------------------------------------------

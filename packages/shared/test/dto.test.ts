@@ -19,6 +19,7 @@ import {
   messageDto,
   paginated,
   sessionDto,
+  taskRunHistoryDto,
   triggerDto,
   tryDecodeFeedCursor,
   type FeedCursor,
@@ -29,6 +30,31 @@ const now = '2026-07-02T12:34:56.789Z';
 const mongoHex = '65a1b2c3d4e5f6a7b8c9d0e1';
 
 describe('resource DTOs', () => {
+  it('parses scheduled-task run history and its rolling allowance', () => {
+    expect(
+      taskRunHistoryDto.parse({
+        items: [
+          {
+            id: uuid('9'),
+            status: 'completed',
+            occurredAt: now,
+            sessionId: uuid('3'),
+            turnId: uuid('8'),
+            manna: 12,
+            latencyMs: 830,
+            errorCode: null,
+          },
+        ],
+        automationBudget: {
+          spent: 61,
+          cap: 80,
+          remaining: 19,
+          windowSeconds: 3600,
+        },
+      }).automationBudget,
+    ).toEqual({ spent: 61, cap: 80, remaining: 19, windowSeconds: 3600 });
+  });
+
   it('parses an agent', () => {
     const agent = {
       id: uuid('1'),

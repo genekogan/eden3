@@ -21,6 +21,8 @@ import type {
   AccountSummary,
   AgentDto,
   TaskSessionTargetInput,
+  TaskRunHistoryDto,
+  TaskRunHistoryItemDto,
   TriggerDto,
   TriggerStatus,
 } from "@/lib/types";
@@ -37,6 +39,7 @@ import {
 } from "./schedule-fields";
 import { NewTaskModal } from "./new-task-modal";
 import { TaskDestinationFields } from "./task-destination-fields";
+import { friendlyTaskIssue, runStatusLabel } from "./task-presentation";
 
 type AgentRef = Pick<AgentDto, "username" | "userImage"> & {
   name?: string | null;
@@ -290,6 +293,31 @@ function EditTaskModal({
 // ---------------------------------------------------------------------------
 
 type Phase = "loading" | "ready" | "error";
+type TaskFilter = "all" | "active" | "paused";
+
+function conversationHref(task: TriggerDto, agent: AgentRef | null): string | null {
+  const sessionId = task.lastRunSessionId ??
+    (task.sessionTarget === "existing" ? task.sessionExternalId : null);
+  if (!sessionId) return null;
+  return agent?.username
+    ? `/agents/${encodeURIComponent(agent.username)}/chats/${sessionId}`
+    : `/sessions/${sessionId}`;
+}
+
+function formatRunTime(value: string): string {
+  return new Date(value).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatDuration(ms: number | null): string | null {
+  if (ms === null) return null;
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} s`;
+}
 
 export function TasksClient({
   fixedAgent,
@@ -304,6 +332,11 @@ export function TasksClient({
   const [tasks, setTasks] = useState<TriggerDto[]>([]);
   const [agents, setAgents] = useState<Map<string, AgentRef>>(new Map());
   const [phase, setPhase] = useState<Phase>("loading");
+  const [filter, setFilter] = useState<TaskFilter>("all");
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [history, setHistory] = useState<TaskRunHistoryDto | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState(false);
   const [loadError, setLoadError] = useState<unknown>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [editingTask, setEditingTask] = useState<{
@@ -327,6 +360,11 @@ export function TasksClient({
       );
       if (!alive.current) return;
       setTasks(items);
+      setSelectedTaskId((current) =>
+        current && items.some((task) => task.id === current)
+          ? current
+          : (items[0]?.id ?? null),
+      );
       setPhase("ready");
       setLoadError(null);
 
@@ -383,6 +421,31 @@ export function TasksClient({
     };
   }, [load]);
 
+  const loadHistory = useCallback(async (taskId: string) => {
+    setHistory(null);
+    setHistoryLoading(true);
+    setHistoryError(false);
+    try {
+      const result = await api.tasks.runs(taskId);
+      if (!alive.current) return;
+      setHistory(result);
+    } catch {
+      if (!alive.current) return;
+      setHistory(null);
+      setHistoryError(true);
+    } finally {
+      if (alive.current) setHistoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedTaskId) {
+      setHistory(null);
+      return;
+    }
+    void loadHistory(selectedTaskId);
+  }, [loadHistory, selectedTaskId]);
+
   // Transient error note fades after a few seconds.
   useEffect(() => {
     if (!note) return;
@@ -423,6 +486,7 @@ export function TasksClient({
       );
       // Authoritative refresh: lastRunTime/lastRunSessionId/status changed.
       void load(true);
+      void loadHistory(task.id);
     } catch (error) {
       // A server response is a definitive outcome. A network failure is
       // ambiguous, so the next click reuses the same request id after restart.
@@ -450,6 +514,7 @@ export function TasksClient({
       await api.tasks.update(task.id, { deleted: true });
       if (!alive.current) return;
       setTasks((prev) => prev.filter((t) => t.id !== task.id));
+      setSelectedTaskId((current) => (current === task.id ? null : current));
     } catch (error) {
       if (alive.current) setNote({ kind: "error", text: errorCopy(error).hint });
     } finally {
@@ -467,8 +532,30 @@ export function TasksClient({
     </button>
   );
 
+  const visibleTasks = tasks.filter((task) => {
+    const status = (task.status ?? "").toLowerCase();
+    if (filter === "active") return status === "active" || status === "running";
+    if (filter === "paused") return status === "paused";
+    return true;
+  });
+  const selectedTask =
+    visibleTasks.find((task) => task.id === selectedTaskId) ?? visibleTasks[0] ?? null;
+  const selectedAgent = selectedTask
+    ? selectedTask.agentId
+      ? (agents.get(selectedTask.agentId) ?? embeddedAgent(selectedTask))
+      : embeddedAgent(selectedTask)
+    : null;
+  const selectedIssue = friendlyTaskIssue(selectedTask?.lastError);
+  const selectedConversationHref = selectedTask
+    ? conversationHref(selectedTask, selectedAgent)
+    : null;
+  const allowance = history?.automationBudget ?? null;
+  const allowancePercent = allowance
+    ? Math.min(100, Math.round((allowance.spent / allowance.cap) * 100))
+    : 0;
+
   return (
-    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-4xl px-6 py-14 md:px-10"}>
+    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-6xl px-6 py-14 md:px-10"}>
       {fixedAgent ? (
         <div className="flex justify-end">{newTaskButton}</div>
       ) : (
@@ -501,7 +588,7 @@ export function TasksClient({
         </p>
       ) : null}
 
-      <div className="mt-10">
+      <div className="mt-8">
         {phase === "loading" ? (
           <SkeletonRows count={4} />
         ) : phase === "error" ? (
@@ -524,133 +611,176 @@ export function TasksClient({
             action={newTaskButton}
           />
         ) : (
-          <ul className="space-y-2">
-            {tasks.map((task) => {
+          <div className="grid min-h-[560px] overflow-hidden rounded-xl border border-edge bg-surface lg:grid-cols-[minmax(260px,0.82fr)_minmax(420px,1.35fr)]">
+            <section className="border-b border-edge lg:border-b-0 lg:border-r" aria-label="Scheduled tasks">
+              <div className="flex items-center gap-1 border-b border-edge px-3 py-3">
+                {(["all", "active", "paused"] as const).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    aria-pressed={filter === option}
+                    onClick={() => setFilter(option)}
+                    className={`rounded-md px-2.5 py-1.5 text-xs capitalize transition-colors ${
+                      filter === option
+                        ? "bg-foreground/[0.07] text-foreground"
+                        : "text-muted hover:text-foreground"
+                    }`}
+                  >
+                    {option}
+                  </button>
+                ))}
+              </div>
+              <ul className="divide-y divide-edge">
+            {visibleTasks.map((task) => {
               const agent = task.agentId
                 ? (agents.get(task.agentId) ?? embeddedAgent(task))
                 : embeddedAgent(task);
               const status = (task.status ?? "").toLowerCase();
-              const busy = busyId === task.id;
-              const pausable = status === "active" || status === "running";
-              const resumable = status === "paused";
-              const runnable = status === "active";
               return (
                 <li
                   key={task.id}
-                  className="rounded-xl border border-edge bg-surface p-4 transition-colors hover:border-edge"
+                  className={selectedTask?.id === task.id ? "bg-accent/[0.055]" : ""}
                 >
-                  <div className="flex flex-wrap items-center gap-x-4 gap-y-3">
-                    <AgentAvatar
-                      account={agent ?? undefined}
-                      name={agent?.username ?? "?"}
-                      size={36}
+                  <button
+                    type="button"
+                    onClick={() => setSelectedTaskId(task.id)}
+                    className="flex w-full items-start gap-3 px-4 py-3.5 text-left transition-colors hover:bg-foreground/[0.025]"
+                  >
+                    <span
+                      className={`mt-1.5 size-2 shrink-0 rounded-full ${
+                        status === "active"
+                          ? "bg-success"
+                          : status === "running"
+                            ? "animate-pulse bg-accent"
+                            : "border border-faint"
+                      }`}
                     />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2.5">
-                        <h3 className="truncate text-sm font-medium">
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center justify-between gap-2">
+                        <span className="truncate text-sm font-medium">
                           {task.name ?? "Untitled task"}
-                        </h3>
-                        <StatusChip status={task.status} />
-                      </div>
-                      <p className="mt-1 truncate text-xs text-muted">
-                        {agent ? `@${agent.username}` : "unknown agent"}
-                        <span className="text-faint"> · </span>
+                        </span>
+                        {task.lastError ? <span className="size-1.5 shrink-0 rounded-full bg-danger" aria-label="Needs attention" /> : null}
+                      </span>
+                      <span className="mt-1 block truncate text-xs text-muted">
                         {describeSchedule(task.schedule)}
-                      </p>
-                      {task.prompt ? (
-                        <p
-                          className="mt-1.5 line-clamp-1 text-xs text-faint"
-                          title={task.prompt}
-                        >
-                          {task.prompt}
-                        </p>
-                      ) : null}
-                      {task.lastRunTime || task.nextScheduledRun || task.lastRunSessionId ? (
-                        <p className="mt-1.5 font-mono text-[10px] uppercase tracking-wider text-faint">
-                          {[
-                            task.lastRunTime
-                              ? `last run ${formatRelativeTime(task.lastRunTime)}`
-                              : null,
-                            task.nextScheduledRun
-                              ? `next run ${formatRelativeTime(task.nextScheduledRun)}`
-                              : null,
-                          ]
-                            .filter(Boolean)
-                            .join(" · ")}
-                          {task.lastRunSessionId ? (
-                            <>
-                              {task.lastRunTime || task.nextScheduledRun ? " · " : null}
-                              <Link
-                                href={`/sessions/${task.lastRunSessionId}`}
-                                className="text-accent-soft underline-offset-2 hover:underline"
-                              >
-                                View output
-                              </Link>
-                            </>
-                          ) : null}
-                        </p>
-                      ) : null}
-                      {task.lastError ? (
-                        <p
-                          className="mt-1.5 line-clamp-2 text-xs text-danger-soft"
-                          title={task.lastError}
-                        >
-                          {task.lastError}
-                        </p>
-                      ) : null}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {runnable ? (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void runNow(task)}
-                          className="rounded-lg border border-accent/40 bg-accent/10 px-3 py-1.5 text-xs text-accent-soft transition-colors hover:border-accent/70 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                          {busy ? "Running…" : "Run now"}
-                        </button>
-                      ) : null}
-                      {pausable || resumable ? (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() =>
-                            void setStatus(task, pausable ? "paused" : "active")
-                          }
-                          className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                          {busy ? "…" : pausable ? "Pause" : "Resume"}
-                        </button>
-                      ) : null}
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => {
-                          const username = agent?.username ?? fixedAgent?.username;
-                          if (username) setEditingTask({ task, agentUsername: username });
-                        }}
-                        className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:border-accent/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        Edit
-                      </button>
-                      <button
-                        type="button"
-                        disabled={busy}
-                        onClick={() => void remove(task)}
-                        className={`rounded-lg border px-3 py-1.5 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
-                          confirmingId === task.id
-                            ? "border-danger/50 bg-danger/10 text-danger-soft"
-                            : "border-edge text-muted hover:border-danger/50 hover:text-danger-soft"
-                        }`}
-                      >
-                        {confirmingId === task.id ? "Confirm" : "Delete"}
-                      </button>
-                    </div>
-                  </div>
+                      </span>
+                      <span className="mt-1 block truncate text-[11px] text-faint">
+                        {agent ? `@${agent.username}` : "Unknown agent"}
+                        {task.nextScheduledRun && status === "active"
+                          ? ` · Next ${formatRelativeTime(task.nextScheduledRun)}`
+                          : task.lastRunTime
+                            ? ` · Last ${formatRelativeTime(task.lastRunTime)}`
+                            : ""}
+                      </span>
+                    </span>
+                  </button>
                 </li>
               );
             })}
-          </ul>
+              </ul>
+              {visibleTasks.length === 0 ? (
+                <p className="px-5 py-10 text-center text-sm text-faint">No {filter} tasks.</p>
+              ) : null}
+            </section>
+
+            <section className="min-w-0 p-5 md:p-6" aria-label="Task details">
+              {selectedTask ? (() => {
+                const status = (selectedTask.status ?? "").toLowerCase();
+                const busy = busyId === selectedTask.id;
+                const pausable = status === "active" || status === "running";
+                const resumable = status === "paused";
+                return (
+                  <div>
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2.5">
+                          <h2 className="truncate text-xl font-medium">{selectedTask.name ?? "Untitled task"}</h2>
+                          <StatusChip status={selectedTask.status} />
+                        </div>
+                        <p className="mt-1.5 text-sm text-muted">
+                          {selectedAgent ? `@${selectedAgent.username} · ` : ""}{describeSchedule(selectedTask.schedule)}
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        {status === "active" ? (
+                          <button type="button" disabled={busy} onClick={() => void runNow(selectedTask)} className="rounded-lg bg-accent px-3 py-1.5 text-xs font-medium text-white hover:bg-accent/85 disabled:opacity-40">
+                            {busy ? "Running…" : "Run now"}
+                          </button>
+                        ) : null}
+                        {pausable || resumable ? (
+                          <button type="button" disabled={busy} onClick={() => void setStatus(selectedTask, pausable ? "paused" : "active")} className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted hover:text-foreground disabled:opacity-40">
+                            {busy ? "…" : pausable ? "Pause" : "Resume"}
+                          </button>
+                        ) : null}
+                        <button type="button" disabled={busy} onClick={() => {
+                          const username = selectedAgent?.username ?? fixedAgent?.username;
+                          if (username) setEditingTask({ task: selectedTask, agentUsername: username });
+                        }} className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted hover:text-foreground disabled:opacity-40">Edit</button>
+                        <button type="button" disabled={busy} onClick={() => void remove(selectedTask)} className={`rounded-lg border px-3 py-1.5 text-xs ${confirmingId === selectedTask.id ? "border-danger/50 bg-danger/10 text-danger-soft" : "border-edge text-muted hover:text-danger-soft"}`}>
+                          {confirmingId === selectedTask.id ? "Confirm delete" : "Delete"}
+                        </button>
+                      </div>
+                    </div>
+
+                    {selectedIssue ? (
+                      <div className={`mt-5 rounded-lg border px-4 py-3 ${selectedIssue.kind === "budget" ? "border-warning/25 bg-warning/5" : "border-danger/25 bg-danger/5"}`}>
+                        <p className="text-sm font-medium">{selectedIssue.title}</p>
+                        <p className="mt-1 text-xs leading-relaxed text-muted">{selectedIssue.detail}</p>
+                      </div>
+                    ) : null}
+
+                    <div className="mt-5 rounded-lg border border-edge bg-background/40 p-4">
+                      <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-faint">Instructions</p>
+                      <p className="mt-2 whitespace-pre-wrap text-sm leading-relaxed text-foreground/90">{selectedTask.prompt || "No instructions."}</p>
+                    </div>
+
+                    <dl className="mt-5 grid gap-4 border-y border-edge py-4 text-sm sm:grid-cols-3">
+                      <div><dt className="text-xs text-faint">Next run</dt><dd className="mt-1">{selectedTask.nextScheduledRun && status === "active" ? formatRunTime(selectedTask.nextScheduledRun) : "Not scheduled"}</dd></div>
+                      <div><dt className="text-xs text-faint">Last run</dt><dd className="mt-1">{selectedTask.lastRunTime ? formatRunTime(selectedTask.lastRunTime) : "No runs yet"}</dd></div>
+                      <div><dt className="text-xs text-faint">Output</dt><dd className="mt-1">{selectedTask.sessionTarget === "new" ? "New conversation each run" : "Existing conversation"}</dd></div>
+                    </dl>
+
+                    <div className="mt-5">
+                      <div className="flex items-end justify-between gap-3">
+                        <div>
+                          <h3 className="text-sm font-medium">Automation allowance</h3>
+                          <p className="mt-0.5 text-xs text-faint">Shared by this agent’s schedules and heartbeat over a rolling hour.</p>
+                        </div>
+                        {allowance ? <p className="shrink-0 text-xs text-muted"><span className="font-medium text-foreground">{allowance.spent}</span> / {allowance.cap} manna</p> : null}
+                      </div>
+                      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-foreground/[0.07]" aria-label={allowance ? `${allowance.spent} of ${allowance.cap} manna used` : "Allowance unavailable"}>
+                        <div className={`h-full rounded-full transition-[width] ${allowancePercent >= 80 ? "bg-warning" : "bg-accent"}`} style={{ width: `${allowancePercent}%` }} />
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-faint">{allowance ? `${allowance.remaining} available now. Capacity returns gradually as earlier runs age out.` : historyLoading ? "Checking allowance…" : "Allowance unavailable."}</p>
+                    </div>
+
+                    <div className="mt-6">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-sm font-medium">Run history</h3>
+                        {selectedConversationHref ? <Link href={selectedConversationHref} className="text-xs text-accent-soft hover:underline">Open latest conversation →</Link> : null}
+                      </div>
+                      {historyLoading ? <div className="mt-3"><SkeletonRows count={3} /></div> : historyError ? (
+                        <button type="button" onClick={() => void loadHistory(selectedTask.id)} className="mt-3 text-xs text-danger-soft hover:underline">Couldn’t load run history. Retry</button>
+                      ) : history && history.items.length > 0 ? (
+                        <ul className="mt-3 divide-y divide-edge rounded-lg border border-edge">
+                          {history.items.map((run: TaskRunHistoryItemDto) => {
+                            const href = run.sessionId && selectedAgent?.username ? `/agents/${encodeURIComponent(selectedAgent.username)}/chats/${run.sessionId}` : run.sessionId ? `/sessions/${run.sessionId}` : null;
+                            const failed = Boolean(run.errorCode) || /error|failed/i.test(run.status);
+                            return <li key={run.id} className="flex items-center gap-3 px-3 py-2.5">
+                              <span className={`size-2 rounded-full ${failed ? "bg-danger" : "bg-success"}`} />
+                              <div className="min-w-0 flex-1"><p className="text-xs font-medium">{runStatusLabel(run)}</p><p className="mt-0.5 text-[11px] text-faint">{formatRunTime(run.occurredAt)}{run.manna !== null ? ` · ${run.manna} manna` : ""}{formatDuration(run.latencyMs) ? ` · ${formatDuration(run.latencyMs)}` : ""}</p></div>
+                              {href ? <Link href={href} className="shrink-0 text-xs text-accent-soft hover:underline">View output</Link> : null}
+                            </li>;
+                          })}
+                        </ul>
+                      ) : <p className="mt-3 rounded-lg border border-dashed border-edge px-4 py-6 text-center text-xs text-faint">No recorded runs yet.</p>}
+                    </div>
+                  </div>
+                );
+              })() : <p className="py-20 text-center text-sm text-faint">Choose a task to see its details.</p>}
+            </section>
+          </div>
         )}
       </div>
 

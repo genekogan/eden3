@@ -4,7 +4,6 @@ import {
   formatClock,
   parseClock,
   parseDatetimeLocal,
-  timezoneOptions,
   toDatetimeLocalValue,
   weekdayLabel,
 } from "./schedule";
@@ -14,17 +13,17 @@ describe("describeSchedule", () => {
   it("renders daily schedules", () => {
     expect(
       describeSchedule({ hour: 9, minute: 30, timezone: "America/Los_Angeles" }),
-    ).toBe("Daily at 9:30 AM · America/Los_Angeles");
+    ).toBe("Daily at 9:30 AM");
     expect(describeSchedule({ hour: 0, minute: 0 })).toBe("Daily at 12:00 AM");
     expect(describeSchedule({ hour: 18, minute: 5, timezone: "UTC" })).toBe(
-      "Daily at 6:05 PM · UTC",
+      "Daily at 6:05 PM",
     );
   });
 
   it("renders weekly schedules from day names and APScheduler indexes", () => {
     expect(
       describeSchedule({ day_of_week: "mon", hour: 18, minute: 0, timezone: "UTC" }),
-    ).toBe("Weekly on Monday at 6:00 PM · UTC");
+    ).toBe("Weekly on Monday at 6:00 PM");
     // APScheduler numeric convention: 0 = Monday, 4 = Friday.
     expect(describeSchedule({ day_of_week: 4, hour: 3, minute: 0 })).toBe(
       "Weekly on Friday at 3:00 AM",
@@ -47,7 +46,7 @@ describe("describeSchedule", () => {
     expect(describeSchedule({ minute: 15 })).toBe("Hourly at :15");
     // Non-numeric hour degrades to the key=value dump instead of lying.
     expect(describeSchedule({ hour: "*/2", timezone: "UTC" })).toBe(
-      "hour=*/2 · UTC",
+      "hour=*/2",
     );
   });
 
@@ -67,7 +66,7 @@ describe("describeSchedule", () => {
 
   it("renders hourly schedules (hour '*')", () => {
     expect(describeSchedule({ hour: "*", minute: 15, timezone: "UTC" })).toBe(
-      "Hourly at :15 · UTC",
+      "Hourly at :15",
     );
   });
 });
@@ -170,15 +169,5 @@ describe("formatClock / parseClock", () => {
     expect(formatClock(0, 0)).toBe("12:00 AM");
     expect(formatClock(12, 0)).toBe("12:00 PM");
     expect(formatClock(15, 4)).toBe("3:04 PM");
-  });
-});
-
-describe("timezoneOptions", () => {
-  it("pins UTC and the current zone first, deduped", () => {
-    const zones = timezoneOptions("America/Los_Angeles");
-    expect(zones[0]).toBe("UTC");
-    expect(zones[1]).toBe("America/Los_Angeles");
-    expect(zones.filter((z) => z === "America/Los_Angeles")).toHaveLength(1);
-    expect(zones.filter((z) => z === "UTC")).toHaveLength(1);
   });
 });

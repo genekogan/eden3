@@ -15,7 +15,6 @@ import {
   browserTimezone,
   parseClock,
   parseDatetimeLocal,
-  timezoneOptions,
   toDatetimeLocalValue,
   WEEKDAYS,
 } from "./schedule";
@@ -134,7 +133,6 @@ export function ScheduleFields({
   form: ScheduleFormState;
   onChange: (next: ScheduleFormState) => void;
 }) {
-  const zones = timezoneOptions(form.timezone);
   const set = (patch: Partial<ScheduleFormState>) => onChange({ ...form, ...patch });
 
   return (
@@ -207,20 +205,9 @@ export function ScheduleFields({
               className={`${FIELD_INPUT} w-32`}
             />
           ) : null}
-          <select
-            value={form.timezone}
-            onChange={(event) => set({ timezone: event.target.value })}
-            aria-label="Timezone"
-            className={`${FIELD_INPUT} min-w-0 flex-1`}
-          >
-            {zones.map((zone) => (
-              <option key={zone} value={zone}>
-                {zone.replace(/_/g, " ")}
-              </option>
-            ))}
-          </select>
         </div>
       )}
+      <p className="text-[11px] text-faint">Times follow your system clock.</p>
     </div>
   );
 }
