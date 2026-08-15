@@ -860,7 +860,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
           },
           cleanupArtifact: (sha256, mime) => voiceMediaStore.deleteByDigest(sha256, mime),
           ...(storageRuntime
-            ? { deletePrivateClip: (object: Parameters<typeof storageRuntime.deletePrivateObject>[0]) => storageRuntime.deletePrivateObject(object) }
+            ? { deletePrivateClip: (object: Parameters<typeof storageRuntime.deletePrivateObject>[0], signal?: AbortSignal) => storageRuntime.deletePrivateObject(object, signal) }
             : {}),
         }),
         autoStartReconciler: process.env.NODE_ENV === 'production',
@@ -1170,7 +1170,7 @@ export function stopVoiceReconciliation(flight: VoiceReconcilerFlight): void {
 
 /** Publish refresh events only for rows atomically transitioned by this recovery pass. */
 export async function reconcileDirectVoiceAndPublish(
-  kernel: Pick<VoiceKernel, 'reconcileDirectVoiceJobs'>,
+  kernel: Pick<VoiceKernel, 'reconcileDirectVoiceJobs' | 'markDirectVoiceRefreshPublished'>,
   bus: Pick<EventsBus, 'publish'>,
   signal?: AbortSignal,
 ): Promise<number> {
@@ -1183,6 +1183,10 @@ export async function reconcileDirectVoiceAndPublish(
       sessionId: settled.sessionId,
       messageId: settled.messageId,
     });
+    // Do not check the deadline between publish and this acknowledgement. If
+    // the process crashes here the pending marker deliberately republishes an
+    // idempotent refetch; otherwise close custody in the same pass.
+    await kernel.markDirectVoiceRefreshPublished(settled.messageId);
   }
   return result.processed;
 }

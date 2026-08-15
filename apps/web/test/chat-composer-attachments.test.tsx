@@ -2,7 +2,13 @@ import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
-import { attachmentError, Composer } from '../components/chat/composer';
+import { attachmentError, clearComposerDraftAfterTurnAcceptance, Composer } from '../components/chat/composer';
+import {
+  clearDictationComposerDraft,
+  loadDictationComposerDraft,
+  persistDictationComposerDraft,
+  type DictationPurgeFenceStore,
+} from '../lib/dictation-storage';
 
 function file(name: string, type: string, size: number): File {
   return { name, type, size } as File;
@@ -10,7 +16,7 @@ function file(name: string, type: string, size: number): File {
 
 describe('chat composer attachments', () => {
   it('renders a multiple guarded file picker and drag/drop surface', () => {
-    const html = renderToStaticMarkup(<Composer onSend={() => {}} />);
+    const html = renderToStaticMarkup(<Composer draftKey="test" onSend={() => true} />);
     expect(html).toContain('aria-label="Attach files"');
     expect(html).toContain('multiple=""');
     expect(html).toContain('image/png,image/jpeg,image/gif,image/webp,text/plain,application/json');
@@ -25,5 +31,20 @@ describe('chat composer attachments', () => {
     expect(attachmentError(file('notes.txt', 'text/plain', 1024 * 1024 + 1))).toMatch(/1 MiB/);
     expect(attachmentError(file('movie.mp4', 'video/mp4', 100))).toMatch(/PNG/);
     expect(attachmentError(file('empty.json', 'application/json', 0))).toMatch(/Empty/);
+  });
+
+  it('retains a recovered transcript across lost send and refresh until turn acknowledgement', async () => {
+    const values = new Map<string, string>();
+    const storage: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    persistDictationComposerDraft('owner', 'session:one', 'ten minute transcript', storage);
+    const clear = () => clearDictationComposerDraft('owner', 'session:one', storage);
+    await expect(clearComposerDraftAfterTurnAcceptance(Promise.resolve(false), clear)).resolves.toBe(false);
+    expect(loadDictationComposerDraft('owner', 'session:one', storage)).toBe('ten minute transcript');
+    await expect(clearComposerDraftAfterTurnAcceptance(Promise.resolve(true), clear)).resolves.toBe(true);
+    expect(loadDictationComposerDraft('owner', 'session:one', storage)).toBeNull();
   });
 });

@@ -330,9 +330,9 @@ export function SessionConversation({
   );
 
   const send = useCallback(
-    (content: string, attachments: ComposerAttachment[] = []) => {
+    async (content: string, attachments: ComposerAttachment[] = []) => {
       const active = activePumpRef.current;
-      if (active && !active.done) return; // one live turn at a time
+      if (active && !active.done) return false; // one live turn at a time
       setNotice(null);
       stickRef.current = true;
       const pump = startSessionTurn(canonicalIdRef.current, content, attachments);
@@ -347,6 +347,12 @@ export function SessionConversation({
         at: nowIso(),
       });
       attachPump(pump);
+      try {
+        await pump.accepted;
+        return true;
+      } catch {
+        return false;
+      }
     },
     [attachPump],
   );
@@ -358,7 +364,7 @@ export function SessionConversation({
   const retryFromError = useCallback(
     (item: { clientId: string }, content: string) => {
       dispatch({ type: "error/dismiss", clientId: item.clientId });
-      send(content);
+      void send(content);
     },
     [send],
   );
@@ -547,7 +553,7 @@ export function SessionConversation({
           onClick={() => {
             const content = notice.retryContent ?? "";
             setNotice(null);
-            send(content);
+            void send(content);
           }}
           className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"
         >
@@ -857,6 +863,7 @@ export function SessionConversation({
             </p>
           ) : (
             <Composer
+              draftKey={`session:${session!.id}`}
               onSend={send}
               onStop={stop}
               streaming={streaming}

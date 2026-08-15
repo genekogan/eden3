@@ -1810,14 +1810,15 @@ export const directVoiceJobs = pgTable('direct_voice_jobs', {
   status: text('status').$type<'queued' | 'generating' | 'attachment_pending' | 'completed' | 'failed'>().notNull().default('queued'),
   generation: integer('generation').notNull().default(0),
   executionId: uuid('execution_id').references(() => voiceExecutions.id, { onDelete: 'set null' }),
+  refreshState: text('refresh_state').$type<'none' | 'pending' | 'published'>().notNull().default('none'),
   lastErrorCode: text('last_error_code'),
   createdAt: timestamptz('created_at').notNull().defaultNow(),
   updatedAt: timestamptz('updated_at').notNull().defaultNow(),
   completedAt: timestamptz('completed_at'),
 }, (t) => [
   uniqueIndex('direct_voice_jobs_execution_uq').on(t.executionId).where(sql`${t.executionId} is not null`),
-  index('direct_voice_jobs_reconcile_idx').on(t.status, t.updatedAt, t.messageId)
-    .where(sql`${t.status} in ('queued','generating','attachment_pending')`),
+  index('direct_voice_jobs_reconcile_idx').on(t.status, t.refreshState, t.updatedAt, t.messageId)
+    .where(sql`${t.status} in ('queued','generating','attachment_pending') or (${t.status}='completed' and ${t.refreshState}='pending')`),
 ]);
 
 // ---------------------------------------------------------------------------

@@ -59,7 +59,8 @@ export function dictationRecoveryDisposition(
 interface UseDictationOptions {
   ownerId: string | null;
   ownerPhase: ViewerPhase;
-  onTranscript: (transcript: string) => void;
+  /** Must durably/idempotently commit deliveryId before returning true. */
+  onTranscript: (transcript: string, deliveryId: string) => boolean | Promise<boolean>;
   transport?: DictationTransport;
 }
 
@@ -122,8 +123,8 @@ export function useDictation({
         }
         await session.finish();
         if (mountedRef.current) {
-          const accepted = await session.consume();
-          if (accepted !== null) onTranscript(accepted);
+          const delivered = await session.consume(onTranscript);
+          if (delivered === null) throw new Error("Your transcript is saved and will be restored when this chat reloads.");
           setState({ phase: "idle", elapsedMs: 0, message: null });
         }
       } catch (error) {
@@ -294,8 +295,8 @@ export function useDictation({
         sessionRef.current = recovered;
         await recovered.finish();
         if (!disposed) {
-          const accepted = await recovered.consume();
-          if (accepted !== null) onTranscript(accepted);
+          const delivered = await recovered.consume(onTranscript);
+          if (delivered === null) throw new Error("Your transcript is saved and will be restored when this chat reloads.");
           setState({ phase: "idle", elapsedMs: 0, message: null });
         }
       } catch (error) {

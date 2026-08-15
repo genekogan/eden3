@@ -114,10 +114,12 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
     const params = messageParams.parse(request.params);
     const body = idempotencySchema.parse(request.body);
     const result = await boundary(() => kernel.directVoiceNote(request.account!.accountId, params.sessionId, params.messageId, body.idempotencyKey));
-    if (!result.execution.replayed) {
+    if (result.refreshPending) {
       app.eventsBus.publish(params.sessionId, { type: 'session.messages.changed', sessionId: params.sessionId, messageId: params.messageId });
+      await boundary(() => kernel.markDirectVoiceRefreshPublished(params.messageId));
     }
-    return reply.code(result.execution.replayed ? 200 : 201).send(result);
+    const { refreshPending: _refreshPending, ...response } = result;
+    return reply.code(result.execution.replayed ? 200 : 201).send(response);
   });
 
   app.post('/voices/clones/quote', { preHandler: app.requireAuth }, async (request) => {

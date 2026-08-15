@@ -45,6 +45,9 @@ describe('0047 voice backend custody', () => {
     expect(migration).toContain('"message_id" uuid PRIMARY KEY');
     expect(migration).toContain("'queued','generating','attachment_pending'");
     expect(migration).toContain('direct_voice_jobs_reconcile_idx');
+    expect(migration).toContain('"refresh_state" text DEFAULT \'none\' NOT NULL');
+    expect(migration).toContain('"status"=\'completed\' and "refresh_state" in (\'pending\',\'published\')');
+    expect(migration).toContain("\"status\"='completed' and \"refresh_state\"='pending'");
     expect(migration).toContain("TG_TABLE_NAME IN ('voice_quotes','direct_voice_jobs')");
     expect(migration).toContain("TG_TABLE_NAME='direct_voice_jobs' AND public.account_erasure_job_claim_tuple_matches(v_owner)");
     expect(migration).toContain("v.status IN ('queued','generating','attachment_pending')");

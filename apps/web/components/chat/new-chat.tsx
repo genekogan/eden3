@@ -108,7 +108,7 @@ function NewSessionComposer({
 
   const send = useCallback(
     async (content: string, attachments: ComposerAttachment[] = []) => {
-      if (!agent || pendingPumpRef.current) return;
+      if (!agent || pendingPumpRef.current) return false;
       setNotice(null);
       setPendingContent(content);
       setStarting(true);
@@ -126,16 +126,18 @@ function NewSessionComposer({
         const sessionId = await ready;
         pendingPumpRef.current = null;
         router.replace(sessionHref(sessionId));
+        return true;
       } catch (error) {
         pendingPumpRef.current = null;
         setStarting(false);
         setPendingContent(null);
-        if (isAbortError(error)) return;
+        if (isAbortError(error)) return false;
         setNotice({
           message: describeSendError(error),
           retryContent: content,
           manna: isInsufficientManna(error),
         });
+        return false;
       }
     },
     [agent, router, sessionHref],
@@ -308,7 +310,8 @@ function NewSessionComposer({
       <div className="shrink-0 px-6 pb-6 pt-2">
         <div className="mx-auto w-full max-w-2xl">
           <Composer
-            onSend={(content) => void send(content)}
+            draftKey={`new:${username}`}
+            onSend={(content, attachments) => send(content, attachments)}
             onStop={stop}
             streaming={starting}
             disabled={phase !== "ready"}

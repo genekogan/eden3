@@ -442,7 +442,7 @@ export interface ChatRoutesOptions {
   voiceKernel?: VoiceKernel;
 }
 
-type AutomaticDirectVoiceKernel = Pick<VoiceKernel, 'processAutomaticDirectVoice'>;
+type AutomaticDirectVoiceKernel = Pick<VoiceKernel, 'processAutomaticDirectVoice' | 'markDirectVoiceRefreshPublished'>;
 
 export type AutomaticDirectVoiceResult = 'disabled' | 'attached' | 'not_enabled' | 'failed';
 
@@ -461,8 +461,11 @@ export async function attachAutomaticDirectVoiceNote(input: {
 }): Promise<AutomaticDirectVoiceResult> {
   if (!input.voiceKernel) return 'disabled';
   try {
-    await input.voiceKernel.processAutomaticDirectVoice(input.assistantMessageId);
-    input.publishChanged();
+    const result = await input.voiceKernel.processAutomaticDirectVoice(input.assistantMessageId);
+    if (result.refreshPending) {
+      input.publishChanged();
+      await input.voiceKernel.markDirectVoiceRefreshPublished(input.assistantMessageId);
+    }
     return 'attached';
   } catch (error) {
     // This is the authoritative off/on-demand path, not an operational error.

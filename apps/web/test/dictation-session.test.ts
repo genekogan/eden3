@@ -14,6 +14,7 @@ import type {
 class MemoryDraftStore {
   draft: DictationDraftRecord | null = null;
   chunks: DictationChunkRecord[] = [];
+  refuseDelete = false;
 
   async putDraft(draft: DictationDraftRecord) { this.draft = draft; }
   private current(draft: DictationDraftRecord) {
@@ -49,6 +50,7 @@ class MemoryDraftStore {
   }
   async deleteDraft(draft: DictationDraftRecord) {
     this.current(draft);
+    if (this.refuseDelete) return false;
     this.chunks = this.chunks.filter((chunk) => chunk.draftId !== draft.id);
     this.draft = null;
     return true;
@@ -92,7 +94,7 @@ describe("durable dictation session", () => {
     await session.append(new Blob(["audio"]), 1_000);
     expect(await session.finish()).toBe("recovered words");
     expect(store.draft?.phase).toBe("complete");
-    await session.consume();
+    await session.consume(async () => true);
     expect(events).toEqual([
       "upload:0:local=1",
       "retrying",
@@ -113,6 +115,19 @@ describe("durable dictation session", () => {
     await session.append(new Blob(["audio"]), 1_000);
     await expect(session.finish()).rejects.toThrow("provider down");
     expect(store.draft?.phase).toBe("failed");
+  });
+
+  it("reports no consumed transcript when the durable delete acknowledgement loses its CAS", async () => {
+    const store = new MemoryDraftStore();
+    const session = await DurableDictationSession.create({
+      ownerId: "account-1",
+      store: store as never,
+      transport: transport(),
+    });
+    await session.finish();
+    store.refuseDelete = true;
+    await expect(session.consume(async () => true)).resolves.toBeNull();
+    expect(store.draft?.phase).toBe("complete");
   });
 
   it("cancels remotely and erases the private local draft", async () => {
@@ -207,7 +222,7 @@ describe("durable dictation session", () => {
       transport: remote,
     });
     await expect(recovered.finish()).resolves.toBe("accepted words");
-    await expect(recovered.consume()).resolves.toBe("accepted words");
+    await expect(recovered.consume(async () => true)).resolves.toBe("accepted words");
     expect(store.draft).toBeNull();
 
     releaseOld();

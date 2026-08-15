@@ -15,11 +15,12 @@ describe('automatic direct-chat voice after a committed turn', () => {
     let resolveAttachment!: (value: unknown) => void;
     const attachment = new Promise((resolve) => { resolveAttachment = resolve; });
     const processAutomaticDirectVoice = vi.fn(() => attachment);
+    const markDirectVoiceRefreshPublished = vi.fn(async () => true);
     const publishChanged = vi.fn();
     const onError = vi.fn();
 
     const result = attachAutomaticDirectVoiceNote({
-      voiceKernel: { processAutomaticDirectVoice } as never,
+      voiceKernel: { processAutomaticDirectVoice, markDirectVoiceRefreshPublished } as never,
       ownerAccountId: OWNER,
       sessionId: SESSION,
       assistantMessageId: MESSAGE,
@@ -31,9 +32,10 @@ describe('automatic direct-chat voice after a committed turn', () => {
     expect(processAutomaticDirectVoice).toHaveBeenCalledWith(MESSAGE);
     expect(publishChanged).not.toHaveBeenCalled();
 
-    resolveAttachment({ execution: {}, message: { id: MESSAGE } });
+    resolveAttachment({ execution: {}, message: { id: MESSAGE }, refreshPending: true });
     await expect(result).resolves.toBe('attached');
     expect(publishChanged).toHaveBeenCalledTimes(1);
+    expect(markDirectVoiceRefreshPublished).toHaveBeenCalledWith(MESSAGE);
     expect(onError).not.toHaveBeenCalled();
   });
 
@@ -45,7 +47,7 @@ describe('automatic direct-chat voice after a committed turn', () => {
     const onError = vi.fn();
 
     await expect(attachAutomaticDirectVoiceNote({
-      voiceKernel: { processAutomaticDirectVoice } as never,
+      voiceKernel: { processAutomaticDirectVoice, markDirectVoiceRefreshPublished: vi.fn() } as never,
       ownerAccountId: OWNER,
       sessionId: SESSION,
       assistantMessageId: MESSAGE,
@@ -64,7 +66,7 @@ describe('automatic direct-chat voice after a committed turn', () => {
     const onError = vi.fn();
 
     await expect(attachAutomaticDirectVoiceNote({
-      voiceKernel: { processAutomaticDirectVoice } as never,
+      voiceKernel: { processAutomaticDirectVoice, markDirectVoiceRefreshPublished: vi.fn() } as never,
       ownerAccountId: OWNER,
       sessionId: SESSION,
       assistantMessageId: MESSAGE,

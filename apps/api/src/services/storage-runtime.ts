@@ -36,7 +36,7 @@ export interface StorageRuntime {
   backend: ObjectBackend;
   objectRoot: string | null;
   cacheRoot: string;
-  deletePrivateObject(object: StoredObject): Promise<void>;
+  deletePrivateObject(object: StoredObject, signal?: AbortSignal): Promise<void>;
 }
 
 export interface CreateStorageRuntimeOptions {
@@ -250,7 +250,7 @@ export async function createStorageRuntime(options: CreateStorageRuntimeOptions)
     backend,
     objectRoot: backend instanceof LocalObjectBackend ? objectRoot : null,
     cacheRoot,
-    deletePrivateObject: (object) => objectService.deletePrivate(object),
+    deletePrivateObject: (object, signal) => objectService.deletePrivate(object, signal),
   };
 }
 

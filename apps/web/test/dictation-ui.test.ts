@@ -9,12 +9,16 @@ import {
 import { PCM_UPLOAD_CHUNK_SAMPLES } from "../lib/pcm-recorder";
 import {
   DICTATION_DRAFT_TTL_MS,
+  DICTATION_COMPOSER_DRAFTS_KEY,
   DICTATION_SIGN_OUT_PURGE_DEADLINE_MS,
   beginDictationPurgeFence,
+  commitDictationTranscriptToComposer,
   clearDictationPurgeFence,
   currentDictationCustodyEpoch,
   currentDictationPurgeFence,
+  loadDictationComposerDraft,
   partitionDictationDrafts,
+  persistDictationComposerDraft,
   purgeDictationDraftsBeforeSignOut,
   resolveDictationPurgeFenceAfterRecovery,
   type DictationDraftRecord,
@@ -74,7 +78,10 @@ describe("dictation UI helpers", () => {
       setItem: (key, value) => { values.set(key, value); },
       removeItem: (key) => { values.delete(key); },
     };
+    persistDictationComposerDraft("account-1", "session:one", "private transcript", fenceStore);
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(true);
     expect(await purgeDictationDraftsBeforeSignOut(async () => undefined, 500, fenceStore)).toBe("purged");
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(false);
     // Success intentionally remains fenced through the auth transition.
     const successfulEpoch = currentDictationPurgeFence(fenceStore)!;
     expect(successfulEpoch).toBeTruthy();
@@ -96,6 +103,27 @@ describe("dictation UI helpers", () => {
     expect(timedOutEpoch).toBeTruthy();
     clearDictationPurgeFence(timedOutEpoch, fenceStore);
     expect(DICTATION_SIGN_OUT_PURGE_DEADLINE_MS).toBeLessThanOrEqual(500);
+  });
+
+  it("durably hands a transcript to the composer before audio ack and replays exactly once", () => {
+    const values = new Map<string, string>();
+    const fenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    expect(persistDictationComposerDraft("account-1", "session:one", "Typed preface", fenceStore)).toBe(true);
+    const first = commitDictationTranscriptToComposer(
+      "account-1", "session:one", "draft-delivery-1", "spoken continuation", fenceStore,
+    );
+    expect(first).toBe("Typed preface spoken continuation");
+    // Simulate a crash before IndexedDB acknowledgement: remount hydrates the
+    // committed composer text, and replaying the same delivery cannot append.
+    expect(loadDictationComposerDraft("account-1", "session:one", fenceStore)).toBe(first);
+    expect(commitDictationTranscriptToComposer(
+      "account-1", "session:one", "draft-delivery-1", "spoken continuation", fenceStore,
+    )).toBe(first);
+    expect(loadDictationComposerDraft("account-1", "session:one", fenceStore)).toBe(first);
   });
 
   it("invalidates a pre-fence writer even after the recovery purge clears its tombstone", () => {

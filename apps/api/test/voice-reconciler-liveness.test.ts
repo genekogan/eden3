@@ -14,15 +14,17 @@ async function flushMicrotasks(): Promise<void> {
 describe('voice reconciler liveness', () => {
   it('publishes one refresh only for each atomically recovered direct attachment', async () => {
     const publish = vi.fn();
+    const markDirectVoiceRefreshPublished = vi.fn(async () => true);
     const reconcileDirectVoiceJobs = vi.fn(async () => ({
       processed: 3,
       settled: [{ sessionId: '22222222-2222-4222-8222-222222222222', messageId: '33333333-3333-4333-8333-333333333333' }],
     }));
     await expect(reconcileDirectVoiceAndPublish(
-      { reconcileDirectVoiceJobs } as never,
+      { reconcileDirectVoiceJobs, markDirectVoiceRefreshPublished } as never,
       { publish },
     )).resolves.toBe(3);
     expect(publish).toHaveBeenCalledTimes(1);
+    expect(markDirectVoiceRefreshPublished).toHaveBeenCalledWith('33333333-3333-4333-8333-333333333333');
     expect(publish).toHaveBeenCalledWith('22222222-2222-4222-8222-222222222222', {
       type: 'session.messages.changed',
       sessionId: '22222222-2222-4222-8222-222222222222',
@@ -32,12 +34,37 @@ describe('voice reconciler liveness', () => {
     publish.mockClear();
     await reconcileDirectVoiceAndPublish({
       reconcileDirectVoiceJobs: vi.fn(async () => ({ processed: 2, settled: [] })),
+      markDirectVoiceRefreshPublished,
     } as never, { publish });
     expect(publish).not.toHaveBeenCalled();
     await expect(reconcileDirectVoiceAndPublish({
       reconcileDirectVoiceJobs: vi.fn(async () => { throw new Error('failed'); }),
+      markDirectVoiceRefreshPublished,
     } as never, { publish })).rejects.toThrow('failed');
     expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('retains a durable pending refresh when aborted after settlement and republishes after restart', async () => {
+    const controller = new AbortController();
+    const settled = [{ sessionId: '22222222-2222-4222-8222-222222222222', messageId: '33333333-3333-4333-8333-333333333333' }];
+    const publish = vi.fn();
+    const markDirectVoiceRefreshPublished = vi.fn(async () => true);
+    await expect(reconcileDirectVoiceAndPublish({
+      reconcileDirectVoiceJobs: vi.fn(async () => {
+        controller.abort(new Error('deadline'));
+        return { processed: 1, settled };
+      }),
+      markDirectVoiceRefreshPublished,
+    } as never, { publish }, controller.signal)).rejects.toThrow('deadline');
+    expect(publish).not.toHaveBeenCalled();
+    expect(markDirectVoiceRefreshPublished).not.toHaveBeenCalled();
+
+    await reconcileDirectVoiceAndPublish({
+      reconcileDirectVoiceJobs: vi.fn(async () => ({ processed: 1, settled })),
+      markDirectVoiceRefreshPublished,
+    } as never, { publish });
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(markDirectVoiceRefreshPublished).toHaveBeenCalledTimes(1);
   });
 
   it('starts without awaiting provider work and suppresses overlapping ticks', async () => {

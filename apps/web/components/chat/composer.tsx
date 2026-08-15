@@ -14,9 +14,14 @@ import type { ChangeEvent, DragEvent, KeyboardEvent, ReactNode } from "react";
 import { getClerkToken } from "@/lib/clerk";
 import { ResumableUploader } from "@/lib/resumable-upload";
 import { useSelectedAgent } from "@/components/shell/selected-agent-context";
+import {
+  clearDictationComposerDraft,
+  commitDictationTranscriptToComposer,
+  loadDictationComposerDraft,
+  persistDictationComposerDraft,
+} from "@/lib/dictation-storage";
 import type { MessageAttachment } from "@/lib/types";
 import {
-  appendTranscript,
   formatDictationTime,
   useDictation,
 } from "./use-dictation";
@@ -48,6 +53,19 @@ export function attachmentError(file: File): string | null {
   if (file.size <= 0) return "Empty files cannot be attached.";
   if (file.size > limit) return file.type.startsWith("image/") ? "Images must be 10 MiB or smaller." : "Text files must be 1 MiB or smaller.";
   return null;
+}
+
+export async function clearComposerDraftAfterTurnAcceptance(
+  acceptance: boolean | Promise<boolean>,
+  clear: () => void,
+): Promise<boolean> {
+  try {
+    const accepted = await acceptance;
+    if (accepted) clear();
+    return accepted;
+  } catch {
+    return false;
+  }
 }
 
 function SendIcon() {
@@ -92,9 +110,10 @@ export function Composer({
   placeholder = "Message…",
   notice,
   autoFocus = false,
+  draftKey,
 }: {
   /** Called with trimmed content; the input clears immediately. */
-  onSend: (content: string, attachments: ComposerAttachment[]) => void;
+  onSend: (content: string, attachments: ComposerAttachment[]) => boolean | Promise<boolean>;
   /** Abort the active stream (only rendered while `streaming`). */
   onStop?: () => void;
   streaming?: boolean;
@@ -104,8 +123,11 @@ export function Composer({
   /** Rendered above the input — 402 notices, retry hints. */
   notice?: ReactNode;
   autoFocus?: boolean;
+  /** Stable view identity for crash-safe dictation transcript handoff. */
+  draftKey: string;
 }) {
   const [value, setValue] = useState("");
+  const valueRef = useRef("");
   const [attachments, setAttachments] = useState<StagedAttachment[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -118,10 +140,17 @@ export function Composer({
     refreshCredentials: async () => { await getClerkToken(); },
   }), []);
   const { viewer, viewerPhase } = useSelectedAgent();
-  const receiveTranscript = useCallback((transcript: string) => {
-    setValue((current) => appendTranscript(current, transcript));
+  const receiveTranscript = useCallback((transcript: string, deliveryId: string) => {
+    if (viewerPhase !== "ready" || !viewer) return false;
+    // This synchronous localStorage commit is the durable handoff. IndexedDB
+    // audio/transcript custody is acknowledged only after it succeeds.
+    const committed = commitDictationTranscriptToComposer(viewer.id, draftKey, deliveryId, transcript);
+    if (committed === null) return false;
+    valueRef.current = committed;
+    setValue(committed);
     queueMicrotask(() => textareaRef.current?.focus());
-  }, []);
+    return true;
+  }, [draftKey, viewer, viewerPhase]);
   const dictation = useDictation({
     ownerId: viewer?.id ?? null,
     ownerPhase: viewerPhase,
@@ -130,6 +159,22 @@ export function Composer({
   const dictationBusy = !["idle", "error"].includes(dictation.state.phase);
   const dictationRecording =
     dictation.state.phase === "recording" || dictation.state.phase === "retrying";
+
+  useEffect(() => {
+    if (viewerPhase === "signed_out") {
+      valueRef.current = "";
+      setValue("");
+      return;
+    }
+    if (viewerPhase !== "ready" || !viewer) return;
+    const restored = loadDictationComposerDraft(viewer.id, draftKey);
+    if (restored === null) {
+      if (valueRef.current) persistDictationComposerDraft(viewer.id, draftKey, valueRef.current);
+      return;
+    }
+    valueRef.current = restored;
+    setValue(restored);
+  }, [draftKey, viewer, viewerPhase]);
 
   useEffect(() => () => {
     for (const url of previewUrls.current) URL.revokeObjectURL(url);
@@ -227,13 +272,18 @@ export function Composer({
     const ready = attachments.flatMap((item) => item.result ? [item.result] : []);
     if ((!content && ready.length === 0) || streaming || disabled || dictationBusy || uploadPending || uploadFailed) return;
     setValue("");
+    valueRef.current = "";
     setAttachments([]);
     for (const item of attachments) if (item.previewUrl) {
       URL.revokeObjectURL(item.previewUrl);
       previewUrls.current.delete(item.previewUrl);
     }
-    onSend(content, ready);
-  }, [value, attachments, streaming, disabled, dictationBusy, uploadPending, uploadFailed, onSend]);
+    void clearComposerDraftAfterTurnAcceptance(onSend(content, ready), () => {
+      // Keep the durable dictation handoff through network ambiguity. Only a
+      // server turn.started acknowledgement permits erasing its retry copy.
+      if (viewer) clearDictationComposerDraft(viewer.id, draftKey);
+    });
+  }, [value, attachments, streaming, disabled, dictationBusy, uploadPending, uploadFailed, onSend, viewer, draftKey]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key !== "Enter" || event.shiftKey) return;
@@ -380,7 +430,14 @@ export function Composer({
           ref={textareaRef}
           rows={1}
           value={value}
-          onChange={(event) => setValue(event.target.value)}
+          onChange={(event) => {
+            const next = event.target.value;
+            valueRef.current = next;
+            setValue(next);
+            if (viewerPhase === "ready" && viewer) {
+              persistDictationComposerDraft(viewer.id, draftKey, next);
+            }
+          }}
           onKeyDown={onKeyDown}
           placeholder={streaming ? "Streaming…" : dragging ? "Drop files here…" : placeholder}
           disabled={disabled || streaming || dictationBusy}
