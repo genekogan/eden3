@@ -20,6 +20,7 @@
     "build": "tsc --noEmit"
   },
   "dependencies": {
+    "@cartesia/cartesia-js": "4.0.1",
     "@eden3/core": "workspace:*",
     "@eden3/db": "workspace:*",
     "@eden3/gateway": "workspace:*",
@@ -31,13 +32,15 @@
     "drizzle-orm": "^0.45.2",
     "eventsource-parser": "^3.0.3",
     "fastify": "^5.4.0",
+    "ws": "^8.21.3",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/archiver": "^8.0.0",
+    "@types/ws": "^8.18.1",
+    "postgres": "^3.4.9",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
-    "postgres": "^3.4.9",
     "vitest": "^3.2.4"
   }
 }

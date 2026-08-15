@@ -4,11 +4,12 @@ import { lstat, realpath, unlink } from 'node:fs/promises';
 import { basename, dirname, resolve, sep } from 'node:path';
 
 import type { PgClient } from '@eden3/db';
-import type { DbHandle } from '@eden3/core';
+import { getEnv, type DbHandle } from '@eden3/core';
 import { sql } from 'drizzle-orm';
 
 import { ApiError } from '../errors';
 import { DEFAULT_EVE_USERNAME } from './default-assistant';
+import { PrivateTranscriptionAudioStore } from './transcription-audio-custody';
 import {
   ACCOUNT_ERASURE_RECOVERY_MANIFEST_SCHEMA_VERSION,
   type AccountErasureClaimResult,
@@ -242,8 +243,14 @@ export interface AccountErasurePresealReconciler {
 }
 
 export class PostgresAccountErasurePresealReconciler implements AccountErasurePresealReconciler {
-  constructor(private readonly client: PgClient) {
+  private readonly transcriptionAudio: PrivateTranscriptionAudioStore;
+
+  constructor(
+    private readonly client: PgClient,
+    transcriptionAudio = new PrivateTranscriptionAudioStore(getEnv().TRANSCRIPTION_AUDIO_DIR),
+  ) {
     if (!client) throw new Error('Account erasure reconciliation requires the dedicated operator client');
+    this.transcriptionAudio = transcriptionAudio;
   }
 
   async reconcile(input: {
@@ -253,6 +260,7 @@ export class PostgresAccountErasurePresealReconciler implements AccountErasurePr
     claimToken?: string;
     claimExpiresAt?: string;
   }): Promise<void> {
+    const prunedSessions: Array<{ ownerId: string; sessionId: string }> = [];
     try {
       await this.client.begin(async (tx) => {
         await tx`select account_erasure_begin_operation()`;
@@ -274,7 +282,39 @@ export class PostgresAccountErasurePresealReconciler implements AccountErasurePr
               and claim_expires_at>statement_timestamp())) for update`;
         if (!job) return;
         await tx`select account_erasure_reconcile_open_work(${input.jobId})`;
+        // Uploading and already-reconciled sessions have no live provider
+        // outcome. Delete their private bytes before deleting the only DB
+        // locators. provider_admitted/running usage remains fail-closed until
+        // the fenced worker reaches a terminal/refunded state.
+        const sessions = await tx<{
+          owner_account_id: string;
+          session_id: string;
+        }[]>`
+          select s.owner_account_id,s.id session_id
+          from transcription_sessions s
+          where s.owner_account_id=${input.accountId}
+            and not exists (
+              select 1 from usage_events u
+              where u.event_type='speech_transcription' and u.turn_id=s.id
+                and u.status in ('provider_admitted','running','refund_pending')
+            )
+          order by s.id
+          for update of s`;
+        for (const session of sessions) {
+          await this.transcriptionAudio.deleteSession(session.owner_account_id, session.session_id);
+        }
+        const deletable = sessions.map((row) => row.session_id);
+        if (deletable.length > 0) {
+          await tx`delete from transcription_sessions where id=any(${deletable}::uuid[])`;
+          prunedSessions.push(...deletable.map((sessionId) => ({
+            ownerId: input.accountId,
+            sessionId,
+          })));
+        }
       });
+      for (const row of prunedSessions) {
+        await this.transcriptionAudio.pruneSessionDirectories(row.ownerId, row.sessionId);
+      }
     } catch (error) {
       if (error instanceof Error &&
           (error as Error & { code?: string }).code === '55000' &&

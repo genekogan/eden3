@@ -87,6 +87,10 @@ const AUTHENTICATED_ROUTES: readonly PathMethods[] = [
   ['/skills/:slug/review', ['POST']],
   ['/skills/user', ['POST']],
   ['/studio/generate', ['POST']],
+  ['/transcriptions', ['POST']],
+  ['/transcriptions/:id', ['DELETE', 'GET', 'HEAD']],
+  ['/transcriptions/:id/chunks/:chunkNumber', ['PUT']],
+  ['/transcriptions/:id/finalize', ['POST']],
   ['/usage/summary', ['GET', 'HEAD']],
 ];
 

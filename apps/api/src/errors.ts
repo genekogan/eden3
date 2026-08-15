@@ -65,6 +65,11 @@ const PUBLIC_SERVER_ERROR_CODES = new Set([
   'turn_capacity_exceeded',
   'turn_queue_timeout',
   'tts_not_configured',
+  'transcription_not_configured',
+  'provider_auth_error',
+  'provider_rate_limited',
+  'provider_response_invalid',
+  'provider_timeout',
 ]);
 
 /**
