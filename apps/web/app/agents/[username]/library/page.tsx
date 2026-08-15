@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { SectionHeader } from "@/components/shell/section-header";
 import { LibraryClient } from "./library-client";
 
 export const metadata: Metadata = { title: "Library" };
@@ -11,16 +12,12 @@ export default async function AgentLibraryPage({
   const { username } = await params;
   const decoded = decodeURIComponent(username);
   return (
-    <div className="mx-auto w-full max-w-6xl px-6 py-10 md:px-10">
-      <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
-        @{decoded}
-      </p>
-      <h1 className="mt-3 text-3xl font-light tracking-tight md:text-4xl">Library</h1>
-      <p className="mt-2 max-w-2xl text-sm text-muted">
-        Upload private files, browse what this agent has created, or switch to all
-        of your creations, Studio output included.
-      </p>
-      <div className="mt-8">
+    <div className="flex min-h-dvh flex-col">
+      <SectionHeader
+        title="Library"
+        help="Browse media created by this agent, or switch to media created by all of your agents."
+      />
+      <div className="mx-auto w-full max-w-6xl flex-1 px-5 py-6 md:px-8">
         <LibraryClient username={decoded} />
       </div>
     </div>

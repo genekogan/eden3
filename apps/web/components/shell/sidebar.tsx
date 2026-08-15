@@ -13,6 +13,7 @@
  */
 
 import Link from "next/link";
+import Image from "next/image";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -29,6 +30,7 @@ import {
 import { AgentSelector } from "./agent-selector";
 import { UserArea } from "./user-area";
 import { useSelectedAgent } from "./selected-agent-context";
+import { COMMAND_PALETTE_OPEN_EVENT } from "./command-palette";
 
 /** Minimal 24px stroke icons (multi-subpath `d` strings, lucide-derived). */
 export const ICONS = {
@@ -77,7 +79,7 @@ export function NavIcon({ d }: { d: string }) {
 
 const AGENT_NAV = [
   { sub: "chats", label: "Chat", icon: ICONS.chats },
-  { sub: "schedule", label: "Schedule", icon: ICONS.schedule },
+  { sub: "schedule", label: "Schedules", icon: ICONS.schedule },
   { sub: "workspace", label: "Workspace", icon: ICONS.workspace },
   { sub: "library", label: "Library", icon: ICONS.library },
   { sub: "gateway", label: "Gateway", icon: ICONS.gateway },
@@ -110,7 +112,7 @@ function DomainToggle({
 }: {
   domain: Domain;
   agentsHref: string;
-  labels?: "responsive" | "always";
+  labels?: "responsive" | "always" | "hidden";
 }) {
   const options: Array<{ value: Domain; label: string; href: string; icon: string }> = [
     { value: "agents", label: "Agents", href: agentsHref, icon: ICONS.agents },
@@ -121,7 +123,7 @@ function DomainToggle({
       role="group"
       aria-label="App domain"
       className={`flex overflow-hidden rounded-lg border border-edge bg-raised ${
-        labels === "responsive" ? "flex-col lg:flex-row" : ""
+        labels === "responsive" ? "flex-col lg:flex-row" : labels === "hidden" ? "flex-col" : ""
       }`}
     >
       {options.map((option) => {
@@ -139,7 +141,15 @@ function DomainToggle({
             }`}
           >
             <NavIcon d={option.icon} />
-            <span className={labels === "responsive" ? "hidden lg:inline" : ""}>
+            <span
+              className={
+                labels === "responsive"
+                  ? "hidden lg:inline"
+                  : labels === "hidden"
+                    ? "hidden"
+                    : ""
+              }
+            >
               {option.label}
             </span>
           </Link>
@@ -154,10 +164,11 @@ function DomainToggle({
 // ---------------------------------------------------------------------------
 
 /** labels: "responsive" hides them below lg (desktop rail); "always" shows them (mobile sheet). */
-type LabelMode = "responsive" | "always";
-const labelClass = (mode: LabelMode) => (mode === "responsive" ? "hidden lg:inline" : "");
+type LabelMode = "responsive" | "always" | "hidden";
+const labelClass = (mode: LabelMode) =>
+  mode === "responsive" ? "hidden lg:inline" : mode === "hidden" ? "hidden" : "";
 const rowClass = (mode: LabelMode) =>
-  mode === "responsive"
+  mode !== "always"
     ? "justify-center gap-0 px-0 lg:justify-start lg:gap-2.5 lg:px-3"
     : "justify-start gap-2.5 px-3";
 
@@ -304,7 +315,20 @@ export function Sidebar() {
   const pathname = usePathname();
   const { username } = useSelectedAgent();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [desktopCollapsed, setDesktopCollapsed] = useState(false);
   const domain = domainFromPathname(pathname);
+
+  useEffect(() => {
+    setDesktopCollapsed(window.localStorage.getItem("eden:sidebar-collapsed") === "1");
+  }, []);
+
+  const toggleDesktopSidebar = () => {
+    setDesktopCollapsed((collapsed) => {
+      const next = !collapsed;
+      window.localStorage.setItem("eden:sidebar-collapsed", next ? "1" : "0");
+      return next;
+    });
+  };
 
   useEffect(() => setMobileOpen(false), [pathname]);
 
@@ -339,9 +363,9 @@ export function Sidebar() {
         <Link
           href="/"
           aria-label="Eden home"
-          className="font-mono text-sm tracking-[0.35em] text-foreground"
+          className="grid size-9 place-items-center overflow-hidden rounded-lg"
         >
-          EDEN<span className="text-accent">3</span>
+          <Image src="/eden-logo.png" alt="" width={36} height={36} priority />
         </Link>
         <div className="flex items-center gap-2">
           <Link
@@ -406,30 +430,82 @@ export function Sidebar() {
       {/* Tablet/desktop rail; labels return at lg+. */}
       <aside
         data-testid="desktop-sidebar"
-        className="sticky top-0 hidden h-dvh w-14 shrink-0 flex-col border-r border-edge bg-surface sm:flex lg:w-60"
+        data-collapsed={desktopCollapsed ? "true" : "false"}
+        className={`sticky top-0 hidden h-dvh shrink-0 flex-col border-r border-edge bg-surface transition-[width] duration-200 sm:flex ${
+          desktopCollapsed ? "w-14" : "w-14 lg:w-60"
+        }`}
       >
-        <div className="flex items-center justify-center pb-3 pt-4 lg:justify-start lg:px-4">
-          <Link
-            href="/"
-            aria-label="Eden home"
-            title="Eden"
-            className="font-mono text-sm tracking-[0.35em] text-foreground"
-          >
-            <span className="hidden lg:inline">
-              EDEN<span className="text-accent">3</span>
-            </span>
-            <span aria-hidden className="block size-2.5 rounded-full bg-accent lg:hidden" />
-          </Link>
+        <div className={`relative flex h-14 shrink-0 items-center ${desktopCollapsed ? "justify-center" : "justify-center lg:justify-start lg:px-4"}`}>
+          {desktopCollapsed ? (
+            <button
+              type="button"
+              aria-label="Expand sidebar"
+              title="Expand sidebar"
+              onClick={toggleDesktopSidebar}
+              className="grid size-8 place-items-center overflow-hidden rounded-lg"
+            >
+              <Image src="/eden-logo.png" alt="" width={32} height={32} priority />
+            </button>
+          ) : (
+            <Link
+              href="/"
+              aria-label="Eden home"
+              title="Eden"
+              className="grid size-8 place-items-center overflow-hidden rounded-lg"
+            >
+              <Image src="/eden-logo.png" alt="" width={32} height={32} priority />
+            </Link>
+          )}
+          {!desktopCollapsed ? (
+            <button
+              type="button"
+              aria-label="Search Eden"
+              title="Search (⌘K)"
+              onClick={() => window.dispatchEvent(new Event(COMMAND_PALETTE_OPEN_EVENT))}
+              className="absolute right-10 top-3 hidden size-8 place-items-center rounded-lg text-faint transition-colors hover:bg-foreground/[0.05] hover:text-foreground lg:grid"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.5}
+                strokeLinecap="round"
+                aria-hidden
+                className="size-4"
+              >
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+              </svg>
+            </button>
+          ) : null}
+          {!desktopCollapsed ? (
+            <button
+              type="button"
+              aria-label="Collapse sidebar"
+              onClick={toggleDesktopSidebar}
+              className="absolute right-1.5 top-3 hidden size-8 place-items-center rounded-lg text-faint transition-colors hover:bg-foreground/[0.05] hover:text-foreground lg:grid"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} aria-hidden className="size-4">
+                <rect x="3" y="4" width="18" height="16" rx="2" />
+                <path d="M9 4v16" />
+                <path d="m16 9-3 3 3 3" />
+              </svg>
+            </button>
+          ) : null}
         </div>
 
         <div className="px-2 lg:px-3">
-          <DomainToggle domain={domain} agentsHref={agentsHref} />
+          <DomainToggle
+            domain={domain}
+            agentsHref={agentsHref}
+            labels={desktopCollapsed ? "hidden" : "responsive"}
+          />
           {domain === "agents" ? (
             <div className="mt-3">
-              <div className="lg:hidden">
+              <div className={desktopCollapsed ? "block" : "lg:hidden"}>
                 <AgentSelector collapsed />
               </div>
-              <div className="hidden lg:block">
+              <div className={desktopCollapsed ? "hidden" : "hidden lg:block"}>
                 <AgentSelector />
               </div>
             </div>
@@ -437,13 +513,17 @@ export function Sidebar() {
         </div>
 
         <nav className="flex-1 overflow-y-auto px-2 pb-4 lg:px-3" aria-label="Primary">
-          {domain === "agents" ? <AgentNav /> : <StudioNav />}
+          {domain === "agents" ? (
+            <AgentNav labels={desktopCollapsed ? "hidden" : "responsive"} />
+          ) : (
+            <StudioNav labels={desktopCollapsed ? "hidden" : "responsive"} />
+          )}
         </nav>
 
-        <div className="lg:hidden">
+        <div className={desktopCollapsed ? "block" : "lg:hidden"}>
           <UserArea collapsed />
         </div>
-        <div className="hidden lg:block">
+        <div className={desktopCollapsed ? "hidden" : "hidden lg:block"}>
           <UserArea />
         </div>
       </aside>

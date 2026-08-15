@@ -10,6 +10,19 @@ const WEB_ROOT = resolve(import.meta.dirname, "..");
 const source = (path: string) => readFileSync(resolve(WEB_ROOT, path), "utf8");
 
 describe("scheduled task primary UI contract", () => {
+  it("uses schedule language and independent desktop scroll panes", () => {
+    const client = source("app/tasks/tasks-client.tsx");
+    const create = source("app/tasks/new-task-modal.tsx");
+    expect(client).toContain('title="Schedules"');
+    expect(client).toContain("New schedule");
+    expect(client).toContain('aria-label="Schedules"');
+    expect(client).toContain('aria-label="Schedule details"');
+    expect(client).toContain("lg:flex-1 lg:overflow-y-auto lg:overscroll-contain");
+    expect(client).toContain("lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain");
+    expect(create).toContain("New schedule");
+    expect(create).toContain("Create schedule");
+  });
+
   it("makes new-versus-existing output destination explicit", () => {
     const newSession = renderToStaticMarkup(
       <TaskDestinationFields

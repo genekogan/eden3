@@ -1,10 +1,8 @@
 "use client";
 
 /**
- * /agents/[username]/library — the agent's creations, newest first, with a
- * scope toggle: "This agent" (GET /feed/creations?agent=) or "All mine"
- * (user=me — every creation you own, including agent-less Studio output and
- * non-public rows).
+ * /agents/[username]/library — agent-created media, newest first, scoped to
+ * the selected agent or all agents owned by the viewer.
  */
 
 import Link from "next/link";
@@ -15,8 +13,8 @@ import { EmptyState } from "@/components/empty-state";
 import { MediaThumb } from "@/components/media";
 import { Skeleton } from "@/components/skeleton";
 import { describeApiFailure } from "@/components/agents/agent-utils";
-import { UploadPanel } from "@/components/uploads/upload-panel";
 import { ContextualHelpLink } from "@/components/help/contextual-help-link";
+import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 
 type Scope = "agent" | "mine";
 
@@ -31,6 +29,7 @@ function GridSkeleton() {
 }
 
 export function LibraryClient({ username }: { username: string }) {
+  const { agent } = useSelectedAgent();
   const [scope, setScope] = useState<Scope>("agent");
   const [items, setItems] = useState<CreationDto[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -44,7 +43,7 @@ export function LibraryClient({ username }: { username: string }) {
     (cursorArg?: string) =>
       scope === "agent"
         ? { agent: username, ...(cursorArg ? { cursor: cursorArg } : {}) }
-        : { user: "me", ...(cursorArg ? { cursor: cursorArg } : {}) },
+        : { user: "me", agentOnly: "true" as const, ...(cursorArg ? { cursor: cursorArg } : {}) },
     [scope, username],
   );
 
@@ -85,17 +84,15 @@ export function LibraryClient({ username }: { username: string }) {
 
   return (
     <div>
-      <UploadPanel />
-
       <div
         role="group"
         aria-label="Library scope"
-        className="mt-8 flex w-fit overflow-hidden rounded-lg border border-edge"
+        className="flex w-fit overflow-hidden rounded-lg border border-edge"
       >
         {(
           [
-            ["agent", "This agent"],
-            ["mine", "All mine"],
+            ["agent", agent?.name || username],
+            ["mine", "All agents"],
           ] as const
         ).map(([value, label]) => (
           <button
@@ -136,8 +133,8 @@ export function LibraryClient({ username }: { username: string }) {
             title={scope === "agent" ? "Nothing created yet" : "No creations yet"}
             hint={
               scope === "agent"
-                ? "This agent hasn't made anything — start a chat and ask for an image."
-                : "Creations from chats and the Studio land here."
+                ? `${agent?.name || username} hasn't made anything — start a chat and ask for an image.`
+                : "Media created by your agents will appear here."
             }
             action={<ContextualHelpLink topic="library-files">Library help</ContextualHelpLink>}
           />

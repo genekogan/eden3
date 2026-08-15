@@ -16,6 +16,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { EmptyState } from "@/components/empty-state";
+import { SectionHeader } from "@/components/shell/section-header";
 import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 
 const SECTIONS = [
@@ -31,7 +32,7 @@ export function SettingsNav({ username }: { username: string }) {
   const pathname = usePathname();
   const base = `/agents/${encodeURIComponent(username)}/settings`;
   return (
-    <nav aria-label="Agent settings sections" className="shrink-0 md:w-44">
+    <nav aria-label="Agent settings sections" className="min-w-0 px-3 py-3 md:px-3">
       <ul className="flex gap-1 overflow-x-auto md:flex-col md:gap-0.5">
         {SECTIONS.map((section) => {
           const href = `${base}/${section.sub}`;
@@ -81,18 +82,17 @@ export function SettingsShell({
   const { canManage, viewer, phase } = useSelectedAgent();
 
   return (
-    <div className="mx-auto w-full max-w-5xl px-6 py-10 md:px-10">
-      <p className="font-mono text-[11px] uppercase tracking-[0.3em] text-faint">
-        @{username} · settings
-      </p>
-      <div className="mt-6 flex flex-col gap-6 md:flex-row md:gap-10">
+    <div className="flex min-h-dvh min-w-0 flex-col md:flex-row">
+      <aside className="shrink-0 border-b border-edge bg-surface/60 md:w-56 md:border-b-0 md:border-r">
+        <SectionHeader
+          title="Settings"
+          help="Configure this agent's identity, persona, tools, skills, memory, and reusable visual concepts."
+        />
         <SettingsNav username={username} />
-        <div className="min-w-0 flex-1">
-          <h1 className="text-2xl font-light tracking-tight md:text-3xl">{title}</h1>
-          {hint ? (
-            <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">{hint}</p>
-          ) : null}
-          <div className="mt-6">
+      </aside>
+      <section className="min-w-0 flex-1">
+        <SectionHeader title={title} help={hint ?? `Configure this agent's ${title.toLowerCase()}.`} />
+        <div className="mx-auto w-full max-w-4xl px-5 py-6 md:px-8">
             {phase === "ready" && !canManage ? (
               <EmptyState
                 title={viewer ? `You don't manage @${username}` : "Sign in first"}
@@ -105,9 +105,8 @@ export function SettingsShell({
             ) : (
               children
             )}
-          </div>
         </div>
-      </div>
+      </section>
     </div>
   );
 }

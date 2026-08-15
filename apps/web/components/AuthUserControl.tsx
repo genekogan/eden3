@@ -1,58 +1,48 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { loadClerk, selectAuthMode, type ClerkJs } from "@/lib/clerk";
-import { DevUserSwitcher } from "@/components/DevUserSwitcher";
+import { useState } from "react";
+import {
+  emitDevUserChange,
+  emitMannaUpdate,
+} from "@/lib/api";
+import { loadClerk, selectAuthMode } from "@/lib/clerk";
 
 export function AuthUserControl({
   variant = "footer",
 }: {
   variant?: "footer" | "panel";
 } = {}) {
-  if (selectAuthMode() === "dev-impersonation") {
-    return <DevUserSwitcher variant={variant} />;
-  }
-  return <ClerkUserControl panel={variant === "panel"} />;
-}
+  const [busy, setBusy] = useState(false);
 
-function ClerkUserControl({ panel = false }: { panel?: boolean }) {
-  const [clerk, setClerk] = useState<ClerkJs | null>(null);
-  const mountRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    void loadClerk().then(
-      (loaded) => {
-        if (!cancelled) setClerk(loaded);
-      },
-      () => {
-        if (!cancelled) setClerk(null);
-      },
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    const el = mountRef.current;
-    if (!el || !clerk?.isSignedIn) return;
-    clerk.mountUserButton(el);
-    return () => {
-      clerk.unmountUserButton?.(el);
-      el.innerHTML = "";
-    };
-  }, [clerk]);
+  const signOut = async () => {
+    setBusy(true);
+    try {
+      if (selectAuthMode() === "clerk") {
+        const clerk = await loadClerk();
+        await clerk.signOut?.();
+      } else {
+        await fetch("/api/dev/logout", {
+          method: "POST",
+          credentials: "include",
+        });
+        emitDevUserChange(null);
+        emitMannaUpdate();
+      }
+    } finally {
+      window.location.assign("/");
+    }
+  };
 
   return (
-    <div
-      className={`flex min-h-14 items-center p-2 ${
-        panel
-          ? "justify-start rounded-xl border border-edge bg-raised"
-          : "justify-center border-t border-edge lg:justify-start lg:px-3"
+    <button
+      type="button"
+      onClick={() => void signOut()}
+      disabled={busy}
+      className={`w-full rounded-lg px-2 py-1.5 text-left text-[13px] text-muted transition-colors hover:bg-foreground/[0.04] hover:text-foreground disabled:opacity-50 ${
+        variant === "panel" ? "block" : "border-t border-edge"
       }`}
     >
-      <div ref={mountRef} />
-    </div>
+      {busy ? "Signing out…" : "Sign out"}
+    </button>
   );
 }

@@ -1,7 +1,7 @@
 "use client";
 
 /**
- * "New task" modal — creates a scheduled trigger:
+ * "New schedule" modal — creates a scheduled trigger:
  *
  *   agent picker (debounced search over GET /api/agents?q=)
  *   name + prompt
@@ -178,7 +178,7 @@ export function NewTaskModal({
       >
         <header className="flex items-center justify-between border-b border-edge px-5 py-4">
           <h2 id="new-task-title" className="text-sm font-medium">
-            New task
+            New schedule
           </h2>
           <button
             type="button"
@@ -350,7 +350,7 @@ export function NewTaskModal({
               disabled={!canSubmit}
               className="rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/85 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              {submitting ? "Creating…" : "Create task"}
+              {submitting ? "Creating…" : "Create schedule"}
             </button>
           </div>
         </form>

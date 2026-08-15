@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { api } from "@/lib/api";
 import type { AppNotificationDto } from "@/lib/types";
@@ -44,7 +45,12 @@ export function NotificationCenter({
     unreadCount: 0,
   });
   const [open, setOpen] = useState(false);
+  const [panelPosition, setPanelPosition] = useState<{ bottom: number; left: number } | null>(
+    null,
+  );
   const root = useRef<HTMLDivElement>(null);
+  const panel = useRef<HTMLElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
   const loadFence = useRef(new NotificationLoadFence());
 
   const refresh = useCallback(async (accountGeneration: number) => {
@@ -80,7 +86,8 @@ export function NotificationCenter({
   useEffect(() => {
     if (!open) return;
     const onPointer = (event: MouseEvent) => {
-      if (!root.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (!root.current?.contains(target) && !panel.current?.contains(target)) setOpen(false);
     };
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false);
@@ -90,6 +97,35 @@ export function NotificationCenter({
     return () => {
       document.removeEventListener("mousedown", onPointer);
       document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) {
+      setPanelPosition(null);
+      return;
+    }
+
+    const positionPanel = () => {
+      const rect = trigger.current?.getBoundingClientRect();
+      if (!rect) return;
+      const gutter = 8;
+      const panelWidth = Math.min(336, window.innerWidth - gutter * 2);
+      setPanelPosition({
+        bottom: Math.max(gutter, window.innerHeight - rect.top + gutter),
+        left: Math.max(
+          gutter,
+          Math.min(rect.right - panelWidth, window.innerWidth - panelWidth - gutter),
+        ),
+      });
+    };
+
+    positionPanel();
+    window.addEventListener("resize", positionPanel);
+    window.addEventListener("scroll", positionPanel, true);
+    return () => {
+      window.removeEventListener("resize", positionPanel);
+      window.removeEventListener("scroll", positionPanel, true);
     };
   }, [open]);
 
@@ -117,17 +153,21 @@ export function NotificationCenter({
       .catch(() => void refresh(loadFence.current.currentAccount()));
   };
 
-  return (
-    <div ref={root} className="relative shrink-0">
-      {open ? (
-        <section
+  const panelContent = open && panelPosition ? (
+    <section
+          ref={panel}
           aria-label="Notifications"
           // Paint an explicit opaque surface instead of relying only on the
           // utility class. This popover sits above the conversation rail; any
           // inherited/transient opacity makes the rail's titles look like
           // duplicated notification copy.
-          style={{ backgroundColor: "var(--color-raised)", isolation: "isolate" }}
-          className="fixed bottom-14 left-2 z-[100] flex max-h-[calc(100vh-4rem)] w-[min(21rem,calc(100vw-1rem))] flex-col overflow-hidden rounded-xl border border-edge bg-raised opacity-100 shadow-xl shadow-black/30 sm:absolute sm:bottom-full sm:left-0 sm:mb-2"
+          style={{
+            backgroundColor: "var(--color-raised)",
+            bottom: panelPosition.bottom,
+            isolation: "isolate",
+            left: panelPosition.left,
+          }}
+          className="fixed z-[1000] flex max-h-[calc(100vh-4rem)] w-[min(21rem,calc(100vw-1rem))] flex-col overflow-hidden rounded-xl border border-edge bg-raised opacity-100 shadow-xl shadow-black/30"
         >
           <header className="relative z-[1] flex shrink-0 items-center justify-between border-b border-edge bg-raised px-3 py-2.5">
             <h2 className="text-sm font-medium">Notifications</h2>
@@ -183,9 +223,14 @@ export function NotificationCenter({
               ))}
             </ul>
           )}
-        </section>
-      ) : null}
+    </section>
+  ) : null;
+
+  return (
+    <div ref={root} className="relative shrink-0">
+      {panelContent ? createPortal(panelContent, document.body) : null}
       <button
+        ref={trigger}
         type="button"
         onClick={() => setOpen((value) => !value)}
         aria-label={`Notifications${state.unreadCount ? `, ${state.unreadCount} unread` : ""}`}

@@ -232,7 +232,7 @@ const AGENT_SECTIONS = [
   },
   {
     section: "schedule",
-    label: "Schedule",
+    label: "Schedules",
     description: "Manage scheduled work for the selected agent.",
     keywords: ["tasks", "cron", "automation", "recurring"],
   },

@@ -38,7 +38,7 @@ describe("fuzzyScore", () => {
 });
 
 describe("fuzzyFilter", () => {
-  const items = ["Chats", "Schedule", "Workspace", "Library", "Gateway", "Log", "Settings"];
+  const items = ["Chats", "Schedules", "Workspace", "Library", "Gateway", "Log", "Settings"];
 
   it("filters and ranks best-first", () => {
     const results = fuzzyFilter("se", items, (s) => s);

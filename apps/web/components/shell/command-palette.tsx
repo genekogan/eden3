@@ -40,6 +40,8 @@ const NEXT_THEME: Record<ThemePreference, ThemePreference> = {
   dark: "system",
 };
 
+export const COMMAND_PALETTE_OPEN_EVENT = "eden:command-palette-open";
+
 export function CommandPalette() {
   const router = useRouter();
   const pathname = usePathname();
@@ -55,7 +57,7 @@ export function CommandPalette() {
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
 
-  // ⌘K / Ctrl-K toggles; Escape closes.
+  // ⌘K / Ctrl-K toggles; the sidebar search button opens the same surface.
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
@@ -65,8 +67,13 @@ export function CommandPalette() {
         setOpen(false);
       }
     };
+    const onOpenRequest = () => setOpen(true);
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    window.addEventListener(COMMAND_PALETTE_OPEN_EVENT, onOpenRequest);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener(COMMAND_PALETTE_OPEN_EVENT, onOpenRequest);
+    };
   }, []);
 
   useEffect(() => setOpen(false), [pathname]);

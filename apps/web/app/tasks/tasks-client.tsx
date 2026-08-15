@@ -7,7 +7,7 @@
  * schedule (once/hourly/daily/weekly), a status chip, real "last run /
  * next run" stamps, the last error when present, a link to the latest
  * run's output session, and a Run-now button (POST /api/tasks/:id/runs).
- * Pause/resume/edit/delete go through PATCH /api/tasks/:id. "New task"
+ * Pause/resume/edit/delete go through PATCH /api/tasks/:id. "New schedule"
  * opens the modal (POST /api/tasks).
  *
  * TriggerDto only carries agentId, so agent identities resolve from
@@ -29,6 +29,7 @@ import type {
 import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
 import { SkeletonRows } from "@/components/skeleton";
+import { SectionHeader } from "@/components/shell/section-header";
 import { formatRelativeTime } from "@/lib/format";
 import { describeSchedule } from "./schedule";
 import {
@@ -194,7 +195,7 @@ function EditTaskModal({
       >
         <header className="flex items-center justify-between border-b border-edge px-5 py-4">
           <h2 id="edit-task-title" className="text-sm font-medium">
-            Edit task
+            Edit schedule
           </h2>
           <button
             type="button"
@@ -528,7 +529,7 @@ export function TasksClient({
       onClick={() => setModalOpen(true)}
       className="rounded-lg bg-accent px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent/85"
     >
-      New task
+      New schedule
     </button>
   );
 
@@ -555,9 +556,14 @@ export function TasksClient({
     : 0;
 
   return (
-    <div className={fixedAgent ? "w-full" : "mx-auto w-full max-w-6xl px-6 py-14 md:px-10"}>
+    <div className={fixedAgent ? "flex h-[calc(100dvh-3.5rem)] min-h-0 w-full flex-col overflow-hidden sm:h-dvh" : "mx-auto w-full max-w-6xl px-6 py-14 md:px-10"}>
       {fixedAgent ? (
-        <div className="flex justify-end">{newTaskButton}</div>
+        <SectionHeader
+          title="Schedules"
+          help="Create recurring routines or one-time tasks for this agent, inspect run history, and control their automation allowance."
+          actions={newTaskButton}
+          sticky
+        />
       ) : (
         <header className="flex flex-wrap items-end justify-between gap-4">
           <div>
@@ -578,7 +584,7 @@ export function TasksClient({
       {note ? (
         <p
           role="status"
-          className={`mt-6 rounded-lg border px-3 py-2 text-xs ${
+          className={`${fixedAgent ? "mx-5 mt-4" : "mt-6"} rounded-lg border px-3 py-2 text-xs ${
             note.kind === "success"
               ? "border-success/25 bg-success/10 text-success-soft"
               : "border-danger/25 bg-danger/10 text-danger-soft"
@@ -588,7 +594,7 @@ export function TasksClient({
         </p>
       ) : null}
 
-      <div className="mt-8">
+      <div className={fixedAgent ? "min-h-0 flex-1 overflow-y-auto lg:overflow-hidden" : "mt-8"}>
         {phase === "loading" ? (
           <SkeletonRows count={4} />
         ) : phase === "error" ? (
@@ -606,13 +612,13 @@ export function TasksClient({
           />
         ) : tasks.length === 0 ? (
           <EmptyState
-            title="No scheduled tasks yet"
+            title="No schedules yet"
             hint="Give an agent a prompt and a cadence — it runs on its own and the results land in your sessions."
             action={newTaskButton}
           />
         ) : (
-          <div className="grid min-h-[560px] overflow-hidden rounded-xl border border-edge bg-surface lg:grid-cols-[minmax(260px,0.82fr)_minmax(420px,1.35fr)]">
-            <section className="border-b border-edge lg:border-b-0 lg:border-r" aria-label="Scheduled tasks">
+          <div className={`grid min-h-[560px] overflow-hidden border-edge bg-surface lg:grid-cols-[minmax(260px,0.82fr)_minmax(420px,1.35fr)] ${fixedAgent ? "border-t lg:h-full lg:min-h-0" : "rounded-xl border"}`}>
+            <section className="border-b border-edge lg:flex lg:min-h-0 lg:flex-col lg:border-b-0 lg:border-r" aria-label="Schedules">
               <div className="flex items-center gap-1 border-b border-edge px-3 py-3">
                 {(["all", "active", "paused"] as const).map((option) => (
                   <button
@@ -630,7 +636,7 @@ export function TasksClient({
                   </button>
                 ))}
               </div>
-              <ul className="divide-y divide-edge">
+              <ul className="divide-y divide-edge lg:min-h-0 lg:flex-1 lg:overflow-y-auto lg:overscroll-contain">
             {visibleTasks.map((task) => {
               const agent = task.agentId
                 ? (agents.get(task.agentId) ?? embeddedAgent(task))
@@ -658,7 +664,7 @@ export function TasksClient({
                     <span className="min-w-0 flex-1">
                       <span className="flex items-center justify-between gap-2">
                         <span className="truncate text-sm font-medium">
-                          {task.name ?? "Untitled task"}
+                          {task.name ?? "Untitled schedule"}
                         </span>
                         {task.lastError ? <span className="size-1.5 shrink-0 rounded-full bg-danger" aria-label="Needs attention" /> : null}
                       </span>
@@ -684,7 +690,7 @@ export function TasksClient({
               ) : null}
             </section>
 
-            <section className="min-w-0 p-5 md:p-6" aria-label="Task details">
+            <section className="min-w-0 p-5 md:p-6 lg:min-h-0 lg:overflow-y-auto lg:overscroll-contain" aria-label="Schedule details">
               {selectedTask ? (() => {
                 const status = (selectedTask.status ?? "").toLowerCase();
                 const busy = busyId === selectedTask.id;
@@ -695,7 +701,7 @@ export function TasksClient({
                     <div className="flex flex-wrap items-start justify-between gap-4">
                       <div className="min-w-0">
                         <div className="flex flex-wrap items-center gap-2.5">
-                          <h2 className="truncate text-xl font-medium">{selectedTask.name ?? "Untitled task"}</h2>
+                          <h2 className="truncate text-xl font-medium">{selectedTask.name ?? "Untitled schedule"}</h2>
                           <StatusChip status={selectedTask.status} />
                         </div>
                         <p className="mt-1.5 text-sm text-muted">
@@ -778,7 +784,7 @@ export function TasksClient({
                     </div>
                   </div>
                 );
-              })() : <p className="py-20 text-center text-sm text-faint">Choose a task to see its details.</p>}
+              })() : <p className="py-20 text-center text-sm text-faint">Choose a schedule to see its details.</p>}
             </section>
           </div>
         )}

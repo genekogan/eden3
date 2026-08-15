@@ -10,8 +10,21 @@ const notificationCenterSource = readFileSync(
   new URL("../components/notification-center.tsx", import.meta.url),
   "utf8",
 );
+const authUserControlSource = readFileSync(
+  new URL("../components/AuthUserControl.tsx", import.meta.url),
+  "utf8",
+);
 
 describe("sidebar account footer layout", () => {
+  it("offers sign out without nesting a dev-user or Clerk account dropdown", () => {
+    expect(userAreaSource).toContain('<AuthUserControl variant="panel" />');
+    expect(authUserControlSource).toContain('"Sign out"');
+    expect(authUserControlSource).toContain('selectAuthMode() === "clerk"');
+    expect(authUserControlSource).toContain('fetch("/api/dev/logout"');
+    expect(authUserControlSource).not.toContain("DevUserSwitcher");
+    expect(authUserControlSource).not.toContain("mountUserButton");
+  });
+
   it("places notifications after the account control on the right", () => {
     const footerStart = userAreaSource.indexOf(
       '<div className={`flex items-center ${collapsed ? "flex-col" : ""}`}>',
@@ -25,10 +38,12 @@ describe("sidebar account footer layout", () => {
   });
 
   it("keeps the notification panel inside the viewport at narrow and desktop widths", () => {
-    expect(notificationCenterSource).toContain("fixed bottom-14 left-2");
+    expect(notificationCenterSource).toContain('import { createPortal } from "react-dom"');
+    expect(notificationCenterSource).toContain("window.innerWidth - panelWidth - gutter");
+    expect(notificationCenterSource).toContain("window.innerHeight - rect.top + gutter");
     expect(notificationCenterSource).toContain("max-h-[calc(100vh-4rem)]");
     expect(notificationCenterSource).toContain("w-[min(21rem,calc(100vw-1rem))]");
-    expect(notificationCenterSource).toContain("sm:absolute sm:bottom-full sm:left-0");
+    expect(notificationCenterSource).not.toContain("sm:absolute sm:bottom-full sm:left-0");
     expect(notificationCenterSource).not.toContain("bottom-full right-0");
   });
 
@@ -42,7 +57,9 @@ describe("sidebar account footer layout", () => {
   it("paints an opaque isolated notification surface above the conversation rail", () => {
     expect(notificationCenterSource).toContain('backgroundColor: "var(--color-raised)"');
     expect(notificationCenterSource).toContain('isolation: "isolate"');
-    expect(notificationCenterSource).toContain("z-[100]");
+    expect(notificationCenterSource).toContain("z-[1000]");
+    expect(notificationCenterSource).toContain("document.body");
+    expect(notificationCenterSource).toContain("!panel.current?.contains(target)");
     expect(notificationCenterSource).toContain("divide-y divide-edge/50");
     expect(notificationCenterSource).toContain("min-h-12");
   });

@@ -48,6 +48,8 @@ const feedCreationsQuerySchema = feedQuerySchema.extend({
   user: z.string().trim().min(1).max(200).optional(),
   /** Filter to creations liked by the signed-in account. */
   favorites: z.literal('mine').optional(),
+  /** Exclude direct Studio output and retain only creations attributed to an agent. */
+  agentOnly: z.literal('true').optional(),
 });
 
 const feedAgentsQuerySchema = z.object({
@@ -69,7 +71,7 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
 
   // ---- GET /feed/creations -------------------------------------------------
   app.get('/creations', async (req) => {
-    const { q, cursor, limit, agent, user, favorites } = feedCreationsQuerySchema.parse(req.query);
+    const { q, cursor, limit, agent, user, favorites, agentOnly } = feedCreationsQuerySchema.parse(req.query);
     const after = parseCursorParam(cursor);
     const pattern = q !== undefined && q !== '' ? `%${escapeLike(q)}%` : null;
     const viewerId = req.account?.accountId ?? null;
@@ -121,6 +123,7 @@ export const feedRoutes: FastifyPluginAsync = async (app) => {
         ${ownScope ? pg`` : pg`and c.public = true`}
         ${ownScope ? pg`` : pg`and ${publicCreationModerationSql(pg)}`}
         ${agentId !== null ? pg`and c.agent_id = ${agentId}` : pg``}
+        ${agentOnly === 'true' ? pg`and c.agent_id is not null` : pg``}
         ${userId !== null ? pg`and c.user_id = ${userId}` : pg``}
         ${
           favorites === 'mine'
