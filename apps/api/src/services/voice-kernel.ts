@@ -113,6 +113,8 @@ export interface VoiceKernelOptions {
   voiceOutputRoot?: string;
   /** Idempotently removes one unshared, private voice-clip object and cache entry. */
   deletePrivateClip?: (object: StoredObject, signal?: AbortSignal) => Promise<void>;
+  /** Deterministic PostgreSQL lock-race seam; never configured by production. */
+  afterDirectVoiceEligibilityLocked?: () => Promise<void>;
 }
 
 export interface VoiceOutputBytes {
@@ -695,7 +697,7 @@ export class VoiceKernel {
           exists(select 1 from voice_executions live where live.id<>${executionId}
             and live.output_sha256=${row.output_sha256}
             and live.status not in ('failed','artifact_cleanup_pending')) shared,
-          (select min(id)::text from voice_executions queued where queued.output_sha256=${row.output_sha256}
+          (select min(id::text) from voice_executions queued where queued.output_sha256=${row.output_sha256}
             and queued.status='artifact_cleanup_pending') elected_id
       `);
       const reference = rows<{ shared: boolean; elected_id: string | null }>(referenceResult)[0];
@@ -925,7 +927,53 @@ export class VoiceKernel {
     assertVoiceReconciliationActive(signal);
     try {
       return await this.dbc.transaction(async (tx) => {
-      const jobResult = await tx.execute(sql`select * from direct_voice_jobs where message_id=${messageId} for update`);
+      const coordinateResult = await tx.execute(sql`
+        select * from direct_voice_jobs where message_id=${messageId}
+      `);
+      const coordinate = rows<DirectVoiceJobRow>(coordinateResult)[0];
+      if (!coordinate) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+      await this.assertOwnerWritableTx(tx, coordinate.owner_account_id);
+      const eligibleResult = await tx.execute(sql`
+        select m.content,s.owner_id,g.owner_id agent_owner_id
+        from messages m join sessions s on s.id=m.session_id
+        join agents g on g.account_id=m.sender_id
+        where m.id=${coordinate.message_id} and m.session_id=${coordinate.session_id} and m.role='assistant'
+          and m.sender_id=${coordinate.agent_account_id} and s.deleted=false and s.visible is distinct from false
+          and s.channel_connection_id is null
+        for update of m,s,g
+      `);
+      const eligible = rows<{ content: string | null; owner_id: string | null; agent_owner_id: string }>(eligibleResult)[0];
+      let currentTextSha256: string | null = null;
+      try { if (eligible?.content) currentTextSha256 = exactTranscript(eligible.content, 'chat').sha256; }
+      catch (error) { if (!(error instanceof VoiceKernelError)) throw error; }
+      if (!eligible || currentTextSha256 !== coordinate.text_sha256) {
+        throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+      }
+      if (eligible.owner_id !== coordinate.owner_account_id) {
+        const member = await tx.execute(sql`
+          select 1 from session_users where session_id=${coordinate.session_id}
+            and user_account_id=${coordinate.owner_account_id} for key share
+        `);
+        if (rows(member).length !== 1) {
+          throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+        }
+      }
+      if (eligible.agent_owner_id !== coordinate.owner_account_id) {
+        const boundAgent = await tx.execute(sql`
+          select 1 from session_agents where session_id=${coordinate.session_id}
+            and agent_account_id=${coordinate.agent_account_id} for key share
+        `);
+        if (rows(boundAgent).length !== 1) {
+          throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
+        }
+      }
+      await this.options.afterDirectVoiceEligibilityLocked?.();
+      const jobResult = await tx.execute(sql`
+        select * from direct_voice_jobs where message_id=${coordinate.message_id}
+          and owner_account_id=${coordinate.owner_account_id} and session_id=${coordinate.session_id}
+          and agent_account_id is not distinct from ${coordinate.agent_account_id}
+          and text_sha256=${coordinate.text_sha256} for update
+      `);
       assertVoiceReconciliationActive(signal);
       const job = rows<DirectVoiceJobRow>(jobResult)[0];
       if (!job) throw new VoiceKernelError(404, 'voice_message_not_eligible', 'Assistant message is not eligible for a voice note');
@@ -946,9 +994,14 @@ export class VoiceKernel {
         voiceExecutionId: execution.id,
       }];
       const messageResult = await tx.execute(sql`
-        update messages set attachments=case when exists (
-          select 1 from jsonb_array_elements(coalesce(attachments,'[]'::jsonb)) item where item->>'voiceExecutionId'=${execution.id}
-        ) then coalesce(attachments,'[]'::jsonb) else coalesce(attachments,'[]'::jsonb)||${JSON.stringify(attachment)}::jsonb end
+        update messages set attachments=(
+          select coalesce(jsonb_agg(item order by ord) filter (
+            where item->>'voiceExecutionId' is distinct from ${execution.id}
+          ),'[]'::jsonb)
+          from jsonb_array_elements(
+            case when jsonb_typeof(attachments)='array' then attachments else '[]'::jsonb end
+          ) with ordinality as existing(item,ord)
+        )||${JSON.stringify(attachment)}::jsonb
         where id=${job.message_id} and session_id=${job.session_id} and role='assistant'
         returning id,external_id,session_id,sender_id,role,content,attachments,tool_calls,reactions,reply_to_external_id,created_at
       `);
@@ -1262,11 +1315,12 @@ export class VoiceKernel {
     }
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      const [canonicalRoot, canonicalFile] = await Promise.all([realpath(root), realpath(row.output_local_path)]);
-      if (path.dirname(canonicalFile) !== canonicalRoot) {
+      const canonicalRoot = await realpath(root);
+      const exactFile = path.resolve(row.output_local_path);
+      if (path.dirname(exactFile) !== canonicalRoot) {
         throw new Error('voice output metadata mismatch');
       }
-      handle = await open(canonicalFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      handle = await open(exactFile, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
       const metadata = await handle.stat();
       if (!metadata.isFile() || metadata.size !== sizeBytes) throw new Error('voice output metadata mismatch');
       const bytes = await handle.readFile();
@@ -1288,17 +1342,25 @@ export class VoiceKernel {
       left join sessions s on s.id=v.session_id
       left join messages m on m.id=v.message_id and m.session_id=v.session_id
       where v.id=${executionId} and v.status='completed' and v.purpose in ('preview','chat')
-        and not exists (select 1 from account_erasure_jobs e where e.state<>'succeeded'
-          and e.account_id in (v.owner_account_id,v.agent_account_id))
+        and not exists (
+          select 1 from account_erasure_jobs e where e.state<>'succeeded' and (
+            e.account_id=v.owner_account_id or exists (
+              select 1 from agents a where a.account_id=v.agent_account_id and a.owner_id=e.account_id
+            )
+          )
+        )
         and (
           (v.purpose='preview' and v.owner_account_id=${viewerAccountId})
           or (
             v.purpose='chat' and s.deleted=false and s.visible is distinct from false
+            and m.role='assistant' and m.sender_id=v.agent_account_id
             and (s.owner_id=${viewerAccountId} or exists (
               select 1 from session_users su where su.session_id=s.id and su.user_account_id=${viewerAccountId}
             ))
             and exists (
-              select 1 from jsonb_array_elements(coalesce(m.attachments,'[]'::jsonb)) item
+              select 1 from jsonb_array_elements(
+                case when jsonb_typeof(m.attachments)='array' then m.attachments else '[]'::jsonb end
+              ) item
               where item->>'voiceExecutionId'=v.id::text and item->>'url'=v.output_url
             )
           )
@@ -1320,8 +1382,13 @@ export class VoiceKernel {
         and v.purpose in ('discord','telegram') and v.status in ('transcoding','completed')
         and ct.status='delivery_pending'
         and cc.desired_state='active' and cc.status='connected'
-        and not exists (select 1 from account_erasure_jobs e where e.state<>'succeeded'
-          and e.account_id in (v.owner_account_id,v.agent_account_id))
+        and not exists (
+          select 1 from account_erasure_jobs e where e.state<>'succeeded' and (
+            e.account_id=v.owner_account_id or exists (
+              select 1 from agents a where a.account_id=v.agent_account_id and a.owner_id=e.account_id
+            )
+          )
+        )
     `);
     const row = rows<ExecutionRow>(result)[0];
     if (!row) throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');

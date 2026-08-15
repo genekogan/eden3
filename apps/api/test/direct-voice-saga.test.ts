@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -8,6 +10,7 @@ const SESSION = '22222222-2222-4222-8222-222222222222';
 const OWNER = '11111111-1111-4111-8111-111111111111';
 const AGENT = '44444444-4444-4444-8444-444444444444';
 const EXECUTION = '55555555-5555-4555-8555-555555555555';
+const HELLO_HASH = createHash('sha256').update('hello').digest('hex');
 
 const dialect = new PgDialect();
 function queryText(statement: unknown): string {
@@ -26,9 +29,11 @@ function kernelWith(db: unknown) {
 
 function rowsFor(statement: unknown, missing?: 'message' | 'usage' | 'job', completed = false): unknown[] {
   const query = queryText(statement);
+  if (query.startsWith('select id from accounts')) return [{ id: OWNER }];
+  if (query.startsWith('select account_erasure_assert_account_writable')) return [];
   if (query.startsWith('select * from direct_voice_jobs')) return [{
     message_id: MESSAGE, owner_account_id: OWNER, session_id: SESSION, agent_account_id: AGENT,
-    voice_id: 'deepinfra:kokoro:af_bella:v1', text_sha256: 'a'.repeat(64), mode: 'always',
+    voice_id: 'deepinfra:kokoro:af_bella:v1', text_sha256: HELLO_HASH, mode: 'always',
     status: completed ? 'completed' : 'attachment_pending', generation: 0, execution_id: EXECUTION, last_error_code: null,
     refresh_state: completed ? 'pending' : 'none',
     updated_at: new Date(),
@@ -37,6 +42,9 @@ function rowsFor(statement: unknown, missing?: 'message' | 'usage' | 'job', comp
     id: EXECUTION, voice_id: 'deepinfra:kokoro:af_bella:v1', purpose: 'chat', status: completed ? 'completed' : 'transcoding',
     output_url: '/media/voice.ogg', output_mime: 'audio/ogg', output_duration_ms: 1_000,
     output_size_bytes: 100, character_count: 5, reserved_manna: 1, request_sha256: 'b'.repeat(64),
+  }];
+  if (query.startsWith('select m.content,s.owner_id,g.owner_id agent_owner_id')) return [{
+    content: 'hello', owner_id: OWNER, agent_owner_id: OWNER,
   }];
   if (query.startsWith('select id,external_id,session_id')) return [{
     id: MESSAGE, external_id: null, session_id: SESSION, sender_id: AGENT, role: 'assistant', content: 'hello',
