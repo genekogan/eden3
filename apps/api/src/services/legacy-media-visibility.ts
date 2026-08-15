@@ -30,6 +30,10 @@ export async function legacyMediaIsPubliclyReachable(
       select av.id,av.agent_account_id,av.state
       from agent_avatar_assets av
       where av.sha256=${sha256} or av.url=${requestPath}
+    ), matching_voice as (
+      select v.id
+      from voice_executions v
+      where v.output_sha256=${sha256}
     ), erasing_media as (
       select m.id from matching_media m
       where exists (
@@ -73,7 +77,8 @@ export async function legacyMediaIsPubliclyReachable(
     )
     select
       (exists(select 1 from matching_media) or exists(select 1 from matching_concepts)
-        or exists(select 1 from matching_avatars) or exists(select 1 from live_avatar_pointers)
+        or exists(select 1 from matching_avatars) or exists(select 1 from matching_voice)
+        or exists(select 1 from live_avatar_pointers)
         or exists(select 1 from creations where url=${requestPath} or thumbnail_url=${requestPath})) as known,
       (exists(select 1 from matching_media m where not exists(select 1 from erasing_media e where e.id=m.id))
         or exists(select 1 from matching_concepts i where not exists(select 1 from erasing_concepts e where e.id=i.id))

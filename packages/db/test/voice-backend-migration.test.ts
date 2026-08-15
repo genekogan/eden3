@@ -60,6 +60,19 @@ describe('0047 voice backend custody', () => {
     }
     expect(migration).toContain('TO eden3_erasure_operator');
     expect(migration).not.toContain('TO eden3_erasure_terminal_writer');
+    expect(migration).toContain('account_erasure_assert_voice_output_writable');
+    expect(migration).toContain("'eden3-erasure-voice:sha:'||p_sha");
+    expect(migration).not.toContain("'voice-output:'");
+    expect(migration).toContain('JOIN public.voice_executions ve');
+    expect(migration).not.toContain('JOIN public.media_assets');
+    expect(migration).not.toContain('t.locator');
+    expect(migration).toContain('REVOKE EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text) FROM PUBLIC');
+    expect(migration).toContain('GRANT EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text) TO SESSION_USER');
+    expect(migration).toContain('GRANT SELECT ON public.voice_executions TO eden3_erasure_guard');
+    expect(migration).toContain('ALTER FUNCTION public.account_erasure_assert_voice_output_writable(text) OWNER TO eden3_erasure_guard');
+    for (const table of ['media_assets', 'concept_images', 'agent_avatar_assets', 'creations']) {
+      expect(migration).not.toContain(`BEFORE INSERT OR UPDATE ON public.${table}`);
+    }
   });
 
   it('keeps migration timestamps strictly increasing so 0047 cannot be skipped after 0046', async () => {

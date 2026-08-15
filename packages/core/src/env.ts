@@ -69,6 +69,11 @@ export const envSchema = z.object({
     .string()
     .min(1)
     .default(() => path.resolve('var', 'transcriptions')),
+  /** Private generated voice root. It is never mounted by the public media wildcard. */
+  VOICE_OUTPUT_DIR: z
+    .string()
+    .min(1)
+    .default(() => path.resolve('var', 'voice-output')),
   /** Trusted-server Cartesia credential; never exposed to a browser or response. */
   CARTESIA_API_KEY: z.string().min(1).optional(),
   /** Active resumable recordings per user. */
@@ -220,12 +225,30 @@ export const envSchema = z.object({
   }
   const mediaRoot = path.resolve(env.MEDIA_DIR);
   const transcriptionRoot = path.resolve(env.TRANSCRIPTION_AUDIO_DIR);
-  const mediaPrefix = mediaRoot.endsWith(path.sep) ? mediaRoot : `${mediaRoot}${path.sep}`;
-  if (transcriptionRoot === mediaRoot || transcriptionRoot.startsWith(mediaPrefix)) {
+  const voiceOutputRoot = path.resolve(env.VOICE_OUTPUT_DIR);
+  const overlaps = (left: string, right: string): boolean => {
+    const relative = path.relative(left, right);
+    return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+  };
+  if (overlaps(mediaRoot, transcriptionRoot) || overlaps(transcriptionRoot, mediaRoot)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['TRANSCRIPTION_AUDIO_DIR'],
       message: 'must be outside MEDIA_DIR so dictation audio can never be served by the CDN/media route',
+    });
+  }
+  if (overlaps(mediaRoot, voiceOutputRoot) || overlaps(voiceOutputRoot, mediaRoot)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['VOICE_OUTPUT_DIR'],
+      message: 'must be outside MEDIA_DIR so private voice output can never be served by the CDN/media route',
+    });
+  }
+  if (overlaps(transcriptionRoot, voiceOutputRoot) || overlaps(voiceOutputRoot, transcriptionRoot)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['VOICE_OUTPUT_DIR'],
+      message: 'must be separate from TRANSCRIPTION_AUDIO_DIR so independent retention policies remain enforceable',
     });
   }
   return {

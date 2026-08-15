@@ -72,6 +72,7 @@ import { ChatMediaCompletionReconciler } from './services/chat-media-reconciler'
 import type { SessionShareRepository } from './services/session-shares';
 import { PostgresSessionShareRepository } from './services/session-shares-postgres';
 import { isPostgresUnavailableError } from './services/postgres-availability';
+import { materializeMediaRoots } from './services/private-media-roots';
 import type { CompatClientLike } from './services/turns';
 import { createAttachmentSightingHandler, MediaWatcher } from './workers/media-watcher';
 import { accountRoutes } from './routes/account';
@@ -117,7 +118,8 @@ import {
   ElevenLabsVoiceClient,
 } from './services/voice-provider';
 import {
-  isShareCapabilityRequest,
+  isPrivateCapabilityRequest,
+  redactedRequestUrl,
   registerShareCapabilityResponseBoundary,
   safeCapabilityErrorMessage,
   safeNotFoundMessage,
@@ -380,13 +382,13 @@ export function registerApiErrorHandler(
       message = err.message || 'Internal server error';
     }
     code = publicErrorCode(statusCode, code);
-    const capabilityRequest = isShareCapabilityRequest(req.url);
+    const capabilityRequest = isPrivateCapabilityRequest(req.url);
     if (statusCode >= 500) {
       logSafeRequestError(
         req.log,
         err,
         { requestId: req.id, statusCode, code },
-        capabilityRequest ? 'share capability request failed' : 'request failed',
+        capabilityRequest ? 'private capability request failed' : 'request failed',
       );
     }
     void reply
@@ -431,6 +433,11 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   assertAccountErasureRuntimeComposition(opts.accountErasure);
   assertAccountErasureRuntimeDatabaseIdentity(opts.accountErasure, { db, pg });
   const env = getEnv();
+  const mediaRoots = await materializeMediaRoots({
+    mediaDir: env.MEDIA_DIR,
+    transcriptionAudioDir: env.TRANSCRIPTION_AUDIO_DIR,
+    voiceOutputDir: env.VOICE_OUTPUT_DIR,
+  });
 
   const app = Fastify({
     logger: opts.logger ?? false,
@@ -470,11 +477,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         {
           requestId: req.id,
           method: req.method,
-          url: req.url.startsWith('/shares/')
-            ? '/shares/[redacted]'
-            : req.url.startsWith('/media/share/')
-              ? '/media/share/[redacted]'
-              : req.url,
+          url: redactedRequestUrl(req.url),
           statusCode: reply.statusCode,
           elapsedMs: Number(reply.elapsedTime.toFixed(1)),
           ...(sessionId ? { sessionId } : {}),
@@ -514,7 +517,9 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // `onSend` is intentionally used instead of fastify-static's raw-response
   // callback so it wins over the earlier Fastify hardening header.
   app.addHook('onSend', async (req, reply, payload) => {
-    if (req.url.startsWith('/media/')) {
+    if (req.url.startsWith('/media/') &&
+        !req.url.startsWith('/media/voice/') &&
+        !req.url.startsWith('/media/runtime/voice/')) {
       reply.header('cross-origin-resource-policy', 'cross-origin');
     }
     return payload;
@@ -836,10 +841,15 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   const storageRuntime =
     opts.storage?.runtime ??
     (opts.storage?.enabled === true
-      ? await createStorageRuntime({ mediaDir: env.MEDIA_DIR, logger: app.log })
+      ? await createStorageRuntime({ mediaDir: mediaRoots.mediaDir, logger: app.log })
       : null);
 
-  const voiceMediaStore = new LocalMediaStore();
+  const voiceMediaStore = new LocalMediaStore({
+    mediaDir: mediaRoots.voiceOutputDir,
+    // Stored URLs are never exposed; VoiceKernel replaces them with an
+    // authenticated execution route or a short-lived private capability.
+    baseUrl: '/media/voice',
+  });
   const voice = opts.voice === null
     ? null
     : opts.voice ?? {
@@ -859,12 +869,17 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
               : {}),
           },
           cleanupArtifact: (sha256, mime) => voiceMediaStore.deleteByDigest(sha256, mime),
+          voiceOutputRoot: mediaRoots.voiceOutputDir,
           ...(storageRuntime
             ? { deletePrivateClip: (object: Parameters<typeof storageRuntime.deletePrivateObject>[0], signal?: AbortSignal) => storageRuntime.deletePrivateObject(object, signal) }
             : {}),
         }),
         autoStartReconciler: process.env.NODE_ENV === 'production',
       };
+
+  // Crash-orphan cleanup is fail-closed and precedes every voice route or
+  // admission. A failed scan leaves the API unstarted.
+  if (voice) await voice.kernel.reconcileOrphanedOutputs();
 
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
   await app.register(chatRoutes, {
@@ -908,6 +923,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   await app.register(channelsRoutes, {
     prefix: '/channels',
     ...(opts.channels ?? {}),
+    ...(voice ? { voiceDelivery: voice.kernel } : {}),
     ...(opts.accountErasure
       ? { providerEvidenceDb: opts.accountErasure.providerEvidenceDb }
       : {}),
@@ -919,6 +935,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       stale: voiceReconcilerFlight(),
       direct: voiceReconcilerFlight(),
       clones: voiceReconcilerFlight(),
+      orphans: voiceReconcilerFlight(),
     };
     const reconcileVoice = () => {
       const onError = (family: keyof typeof voiceFlights) => () => {
@@ -940,6 +957,11 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         voiceFlights.clones,
         async (signal) => await voice.kernel.reconcileAmbiguousClones(undefined, signal),
         onError('clones'),
+      );
+      startVoiceReconciliation(
+        voiceFlights.orphans,
+        async (signal) => await voice.kernel.reconcileOrphanedOutputs(signal),
+        onError('orphans'),
       );
     };
     app.addHook('onReady', async () => {
@@ -977,6 +999,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   const transcriptionRuntime =
     opts.transcriptions?.runtime ??
     await createTranscriptionRuntime({
+      audioDir: mediaRoots.transcriptionAudioDir,
       onError: (_error) => app.log.error({}, 'transcription worker tick failed'),
     });
   await app.register(transcriptionsRoutes, {
@@ -1073,7 +1096,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Existing generated media keeps its content-addressed filename URLs. This
   // wildcard is deliberately registered after `/media/:objectId`; it serves
   // only MEDIA_DIR and cannot see pending/quarantined object-backend bytes.
-  mkdirSync(env.MEDIA_DIR, { recursive: true });
+  mkdirSync(mediaRoots.mediaDir, { recursive: true });
   await app.register(async (legacyMedia) => {
     legacyMedia.addHook('onRequest', async (req, reply) => {
       const path = req.url.split('?', 1)[0]!;
@@ -1085,7 +1108,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       return reply.code(404).send(errorEnvelope(404, 'not_found', 'Media not found'));
     });
     await legacyMedia.register(fastifyStatic, {
-      root: env.MEDIA_DIR,
+      root: mediaRoots.mediaDir,
       prefix: '/media/',
       index: false,
       list: false,

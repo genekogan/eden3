@@ -10,6 +10,9 @@ const CLIP_A = '22222222-2222-4222-8222-222222222222';
 const CLIP_B = '33333333-3333-4333-8333-333333333333';
 const CLONE_ID = '44444444-4444-4444-8444-444444444444';
 const VOICE_ID = 'deepinfra:kokoro:af_bella:v1';
+const TURN = '77777777-7777-4777-8777-777777777777';
+const OPERATION = '88888888-8888-4888-8888-888888888888';
+const RUNTIME_TOKEN = 'fake-runtime-token';
 
 const apps: ReturnType<typeof Fastify>[] = [];
 
@@ -47,7 +50,7 @@ async function harness() {
     voiceId: VOICE_ID,
     purpose: 'preview' as const,
     status: 'completed' as const,
-    url: '/media/voice.mp3',
+    url: '/media/voice/66666666-6666-4666-8666-666666666666',
     mime: 'audio/mpeg',
     durationMs: 1000,
     sizeBytes: 123,
@@ -84,11 +87,19 @@ async function harness() {
     getClone: vi.fn(async () => clone),
     revokeClone: vi.fn(async () => clone),
     deleteClone: vi.fn(async () => clone),
-    channelVoiceNote: vi.fn(),
+    ownerVoiceOutput: vi.fn(async () => ({ bytes: Buffer.from('0123456789'), mime: 'audio/mpeg', sizeBytes: 10, sha256: 'c'.repeat(64) })),
+    channelVoiceOutput: vi.fn(async () => ({ bytes: Buffer.from('voice'), mime: 'audio/ogg', sizeBytes: 5, sha256: 'd'.repeat(64) })),
+    channelVoiceNote: vi.fn(async () => ({
+      ...execution,
+      purpose: 'discord' as const,
+      status: 'transcoding' as const,
+      mime: 'audio/ogg',
+      waveform: 'AQID',
+    })),
   };
   await app.register(voiceRoutes, {
     kernel: kernel as unknown as VoiceKernel,
-    runtimeToken: 'fake-runtime-token',
+    runtimeToken: RUNTIME_TOKEN,
     autoStartReconciler: false,
   });
   return { app, kernel, quote, execution };
@@ -204,5 +215,48 @@ describe('voice HTTP contract', () => {
     });
     expect(replay.statusCode).toBe(200);
     expect(replay.json()).toHaveProperty('execution.replayed', true);
+  });
+
+  it('serves browser voice only behind session auth with private range semantics', async () => {
+    const { app, kernel, execution } = await harness();
+    const url = `/media/voice/${execution.id}`;
+    expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401);
+    const response = await app.inject({ method: 'GET', url, headers: { 'x-test-owner': OWNER, range: 'bytes=2-5' } });
+    expect(response.statusCode).toBe(206);
+    expect(response.body).toBe('2345');
+    expect(response.headers).toMatchObject({
+      'cache-control': 'private, no-store',
+      'cross-origin-resource-policy': 'same-origin',
+      'content-range': 'bytes 2-5/10',
+      vary: 'Cookie, Authorization',
+    });
+    expect(kernel.ownerVoiceOutput).toHaveBeenCalledWith(OWNER, execution.id);
+    const head = await app.inject({ method: 'HEAD', url, headers: { 'x-test-owner': OWNER } });
+    expect(head.statusCode).toBe(200);
+    expect(head.headers['content-length']).toBe('10');
+    expect(head.body).toBe('');
+  });
+
+  it('mints one private channel capability and rejects tampering before byte lookup', async () => {
+    const { app, kernel, execution } = await harness();
+    const connectionId = '99999999-9999-4999-8999-999999999999';
+    const response = await app.inject({
+      method: 'POST',
+      url: `/channels/runtime/turns/${TURN}/voice-note`,
+      headers: { authorization: `Bearer ${RUNTIME_TOKEN}` },
+      payload: { voiceOperationId: OPERATION, connectionId, text: 'hello' },
+    });
+    expect(response.statusCode).toBe(200);
+    const capability = response.json().attachment.url as string;
+    expect(capability).toMatch(new RegExp(`^/media/runtime/voice/${TURN}/${execution.id}/${OPERATION}/\\d{10}/[0-9a-f]{64}\\.ogg$`));
+    const fetched = await app.inject({ method: 'GET', url: capability });
+    expect(fetched.statusCode).toBe(200);
+    expect(fetched.body).toBe('voice');
+    expect(fetched.headers['cache-control']).toContain('no-store');
+    expect(kernel.channelVoiceOutput).toHaveBeenCalledWith(TURN, execution.id, OPERATION);
+
+    const tampered = capability.replace(/([0-9a-f])\.ogg$/, (_all, value) => `${value === 'a' ? 'b' : 'a'}.ogg`);
+    expect((await app.inject({ method: 'GET', url: tampered })).statusCode).toBe(404);
+    expect(kernel.channelVoiceOutput).toHaveBeenCalledTimes(1);
   });
 });

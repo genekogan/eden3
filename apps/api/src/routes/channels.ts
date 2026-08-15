@@ -104,6 +104,10 @@ export interface ChannelsRoutesOptions {
   > &
     Partial<Pick<ChannelTurnMeteringService, 'refundStale'>>;
   runtimeToken?: string;
+  voiceDelivery?: {
+    settleChannelVoiceDelivery(turnId: string): Promise<boolean>;
+    refundChannelVoiceDelivery(turnId: string, code?: string): Promise<boolean>;
+  };
   providerEvidenceDb?: DbHandle;
   xConnector?: Pick<XByoConnectorService, 'connect' | 'post' | 'revoke'>;
   telegramManager?: {
@@ -3016,7 +3020,11 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
 
   app.post('/runtime/turns/:turnId/delivery-failed', serviceAuthenticatedCallback(requireRuntime), async (req) => {
     const { turnId } = turnParamsSchema.parse(req.params);
+    // The channel ledger owns the terminal delivery decision. Complete that
+    // claim before touching voice so a racing native-success callback cannot
+    // leave a delivered turn with a refunded/deleted voice attachment.
     await turnMetering.refundDeliveryFailure(turnId);
+    await opts.voiceDelivery?.refundChannelVoiceDelivery(turnId, 'channel_delivery_failed');
     return { ok: true, turnId };
   });
 
@@ -3024,6 +3032,7 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     const { turnId } = turnParamsSchema.parse(req.params);
     try {
       await turnMetering.markDelivered(turnId);
+      await opts.voiceDelivery?.settleChannelVoiceDelivery(turnId);
     } catch (error) {
       if (error instanceof ChannelDeliveryTerminalCompensatedError) {
         throw new ApiError(

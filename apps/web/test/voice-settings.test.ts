@@ -14,11 +14,11 @@ const identitySource = readFileSync(
 
 describe("voice settings", () => {
   it("accepts only Eden-owned preview media paths", () => {
-    expect(executionAudioUrl({ execution: { mediaUrl: "/media/voice-preview.mp3" } })).toBe(
-      "/media/voice-preview.mp3",
+    expect(executionAudioUrl({ execution: { mediaUrl: "/media/voice/66666666-6666-4666-8666-666666666666" } })).toBe(
+      "/media/voice/66666666-6666-4666-8666-666666666666",
     );
-    expect(executionAudioUrl({ execution: { output: { url: "/media/voice-note.ogg" } } })).toBe(
-      "/media/voice-note.ogg",
+    expect(executionAudioUrl({ execution: { output: { url: "/media/voice/77777777-7777-4777-8777-777777777777" } } })).toBe(
+      "/media/voice/77777777-7777-4777-8777-777777777777",
     );
     expect(executionAudioUrl({ execution: { mediaUrl: "https://tracker.example/audio.mp3" } })).toBeNull();
     expect(executionAudioUrl({ execution: { mediaUrl: "data:audio/mpeg;base64,AAAA" } })).toBeNull();

@@ -1,3 +1,5 @@
+import { createHmac, timingSafeEqual } from 'node:crypto';
+
 import { getEnv } from '@eden3/core';
 import { voiceAssignmentModeSchema, voiceIdSchema } from '@eden3/shared';
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
@@ -6,7 +8,8 @@ import { z } from 'zod';
 import { serviceAuthenticatedCallback } from '../auth-plugin';
 import { ApiError, sendError } from '../errors';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
-import { VoiceKernel, VoiceKernelError } from '../services/voice-kernel';
+import { VoiceKernel, VoiceKernelError, type VoiceOutputBytes } from '../services/voice-kernel';
+import { applyPrivateCapabilityHeaders } from '../services/share-cache-policy';
 
 export interface VoiceRoutesOptions {
   kernel: VoiceKernel;
@@ -50,6 +53,14 @@ const usernameParams = z.object({ username: z.string().trim().min(1).max(200) })
 const cloneParams = z.object({ id: z.string().uuid() });
 const messageParams = z.object({ sessionId: z.string().uuid(), messageId: z.string().uuid() });
 const turnParams = z.object({ turnId: z.string().uuid() });
+const executionParams = z.object({ executionId: z.string().uuid() });
+const runtimeAudioParams = z.object({
+  turnId: z.string().uuid(),
+  executionId: z.string().uuid(),
+  operationId: z.string().uuid(),
+  expires: z.string().regex(/^\d{10}$/),
+  signature: z.string().regex(/^[0-9a-f]{64}$/),
+});
 const channelBody = z.object({
   voiceOperationId: z.string().uuid(),
   connectionId: z.string().uuid(),
@@ -65,11 +76,78 @@ async function boundary<T>(task: () => Promise<T>): Promise<T> {
   }
 }
 
+const VOICE_CAPABILITY_TTL_SECONDS = 5 * 60;
+function capabilityPayload(input: { turnId: string; executionId: string; operationId: string; expires: string }): string {
+  return ['eden3-channel-voice-v1', input.turnId, input.executionId, input.operationId, input.expires].join('\n');
+}
+function capabilitySignature(secret: string, input: { turnId: string; executionId: string; operationId: string; expires: string }): string {
+  if (secret.length < 16 || secret.length > 8_192) throw new Error('channel voice capability key unavailable');
+  return createHmac('sha256', secret).update(capabilityPayload(input)).digest('hex');
+}
+function channelVoiceCapabilityPath(secret: string, turnId: string, executionId: string, operationId: string, now = Date.now()): string {
+  const expires = String(Math.floor(now / 1000) + VOICE_CAPABILITY_TTL_SECONDS);
+  const signature = capabilitySignature(secret, { turnId, executionId, operationId, expires });
+  return `/media/runtime/voice/${turnId}/${executionId}/${operationId}/${expires}/${signature}.ogg`;
+}
+function validCapability(secret: string, input: z.infer<typeof runtimeAudioParams>, now = Date.now()): boolean {
+  if (secret.length < 16 || secret.length > 8_192) return false;
+  const expires = Number(input.expires);
+  const nowSeconds = Math.floor(now / 1000);
+  if (!Number.isSafeInteger(expires) || expires < nowSeconds || expires > nowSeconds + VOICE_CAPABILITY_TTL_SECONDS) return false;
+  const expected = Buffer.from(capabilitySignature(secret, input), 'hex');
+  const received = Buffer.from(input.signature, 'hex');
+  return expected.length === received.length && timingSafeEqual(expected, received);
+}
+
+interface ByteRange { start: number; end: number }
+function parseVoiceRange(value: string | undefined, size: number): ByteRange | null {
+  if (!value) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value.trim());
+  if (!match || size === 0) throw new ApiError(416, 'invalid_range', 'Requested range is not satisfiable');
+  const [, startText, endText] = match;
+  let start: number;
+  let end: number;
+  if (!startText) {
+    const suffix = Number(endText);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) throw new ApiError(416, 'invalid_range', 'Requested range is not satisfiable');
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(startText);
+    end = endText ? Number(endText) : size - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)) throw new ApiError(416, 'invalid_range', 'Requested range is not satisfiable');
+    end = Math.min(end, size - 1);
+  }
+  if (start < 0 || start >= size || end < start) throw new ApiError(416, 'invalid_range', 'Requested range is not satisfiable');
+  return { start, end };
+}
+
+function sendVoiceBytes(request: FastifyRequest, reply: FastifyReply, output: VoiceOutputBytes, allowRange: boolean) {
+  reply.header('content-type', output.mime);
+  reply.header('etag', `"${output.sha256}"`);
+  reply.header('cache-control', 'private, no-store');
+  reply.header('cdn-cache-control', 'no-store');
+  reply.header('cross-origin-resource-policy', 'same-origin');
+  reply.header('referrer-policy', 'no-referrer');
+  const rawRange = allowRange ? request.headers.range : undefined;
+  const range = parseVoiceRange(Array.isArray(rawRange) ? rawRange[0] : rawRange, output.sizeBytes);
+  if (allowRange) reply.header('accept-ranges', 'bytes');
+  if (range) {
+    reply.code(206).header('content-range', `bytes ${range.start}-${range.end}/${output.sizeBytes}`);
+    reply.header('content-length', String(range.end - range.start + 1));
+  } else {
+    reply.header('content-length', String(output.sizeBytes));
+  }
+  if (request.method === 'HEAD') return reply.send();
+  return reply.send(range ? output.bytes.subarray(range.start, range.end + 1) : output.bytes);
+}
+
 export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, options) => {
   const kernel = options.kernel;
-  const expectedRuntimeToken = options.runtimeToken ?? getEnv().OPENCLAW_GATEWAY_TOKEN;
+  const expectedRuntimeToken = options.runtimeToken ?? getEnv().OPENCLAW_GATEWAY_TOKEN ?? '';
   const requireRuntime = async (request: FastifyRequest, reply: FastifyReply) => {
-    if (!isValidChannelRuntimeAuthorization(request.headers.authorization, expectedRuntimeToken)) {
+    if (expectedRuntimeToken.length < 16 || expectedRuntimeToken.length > 8_192 ||
+        !isValidChannelRuntimeAuthorization(request.headers.authorization, expectedRuntimeToken)) {
       return sendError(reply, 401, 'runtime_unauthorized', 'Runtime authorization required');
     }
   };
@@ -96,6 +174,30 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
       idempotencyKey: body.idempotencyKey,
     }));
     return reply.code(execution.replayed ? 200 : 201).send({ execution });
+  });
+
+  const ownerAudio = async (request: FastifyRequest, reply: FastifyReply) => {
+    const { executionId } = executionParams.parse(request.params);
+    reply.header('vary', 'Cookie, Authorization');
+    const output = await boundary(() => kernel.ownerVoiceOutput(request.account!.accountId, executionId));
+    return sendVoiceBytes(request, reply, output, true);
+  };
+  app.get('/media/voice/:executionId', { exposeHeadRoute: false, preHandler: app.requireAuth }, ownerAudio);
+  app.head('/media/voice/:executionId', { preHandler: app.requireAuth }, ownerAudio);
+
+  app.get('/media/runtime/voice/:turnId/:executionId/:operationId/:expires/:signature.ogg', { exposeHeadRoute: false }, async (request, reply) => {
+    applyPrivateCapabilityHeaders(reply);
+    const parsed = runtimeAudioParams.safeParse(request.params);
+    if (!parsed.success || !validCapability(expectedRuntimeToken, parsed.data)) {
+      throw new ApiError(404, 'voice_output_not_found', 'Voice output not found');
+    }
+    const output = await boundary(() => kernel.channelVoiceOutput(
+      parsed.data.turnId,
+      parsed.data.executionId,
+      parsed.data.operationId,
+    ));
+    if (output.mime !== 'audio/ogg') throw new ApiError(404, 'voice_output_not_found', 'Voice output not found');
+    return sendVoiceBytes(request, reply, output, false);
   });
 
   app.put('/agents/:username/voice-assignment', { preHandler: app.requireAuth }, async (request) => {
@@ -169,7 +271,7 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
       voiceOperationId: body.voiceOperationId,
       execution,
       attachment: {
-        url: execution.url,
+        url: channelVoiceCapabilityPath(expectedRuntimeToken, turnId, execution.id, body.voiceOperationId),
         mime: execution.mime,
         durationSecs: execution.durationMs === null ? null : execution.durationMs / 1000,
         waveform: execution.waveform,
@@ -179,4 +281,11 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
         : { channel: 'telegram', method: 'sendVoice', multipart: true },
     };
   });
+};
+
+export const voiceRoutesInternals = {
+  channelVoiceCapabilityPath,
+  validCapability,
+  parseVoiceRange,
+  VOICE_CAPABILITY_TTL_SECONDS,
 };

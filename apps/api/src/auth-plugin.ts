@@ -104,13 +104,17 @@ const GATE_EXEMPT_PREFIXES = ['/auth/', '/dev/'] as const;
 const PUBLIC_SHARE_PATH = /^\/shares\/[^/]+$/;
 const PUBLIC_SHARE_MEDIA_PATH =
   /^\/media\/share\/[^/]+\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+const UUID_PATH = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}';
+const PRIVATE_RUNTIME_VOICE_PATH =
+  new RegExp(`^/media/runtime/voice/${UUID_PATH}/${UUID_PATH}/${UUID_PATH}/[0-9]{10}/[0-9a-f]{64}\\.ogg$`);
 function isGateExempt(method: string, url: string, serviceCallback: boolean): boolean {
   const path = url.split('?', 1)[0]!;
   return (
     GATE_EXEMPT_EXACT.has(path) ||
     (method === 'POST' && serviceCallback) ||
     ((method === 'GET' || method === 'HEAD') &&
-      (PUBLIC_SHARE_PATH.test(path) || PUBLIC_SHARE_MEDIA_PATH.test(path))) ||
+      (PUBLIC_SHARE_PATH.test(path) || PUBLIC_SHARE_MEDIA_PATH.test(path) ||
+        (method === 'GET' && PRIVATE_RUNTIME_VOICE_PATH.test(path)))) ||
     GATE_EXEMPT_PREFIXES.some((prefix) =>
       path === prefix.slice(0, -1) || path.startsWith(prefix),
     )

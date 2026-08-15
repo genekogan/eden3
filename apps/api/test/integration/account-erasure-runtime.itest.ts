@@ -37,6 +37,7 @@ import {
 import {
   AccountErasureTargetWorker,
   attestAccountErasureLegacyMediaBoundary,
+  attestAccountErasureVoiceOutputBoundary,
   attestAccountErasureDatabaseBoundary,
   type AccountErasureDatabaseBoundary,
   PostgresAccountErasureStore,
@@ -99,9 +100,12 @@ const erasureStore = () => new PostgresAccountErasureStore({
 });
 const erasureTargetStore = (legacyMediaRoot = join(tmpdir(), 'eden3-erasure-default-media')) => {
   mkdirSync(legacyMediaRoot, { recursive: true });
+  const voiceOutputRoot = `${legacyMediaRoot}-voice`;
+  mkdirSync(voiceOutputRoot, { recursive: true });
   return new PostgresAccountErasureTargetStore({
     databaseBoundary: ERASURE_DB_BOUNDARY,
     legacyMediaBoundary: attestAccountErasureLegacyMediaBoundary(legacyMediaRoot),
+    voiceOutputBoundary: attestAccountErasureVoiceOutputBoundary(voiceOutputRoot),
   });
 };
 const HUMAN = '10000000-0000-4000-8000-000000000001';
@@ -1023,7 +1027,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
         throw new Error('avatar erasure target was not claimable');
       };
       const claim = await claimAvatar(avatar!.id);
-      const executor = new LocalLegacyErasureExecutor(targetStore.legacyMediaBoundary, {
+      const executor = new LocalLegacyErasureExecutor(targetStore.legacyMediaBoundary, targetStore.voiceOutputBoundary, {
         erase: async () => { throw new Error('local avatar must not use external erasure'); },
       });
       await expect(executor.erase({ ...claim, signal: AbortSignal.timeout(5_000) }))
@@ -1590,6 +1594,7 @@ describe.sequential('T12-U03 account erasure runtime on fully migrated scratch P
     const externalErase = vi.fn(async () => ({ confirmedAbsent: true as const }));
     const executor = new LocalLegacyErasureExecutor(
       targetStore.legacyMediaBoundary,
+      targetStore.voiceOutputBoundary,
       { erase: externalErase },
     );
     for (const claimedTarget of claimed) {

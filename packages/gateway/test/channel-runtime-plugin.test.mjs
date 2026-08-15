@@ -41,6 +41,9 @@ const SESSION_B = 'agent:agent-b:discord:account-b:direct:1532630091471786166';
 const TELEGRAM_SESSION_A = 'agent:agent-a:telegram:account-a:direct:963544662646354001';
 const MEMORY_A = 'memory/users/alice-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.md';
 const MEMORY_GROUP = `memory/users/channel-group-${'a'.repeat(64)}.md`;
+const VOICE_EXECUTION = '99999999-9999-4999-8999-999999999999';
+const VOICE_OPERATION = '88888888-8888-4888-8888-888888888888';
+const VOICE_CAPABILITY = `/media/runtime/voice/${RUN_A}/${VOICE_EXECUTION}/${VOICE_OPERATION}/1999999999/${'a'.repeat(64)}.ogg`;
 
 function hostedConfig(overrides = {}) {
   return {
@@ -220,7 +223,7 @@ function mockBridge(config = hostedConfig(), handlers = {}, bridgeOptions = {}) 
   const calls = [];
   const client = {
     mediaUrl(relativePath) {
-      if (!/^\/media\/[0-9a-f]{64}\.ogg$/.test(relativePath)) throw new Error('invalid media path');
+      if (!/^\/media\/runtime\/voice\/[0-9a-f-]{36}\/[0-9a-f-]{36}\/[0-9a-f-]{36}\/[0-9]{10}\/[0-9a-f]{64}\.ogg$/.test(relativePath)) throw new Error('invalid media path');
       return `http://host.docker.internal:4312${relativePath}`;
     },
     post: vi.fn(async (path, body, options) => {
@@ -568,7 +571,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
           voiceOperationId: body.voiceOperationId,
           execution: { purpose: channel },
           attachment: {
-            url: `/media/${'a'.repeat(64)}.ogg`,
+            url: VOICE_CAPABILITY,
             mime: 'audio/ogg',
             durationSecs: 1.25,
             waveform: channel === 'discord' ? 'AQID' : null,
@@ -593,7 +596,7 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
       { runId: RUN_A, sessionKey, channelId: channel, accountId: 'account-a', messageId: channel === 'discord' ? '1532630091471786166' : '42' },
     )).resolves.toBeUndefined();
 
-    const expectedMediaUrl = `http://host.docker.internal:4312/media/${'a'.repeat(64)}.ogg`;
+    const expectedMediaUrl = `http://host.docker.internal:4312${VOICE_CAPABILITY}`;
     expect(payload).toMatchObject({
       text: '', spokenText: '', mediaUrl: expectedMediaUrl,
       mediaUrls: [expectedMediaUrl], audioAsVoice: true,

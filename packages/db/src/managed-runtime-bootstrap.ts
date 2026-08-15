@@ -45,6 +45,7 @@ export function managedRuntimeBootstrapStatements(
     'SET ROLE eden3_erasure_guard',
     `GRANT EXECUTE ON FUNCTION public.account_erasure_assert_account_writable(uuid) TO ${roleName}`,
     `GRANT EXECUTE ON FUNCTION public.account_erasure_lock_legacy_content(text,text,text,text,text,text,text,text,text,text) TO ${roleName}`,
+    `GRANT EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text) TO ${roleName}`,
     'RESET ROLE',
     `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${roleName}`,
     `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${roleName}`,
@@ -82,7 +83,8 @@ export async function bootstrapManagedRuntimeRole(
            has_schema_privilege(r.rolname, 'public', 'CREATE') as "schemaCreate",
            pg_has_role(r.rolname, 'eden3_erasure_operator', 'member') as "erasureOperator",
            pg_has_role(r.rolname, 'eden3_erasure_guard', 'member') as "erasureGuard",
-           pg_has_role(r.rolname, 'eden3_erasure_terminal_writer', 'member') as "terminalWriter"
+           pg_has_role(r.rolname, 'eden3_erasure_terminal_writer', 'member') as "terminalWriter",
+           has_function_privilege(r.rolname, 'public.account_erasure_assert_voice_output_writable(text)', 'EXECUTE') as "voiceOutputFence"
     from pg_roles r where r.rolname=${options.roleName}
   ` as readonly [{
     canLogin: boolean;
@@ -98,6 +100,7 @@ export async function bootstrapManagedRuntimeRole(
     erasureOperator: boolean;
     erasureGuard: boolean;
     terminalWriter: boolean;
+    voiceOutputFence: boolean;
   }];
   const [counts] = await sql`
     select count(*) filter (where c.relkind in ('r','p')
@@ -114,7 +117,7 @@ export async function bootstrapManagedRuntimeRole(
   if (
     !role?.canLogin || role.superuser || role.createDatabase || role.createRole || role.inherit ||
     role.replication || role.bypassRls || !role.canConnect || !role.schemaUsage || role.schemaCreate ||
-    role.erasureOperator || role.erasureGuard || role.terminalWriter ||
+    role.erasureOperator || role.erasureGuard || role.terminalWriter || !role.voiceOutputFence ||
     !Number.isSafeInteger(counts?.tableCount) || counts.tableCount < 1 ||
     !Number.isSafeInteger(counts?.sequenceCount)
   ) {
@@ -129,4 +132,40 @@ export async function bootstrapManagedRuntimeRole(
     lockTimeout: '5s',
     idleInTransactionTimeout: '15s',
   };
+}
+
+/** Idempotently upgrade an already-reviewed managed runtime role after 0049. */
+export async function upgradeManagedRuntimeVoicePrivilege(
+  sql: postgres.TransactionSql,
+  roleName: string,
+): Promise<void> {
+  if (!ROLE_NAME.test(roleName)) throw new Error('managed runtime role name is not canonical');
+  const [role] = await sql`
+    select rolcanlogin,rolsuper,rolcreatedb,rolcreaterole,rolinherit,rolreplication,rolbypassrls,
+      pg_has_role(rolname,'eden3_erasure_operator','member') operator_member,
+      pg_has_role(rolname,'eden3_erasure_guard','member') guard_member,
+      pg_has_role(rolname,'eden3_erasure_terminal_writer','member') terminal_member,
+      has_database_privilege(rolname,current_database(),'CONNECT') can_connect,
+      has_schema_privilege(rolname,'public','CREATE') schema_create
+    from pg_roles where rolname=${roleName}
+  ` as readonly [{
+    rolcanlogin: boolean; rolsuper: boolean; rolcreatedb: boolean; rolcreaterole: boolean;
+    rolinherit: boolean; rolreplication: boolean; rolbypassrls: boolean; operator_member: boolean;
+    guard_member: boolean; terminal_member: boolean; can_connect: boolean; schema_create: boolean;
+  }];
+  if (!role?.rolcanlogin || role.rolsuper || role.rolcreatedb || role.rolcreaterole || role.rolinherit ||
+      role.rolreplication || role.rolbypassrls || role.operator_member || role.guard_member ||
+      role.terminal_member || !role.can_connect || role.schema_create) {
+    throw new Error('managed runtime role did not meet the least-privilege upgrade contract');
+  }
+  await sql.unsafe('SET LOCAL ROLE eden3_erasure_guard');
+  try {
+    await sql.unsafe(`GRANT EXECUTE ON FUNCTION public.account_erasure_assert_voice_output_writable(text) TO ${roleName}`);
+  } finally {
+    await sql.unsafe('RESET ROLE');
+  }
+  const [grant] = await sql`
+    select has_function_privilege(${roleName},'public.account_erasure_assert_voice_output_writable(text)','EXECUTE') granted
+  ` as readonly [{ granted: boolean }];
+  if (grant?.granted !== true) throw new Error('managed runtime voice output fence grant was not installed');
 }

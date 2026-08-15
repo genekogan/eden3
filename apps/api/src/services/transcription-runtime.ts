@@ -14,9 +14,10 @@ export interface TranscriptionRuntime {
 
 export async function createTranscriptionRuntime(options: {
   onError?: (error: unknown) => void;
+  audioDir?: string;
 } = {}): Promise<TranscriptionRuntime> {
   const env = getEnv();
-  const audio = new PrivateTranscriptionAudioStore(env.TRANSCRIPTION_AUDIO_DIR);
+  const audio = new PrivateTranscriptionAudioStore(options.audioDir ?? env.TRANSCRIPTION_AUDIO_DIR);
   await audio.initialize();
   const repository = new PostgresTranscriptionRepository({
     audio,

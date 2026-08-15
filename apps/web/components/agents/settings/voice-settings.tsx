@@ -105,12 +105,12 @@ export function executionAudioUrl(value: unknown): string | null {
     ? root.execution as Record<string, unknown>
     : root;
   for (const candidate of [execution.mediaUrl, execution.outputUrl, execution.url]) {
-    if (typeof candidate === "string" && candidate.startsWith("/media/")) return candidate;
+    if (typeof candidate === "string" && /^\/media\/voice\/[0-9a-f-]{36}$/.test(candidate)) return candidate;
   }
   const output = execution.output;
   if (output && typeof output === "object") {
     const url = (output as Record<string, unknown>).url;
-    if (typeof url === "string" && url.startsWith("/media/")) return url;
+    if (typeof url === "string" && /^\/media\/voice\/[0-9a-f-]{36}$/.test(url)) return url;
   }
   return null;
 }

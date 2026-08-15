@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
 import { lstat, realpath, unlink } from 'node:fs/promises';
-import { basename, dirname, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import type { PgClient } from '@eden3/db';
 import { getEnv, type DbHandle } from '@eden3/core';
@@ -342,6 +342,7 @@ export interface AccountErasureStoreOptions {
 
 const erasureDatabaseBoundary = Symbol('eden3.account-erasure-database-boundary');
 const legacyMediaBoundaryBrand = Symbol('eden3.account-erasure-legacy-media-boundary');
+const voiceOutputBoundaryBrand = Symbol('eden3.account-erasure-voice-output-boundary');
 const databaseRoleName = /^[a-z_][a-z0-9_]{0,62}$/;
 
 export interface AccountErasureDatabaseBoundary {
@@ -466,6 +467,35 @@ export function attestAccountErasureLegacyMediaBoundary(
 
 function isLegacyMediaBoundary(value: object | undefined): value is AccountErasureLegacyMediaBoundary {
   return Boolean(value && (value as AccountErasureLegacyMediaBoundary)[legacyMediaBoundaryBrand] === true);
+}
+
+export interface AccountErasureVoiceOutputBoundary {
+  readonly [voiceOutputBoundaryBrand]: true;
+  readonly root: string;
+}
+
+/** Attest the physically private voice root independently from public MEDIA_DIR. */
+export function attestAccountErasureVoiceOutputBoundary(root: string): AccountErasureVoiceOutputBoundary {
+  const requested = resolve(root);
+  const requestedStat = lstatSync(requested);
+  if (requestedStat.isSymbolicLink()) {
+    throw new Error('Account erasure voice output root must not be a symlink');
+  }
+  const canonical = realpathSync(requested);
+  const stat = lstatSync(canonical);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error('Account erasure voice output root must be a real directory');
+  }
+  return Object.freeze({ [voiceOutputBoundaryBrand]: true as const, root: canonical });
+}
+
+function isVoiceOutputBoundary(value: object | undefined): value is AccountErasureVoiceOutputBoundary {
+  return Boolean(value && (value as AccountErasureVoiceOutputBoundary)[voiceOutputBoundaryBrand] === true);
+}
+
+function rootsOverlap(left: string, right: string): boolean {
+  const candidate = relative(left, right);
+  return candidate === '' || (!candidate.startsWith(`..${sep}`) && candidate !== '..' && !isAbsolute(candidate));
 }
 
 /** PostgreSQL implementation of both route admission and provider-free recovery. */
@@ -729,8 +759,8 @@ export class PostgresAccountErasureStore implements AccountErasureRecoveryStore 
       }[]>`
         select ve.id,ve.output_local_path,ve.output_url,ve.output_sha256,
           not exists(select 1 from voice_executions other where other.id<>ve.id
-            and other.status='completed' and other.output_sha256=ve.output_sha256
-            and other.owner_account_id<>${input.accountId}) delete_physical
+            and other.status not in ('failed','artifact_cleanup_pending')
+            and other.output_sha256=ve.output_sha256) delete_physical
         from voice_executions ve where ve.owner_account_id=${input.accountId} and ve.status='completed'
           and ve.output_local_path is not null and ve.output_url is not null and ve.output_sha256 is not null
         order by id for update`;
@@ -1451,6 +1481,7 @@ export interface AccountErasureTargetClaim {
 export interface AccountErasureTargetStore {
   readonly databaseBoundary?: object;
   readonly legacyMediaBoundary?: AccountErasureLegacyMediaBoundary;
+  readonly voiceOutputBoundary?: AccountErasureVoiceOutputBoundary;
   readonly claimLeaseMs?: number;
   claimTarget(): Promise<AccountErasureTargetClaim | { targetId: string; status: 'attention' } | null>;
   completeTarget(claim: AccountErasureTargetClaim): Promise<'completed' | 'stale'>;
@@ -1539,10 +1570,12 @@ interface LegacyMatchingSource extends LegacySourceLocator {
 export class PostgresAccountErasureTargetStore implements AccountErasureTargetStore {
   readonly databaseBoundary: object;
   readonly legacyMediaBoundary: AccountErasureLegacyMediaBoundary;
+  readonly voiceOutputBoundary: AccountErasureVoiceOutputBoundary;
 
   constructor(options: {
     databaseBoundary: AccountErasureDatabaseBoundary;
     legacyMediaBoundary: AccountErasureLegacyMediaBoundary;
+    voiceOutputBoundary: AccountErasureVoiceOutputBoundary;
     claimLeaseMs?: number;
     maxAttempts?: number;
   }) {
@@ -1552,8 +1585,14 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
     if (!isLegacyMediaBoundary(options.legacyMediaBoundary)) {
       throw new Error('Account erasure targets require an attested legacy media boundary');
     }
+    if (!isVoiceOutputBoundary(options.voiceOutputBoundary) ||
+        rootsOverlap(options.voiceOutputBoundary.root, options.legacyMediaBoundary.root) ||
+        rootsOverlap(options.legacyMediaBoundary.root, options.voiceOutputBoundary.root)) {
+      throw new Error('Account erasure targets require a distinct attested voice output boundary');
+    }
     this.client = options.databaseBoundary.client;
     this.legacyMediaBoundary = options.legacyMediaBoundary;
+    this.voiceOutputBoundary = options.voiceOutputBoundary;
     this.legacyMediaRoot = options.legacyMediaBoundary.root;
     this.databaseBoundary = options.databaseBoundary;
     this.claimLeaseMs = options.claimLeaseMs ?? 60_000;
@@ -1655,7 +1694,9 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
         sourceDisposition.kind === 'ambiguous' || sourceDisposition.key !== disposition.key ||
         source.active_target_ids.length === 0,
     );
-    const targetIds = [...new Set(exactSources.flatMap((source) => source.active_target_ids))].sort();
+    const targetIds = [...new Set([
+      ...exactSources.flatMap((source) => source.active_target_ids),
+    ])].sort();
     return { foreignShared, elected: !foreignShared && targetIds[0] === target.id };
   }
 
@@ -1751,15 +1792,17 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
         select output_local_path,output_url,output_sha256 from voice_executions
         where id=${target.resource_id} and status='completed' for update`;
       if (!row?.output_local_path || !row.output_url || !row.output_sha256) return null;
-      await tx`select pg_advisory_xact_lock(hashtextextended('voice-output:'||${row.output_sha256},0))`;
+      await tx`select pg_advisory_xact_lock(hashtextextended('eden3-erasure-voice:sha:'||${row.output_sha256},0))`;
       const [election] = await tx<{ foreign_shared: boolean; elected_target_id: string | null }[]>`
-        with matching as materialized (
-          select ve.id,coalesce(array(select t.id::text from account_erasure_targets t
+        with voice_matching as materialized (
+          select coalesce(array(select t.id::text from account_erasure_targets t
             join account_erasure_jobs j on j.id=t.job_id
             where t.kind='voice_output' and t.resource_id=ve.id
               and t.state<>'succeeded' and j.state<>'succeeded'),array[]::text[]) active_target_ids
-          from voice_executions ve
-          where ve.status='completed' and ve.output_sha256=${row.output_sha256}
+          from voice_executions ve where ve.output_sha256=${row.output_sha256}
+            and ve.status not in ('failed','artifact_cleanup_pending')
+        ), matching as materialized (
+          select active_target_ids from voice_matching
         ), target_ids as (
           select distinct unnest(active_target_ids) id from matching
         )
@@ -2072,6 +2115,7 @@ export class PostgresAccountErasureTargetStore implements AccountErasureTargetSt
 
 export interface AccountErasureTargetExecutor {
   readonly legacyMediaBoundary?: AccountErasureLegacyMediaBoundary;
+  readonly voiceOutputBoundary?: AccountErasureVoiceOutputBoundary;
   readonly voiceCloneCustody?: true;
   erase(input: Pick<AccountErasureTargetClaim, 'targetId' | 'jobId' | 'kind' | 'resourceId' | 'locator'> & {
     signal: AbortSignal;
@@ -2085,16 +2129,23 @@ export interface AccountErasureTargetExecutor {
  */
 export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor {
   readonly legacyMediaBoundary: AccountErasureLegacyMediaBoundary;
+  readonly voiceOutputBoundary: AccountErasureVoiceOutputBoundary;
   readonly voiceCloneCustody: true | undefined;
 
   constructor(
     boundary: AccountErasureLegacyMediaBoundary,
+    voiceBoundary: AccountErasureVoiceOutputBoundary,
     private readonly external: AccountErasureTargetExecutor,
   ) {
     if (!isLegacyMediaBoundary(boundary)) {
       throw new Error('Local legacy erasure requires an attested media boundary');
     }
+    if (!isVoiceOutputBoundary(voiceBoundary) || rootsOverlap(voiceBoundary.root, boundary.root) ||
+        rootsOverlap(boundary.root, voiceBoundary.root)) {
+      throw new Error('Local voice erasure requires a distinct attested voice output boundary');
+    }
     this.legacyMediaBoundary = boundary;
+    this.voiceOutputBoundary = voiceBoundary;
     this.voiceCloneCustody = external.voiceCloneCustody;
     this.mediaRoot = boundary.root;
   }
@@ -2118,7 +2169,7 @@ export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor 
     if (typeof locator.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(locator.sha256)) {
       throw new Error('legacy erasure locator is invalid');
     }
-    const root = await realpath(this.mediaRoot);
+    const root = await realpath(input.kind === 'voice_output' ? this.voiceOutputBoundary.root : this.mediaRoot);
     let candidate: string;
     if (typeof locator.localPath === 'string') {
       candidate = resolve(locator.localPath);
@@ -2151,6 +2202,7 @@ export class LocalLegacyErasureExecutor implements AccountErasureTargetExecutor 
 /** Confirms Cartesia clone absence before the erasure worker may delete custody rows. */
 export class CartesiaVoiceCloneErasureExecutor implements AccountErasureTargetExecutor {
   readonly legacyMediaBoundary: AccountErasureLegacyMediaBoundary | undefined;
+  readonly voiceOutputBoundary: AccountErasureVoiceOutputBoundary | undefined;
   readonly voiceCloneCustody = true as const;
 
   constructor(
@@ -2161,6 +2213,7 @@ export class CartesiaVoiceCloneErasureExecutor implements AccountErasureTargetEx
       throw new Error('Cartesia clone erasure requires a delete-capable Cartesia provider');
     }
     this.legacyMediaBoundary = fallback.legacyMediaBoundary;
+    this.voiceOutputBoundary = fallback.voiceOutputBoundary;
   }
 
   async erase(input: Parameters<AccountErasureTargetExecutor['erase']>[0]): Promise<{ confirmedAbsent: true }> {
