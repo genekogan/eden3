@@ -1263,6 +1263,122 @@ export const usageEvents = pgTable(
   ],
 );
 
+// ---------------------------------------------------------------------------
+// Private, resumable speech-to-text custody. Audio bytes live only under the
+// non-public TRANSCRIPTION_AUDIO_DIR; these rows contain checkpoints and safe
+// relative locators, never CDN/media URLs or provider credentials.
+// ---------------------------------------------------------------------------
+export const transcriptionSessions = pgTable(
+  'transcription_sessions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    ownerAccountId: uuid('owner_account_id')
+      .notNull()
+      .references(() => accounts.id, { onDelete: 'restrict' }),
+    createIdempotencyKey: uuid('create_idempotency_key').notNull(),
+    finalizeIdempotencyKey: uuid('finalize_idempotency_key'),
+    status: text('status')
+      .$type<'uploading' | 'reserving' | 'queued' | 'processing' | 'completed' | 'failed' | 'deleted' | 'expired'>()
+      .notNull()
+      .default('uploading'),
+    language: text('language').notNull().default('en'),
+    encoding: text('encoding').notNull().default('pcm_s16le'),
+    sampleRateHz: integer('sample_rate_hz').notNull().default(16_000),
+    channels: integer('channels').notNull().default(1),
+    acknowledgedThrough: integer('acknowledged_through').notNull().default(-1),
+    nextChunkNumber: integer('next_chunk_number').notNull().default(0),
+    receivedBytes: bigint('received_bytes', { mode: 'number' }).notNull().default(0),
+    receivedDurationMs: bigint('received_duration_ms', { mode: 'number' }).notNull().default(0),
+    maxDurationMs: integer('max_duration_ms').notNull().default(600_000),
+    finalChunkNumber: integer('final_chunk_number'),
+    provider: text('provider'),
+    providerModel: text('provider_model'),
+    providerRequestId: text('provider_request_id'),
+    providerStartedAt: timestamptz('provider_started_at'),
+    providerCompletedAt: timestamptz('provider_completed_at'),
+    transcript: text('transcript'),
+    errorCode: text('error_code'),
+    quotedCostUsd: numeric('quoted_cost_usd', { precision: 20, scale: 8 }),
+    quotedManna: integer('quoted_manna'),
+    tableVersion: text('table_version'),
+    reservationTransactionId: uuid('reservation_transaction_id').references(
+      () => mannaTransactions.id,
+      { onDelete: 'set null' },
+    ),
+    usageEventId: uuid('usage_event_id').references(() => usageEvents.id, { onDelete: 'set null' }),
+    claimToken: uuid('claim_token'),
+    claimExpiresAt: timestamptz('claim_expires_at'),
+    deleteRequestedAt: timestamptz('delete_requested_at'),
+    audioDeletedAt: timestamptz('audio_deleted_at'),
+    expiresAt: timestamptz('expires_at').notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+    updatedAt: timestamptz('updated_at').notNull().defaultNow(),
+    completedAt: timestamptz('completed_at'),
+  },
+  (t) => [
+    uniqueIndex('transcription_sessions_owner_create_key_uq').on(
+      t.ownerAccountId,
+      t.createIdempotencyKey,
+    ),
+    index('transcription_sessions_owner_created_idx').on(t.ownerAccountId, t.createdAt.desc()),
+    index('transcription_sessions_worker_idx').on(t.status, t.claimExpiresAt, t.createdAt),
+    index('transcription_sessions_expiry_idx').on(t.expiresAt),
+    check(
+      'transcription_sessions_status_check',
+      sql`${t.status} in ('uploading','reserving','queued','processing','completed','failed','deleted','expired')`,
+    ),
+    check(
+      'transcription_sessions_format_check',
+      sql`${t.language}='en' and ${t.encoding}='pcm_s16le' and ${t.sampleRateHz}=16000 and ${t.channels}=1`,
+    ),
+    check(
+      'transcription_sessions_duration_check',
+      sql`${t.maxDurationMs} between 1000 and 600000 and ${t.receivedDurationMs} between 0 and ${t.maxDurationMs} and ${t.receivedBytes}=${t.receivedDurationMs}*32`,
+    ),
+    check(
+      'transcription_sessions_checkpoint_check',
+      sql`${t.acknowledgedThrough}=${t.nextChunkNumber}-1 and ${t.nextChunkNumber}>=0 and (${t.finalChunkNumber} is null or ${t.finalChunkNumber}=${t.acknowledgedThrough})`,
+    ),
+    check(
+      'transcription_sessions_claim_check',
+      sql`(${t.claimToken} is null and ${t.claimExpiresAt} is null) or (${t.status}='processing' and ${t.claimToken} is not null and ${t.claimExpiresAt} is not null)`,
+    ),
+    check(
+      'transcription_sessions_quote_check',
+      sql`(${t.quotedManna} is null and ${t.quotedCostUsd} is null and ${t.tableVersion} is null and ${t.reservationTransactionId} is null and ${t.usageEventId} is null) or (${t.quotedManna}>0 and ${t.quotedCostUsd}>0 and ${t.tableVersion} is not null and ${t.reservationTransactionId} is not null and ${t.usageEventId} is not null)`,
+    ),
+  ],
+);
+
+export const transcriptionChunks = pgTable(
+  'transcription_chunks',
+  {
+    sessionId: uuid('session_id')
+      .notNull()
+      .references(() => transcriptionSessions.id, { onDelete: 'cascade' }),
+    chunkNumber: integer('chunk_number').notNull(),
+    sizeBytes: integer('size_bytes').notNull(),
+    durationMs: integer('duration_ms').notNull(),
+    sha256: text('sha256').notNull(),
+    relativePath: text('relative_path').notNull(),
+    createdAt: timestamptz('created_at').notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.sessionId, t.chunkNumber] }),
+    uniqueIndex('transcription_chunks_path_uq').on(t.relativePath),
+    check('transcription_chunks_number_check', sql`${t.chunkNumber}>=0`),
+    check(
+      'transcription_chunks_size_check',
+      sql`${t.sizeBytes} between 320 and 320000 and ${t.sizeBytes}%320=0 and ${t.durationMs}=${t.sizeBytes}/32`,
+    ),
+    check('transcription_chunks_sha_check', sql`${t.sha256} ~ '^[0-9a-f]{64}$'`),
+    check(
+      'transcription_chunks_path_check',
+      sql`${t.relativePath} ~ '^[0-9a-f-]{36}/[0-9a-f-]{36}/[0-9]+-[0-9a-f-]{36}[.]pcm$'`,
+    ),
+  ],
+);
+
 // Cross-process lease for subscription-backed Claude turns. Transcript usage
 // is timestamp-window based, so two concurrent turns in one gateway session
 // would otherwise both claim the same provider messages. The API heartbeats a
@@ -2183,6 +2299,10 @@ export type DistillState = typeof distillState.$inferSelect;
 export type NewDistillState = typeof distillState.$inferInsert;
 export type UsageEvent = typeof usageEvents.$inferSelect;
 export type NewUsageEvent = typeof usageEvents.$inferInsert;
+export type TranscriptionSession = typeof transcriptionSessions.$inferSelect;
+export type NewTranscriptionSession = typeof transcriptionSessions.$inferInsert;
+export type TranscriptionChunk = typeof transcriptionChunks.$inferSelect;
+export type NewTranscriptionChunk = typeof transcriptionChunks.$inferInsert;
 export type ClaudeSessionTurnClaim = typeof claudeSessionTurnClaims.$inferSelect;
 export type NewClaudeSessionTurnClaim = typeof claudeSessionTurnClaims.$inferInsert;
 export type MemoryRevision = typeof memoryRevisions.$inferSelect;

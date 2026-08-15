@@ -176,6 +176,17 @@ describe('CostTable', () => {
     ]);
   });
 
+  it('prices Cartesia Ink-2 from audio duration rather than client estimates', () => {
+    const estimate = costFromParams({
+      provider: 'cartesia',
+      model: 'ink-2',
+      units: { audio_second: 600 },
+      asOf: '2026-08-15',
+    });
+    expect(estimate.totalCostUsd).toBeCloseTo(0.09, 10);
+    expect(mannaForEstimate(estimate)).toBe(122);
+  });
+
   it('charges cached prompt tokens at the cache-read rate', () => {
     const cold = costFromLlmUsage({
       provider: 'anthropic',

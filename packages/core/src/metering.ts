@@ -6,13 +6,14 @@
  * snapshot and should be reconciled against provider invoices/pricing updates.
  */
 
-export const COST_TABLE_VERSION = '2026-08-12.media-v2';
+export const COST_TABLE_VERSION = '2026-08-15.stt-v1';
 
 export const DEFAULT_MANNA_PER_USD = 1_000;
 export const DEFAULT_MARKUP = 0.35;
 
 export type CostProvider =
   | 'anthropic'
+  | 'cartesia'
   | 'elevenlabs'
   | 'fal'
   | 'google'
@@ -28,6 +29,7 @@ export type CostUnit =
   | 'image'
   | 'megapixel'
   | 'video_second'
+  | 'audio_second'
   | 'audio_character'
   | 'music_clip'
   | 'music_second'
@@ -79,6 +81,16 @@ export class CostTableError extends Error {
 const RATE_SOURCE = 'Eden3 launch pricing snapshot; reconcile monthly before production billing';
 
 export const COST_TABLE: readonly CostTableEntry[] = [
+  {
+    provider: 'cartesia',
+    model: 'ink-2',
+    unit: 'audio_second',
+    // Ink-2 realtime is 3 credits/second. Cartesia Pro is $5 for 100,000
+    // credits, so the plan-value equivalent is $0.00015/second ($0.009/min).
+    usdPerUnit: 0.00015,
+    effectiveDate: '2026-08-15',
+    source: 'Cartesia official pricing and Ink-2 pricing docs, reviewed 2026-08-15',
+  },
   // Anthropic-style LLM tiers. Cache read/write rates follow the common
   // 0.1x / 1.25x prompt-cache convention for launch accounting.
   {
