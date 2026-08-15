@@ -110,7 +110,34 @@ import type {
 
 function publicApiOrigin(): string | null {
   const origin = process.env.NEXT_PUBLIC_API_ORIGIN?.trim();
-  return origin ? origin.replace(/\/+$/, "") : null;
+  if (!origin) return null;
+  const normalized = origin.replace(/\/+$/, "");
+
+  // Dev impersonation is a host-only HttpOnly cookie. Browsers consider
+  // `localhost` and `127.0.0.1` different cookie sites even though both reach
+  // the same loopback interface. Keep a configured loopback API port, but
+  // align its hostname with the page the user actually opened so direct
+  // long-running streams carry the same identity as ordinary `/api` calls.
+  if (typeof window !== "undefined") {
+    try {
+      const configured = new URL(normalized);
+      const pageHost = window.location?.hostname;
+      const loopback = new Set(["localhost", "127.0.0.1", "[::1]"]);
+      if (
+        pageHost &&
+        loopback.has(configured.hostname) &&
+        loopback.has(pageHost) &&
+        configured.hostname !== pageHost
+      ) {
+        configured.hostname = pageHost;
+        return configured.toString().replace(/\/+$/, "");
+      }
+    } catch {
+      // Configuration validation belongs to the environment boundary. Keep
+      // the historical value here so fetch reports the same useful failure.
+    }
+  }
+  return normalized;
 }
 
 function apiBase(opts: { direct?: boolean } = {}): string {

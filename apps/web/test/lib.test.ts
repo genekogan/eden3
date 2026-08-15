@@ -264,6 +264,31 @@ describe("lib/api browser transport", () => {
     });
   });
 
+  it("keeps loopback direct streams on the browser's cookie host", async () => {
+    process.env.NEXT_PUBLIC_API_ORIGIN = "http://localhost:4531/";
+    vi.stubGlobal("window", { location: { hostname: "127.0.0.1" } });
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(encodeSseComment("connected"), {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    for await (const _event of api.sessions.sendNew({
+      content: "authenticated loopback stream",
+      agentUsername: "rocket",
+    })) {
+      // A comment-only stream intentionally yields no typed event.
+    }
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://127.0.0.1:4531/sessions/new/messages",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ credentials: "include" });
+  });
+
   it("keeps ordinary browser API calls on the same-origin rewrite", async () => {
     process.env.NEXT_PUBLIC_API_ORIGIN = "http://127.0.0.1:4301";
     vi.stubGlobal("window", {});
