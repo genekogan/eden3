@@ -292,6 +292,40 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
+export interface VoiceNoteAction {
+  status: "idle" | "generating" | "error";
+  onRequest: () => void;
+}
+
+function VoiceNoteButton({ action }: { action: VoiceNoteAction }) {
+  const label = action.status === "generating"
+    ? "Creating voice note"
+    : action.status === "error"
+      ? "Retry voice note"
+      : "Read aloud";
+  return (
+    <button
+      type="button"
+      onClick={action.onRequest}
+      disabled={action.status === "generating"}
+      aria-label={label}
+      title={label}
+      className={`inline-flex items-center rounded transition-colors hover:text-muted disabled:cursor-wait ${
+        action.status === "error" ? "text-warning-soft" : ""
+      }`}
+    >
+      {action.status === "generating" ? (
+        <span aria-hidden className="size-3 animate-pulse rounded-full border border-current" />
+      ) : (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.75} aria-hidden className="size-3.5">
+          <path d="M11 5 6.5 9H3v6h3.5L11 19V5Z" strokeLinejoin="round" />
+          <path d="M15 9a4 4 0 0 1 0 6M18 6a8 8 0 0 1 0 12" strokeLinecap="round" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 /**
  * Subtle hover meta beneath a text bubble: relative time + (optional) copy.
  * Muted, hidden until the row is hovered or the copy button is focused.
@@ -300,13 +334,15 @@ function CopyButton({ text }: { text: string }) {
 function MessageMeta({
   at,
   copyText,
+  voiceNote,
   align = "left",
 }: {
   at?: string;
   copyText?: string;
+  voiceNote?: VoiceNoteAction;
   align?: "left" | "right";
 }) {
-  if (!at && !copyText) return null;
+  if (!at && !copyText && !voiceNote) return null;
   return (
     <div
       className={`mt-1 flex items-center gap-2 text-faint opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100 ${
@@ -319,6 +355,7 @@ function MessageMeta({
         </span>
       ) : null}
       {copyText ? <CopyButton text={copyText} /> : null}
+      {voiceNote ? <VoiceNoteButton action={voiceNote} /> : null}
     </div>
   );
 }
@@ -499,10 +536,12 @@ export function MessageRow({
   message,
   sender,
   showAvatar = true,
+  voiceNote,
 }: {
   message: MessageDto;
   sender: AccountSummary | null;
   showAvatar?: boolean;
+  voiceNote?: VoiceNoteAction;
 }) {
   const role = message.role ?? "assistant";
 
@@ -540,6 +579,7 @@ export function MessageRow({
       <MessageMeta
         at={message.createdAt}
         copyText={hasText ? assistantText : undefined}
+        voiceNote={voiceNote}
       />
     </AgentRow>
   );

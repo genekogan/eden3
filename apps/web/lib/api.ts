@@ -77,6 +77,7 @@ import type {
   SessionShareListResponseDto,
   SessionShareSummaryDto,
   UserUsageSummary,
+  VoiceExecutionDto,
   AgentSkillsResponse,
   AppNotificationsResponseDto,
   SessionDetail,
@@ -732,6 +733,17 @@ export const api = {
     /** Soft-delete one owned conversation. */
     async remove(id: string): Promise<void> {
       await apiFetch<unknown>(`/sessions/${enc(id)}`, { method: "DELETE" });
+    },
+
+    /** Idempotently attach the selected agent's assigned voice to one assistant row. */
+    voiceNote(
+      sessionId: string,
+      messageId: string,
+      idempotencyKey: string,
+    ): Promise<{ execution: VoiceExecutionDto; message: MessageDto }> {
+      return post(`/sessions/${enc(sessionId)}/messages/${enc(messageId)}/voice-note`, {
+        idempotencyKey,
+      });
     },
 
     /**

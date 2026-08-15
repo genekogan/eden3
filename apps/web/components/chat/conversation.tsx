@@ -34,9 +34,12 @@ import type { AccountSummary, MessageDto, SessionDto } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
 import { ContextualHelpLink } from "@/components/help/contextual-help-link";
+import { useSelectedAgent } from "@/components/shell/selected-agent-context";
 import { Skeleton } from "@/components/skeleton";
 import {
   describeSendError,
+  directVoiceNoteIdempotencyKey,
+  directVoiceNoteRetryKey,
   fetchSessionPage,
   sessionAgents,
   sessionTitle,
@@ -124,6 +127,8 @@ export function SessionConversation({
   const [fallbackAgent, setFallbackAgent] = useState<AccountSummary | null>(
     null,
   );
+  const { agent: selectedAgent } = useSelectedAgent();
+  const [voiceStatus, setVoiceStatus] = useState<Record<string, "idle" | "generating" | "error">>({});
 
   // The uuid to talk to the API with (route may carry a legacy 24-hex id).
   const canonicalIdRef = useRef(routeId);
@@ -146,6 +151,7 @@ export function SessionConversation({
   const adoptedPumpRef = useRef<string | null>(null);
   const localTurnsRef = useRef<Set<string>>(new Set());
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const voiceRequestKeysRef = useRef<Map<string, string>>(new Map());
 
   // Scroll management (used inside callbacks defined below).
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -183,6 +189,37 @@ export function SessionConversation({
     },
     [refreshHistory],
   );
+
+  const requestVoiceNote = useCallback(async (messageId: string) => {
+    setVoiceStatus((current) => ({ ...current, [messageId]: "generating" }));
+    try {
+      let key = voiceRequestKeysRef.current.get(messageId) ?? directVoiceNoteIdempotencyKey(messageId);
+      try {
+        await api.sessions.voiceNote(canonicalIdRef.current, messageId, key);
+      } catch (error) {
+        const body = error instanceof ApiError && error.body && typeof error.body === "object"
+          ? error.body as { error?: { code?: unknown }; code?: unknown }
+          : null;
+        const code = body?.error?.code ?? body?.code;
+        if (code !== "voice_execution_terminal") throw error;
+        // A known terminal attempt is refunded and cannot replay. Only this
+        // authoritative response permits a fresh key; network ambiguity and
+        // in-progress responses always retain the existing identity.
+        key = directVoiceNoteRetryKey(messageId, crypto.randomUUID());
+        voiceRequestKeysRef.current.set(messageId, key);
+        await api.sessions.voiceNote(canonicalIdRef.current, messageId, key);
+      }
+      await refreshHistory();
+      setVoiceStatus((current) => ({ ...current, [messageId]: "idle" }));
+    } catch (error) {
+      setVoiceStatus((current) => ({ ...current, [messageId]: "error" }));
+      setNotice({
+        message: describeSendError(error),
+        retryContent: null,
+        manna: error instanceof ApiError && error.status === 402,
+      });
+    }
+  }, [refreshHistory]);
 
   const loadHistory = useCallback(async () => {
     setLoadPhase((phase) => (phase === "ready" ? phase : "loading"));
@@ -734,6 +771,19 @@ export function SessionConversation({
                   message={message}
                   sender={senderFor(message)}
                   showAvatar={!grouped}
+                  voiceNote={
+                    message.role === "assistant" &&
+                    Boolean(message.content?.trim()) &&
+                    !message.attachments.some((attachment) => Boolean(attachment.voiceExecutionId)) &&
+                    message.senderId === selectedAgent?.id &&
+                    (selectedAgent?.voiceAssignment?.delivery.chat === "on_demand" ||
+                      selectedAgent?.voiceAssignment?.delivery.chat === "always")
+                      ? {
+                          status: voiceStatus[message.id] ?? "idle",
+                          onRequest: () => void requestVoiceNote(message.id),
+                        }
+                      : undefined
+                  }
                 />
               );
             }

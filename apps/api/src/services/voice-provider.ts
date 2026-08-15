@@ -44,6 +44,8 @@ export interface VoiceProviderClient {
     signal?: AbortSignal;
   }): Promise<VoiceCloneResult>;
   deleteClone?(providerVoiceId: string, signal?: AbortSignal): Promise<void>;
+  /** Exact owner/private lookup used only to reconcile an ambiguous create. */
+  findOwnedCloneByName?(name: string, signal?: AbortSignal): Promise<{ providerVoiceId: string } | null>;
 }
 
 function safeHeader(response: Response, name: string): string | null {
@@ -229,6 +231,52 @@ export class CartesiaVoiceClient implements VoiceProviderClient {
       method: 'DELETE', headers: this.headers(),
     }, signal);
     if (response.status !== 204 && response.status !== 404) assertOk(response);
+  }
+
+  async findOwnedCloneByName(name: string, signal?: AbortSignal): Promise<{ providerVoiceId: string } | null> {
+    const exact: unknown[] = [];
+    let startingAfter: string | undefined;
+    // Exhaust the owner-filtered cursor before declaring absence. A truncated
+    // first page must never permit local deletion while a provider clone lives.
+    for (let page = 0; page < 100; page += 1) {
+      const query = new URLSearchParams({ q: name, is_owner: 'true', limit: '100' });
+      if (startingAfter) query.set('starting_after', startingAfter);
+      const response = await fetchAtMostOnce(
+        this.fetchFn,
+        `https://api.cartesia.ai/voices?${query.toString()}`,
+        { method: 'GET', headers: this.headers() },
+        signal,
+      );
+      assertOk(response);
+      const raw = await boundedBytes(response, 256 * 1024);
+      let payload: unknown;
+      try { payload = JSON.parse(raw.toString('utf8')); }
+      catch { throw new VoiceProviderError('provider_response_invalid', false); }
+      const data = payload && typeof payload === 'object' && Array.isArray((payload as { data?: unknown }).data)
+        ? (payload as { data: unknown[] }).data
+        : null;
+      if (!data || data.length > 100) throw new VoiceProviderError('provider_response_invalid', false);
+      exact.push(...data.filter((item) => item && typeof item === 'object' && (item as { name?: unknown }).name === name));
+      if (data.length === 0) break;
+      const last = data.at(-1);
+      if (!last || typeof last !== 'object' || typeof (last as { id?: unknown }).id !== 'string') {
+        throw new VoiceProviderError('provider_response_invalid', false);
+      }
+      startingAfter = (last as { id: string }).id;
+      if (page === 99) throw new VoiceProviderError('provider_response_invalid', false);
+    }
+    if (exact.length === 0) return null;
+    if (exact.length !== 1) throw new VoiceProviderError('provider_response_invalid', false);
+    const match = exact[0] as Record<string, unknown>;
+    if (
+      typeof match.id !== 'string' ||
+      match.is_owner !== true ||
+      match.access !== 'private' ||
+      (match.visibility !== undefined && match.visibility !== 'owner')
+    ) {
+      throw new VoiceProviderError('provider_response_invalid', false);
+    }
+    return { providerVoiceId: match.id };
   }
 }
 

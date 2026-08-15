@@ -869,6 +869,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Resource routes (remaining stub: studio) + real dev/chat/session routes.
   await app.register(chatRoutes, {
     prefix: '/sessions',
+    ...(voice ? { voiceKernel: voice.kernel } : {}),
     ...(storageRuntime ? { mediaResolver: storageRuntime.mediaResolver } : {}),
     ...(opts.accountErasure
       ? { providerEvidenceDb: opts.accountErasure.providerEvidenceDb }
@@ -916,9 +917,15 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     let voiceTimer: ReturnType<typeof setInterval> | undefined;
     app.addHook('onReady', async () => {
       await voice.kernel.reconcileStaleExecutions();
+      void voice.kernel.reconcileAmbiguousClones().catch(() => {
+        app.log.error({ component: 'voice-reconciler' }, 'voice clone reconciliation failed');
+      });
       voiceTimer = setInterval(() => {
-        void voice.kernel.reconcileStaleExecutions().catch(() => {
-          app.log.error({ component: 'voice-reconciler' }, 'voice execution reconciliation failed');
+        void Promise.all([
+          voice.kernel.reconcileStaleExecutions(),
+          voice.kernel.reconcileAmbiguousClones(),
+        ]).catch(() => {
+          app.log.error({ component: 'voice-reconciler' }, 'voice reconciliation failed');
         });
       }, 60_000);
       voiceTimer.unref?.();
