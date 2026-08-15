@@ -30,7 +30,23 @@ export function assertManagedVoiceUpgradeUrls(
   return { ownerAuthority, runtimeAuthority };
 }
 
-async function main() {
+export function buildManagedVoiceUpgradeValidation(
+  ownerRaw: string,
+  runtimeRaw: string,
+  databaseName: string,
+  roleName: string,
+) {
+  const { ownerAuthority } = assertManagedVoiceUpgradeUrls(ownerRaw, runtimeRaw, databaseName, roleName);
+  return {
+    databaseName,
+    hostSha256: ownerAuthority.hostSha256,
+    port: ownerAuthority.port,
+    roleSha256: createHash('sha256').update(roleName).digest('hex'),
+    validation: 'managed-owner-runtime-authority-split',
+  };
+}
+
+async function main(args: readonly string[]) {
   const ownerDatabaseUrl = process.env.MANAGED_OWNER_DATABASE_URL;
   const runtimeDatabaseUrl = process.env.MANAGED_DATABASE_URL;
   const databaseName = process.env.MANAGED_DATABASE_EXPECTED_NAME;
@@ -38,7 +54,14 @@ async function main() {
   if (!ownerDatabaseUrl || !runtimeDatabaseUrl || !databaseName || !roleName) {
     throw new Error('managed runtime voice upgrade environment is incomplete');
   }
-  assertManagedVoiceUpgradeUrls(ownerDatabaseUrl, runtimeDatabaseUrl, databaseName, roleName);
+  const validation = buildManagedVoiceUpgradeValidation(
+    ownerDatabaseUrl,
+    runtimeDatabaseUrl,
+    databaseName,
+    roleName,
+  );
+  if (args.length === 1 && args[0] === '--validate-only') return validation;
+  if (args.length !== 0) throw new Error('managed runtime voice upgrade arguments are invalid');
   const client = postgres(ownerDatabaseUrl, {
     max: 1,
     ssl: 'verify-full',
@@ -85,7 +108,7 @@ async function main() {
 
 const invoked = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : null;
 if (invoked === import.meta.url) {
-  main()
+  main(process.argv.slice(2))
     .then((evidence) => console.log(JSON.stringify({ ok: true, evidence })))
     .catch(() => {
       console.error(JSON.stringify({ ok: false, error: 'managed_runtime_voice_upgrade_failed' }));
