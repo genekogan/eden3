@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { IDBFactory } from "fake-indexeddb";
 
 import {
   appendTranscript,
@@ -9,6 +10,7 @@ import {
 import { PCM_UPLOAD_CHUNK_SAMPLES } from "../lib/pcm-recorder";
 import {
   DICTATION_DRAFT_TTL_MS,
+  DICTATION_DB_NAME,
   DICTATION_COMPOSER_DRAFTS_KEY,
   DICTATION_SIGN_OUT_PURGE_DEADLINE_MS,
   beginDictationPurgeFence,
@@ -16,6 +18,7 @@ import {
   clearDictationPurgeFence,
   currentDictationCustodyEpoch,
   currentDictationPurgeFence,
+  DictationDraftStore,
   loadDictationComposerDraft,
   partitionDictationDrafts,
   persistDictationComposerDraft,
@@ -78,7 +81,7 @@ describe("dictation UI helpers", () => {
       setItem: (key, value) => { values.set(key, value); },
       removeItem: (key) => { values.delete(key); },
     };
-    persistDictationComposerDraft("account-1", "session:one", "private transcript", fenceStore);
+    values.set(DICTATION_COMPOSER_DRAFTS_KEY, "legacy private transcript");
     expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(true);
     expect(await purgeDictationDraftsBeforeSignOut(async () => undefined, 500, fenceStore)).toBe("purged");
     expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(false);
@@ -105,25 +108,80 @@ describe("dictation UI helpers", () => {
     expect(DICTATION_SIGN_OUT_PURGE_DEADLINE_MS).toBeLessThanOrEqual(500);
   });
 
-  it("durably hands a transcript to the composer before audio ack and replays exactly once", () => {
+  it("durably hands a transcript to the composer before audio ack and replays exactly once", async () => {
     const values = new Map<string, string>();
     const fenceStore: DictationPurgeFenceStore = {
       getItem: (key) => values.get(key) ?? null,
       setItem: (key, value) => { values.set(key, value); },
       removeItem: (key) => { values.delete(key); },
     };
-    expect(persistDictationComposerDraft("account-1", "session:one", "Typed preface", fenceStore)).toBe(true);
-    const first = commitDictationTranscriptToComposer(
-      "account-1", "session:one", "draft-delivery-1", "spoken continuation", fenceStore,
+    const options = { indexedDB: new IDBFactory(), purgeFenceStore: fenceStore };
+    await expect(persistDictationComposerDraft("account-1", "session:one", "Typed preface", options)).resolves.toBe(true);
+    const first = await commitDictationTranscriptToComposer(
+      "account-1", "session:one", "draft-delivery-1", "spoken continuation", options,
     );
     expect(first).toBe("Typed preface spoken continuation");
     // Simulate a crash before IndexedDB acknowledgement: remount hydrates the
     // committed composer text, and replaying the same delivery cannot append.
-    expect(loadDictationComposerDraft("account-1", "session:one", fenceStore)).toBe(first);
-    expect(commitDictationTranscriptToComposer(
-      "account-1", "session:one", "draft-delivery-1", "spoken continuation", fenceStore,
-    )).toBe(first);
-    expect(loadDictationComposerDraft("account-1", "session:one", fenceStore)).toBe(first);
+    await expect(loadDictationComposerDraft("account-1", "session:one", options)).resolves.toBe(first);
+    await expect(commitDictationTranscriptToComposer(
+      "account-1", "session:one", "draft-delivery-1", "spoken continuation", options,
+    )).resolves.toBe(first);
+    await expect(loadDictationComposerDraft("account-1", "session:one", options)).resolves.toBe(first);
+  });
+
+  it("serializes concurrent cross-tab composer handoffs without losing either transcript", async () => {
+    const values = new Map<string, string>();
+    const fenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const options = { indexedDB: new IDBFactory(), purgeFenceStore: fenceStore };
+    await Promise.all([
+      commitDictationTranscriptToComposer("account-1", "session:a", "delivery-a", "alpha", options),
+      commitDictationTranscriptToComposer("account-1", "session:b", "delivery-b", "beta", options),
+    ]);
+    await expect(loadDictationComposerDraft("account-1", "session:a", options)).resolves.toBe("alpha");
+    await expect(loadDictationComposerDraft("account-1", "session:b", options)).resolves.toBe("beta");
+
+    await Promise.all([
+      commitDictationTranscriptToComposer("account-1", "session:c", "delivery-c1", "one", options),
+      commitDictationTranscriptToComposer("account-1", "session:c", "delivery-c2", "two", options),
+    ]);
+    const sameContext = await loadDictationComposerDraft("account-1", "session:c", options);
+    expect(sameContext?.split(" ").sort()).toEqual(["one", "two"]);
+    await Promise.all([
+      commitDictationTranscriptToComposer("account-1", "session:c", "delivery-c1", "one", options),
+      commitDictationTranscriptToComposer("account-1", "session:c", "delivery-c2", "two", options),
+    ]);
+    expect(await loadDictationComposerDraft("account-1", "session:c", options)).toBe(sameContext);
+  });
+
+  it("upgrades existing dictation custody and purges composer handoffs atomically", async () => {
+    const indexedDB = new IDBFactory();
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open(DICTATION_DB_NAME, 2);
+      request.addEventListener("upgradeneeded", () => {
+        request.result.createObjectStore("drafts", { keyPath: "id" });
+        const chunks = request.result.createObjectStore("chunks", { keyPath: ["draftId", "index"] });
+        chunks.createIndex("by-draft", "draftId", { unique: false });
+      });
+      request.addEventListener("success", () => { request.result.close(); resolve(); });
+      request.addEventListener("error", () => reject(request.error));
+    });
+    const values = new Map<string, string>();
+    const purgeFenceStore: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const options = { indexedDB, purgeFenceStore };
+    await persistDictationComposerDraft("account-1", "session:upgrade", "survives upgrade", options);
+    await expect(loadDictationComposerDraft("account-1", "session:upgrade", options))
+      .resolves.toBe("survives upgrade");
+    await new DictationDraftStore(options).purgeAll();
+    await expect(loadDictationComposerDraft("account-1", "session:upgrade", options)).resolves.toBeNull();
   });
 
   it("invalidates a pre-fence writer even after the recovery purge clears its tombstone", () => {

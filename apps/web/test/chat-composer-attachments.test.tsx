@@ -1,10 +1,19 @@
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import { IDBFactory } from 'fake-indexeddb';
 
-import { attachmentError, clearComposerDraftAfterTurnAcceptance, Composer } from '../components/chat/composer';
+import {
+  attachmentError,
+  clearComposerDraftAfterTurnAcceptance,
+  Composer,
+  resolveComposerDraftIdentity,
+  retryComposerDraftAfterTurnAcceptance,
+  shouldApplyComposerHydration,
+} from '../components/chat/composer';
 import {
   clearDictationComposerDraft,
+  DICTATION_CUSTODY_EPOCH_KEY,
   loadDictationComposerDraft,
   persistDictationComposerDraft,
   type DictationPurgeFenceStore,
@@ -40,11 +49,87 @@ describe('chat composer attachments', () => {
       setItem: (key, value) => { values.set(key, value); },
       removeItem: (key) => { values.delete(key); },
     };
-    persistDictationComposerDraft('owner', 'session:one', 'ten minute transcript', storage);
-    const clear = () => clearDictationComposerDraft('owner', 'session:one', storage);
+    const options = { indexedDB: new IDBFactory(), purgeFenceStore: storage };
+    await persistDictationComposerDraft('owner', 'session:one', 'ten minute transcript', options);
+    const clear = () => clearDictationComposerDraft('owner', 'session:one', options);
     await expect(clearComposerDraftAfterTurnAcceptance(Promise.resolve(false), clear)).resolves.toBe(false);
-    expect(loadDictationComposerDraft('owner', 'session:one', storage)).toBe('ten minute transcript');
+    await expect(loadDictationComposerDraft('owner', 'session:one', options)).resolves.toBe('ten minute transcript');
     await expect(clearComposerDraftAfterTurnAcceptance(Promise.resolve(true), clear)).resolves.toBe(true);
-    expect(loadDictationComposerDraft('owner', 'session:one', storage)).toBeNull();
+    await expect(loadDictationComposerDraft('owner', 'session:one', options)).resolves.toBeNull();
+  });
+
+  it('keeps failed retries across refresh and clears only the exact accepted retry context', async () => {
+    const values = new Map<string, string>();
+    const storage: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const options = { indexedDB: new IDBFactory(), purgeFenceStore: storage };
+    await persistDictationComposerDraft('owner', 'new:rocket', 'new-chat transcript', options);
+    await persistDictationComposerDraft('owner', 'session:one', 'session transcript', options);
+
+    await expect(retryComposerDraftAfterTurnAcceptance(
+      Promise.resolve(false), 'owner', 'new:rocket', options,
+    )).resolves.toBe(false);
+    await expect(loadDictationComposerDraft('owner', 'new:rocket', options)).resolves.toBe('new-chat transcript');
+
+    await expect(retryComposerDraftAfterTurnAcceptance(
+      Promise.resolve(true), 'owner', 'session:one', options,
+    )).resolves.toBe(true);
+    await expect(loadDictationComposerDraft('owner', 'session:one', options)).resolves.toBeNull();
+    await expect(loadDictationComposerDraft('owner', 'new:rocket', options)).resolves.toBe('new-chat transcript');
+  });
+
+  it('never copies a composer draft across sessions or accounts', async () => {
+    const values = new Map<string, string>();
+    const storage: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const options = { indexedDB: new IDBFactory(), purgeFenceStore: storage };
+    await persistDictationComposerDraft('owner-a', 'session:a', 'private A', options);
+    const a = await resolveComposerDraftIdentity('owner-a', 'session:a', null, options);
+    expect(a).toMatchObject({ changed: true, value: 'private A' });
+
+    const blankB = await resolveComposerDraftIdentity('owner-a', 'session:b', a.identity, options);
+    expect(blankB).toMatchObject({ changed: true, value: '' });
+    await expect(loadDictationComposerDraft('owner-a', 'session:a', options)).resolves.toBe('private A');
+
+    await persistDictationComposerDraft('owner-a', 'session:b', 'saved B', options);
+    await expect(resolveComposerDraftIdentity('owner-a', 'session:b', a.identity, options))
+      .resolves.toMatchObject({ value: 'saved B' });
+
+    const other = await resolveComposerDraftIdentity('owner-b', 'session:a', a.identity, options);
+    expect(other).toMatchObject({ changed: true, value: '' });
+    expect(other.value).not.toContain('private A');
+  });
+
+  it('cannot let late hydration overwrite a local edit', () => {
+    expect(shouldApplyComposerHydration('owner:a', 'owner:a', 0, 0)).toBe(true);
+    expect(shouldApplyComposerHydration('owner:a', 'owner:a', 0, 1)).toBe(false);
+    expect(shouldApplyComposerHydration('owner:a', 'owner:b', 0, 0)).toBe(false);
+  });
+
+  it('cannot let an old accepted send clear a relogged-in epoch', async () => {
+    const values = new Map<string, string>([[DICTATION_CUSTODY_EPOCH_KEY, 'epoch-a']]);
+    const storage: DictationPurgeFenceStore = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => { values.set(key, value); },
+      removeItem: (key) => { values.delete(key); },
+    };
+    const options = { indexedDB: new IDBFactory(), purgeFenceStore: storage };
+    await persistDictationComposerDraft('owner', 'session:one', 'old epoch', options);
+    let accept!: (accepted: boolean) => void;
+    const acceptance = new Promise<boolean>((resolve) => { accept = resolve; });
+    const clearing = retryComposerDraftAfterTurnAcceptance(
+      acceptance, 'owner', 'session:one', options,
+    );
+    storage.setItem(DICTATION_CUSTODY_EPOCH_KEY, 'epoch-b');
+    await persistDictationComposerDraft('owner', 'session:one', 'new epoch', options);
+    accept(true);
+    await expect(clearing).resolves.toBe(true);
+    await expect(loadDictationComposerDraft('owner', 'session:one', options)).resolves.toBe('new epoch');
   });
 });
