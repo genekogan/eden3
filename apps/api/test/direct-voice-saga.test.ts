@@ -24,18 +24,23 @@ function kernelWith(db: unknown) {
   });
 }
 
-function rowsFor(statement: unknown, missing?: 'message' | 'usage' | 'job'): unknown[] {
+function rowsFor(statement: unknown, missing?: 'message' | 'usage' | 'job', completed = false): unknown[] {
   const query = queryText(statement);
   if (query.startsWith('select * from direct_voice_jobs')) return [{
     message_id: MESSAGE, owner_account_id: OWNER, session_id: SESSION, agent_account_id: AGENT,
     voice_id: 'deepinfra:kokoro:af_bella:v1', text_sha256: 'a'.repeat(64), mode: 'always',
-    status: 'attachment_pending', generation: 0, execution_id: EXECUTION, last_error_code: null,
+    status: completed ? 'completed' : 'attachment_pending', generation: 0, execution_id: EXECUTION, last_error_code: null,
     updated_at: new Date(),
   }];
   if (query.startsWith('select * from voice_executions')) return [{
-    id: EXECUTION, voice_id: 'deepinfra:kokoro:af_bella:v1', purpose: 'chat', status: 'transcoding',
+    id: EXECUTION, voice_id: 'deepinfra:kokoro:af_bella:v1', purpose: 'chat', status: completed ? 'completed' : 'transcoding',
     output_url: '/media/voice.ogg', output_mime: 'audio/ogg', output_duration_ms: 1_000,
     output_size_bytes: 100, character_count: 5, reserved_manna: 1, request_sha256: 'b'.repeat(64),
+  }];
+  if (query.startsWith('select id,external_id,session_id')) return [{
+    id: MESSAGE, external_id: null, session_id: SESSION, sender_id: AGENT, role: 'assistant', content: 'hello',
+    attachments: [{ url: '/media/voice.ogg', mime: 'audio/ogg', durationMs: 1_000, voiceExecutionId: EXECUTION }],
+    tool_calls: null, reactions: null, reply_to_external_id: null, created_at: new Date(),
   }];
   if (query.startsWith('update messages set attachments')) return missing !== 'message' ? [{
     id: MESSAGE, external_id: null, session_id: SESSION, sender_id: AGENT, role: 'assistant', content: 'hello',
@@ -77,6 +82,24 @@ describe('direct voice attachment settlement saga', () => {
       expect.stringContaining("update usage_events set status='completed'"),
       expect.stringContaining("update direct_voice_jobs set status='completed'"),
     ]));
+  });
+
+  it('marks only the atomic attachment transition as newly settled', async () => {
+    const executed: string[] = [];
+    const tx = { execute: vi.fn(async (statement: unknown) => {
+      executed.push(queryText(statement));
+      return rowsFor(statement, undefined, true);
+    }) };
+    const kernel = kernelWith({
+      transaction: vi.fn(async (work: (handle: typeof tx) => Promise<unknown>) => await work(tx)),
+      execute: vi.fn(async () => []),
+    });
+    const result = await (kernel as unknown as {
+      settleDirectVoiceAttachment(messageId: string): Promise<{ newlySettled: boolean }>;
+    }).settleDirectVoiceAttachment(MESSAGE);
+    expect(result.newlySettled).toBe(false);
+    expect(executed.some((query) => query.startsWith('update messages set attachments'))).toBe(false);
+    expect(executed.some((query) => query.startsWith("update usage_events set status='completed'"))).toBe(false);
   });
 
   it('does not settle money when the assistant attachment cannot be committed', async () => {

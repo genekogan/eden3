@@ -915,16 +915,33 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   if (voice) await app.register(voiceRoutes, voice);
   if (voice?.autoStartReconciler) {
     let voiceTimer: ReturnType<typeof setInterval> | undefined;
-    const voiceFlight: VoiceReconcilerFlight = { running: false };
-    const reconcileVoice = () => startVoiceReconciliation(
-      voiceFlight,
-      async () => await settleVoiceReconciliationTasks([
-        () => voice.kernel.reconcileStaleExecutions(),
-        () => voice.kernel.reconcileDirectVoiceJobs(),
-        () => voice.kernel.reconcileAmbiguousClones(),
-      ]),
-      () => { app.log.error({ component: 'voice-reconciler' }, 'voice reconciliation failed'); },
-    );
+    const voiceFlights = {
+      stale: voiceReconcilerFlight(),
+      direct: voiceReconcilerFlight(),
+      clones: voiceReconcilerFlight(),
+    };
+    const reconcileVoice = () => {
+      const onError = (family: keyof typeof voiceFlights) => () => {
+        app.log.error({ component: 'voice-reconciler', family }, 'voice reconciliation failed');
+      };
+      // Keep provider families independent. A stuck clone lookup must never
+      // starve direct attachment/refund recovery or provider-free stale work.
+      startVoiceReconciliation(
+        voiceFlights.stale,
+        async (signal) => await voice.kernel.reconcileStaleExecutions(undefined, signal),
+        onError('stale'),
+      );
+      startVoiceReconciliation(
+        voiceFlights.direct,
+        async (signal) => await reconcileDirectVoiceAndPublish(voice.kernel, app.eventsBus, signal),
+        onError('direct'),
+      );
+      startVoiceReconciliation(
+        voiceFlights.clones,
+        async (signal) => await voice.kernel.reconcileAmbiguousClones(undefined, signal),
+        onError('clones'),
+      );
+    };
     app.addHook('onReady', async () => {
       // Provider reconciliation is intentionally detached from readiness: an
       // outage/backlog must not prevent the API from starting and serving
@@ -935,7 +952,10 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       }, 60_000);
       voiceTimer.unref?.();
     });
-    app.addHook('onClose', async () => { if (voiceTimer) clearInterval(voiceTimer); });
+    app.addHook('onClose', async () => {
+      if (voiceTimer) clearInterval(voiceTimer);
+      for (const flight of Object.values(voiceFlights)) stopVoiceReconciliation(flight);
+    });
   }
   // Gateway-only fail-closed media authorization callbacks. These exact POST
   // routes authenticate the gateway bearer before any allowlist bypass.
@@ -1087,24 +1107,82 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   return app;
 }
 
-export interface VoiceReconcilerFlight { running: boolean }
+export const VOICE_RECONCILIATION_DEADLINE_MS = 45_000;
 
-export async function settleVoiceReconciliationTasks(
-  tasks: ReadonlyArray<() => Promise<unknown>>,
-): Promise<void> {
-  const results = await Promise.allSettled(tasks.map((task) => task()));
-  const failures = results.filter((result) => result.status === 'rejected').length;
-  if (failures > 0) throw new Error(`${failures} voice reconciliation task(s) failed`);
+export interface VoiceReconcilerFlight {
+  running: boolean;
+  generation: number;
+  controller: AbortController | null;
+}
+
+export function voiceReconcilerFlight(): VoiceReconcilerFlight {
+  return { running: false, generation: 0, controller: null };
 }
 
 /** Starts provider-capable recovery without blocking readiness or overlapping. */
 export function startVoiceReconciliation(
   flight: VoiceReconcilerFlight,
-  task: () => Promise<unknown>,
+  task: (signal: AbortSignal) => Promise<unknown>,
   onError: (error: unknown) => void,
+  deadlineMs = VOICE_RECONCILIATION_DEADLINE_MS,
 ): boolean {
   if (flight.running) return false;
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs >= 60_000) {
+    throw new Error('voice reconciliation deadline must be below its tick interval');
+  }
+  const generation = flight.generation + 1;
+  const controller = new AbortController();
+  let timedOut = false;
+  flight.generation = generation;
   flight.running = true;
-  void task().catch(onError).finally(() => { flight.running = false; });
+  flight.controller = controller;
+  const deadline = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new Error('voice reconciliation deadline exceeded'));
+    if (flight.generation === generation) {
+      flight.running = false;
+      flight.controller = null;
+    }
+    onError(controller.signal.reason);
+  }, deadlineMs);
+  deadline.unref?.();
+  void Promise.resolve()
+    .then(() => task(controller.signal))
+    .catch((error) => {
+      if (!timedOut && flight.generation === generation) onError(error);
+    })
+    .finally(() => {
+      clearTimeout(deadline);
+      if (flight.generation === generation) {
+        flight.running = false;
+        flight.controller = null;
+      }
+    });
   return true;
+}
+
+export function stopVoiceReconciliation(flight: VoiceReconcilerFlight): void {
+  flight.generation += 1;
+  flight.controller?.abort(new Error('voice reconciliation stopped'));
+  flight.controller = null;
+  flight.running = false;
+}
+
+/** Publish refresh events only for rows atomically transitioned by this recovery pass. */
+export async function reconcileDirectVoiceAndPublish(
+  kernel: Pick<VoiceKernel, 'reconcileDirectVoiceJobs'>,
+  bus: Pick<EventsBus, 'publish'>,
+  signal?: AbortSignal,
+): Promise<number> {
+  const result = await kernel.reconcileDirectVoiceJobs(undefined, signal);
+  signal?.throwIfAborted();
+  for (const settled of result.settled) {
+    signal?.throwIfAborted();
+    bus.publish(settled.sessionId, {
+      type: 'session.messages.changed',
+      sessionId: settled.sessionId,
+      messageId: settled.messageId,
+    });
+  }
+  return result.processed;
 }
