@@ -68,7 +68,7 @@ describe('voice contract invariants', () => {
     expect(voiceKernelInternals.providerCloneName(id)).toBe(`eden3-clone-${id}`);
     expect(voiceKernelInternals.providerCloneName(id)).not.toContain('My voice');
     expect(kernelSource).toContain('name: providerCloneName(String(clone.row.id))');
-    expect(kernelSource).toContain('provider.findOwnedCloneByName(providerCloneName(id))');
+    expect(kernelSource).toContain('provider.findOwnedCloneByName(providerCloneName(id), signal)');
     expect(kernelSource).toContain("failure_code='provider_create_absence_observed'");
     expect(kernelSource).toContain("failure_code='provider_create_absence_confirmed'");
   });

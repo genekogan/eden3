@@ -114,7 +114,9 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
     const params = messageParams.parse(request.params);
     const body = idempotencySchema.parse(request.body);
     const result = await boundary(() => kernel.directVoiceNote(request.account!.accountId, params.sessionId, params.messageId, body.idempotencyKey));
-    app.eventsBus.publish(params.sessionId, { type: 'session.messages.changed', sessionId: params.sessionId, messageId: params.messageId });
+    if (!result.execution.replayed) {
+      app.eventsBus.publish(params.sessionId, { type: 'session.messages.changed', sessionId: params.sessionId, messageId: params.messageId });
+    }
     return reply.code(result.execution.replayed ? 200 : 201).send(result);
   });
 
