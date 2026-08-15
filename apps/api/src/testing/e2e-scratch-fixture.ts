@@ -34,6 +34,16 @@ export interface E2EScratchSideEffects {
   providerRunCount: number;
   mannaAccountCount: number;
   mannaTransactionCount: number;
+  agentVoiceAssignmentCount: number;
+  voiceCloneCount: number;
+  voiceCloneClipCount: number;
+  voiceQuoteCount: number;
+  voiceExecutionCount: number;
+  directVoiceJobCount: number;
+  transcriptionSessionCount: number;
+  transcriptionChunkCount: number;
+  storageUploadCount: number;
+  storageObjectCount: number;
 }
 
 export interface E2EScratchFixtureRepository {
@@ -215,7 +225,17 @@ export function assertNoE2EScratchSideEffects(
     counts.usageCount !== 0 ||
     counts.providerRunCount !== 0 ||
     counts.mannaAccountCount !== 0 ||
-    counts.mannaTransactionCount !== 0
+    counts.mannaTransactionCount !== 0 ||
+    counts.agentVoiceAssignmentCount !== 0 ||
+    counts.voiceCloneCount !== 0 ||
+    counts.voiceCloneClipCount !== 0 ||
+    counts.voiceQuoteCount !== 0 ||
+    counts.voiceExecutionCount !== 0 ||
+    counts.directVoiceJobCount !== 0 ||
+    counts.transcriptionSessionCount !== 0 ||
+    counts.transcriptionChunkCount !== 0 ||
+    counts.storageUploadCount !== 0 ||
+    counts.storageObjectCount !== 0
   ) {
     throw new Error('scratch fixture preflight found agent or provider side effects');
   }
