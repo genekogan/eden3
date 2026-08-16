@@ -27,6 +27,7 @@ describe('closed-alpha public share gate seam', () => {
     app.post('/shares/:token', async () => ({ mutated: true }));
     app.get('/media/share/:token/:objectId', { exposeHeadRoute: false }, async () => ({ media: true }));
     app.head('/media/share/:token/:objectId', async (_request, reply) => reply.send());
+    app.get('/media/voice/:executionId', { preHandler: app.requireAuth }, async () => ({ media: true }));
     return app;
   }
 
@@ -64,6 +65,7 @@ describe('closed-alpha public share gate seam', () => {
     ['GET', `/shares/${'x'.repeat(32)}/extra`],
     ['POST', `/media/share/${'x'.repeat(32)}/00000000-0000-4000-8000-000000000001`],
     ['GET', `/media/share/${'x'.repeat(32)}/not-a-uuid`],
+    ['GET', '/media/voice/00000000-0000-4000-8000-000000000001'],
   ] as const)('keeps %s %s behind the gate', async (method, url) => {
     const app = await setup();
     const response = await app.inject({ method, url });
