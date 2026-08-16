@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   claimGate3DatabaseOwnership,
   dropOwnedGate3Database,
+  planOwnedGate3DatabaseTeardown,
   verifyGate3DatabaseOwnership,
 } from '../../../e2e/gate3-database-ownership';
 
@@ -14,6 +15,10 @@ const markerHash = 'b'.repeat(64);
 const clusterIdentity = createHash('sha256').update(JSON.stringify({
   systemIdentifier: '1234567890123456789', port: 5432, version: '180000',
 })).digest('hex');
+const ownerRoleName = 'eden3_g3_owner_111111111111111111111111';
+const ownerRoleOid = '16385';
+const ownerRoleMarkerHash = 'c'.repeat(64);
+const protectedDatabaseSetHash = createHash('sha256').update('postgres\ntemplate0').digest('hex');
 
 function environment(identity: { databaseOid?: string; clusterIdentity?: string } = {}) {
   Object.assign(process.env, {
@@ -21,6 +26,9 @@ function environment(identity: { databaseOid?: string; clusterIdentity?: string 
     E2E_GATE3_DATABASE_INTEGRATION_HEAD: head,
     E2E_GATE3_DATABASE_NAME: databaseName,
     E2E_GATE3_DATABASE_MARKER_HASH: markerHash,
+    E2E_GATE3_DATABASE_OWNER_ROLE_NAME: ownerRoleName,
+    E2E_GATE3_DATABASE_OWNER_ROLE_OID: ownerRoleOid,
+    E2E_GATE3_DATABASE_OWNER_ROLE_MARKER_HASH: ownerRoleMarkerHash,
     ...(identity.databaseOid ? { E2E_GATE3_DATABASE_OID: identity.databaseOid } : {}),
     ...(identity.clusterIdentity ? { E2E_GATE3_DATABASE_CLUSTER_IDENTITY: identity.clusterIdentity } : {}),
   });
@@ -35,9 +43,12 @@ function fakeDatabase(options: {
 } = {}) {
   const state = {
     oid: options.oid ?? '16384',
+    databasePresent: true,
+    rolePresent: true,
     marker: null as null | Record<string, string>,
     terminate: 0,
     drop: 0,
+    roleDrop: 0,
     released: 0,
   };
   const sql: any = async (strings: TemplateStringsArray, ...values: unknown[]) => {
@@ -63,6 +74,14 @@ function fakeDatabase(options: {
     if (query === 'select current_database()::text as name') {
       return [{ name: options.operatorDatabase ?? 'postgres' }];
     }
+    if (query.includes('from pg_database d join pg_roles r')) return state.databasePresent ? [{
+      databaseOid: state.oid, ownerRoleOid, ownerRoleName,
+    }] : [];
+    if (query.includes('from pg_roles r where r.rolname')) return state.rolePresent ? [{
+      oid: ownerRoleOid, name: ownerRoleName, login: false, superuser: false,
+      createDatabase: false, createRole: false, inherit: false, replication: false,
+      bypassRls: false, comment: `eden3-gate3-owner-role-v1:${ownerRoleMarkerHash}`,
+    }] : [];
     if (query.includes('select oid::text as "databaseoid" from pg_database')) return [{ databaseOid: state.oid }];
     if (query.includes('select datname::text as name from pg_database')) return [{ name: 'postgres' }, { name: 'template0' }];
     if (query.includes('pg_terminate_backend')) {
@@ -70,11 +89,13 @@ function fakeDatabase(options: {
       if (options.replaceAfterTerminate) state.oid = '32768';
       return [];
     }
-    if (query.includes('select count(*)::int as count from pg_database')) return [{ count: state.drop ? 0 : 1 }];
+    if (query.includes('select count(*)::int as count from pg_database')) return [{ count: state.databasePresent ? 1 : 0 }];
+    if (query.includes('select count(*)::int as count from pg_roles')) return [{ count: state.rolePresent ? 1 : 0 }];
     throw new Error(`unexpected modeled SQL: ${query}`);
   };
   sql.unsafe = async (query: string) => {
-    if (query.startsWith('drop database')) { state.drop += 1; return []; }
+    if (query.startsWith('drop database')) { state.drop += 1; state.databasePresent = false; return []; }
+    if (query.startsWith('drop role')) { state.roleDrop += 1; state.rolePresent = false; return []; }
     if (query.startsWith('create schema') || query.startsWith('create table')) return [];
     throw new Error(`unexpected unsafe SQL: ${query}`);
   };
@@ -99,7 +120,33 @@ describe('Gate 3 physical database ownership', () => {
     environment({ databaseOid: claim.databaseOid, clusterIdentity: claim.clusterIdentity });
     const receipt = await dropOwnedGate3Database(model.sql);
     expect(receipt).toMatchObject({ ok: true, phase: 'teardown', databaseName, databaseOid: '16384', scratchDatabaseAbsent: true });
-    expect(model.state).toMatchObject({ terminate: 1, drop: 1, released: 1 });
+    expect(model.state).toMatchObject({ terminate: 1, drop: 1, roleDrop: 1, released: 1 });
+  });
+
+  it('plans exact owner-role custody and replays DB/role response loss only under durable recovery authority', async () => {
+    environment({ databaseOid: '16384', clusterIdentity });
+    const model = fakeDatabase();
+    const plan = await planOwnedGate3DatabaseTeardown(model.sql);
+    expect(plan).toMatchObject({
+      databaseOid: '16384', ownerRoleName, ownerRoleOid, ownerRoleMarkerHash,
+      protectedDatabaseSetHash,
+    });
+
+    Object.assign(process.env, {
+      E2E_GATE3_DATABASE_RECOVERY: '1',
+      E2E_GATE3_EXPECTED_PROTECTED_DATABASE_SET_HASH: protectedDatabaseSetHash,
+    });
+    // Model SIGKILL after the irreversible database DROP but before role DROP/stdout.
+    model.state.databasePresent = false;
+    model.state.drop = 1;
+    const afterDatabaseLoss = await dropOwnedGate3Database(model.sql);
+    expect(afterDatabaseLoss).toMatchObject({ scratchDatabaseAbsent: true, ownerRoleAbsent: true });
+    expect(model.state).toMatchObject({ drop: 1, roleDrop: 1, databasePresent: false, rolePresent: false });
+
+    // Model lost stdout after role DROP: exact terminal absence is idempotent and non-destructive.
+    const afterRoleLoss = await dropOwnedGate3Database(model.sql);
+    expect(afterRoleLoss).toEqual(afterDatabaseLoss);
+    expect(model.state).toMatchObject({ drop: 1, roleDrop: 1, databasePresent: false, rolePresent: false });
   });
 
   it('refuses wrong coordinates, operator DB, cluster, server port, and OID replacement without DROP', async () => {

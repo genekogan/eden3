@@ -48,6 +48,7 @@
     "@types/node": "^22.15.34",
     "concurrently": "^9.1.2",
     "drizzle-kit": "^0.31.4",
+    "postgres": "^3.4.9",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
     "vitest": "^3.2.4",
