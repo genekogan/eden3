@@ -30,6 +30,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { api, ApiError } from "@/lib/api";
+import { verifiedSessionDraftKey } from "@/lib/conversation-render-authority";
 import type { AccountSummary, MessageDto, SessionDto } from "@/lib/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { EmptyState } from "@/components/empty-state";
@@ -632,6 +633,7 @@ export function SessionConversation({
     ...state.local,
   ];
   const readOnlyChannel = session?.readOnly === true;
+  const composerDraftKey = verifiedSessionDraftKey(session?.id);
   const channelLabel = session?.platform
     ? `${session.platform.charAt(0).toUpperCase()}${session.platform.slice(1)}`
     : "external channel";
@@ -860,14 +862,21 @@ export function SessionConversation({
       {/* Composer */}
       <div className="shrink-0 border-t border-edge bg-background px-4 pb-4 pt-3 md:px-6">
         <div className="mx-auto w-full max-w-3xl">
-          {readOnlyChannel ? (
+          {!composerDraftKey ? (
+            <p
+              role="status"
+              className="rounded-xl border border-edge bg-surface px-4 py-3 text-center text-xs text-muted"
+            >
+              Loading conversation…
+            </p>
+          ) : readOnlyChannel ? (
             <p className="rounded-xl border border-edge bg-surface px-4 py-3 text-center text-xs text-muted">
               This is a read-only mirror of the {channelLabel} conversation. Reply from the
               channel itself.
             </p>
           ) : (
             <Composer
-              draftKey={`session:${session!.id}`}
+              draftKey={composerDraftKey}
               onSend={send}
               onStop={stop}
               streaming={streaming}
