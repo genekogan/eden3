@@ -546,6 +546,8 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(businessCalls[2].options).toEqual({ timeoutMs: 20_000 });
     expect(businessCalls[3].body).toMatchObject({
       connectionId: CONNECTION_A,
+      runtimeAccountId: 'account-a',
+      agentId: 'agent-a',
       text: 'assistant answer',
     });
     expect(businessCalls[3].options).toEqual({ timeoutMs: 30_000 });
@@ -606,6 +608,12 @@ describe('OpenClaw hosted-channel lifecycle bridge', () => {
     expect(payload).not.toHaveProperty('sendMethod');
     expect(calls.filter((call) => call.path.endsWith('/settle'))).toHaveLength(1);
     expect(calls.filter((call) => call.path.endsWith('/voice-note'))).toHaveLength(1);
+    expect(calls.find((call) => call.path.endsWith('/voice-note')).body).toMatchObject({
+      connectionId: CONNECTION_A,
+      runtimeAccountId: 'account-a',
+      agentId: 'agent-a',
+      text: 'spoken answer',
+    });
     expect(calls.find((call) => call.path === '/channels/runtime/messages' && call.body.role === 'assistant').body.content).toBe('spoken answer');
   });
 

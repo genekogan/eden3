@@ -7,6 +7,9 @@ const TURN = '11111111-1111-4111-8111-111111111111';
 const OWNER = '22222222-2222-4222-8222-222222222222';
 const AGENT = '33333333-3333-4333-8333-333333333333';
 const CONNECTION = '44444444-4444-4444-8444-444444444444';
+const BINDING = '77777777-7777-4777-8777-777777777777';
+const RUNTIME_ACCOUNT = 'runtime-account';
+const RUNTIME_AGENT = 'voice-agent';
 const EXECUTION = '55555555-5555-4555-8555-555555555555';
 const OPERATION_KEY = 'channel:66666666-6666-4666-8666-666666666666';
 const TEXT = 'hello channel';
@@ -26,14 +29,18 @@ function kernelWith(db: unknown) {
   });
 }
 
-function contextRow() {
+function contextRow(overrides: Record<string, unknown> = {}) {
   return {
     account_id: OWNER,
     agent_id: AGENT,
     session_id: null,
     channel: 'discord',
+    metadata: { _runtimeBindingId: BINDING },
+    runtime_account_id: RUNTIME_ACCOUNT,
+    openclaw_id: RUNTIME_AGENT,
     voice_id: 'deepinfra:kokoro:af_bella:v1',
     voice_mode: 'always',
+    ...overrides,
   };
 }
 
@@ -57,6 +64,37 @@ function executionRow(status: 'transcoding' | 'completed' | 'failed' = 'transcod
 }
 
 describe('channel voice deferred delivery saga', () => {
+  it.each([
+    ['runtime account', { runtimeAccountId: 'wrong-runtime' }, {}],
+    ['agent', { agentId: 'wrong-agent' }, {}],
+    ['binding generation', { bindingId: '88888888-8888-4888-8888-888888888888' }, {}],
+    ['stored agent', {}, { openclaw_id: 'wrong-agent' }],
+    ['malformed binding', {}, { metadata: { _runtimeBindingId: 'not-a-uuid' } }],
+  ])('refuses a mismatched %s before quote, provider, or debit work', async (_label, inputMutation, rowMutation) => {
+    const execute = vi.fn(async (statement: unknown) => {
+      const query = queryText(statement);
+      if (query.startsWith('select ct.account_id')) return [contextRow(rowMutation)];
+      throw new Error(`unexpected query: ${query}`);
+    });
+    const kernel = kernelWith({ execute, transaction: vi.fn() });
+    const quote = vi.spyOn(kernel, 'quote');
+    const synthesize = vi.spyOn(kernel, 'synthesize');
+
+    await expect(kernel.channelVoiceNote({
+      turnId: TURN,
+      connectionId: CONNECTION,
+      runtimeAccountId: RUNTIME_ACCOUNT,
+      agentId: RUNTIME_AGENT,
+      bindingId: BINDING,
+      text: TEXT,
+      idempotencyKey: OPERATION_KEY,
+      ...inputMutation,
+    })).rejects.toMatchObject({ statusCode: 404, code: 'channel_voice_unavailable' });
+    expect(quote).not.toHaveBeenCalled();
+    expect(synthesize).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it('replays a durable playable output after an ambiguous response without provider or debit work', async () => {
     const execute = vi.fn(async (statement: unknown) => {
       const query = queryText(statement);
@@ -70,7 +108,8 @@ describe('channel voice deferred delivery saga', () => {
     const synthesize = vi.spyOn(kernel, 'synthesize');
 
     const result = await kernel.channelVoiceNote({
-      turnId: TURN, connectionId: CONNECTION, text: TEXT, idempotencyKey: OPERATION_KEY,
+      turnId: TURN, connectionId: CONNECTION, runtimeAccountId: RUNTIME_ACCOUNT,
+      agentId: RUNTIME_AGENT, bindingId: BINDING, text: TEXT, idempotencyKey: OPERATION_KEY,
     });
     expect(result).toMatchObject({ id: EXECUTION, status: 'transcoding', replayed: true, waveform: 'AQID' });
     expect(quote).not.toHaveBeenCalled();
@@ -92,7 +131,8 @@ describe('channel voice deferred delivery saga', () => {
     } as never);
 
     await kernel.channelVoiceNote({
-      turnId: TURN, connectionId: CONNECTION, text: TEXT, idempotencyKey: OPERATION_KEY,
+      turnId: TURN, connectionId: CONNECTION, runtimeAccountId: RUNTIME_ACCOUNT,
+      agentId: RUNTIME_AGENT, bindingId: BINDING, text: TEXT, idempotencyKey: OPERATION_KEY,
     });
     expect(synthesize).toHaveBeenCalledWith(expect.objectContaining({
       channelTurnId: TURN,

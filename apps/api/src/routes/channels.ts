@@ -27,6 +27,7 @@ import { defaultOpenclawDataDir } from '../gateway-glue';
 import {
   ChannelTurnMeteringService,
   ChannelDeliveryTerminalCompensatedError,
+  ChannelDeliveryTerminalDeliveredError,
   ChannelExecutionMismatchError,
   PostgresChannelTurnStore,
   type ChannelTurnUsage,
@@ -3023,7 +3024,14 @@ export const channelsRoutes: FastifyPluginAsync<ChannelsRoutesOptions> = async (
     // The channel ledger owns the terminal delivery decision. Complete that
     // claim before touching voice so a racing native-success callback cannot
     // leave a delivered turn with a refunded/deleted voice attachment.
-    await turnMetering.refundDeliveryFailure(turnId);
+    try {
+      await turnMetering.refundDeliveryFailure(turnId);
+    } catch (error) {
+      if (error instanceof ChannelDeliveryTerminalDeliveredError) {
+        throw new ApiError(409, error.code, 'Channel turn was already terminal-delivered');
+      }
+      throw error;
+    }
     await opts.voiceDelivery?.refundChannelVoiceDelivery(turnId, 'channel_delivery_failed');
     return { ok: true, turnId };
   });

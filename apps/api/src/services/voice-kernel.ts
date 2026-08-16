@@ -21,6 +21,7 @@ import type { MessageDto, VoiceAssignmentDto, VoiceCatalogEntryDto, VoiceCloneDt
 import { sql } from 'drizzle-orm';
 
 import type { MediaObjectResolver } from './media-object-repository';
+import { channelRuntimeBindingMatches } from './channel-runtime-binding';
 import type { VoiceAudioProcessor } from './voice-audio';
 import { VoiceAudioError } from './voice-audio';
 import type { VoiceProviderClient } from './voice-provider';
@@ -1270,18 +1271,47 @@ export class VoiceKernel {
     return { processed: rows(result).length, settled };
   }
 
-  async channelVoiceNote(input: { turnId: string; text: string; idempotencyKey: string; connectionId: string; bindingId?: string }): Promise<VoiceExecutionDto & { waveform: string | null }> {
+  async channelVoiceNote(input: {
+    turnId: string;
+    text: string;
+    idempotencyKey: string;
+    connectionId: string;
+    runtimeAccountId: string;
+    agentId: string;
+    bindingId?: string;
+  }): Promise<VoiceExecutionDto & { waveform: string | null }> {
     const result = await this.dbc.execute(sql`
-      select ct.account_id,ct.agent_id,ct.session_id,ct.channel,cc.metadata,av.voice_id,
+      select ct.account_id,ct.agent_id,ct.session_id,ct.channel,cc.metadata,cc.runtime_account_id,a.openclaw_id,av.voice_id,
         case ct.channel when 'discord' then av.discord_mode when 'telegram' then av.telegram_mode else 'off' end voice_mode
       from channel_turns ct join channel_connections cc on cc.id=ct.connection_id
+      join agents a on a.account_id=ct.agent_id and a.owner_id=ct.account_id
       join agent_voice_assignments av on av.agent_account_id=ct.agent_id
       where ct.turn_id=${input.turnId} and ct.connection_id=${input.connectionId}
         and ct.status in ('settled','delivery_pending') and cc.desired_state='active' and cc.status='connected'
-        and (cc.metadata->>'_runtimeBindingId') is not distinct from ${input.bindingId ?? null}
     `);
-    const row = rows<{ account_id: string; agent_id: string; session_id: string | null; channel: 'discord' | 'telegram'; voice_id: string; voice_mode: string }>(result)[0];
-    if (!row || row.voice_mode !== 'always') throw new VoiceKernelError(409, 'channel_voice_not_enabled', 'Channel voice is not enabled');
+    const row = rows<{
+      account_id: string;
+      agent_id: string;
+      session_id: string | null;
+      channel: 'discord' | 'telegram';
+      metadata: unknown;
+      runtime_account_id: string | null;
+      openclaw_id: string | null;
+      voice_id: string;
+      voice_mode: string;
+    }>(result)[0];
+    if (
+      !row || row.runtime_account_id !== input.runtimeAccountId || !row.openclaw_id ||
+      !channelRuntimeBindingMatches({
+        metadata: row.metadata,
+        storedAgentId: row.openclaw_id,
+        requesterAgentId: input.agentId,
+        requesterBindingId: input.bindingId,
+      })
+    ) {
+      throw new VoiceKernelError(404, 'channel_voice_unavailable', 'Channel voice unavailable');
+    }
+    if (row.voice_mode !== 'always') throw new VoiceKernelError(409, 'channel_voice_not_enabled', 'Channel voice is not enabled');
     const transcript = exactTranscript(input.text, row.channel);
     const priorResult = await this.dbc.execute(sql`
       select * from voice_executions where channel_turn_id=${input.turnId} and owner_account_id=${row.account_id}

@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { TurnCeilingError } from '@eden3/core';
 
 import {
+  ChannelDeliveryTerminalDeliveredError,
   ChannelExecutionMismatchError,
   REAPABLE_CHANNEL_TURN_STATUSES,
   ChannelTurnMeteringService,
@@ -310,6 +311,16 @@ describe('ChannelTurnMeteringService economic authorization', () => {
       'not refundable',
     );
     expect(different.reverseAuthorized).not.toHaveBeenCalled();
+  });
+
+  it('refuses the opposite delivery-failed terminal after native delivery already won', async () => {
+    const turnId = randomUUID();
+    const delivered = store({
+      claimRefund: vi.fn(async () => ({ turnId, status: 'delivered' as const, claimed: false })),
+    });
+    await expect(new ChannelTurnMeteringService(delivered).refundDeliveryFailure(turnId))
+      .rejects.toBeInstanceOf(ChannelDeliveryTerminalDeliveredError);
+    expect(delivered.reverseAuthorized).not.toHaveBeenCalled();
   });
 
   it('keeps settled authorization terminal and permits only the delivery-pending compensation marker', () => {

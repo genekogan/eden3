@@ -5,6 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { pg } from '@eden3/db';
 
 import { buildServer } from '../src/server.js';
+import { ChannelDeliveryTerminalDeliveredError } from '../src/services/channel-metering.js';
 import {
   deleteFixturesByMarker,
   insertAgentAccount,
@@ -243,6 +244,26 @@ describe('private channel runtime routes', () => {
     expect(accepted.statusCode).toBe(200);
     expect(refundDeliveryFailure).toHaveBeenCalledWith(turnId);
     expect(refundChannelVoiceDelivery).toHaveBeenCalledWith(turnId, 'channel_delivery_failed');
+  });
+
+  it('maps an opposite delivery-failed callback after delivered to an exact safe conflict', async () => {
+    const turnId = randomUUID();
+    const voiceCalls = refundChannelVoiceDelivery.mock.calls.length;
+    refundDeliveryFailure.mockRejectedValueOnce(new ChannelDeliveryTerminalDeliveredError());
+    const response = await app.inject({
+      method: 'POST',
+      url: `/channels/runtime/turns/${turnId}/delivery-failed`,
+      headers: { authorization: `Bearer ${runtimeToken}` },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toEqual({
+      error: {
+        code: 'channel_turn_terminal_delivered',
+        message: 'Channel turn was already terminal-delivered',
+        statusCode: 409,
+      },
+    });
+    expect(refundChannelVoiceDelivery).toHaveBeenCalledTimes(voiceCalls);
   });
 
   it('finalizes successful outbound delivery only behind runtime auth', async () => {

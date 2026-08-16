@@ -13,6 +13,8 @@ const VOICE_ID = 'deepinfra:kokoro:af_bella:v1';
 const TURN = '77777777-7777-4777-8777-777777777777';
 const OPERATION = '88888888-8888-4888-8888-888888888888';
 const RUNTIME_TOKEN = 'fake-runtime-token';
+const RUNTIME_ACCOUNT = 'runtime-account';
+const AGENT_ID = 'voice-agent';
 
 const apps: ReturnType<typeof Fastify>[] = [];
 
@@ -244,9 +246,23 @@ describe('voice HTTP contract', () => {
       method: 'POST',
       url: `/channels/runtime/turns/${TURN}/voice-note`,
       headers: { authorization: `Bearer ${RUNTIME_TOKEN}` },
-      payload: { voiceOperationId: OPERATION, connectionId, text: 'hello' },
+      payload: {
+        voiceOperationId: OPERATION,
+        connectionId,
+        runtimeAccountId: RUNTIME_ACCOUNT,
+        agentId: AGENT_ID,
+        text: 'hello',
+      },
     });
     expect(response.statusCode).toBe(200);
+    expect(kernel.channelVoiceNote).toHaveBeenCalledWith({
+      turnId: TURN,
+      text: 'hello',
+      idempotencyKey: `channel:${OPERATION}`,
+      connectionId,
+      runtimeAccountId: RUNTIME_ACCOUNT,
+      agentId: AGENT_ID,
+    });
     const capability = response.json().attachment.url as string;
     expect(capability).toMatch(new RegExp(`^/media/runtime/voice/${TURN}/${execution.id}/${OPERATION}/\\d{10}/[0-9a-f]{64}\\.ogg$`));
     const fetched = await app.inject({ method: 'GET', url: capability });

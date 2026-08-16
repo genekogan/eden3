@@ -64,6 +64,8 @@ const runtimeAudioParams = z.object({
 const channelBody = z.object({
   voiceOperationId: z.string().uuid(),
   connectionId: z.string().uuid(),
+  runtimeAccountId: z.string().min(1).max(128),
+  agentId: z.string().min(1).max(200),
   bindingId: z.string().uuid().optional(),
   text: z.string().min(1).max(2_000),
 }).strict();
@@ -84,10 +86,16 @@ function capabilitySignature(secret: string, input: { turnId: string; executionI
   if (secret.length < 16 || secret.length > 8_192) throw new Error('channel voice capability key unavailable');
   return createHmac('sha256', secret).update(capabilityPayload(input)).digest('hex');
 }
+function channelVoiceCapabilityPathAtExpiry(
+  secret: string,
+  input: { turnId: string; executionId: string; operationId: string; expires: string },
+): string {
+  const signature = capabilitySignature(secret, input);
+  return `/media/runtime/voice/${input.turnId}/${input.executionId}/${input.operationId}/${input.expires}/${signature}.ogg`;
+}
 function channelVoiceCapabilityPath(secret: string, turnId: string, executionId: string, operationId: string, now = Date.now()): string {
   const expires = String(Math.floor(now / 1000) + VOICE_CAPABILITY_TTL_SECONDS);
-  const signature = capabilitySignature(secret, { turnId, executionId, operationId, expires });
-  return `/media/runtime/voice/${turnId}/${executionId}/${operationId}/${expires}/${signature}.ogg`;
+  return channelVoiceCapabilityPathAtExpiry(secret, { turnId, executionId, operationId, expires });
 }
 function validCapability(secret: string, input: z.infer<typeof runtimeAudioParams>, now = Date.now()): boolean {
   if (secret.length < 16 || secret.length > 8_192) return false;
@@ -264,6 +272,8 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
       text: body.text,
       idempotencyKey: `channel:${body.voiceOperationId}`,
       connectionId: body.connectionId,
+      runtimeAccountId: body.runtimeAccountId,
+      agentId: body.agentId,
       ...(body.bindingId ? { bindingId: body.bindingId } : {}),
     }));
     return {
@@ -285,6 +295,7 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
 
 export const voiceRoutesInternals = {
   channelVoiceCapabilityPath,
+  channelVoiceCapabilityPathAtExpiry,
   validCapability,
   parseVoiceRange,
   VOICE_CAPABILITY_TTL_SECONDS,

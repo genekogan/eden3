@@ -993,6 +993,15 @@ export class ChannelDeliveryTerminalCompensatedError extends Error {
   }
 }
 
+export class ChannelDeliveryTerminalDeliveredError extends Error {
+  readonly code = 'channel_turn_terminal_delivered';
+
+  constructor() {
+    super('channel turn was already terminal-delivered');
+    this.name = 'ChannelDeliveryTerminalDeliveredError';
+  }
+}
+
 function modelIdentity(model: string): { provider: string; model: string } {
   const separator = model.indexOf('/');
   if (separator <= 0 || separator === model.length - 1) {
@@ -1229,6 +1238,7 @@ export class ChannelTurnMeteringService {
     const claim = await this.store.claimRefund(turnId, false, true);
     if (!claim) throw new Error('channel turn unavailable');
     if (claim.status === 'refunded' && claim.errorCode === 'channel_delivery_failed') return;
+    if (claim.status === 'delivered') throw new ChannelDeliveryTerminalDeliveredError();
     if (claim.claimed && claim.status === 'refunding') {
       await this.refundClaimedTurn(turnId, 'channel_delivery_failed');
       return;
