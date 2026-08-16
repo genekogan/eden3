@@ -20,6 +20,9 @@ importers:
       drizzle-kit:
         specifier: ^0.31.4
         version: 0.31.10
+      pnpm:
+        specifier: 10.27.0
+        version: 10.27.0
       postgres:
         specifier: ^3.4.9
         version: 3.4.9
@@ -2155,6 +2158,11 @@ packages:
   playwright@1.61.1:
     resolution: {integrity: sha512-DWnY5o3YbLWK4GovuAVwpqL+1VwGNdUGrRr++8j8PtQQzvAVZUIMjKQ90fY689sEJZJBbZVw1rXaOKSTitkzPQ==}
     engines: {node: '>=18'}
+    hasBin: true
+
+  pnpm@10.27.0:
+    resolution: {integrity: sha512-ctaZ2haxF5wUup5k3HHJpAmIy9xlwmTLDkidt96RfyDc9NZNhyNiXylpulLUt+KhFwaC2awqXcrqq3MrfhbwSg==}
+    engines: {node: '>=18.12'}
     hasBin: true
 
   postcss@8.4.31:
@@ -4346,6 +4354,8 @@ snapshots:
       playwright-core: 1.61.1
     optionalDependencies:
       fsevents: 2.3.2
+
+  pnpm@10.27.0: {}
 
   postcss@8.4.31:
     dependencies:
