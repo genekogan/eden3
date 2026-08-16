@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -137,10 +137,13 @@ describe('resolveDataDir', () => {
 });
 
 describe('resolveSandboxAssetsDir', () => {
-  it('stays anchored to the checkout when the OpenClaw data directory is relocated', () => {
-    const expected = path.resolve(
-      fileURLToPath(new URL('../../../assets/sandbox/', import.meta.url)),
-    );
+  it('stays anchored to the main checkout bind source when the OpenClaw data directory is relocated', () => {
+    const commonGitDir = execFileSync(
+      'git',
+      ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+      { cwd: REPO_ROOT, encoding: 'utf8' },
+    ).trim();
+    const expected = path.join(path.dirname(commonGitDir), 'assets', 'sandbox');
     expect(resolveSandboxAssetsDir('/tmp/isolated-review/openclaw-data', {})).toBe(expected);
     expect(resolveSandboxAssetsDir('/tmp/isolated-review/openclaw-data', {
       EDEN3_SANDBOX_ASSETS_DIR: '/tmp/review-assets',
