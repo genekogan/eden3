@@ -10,14 +10,20 @@ const channel = process.env.PLAYWRIGHT_CHANNEL;
 const forceEvidence = process.env.PLAYWRIGHT_FORCE_EVIDENCE === '1';
 const outputDir = process.env.PLAYWRIGHT_OUTPUT_DIR ?? 'var/acceptance/artifacts';
 const reportDir = process.env.PLAYWRIGHT_REPORT_DIR ?? 'var/acceptance/report';
-const browserHome = path.join(ROOT, 'var/chrome-home');
+const runtimeRoot = process.env.PLAYWRIGHT_RUNTIME_DIR
+  ? path.resolve(process.env.PLAYWRIGHT_RUNTIME_DIR)
+  : path.join(ROOT, 'var');
+if (process.env.PLAYWRIGHT_RUNTIME_DIR && runtimeRoot !== process.env.PLAYWRIGHT_RUNTIME_DIR) {
+  throw new Error('PLAYWRIGHT_RUNTIME_DIR must be one exact absolute path');
+}
+const browserHome = path.join(runtimeRoot, 'chrome-home');
 mkdirSync(browserHome, { recursive: true });
 const chromiumLaunchOptions = {
   env: { ...process.env, HOME: browserHome },
   args: [
     '--disable-crash-reporter',
     '--disable-crashpad',
-    `--crash-dumps-dir=${path.join(ROOT, 'var/chrome-crashes')}`,
+    `--crash-dumps-dir=${path.join(runtimeRoot, 'chrome-crashes')}`,
   ],
 };
 
