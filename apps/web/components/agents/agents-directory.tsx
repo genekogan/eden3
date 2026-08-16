@@ -24,6 +24,12 @@ import {
   primaryButtonClass,
   quietButtonClass,
 } from "@/components/agents/form-fields";
+import { useSelectedAgent } from "@/components/shell/selected-agent-context";
+import {
+  directoryAuthorityMatches,
+  directoryAuthorityToken,
+  directoryRowsVisible,
+} from "@/lib/agent-directory-authority";
 
 const SEARCH_DEBOUNCE_MS = 250;
 
@@ -68,6 +74,7 @@ function CardSkeleton() {
 type DirectoryState = "loading" | "ready" | "error";
 
 export function AgentsDirectory() {
+  const { viewer, viewerPhase } = useSelectedAgent();
   const [query, setQuery] = useState("");
   const [items, setItems] = useState<AgentDto[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -76,25 +83,91 @@ export function AgentsDirectory() {
   const [errorText, setErrorText] = useState("");
   const [moreError, setMoreError] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [itemsViewerId, setItemsViewerId] = useState<string | null>(null);
+  const [refusedViewerId, setRefusedViewerId] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const seq = useRef(0);
+  const authorityGeneration = useRef(0);
+  const authorityViewerId = useRef<string | null>(null);
+  const authorityPhase = useRef(viewerPhase);
+
+  // Invalidate every admitted request and retire stored rows at the auth
+  // handoff. The render-time authority check below hides them synchronously;
+  // a delayed response for viewer A can never land for signed-out or viewer B.
+  useEffect(() => {
+    authorityGeneration.current += 1;
+    authorityViewerId.current = viewer?.id ?? null;
+    authorityPhase.current = viewerPhase;
+    seq.current += 1;
+    setItems([]);
+    setItemsViewerId(null);
+    setRefusedViewerId(null);
+    setCursor(null);
+    setMoreError(null);
+    setLoadingMore(false);
+  }, [viewer?.id, viewerPhase]);
 
   // Page 1 — debounced on query, re-armed by "Try again".
   useEffect(() => {
+    const token = refusedViewerId === viewer?.id ? null : directoryAuthorityToken(
+      viewer?.id ?? null,
+      viewerPhase,
+      authorityGeneration.current,
+    );
+    if (!token) {
+      setItems([]);
+      setItemsViewerId(null);
+      setCursor(null);
+      setEndpointMissing(false);
+      setMoreError(null);
+      if (viewerPhase === "loading") {
+        setState("loading");
+        setErrorText("");
+      } else if (viewerPhase === "error" || refusedViewerId === viewer?.id) {
+        setState("error");
+        setErrorText("We couldn’t verify your sign-in. Reload to try again.");
+      } else {
+        setState("error");
+        setErrorText("Sign in to see your agents.");
+      }
+      return;
+    }
     setState("loading");
+    setItemsViewerId(token.viewerId);
     setMoreError(null);
+    setLoadingMore(false);
+    const id = ++seq.current;
     const timer = window.setTimeout(async () => {
-      const id = ++seq.current;
       try {
         const page = await api.agents.list({ q: query.trim() || undefined, scope: "mine" });
-        if (seq.current !== id) return;
+        if (
+          seq.current !== id ||
+          !directoryAuthorityMatches(
+            token,
+            authorityViewerId.current,
+            authorityPhase.current,
+            authorityGeneration.current,
+          )
+        ) return;
         setItems(page.items);
         setCursor(page.nextCursor);
         setState("ready");
       } catch (error) {
-        if (seq.current !== id) return;
-        if (error instanceof ApiError && error.status === 401) {
-          setErrorText("Sign in to see your agents.");
+        if (
+          seq.current !== id ||
+          !directoryAuthorityMatches(
+            token,
+            authorityViewerId.current,
+            authorityPhase.current,
+            authorityGeneration.current,
+          )
+        ) return;
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          setItems([]);
+          setItemsViewerId(null);
+          setCursor(null);
+          setRefusedViewerId(token.viewerId);
+          setErrorText("We couldn’t verify your sign-in. Reload to try again.");
           setEndpointMissing(false);
           setState("error");
           return;
@@ -105,10 +178,16 @@ export function AgentsDirectory() {
       }
     }, SEARCH_DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [query, reloadKey]);
+  }, [query, reloadKey, refusedViewerId, viewer?.id, viewerPhase]);
 
   const loadMore = useCallback(async () => {
-    if (!cursor || loadingMore) return;
+    const token = refusedViewerId === viewer?.id ? null : directoryAuthorityToken(
+      viewer?.id ?? null,
+      viewerPhase,
+      authorityGeneration.current,
+    );
+    if (!cursor || loadingMore || !token) return;
+    const id = ++seq.current;
     setLoadingMore(true);
     setMoreError(null);
     try {
@@ -117,16 +196,66 @@ export function AgentsDirectory() {
         scope: "mine",
         cursor,
       });
+      if (!directoryAuthorityMatches(
+        token,
+        authorityViewerId.current,
+        authorityPhase.current,
+        authorityGeneration.current,
+      ) || seq.current !== id) return;
       setItems((prev) => dedupeById([...prev, ...page.items]));
       setCursor(page.nextCursor);
     } catch (error) {
+      if (!directoryAuthorityMatches(
+        token,
+        authorityViewerId.current,
+        authorityPhase.current,
+        authorityGeneration.current,
+      ) || seq.current !== id) return;
+      if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+        setItems([]);
+        setItemsViewerId(null);
+        setCursor(null);
+        setMoreError(null);
+        setRefusedViewerId(token.viewerId);
+        setErrorText("We couldn’t verify your sign-in. Reload to try again.");
+        setEndpointMissing(false);
+        setState("error");
+        return;
+      }
       setMoreError(describeApiFailure(error));
     } finally {
-      setLoadingMore(false);
+      if (directoryAuthorityMatches(
+        token,
+        authorityViewerId.current,
+        authorityPhase.current,
+        authorityGeneration.current,
+      ) && seq.current === id) setLoadingMore(false);
     }
-  }, [cursor, loadingMore, query]);
+  }, [cursor, loadingMore, query, refusedViewerId, viewer?.id, viewerPhase]);
 
   const trimmedQuery = query.trim();
+  const viewerId = viewer?.id ?? null;
+  const locallyRefused = viewerId !== null && refusedViewerId === viewerId;
+  const rowsVisible = directoryRowsVisible(
+    itemsViewerId,
+    viewerId,
+    viewerPhase,
+    locallyRefused,
+  );
+  const visibleItems = rowsVisible ? items : [];
+  const visibleCursor = rowsVisible ? cursor : null;
+  const visibleState: DirectoryState = viewerPhase === "loading"
+    ? "loading"
+    : viewerPhase !== "ready" || viewerId === null || locallyRefused
+      ? "error"
+      : itemsViewerId !== viewerId
+        ? "loading"
+        : state;
+  const visibleErrorText = viewerPhase === "error" || locallyRefused
+    ? "We couldn’t verify your sign-in. Reload to try again."
+    : viewerPhase === "signed_out" || viewerId === null
+      ? "Sign in to see your agents."
+      : errorText;
 
   return (
     <div className="mx-auto w-full max-w-5xl px-6 py-10 md:px-10">
@@ -175,34 +304,39 @@ export function AgentsDirectory() {
         </div>
       </div>
 
-      {state === "loading" ? (
+      {visibleState === "loading" ? (
         <div className="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {Array.from({ length: 6 }, (_, i) => (
             <CardSkeleton key={i} />
           ))}
         </div>
-      ) : state === "error" ? (
+      ) : visibleState === "error" ? (
         <EmptyState
           className="mt-6"
           title={
-            endpointMissing
+            viewerPhase === "error" || locallyRefused
+              ? "Couldn’t verify sign-in"
+              : endpointMissing
               ? "The agent directory isn't wired up yet"
               : "Couldn't load agents"
           }
-          hint={errorText}
-          action={
+          hint={visibleErrorText}
+          action={viewerPhase === "error" || locallyRefused || viewer !== null ? (
             <button
               type="button"
-              onClick={() => setReloadKey((k) => k + 1)}
+              onClick={() => {
+                if (viewerPhase === "error" || locallyRefused) window.location.reload();
+                else setReloadKey((k) => k + 1);
+              }}
               className={quietButtonClass}
             >
-              Try again
+              {viewerPhase === "error" || locallyRefused ? "Reload" : "Try again"}
             </button>
-          }
+          ) : undefined}
         />
-      ) : items.length === 0 && !trimmedQuery ? (
+      ) : visibleItems.length === 0 && !trimmedQuery ? (
         <EveEmptyState />
-      ) : items.length === 0 ? (
+      ) : visibleItems.length === 0 ? (
         <EmptyState
           className="mt-6"
           title={`No agents match “${trimmedQuery}”`}
@@ -211,16 +345,16 @@ export function AgentsDirectory() {
       ) : (
         <>
           <p className="mt-6 font-mono text-xs text-faint">
-            {items.length.toLocaleString("en-US")}
-            {cursor ? "+" : ""} {items.length === 1 ? "agent" : "agents"}
+            {visibleItems.length.toLocaleString("en-US")}
+            {visibleCursor ? "+" : ""} {visibleItems.length === 1 ? "agent" : "agents"}
             {trimmedQuery ? ` matching “${trimmedQuery}”` : ""}
           </p>
           <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {items.map((agent) => (
+            {visibleItems.map((agent) => (
               <AgentCard key={agent.id} agent={agent} />
             ))}
           </div>
-          {cursor ? (
+          {visibleCursor ? (
             <div className="mt-8 flex flex-col items-center gap-2">
               <button
                 type="button"

@@ -2,7 +2,38 @@ import { readFile } from "node:fs/promises";
 
 import { describe, expect, it } from "vitest";
 
+import {
+  directoryAuthorityMatches,
+  directoryAuthorityToken,
+  directoryRowsVisible,
+  type DirectoryViewerPhase,
+} from "../lib/agent-directory-authority";
+
 describe("selected-agent authentication refresh", () => {
+  it.each<DirectoryViewerPhase>(["loading", "signed_out", "error"])(
+    "does not admit scope=mine requests while viewer authority is %s",
+    (phase) => {
+      expect(directoryAuthorityToken("viewer-a", phase, 1)).toBeNull();
+    },
+  );
+
+  it("rejects delayed page and load-more responses after sign-out or A-to-B", () => {
+    const admitted = directoryAuthorityToken("viewer-a", "ready", 7);
+    expect(admitted).toEqual({ viewerId: "viewer-a", generation: 7 });
+    if (!admitted) throw new Error("test authority was not admitted");
+
+    expect(directoryAuthorityMatches(admitted, "viewer-a", "ready", 7)).toBe(true);
+    expect(directoryAuthorityMatches(admitted, null, "signed_out", 8)).toBe(false);
+    expect(directoryAuthorityMatches(admitted, "viewer-b", "ready", 8)).toBe(false);
+    expect(directoryAuthorityMatches(admitted, "viewer-a", "error", 8)).toBe(false);
+    expect(directoryAuthorityMatches(admitted, "viewer-a", "ready", 8)).toBe(false);
+    expect(directoryRowsVisible("viewer-a", null, "signed_out", false)).toBe(false);
+    expect(directoryRowsVisible("viewer-a", "viewer-b", "ready", false)).toBe(false);
+    expect(directoryRowsVisible("viewer-a", "viewer-a", "error", false)).toBe(false);
+    expect(directoryRowsVisible("viewer-a", "viewer-a", "ready", true)).toBe(false);
+    expect(directoryRowsVisible("viewer-a", "viewer-a", "ready", false)).toBe(true);
+  });
+
   it("refreshes viewer authority and owned agents after dev impersonation", async () => {
     const source = await readFile(
       new URL("../components/shell/selected-agent-context.tsx", import.meta.url),
@@ -75,5 +106,30 @@ describe("selected-agent authentication refresh", () => {
       selectorSource.indexOf("agents.length === 0"),
     );
     expect(selectorSource).toContain("Couldn’t load your agents.");
+  });
+
+  it("does not fetch or retain private directory rows without exact viewer authority", async () => {
+    const source = await readFile(
+      new URL("../components/agents/agents-directory.tsx", import.meta.url),
+      "utf8",
+    );
+    expect(source).toContain("const { viewer, viewerPhase } = useSelectedAgent();");
+    expect(source).toContain("directoryAuthorityToken(");
+    expect(source.match(/directoryAuthorityMatches\(/g)?.length).toBeGreaterThanOrEqual(4);
+    expect(source).toMatch(
+      /authorityGeneration\.current \+= 1;[\s\S]*setItems\(\[\]\);[\s\S]*setCursor\(null\);/,
+    );
+    expect(source).toContain(
+      "refusedViewerId === viewer?.id ? null : directoryAuthorityToken(",
+    );
+    expect(source).toMatch(
+      /if \(!token\) \{[\s\S]*viewerPhase === "loading"[\s\S]*viewerPhase === "error"[\s\S]*return;[\s\S]*api\.agents\.list/,
+    );
+    expect(source).toContain(
+      'if (viewerPhase === "error" || locallyRefused) window.location.reload();',
+    );
+    expect(source).toContain("const rowsVisible = directoryRowsVisible(");
+    expect(source).toContain("error.status === 401 || error.status === 403");
+    expect(source.match(/setRefusedViewerId\(token\.viewerId\)/g)).toHaveLength(2);
   });
 });
