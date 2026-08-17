@@ -570,6 +570,7 @@ export function AgentMemoryPanel({
         ))}
       </div>
       <textarea
+        aria-label="MEMORY.md owner correction"
         value={draft}
         onChange={(event) => setDraft(event.target.value)}
         spellCheck={false}

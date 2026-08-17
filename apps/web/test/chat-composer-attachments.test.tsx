@@ -7,8 +7,10 @@ import {
   attachmentError,
   clearComposerDraftAfterTurnAcceptance,
   Composer,
+  hasComposerRetryPayload,
   resolveComposerDraftIdentity,
   retryComposerDraftAfterTurnAcceptance,
+  retryInlineErrorAfterTurnAcceptance,
   shouldApplyComposerHydration,
 } from '../components/chat/composer';
 import {
@@ -40,6 +42,17 @@ describe('chat composer attachments', () => {
     expect(attachmentError(file('notes.txt', 'text/plain', 1024 * 1024 + 1))).toMatch(/1 MiB/);
     expect(attachmentError(file('movie.mp4', 'video/mp4', 100))).toMatch(/PNG/);
     expect(attachmentError(file('empty.json', 'application/json', 0))).toMatch(/Empty/);
+  });
+
+  it('keeps Retry reachable for attachment-only messages', () => {
+    const attachment = {
+      objectId: 'object-review-1',
+      attachment: { url: '/objects/object-review-1', mime: 'image/png' },
+    };
+    expect(hasComposerRetryPayload('', [attachment])).toBe(true);
+    expect(hasComposerRetryPayload(null, [attachment])).toBe(true);
+    expect(hasComposerRetryPayload('', [])).toBe(true);
+    expect(hasComposerRetryPayload(null, [])).toBe(false);
   });
 
   it('retains a recovered transcript across lost send and refresh until turn acknowledgement', async () => {
@@ -79,6 +92,19 @@ describe('chat composer attachments', () => {
     )).resolves.toBe(true);
     await expect(loadDictationComposerDraft('owner', 'session:one', options)).resolves.toBeNull();
     await expect(loadDictationComposerDraft('owner', 'new:rocket', options)).resolves.toBe('new-chat transcript');
+  });
+
+  it('dismisses an inline attachment error only after the retry is admitted', async () => {
+    let dismissed = 0;
+    await expect(retryInlineErrorAfterTurnAcceptance(
+      Promise.resolve(false), null, 'session:one', () => { dismissed += 1; },
+    )).resolves.toBe(false);
+    expect(dismissed).toBe(0);
+
+    await expect(retryInlineErrorAfterTurnAcceptance(
+      Promise.resolve(true), null, 'session:one', () => { dismissed += 1; },
+    )).resolves.toBe(true);
+    expect(dismissed).toBe(1);
   });
 
   it('never copies a composer draft across sessions or accounts', async () => {

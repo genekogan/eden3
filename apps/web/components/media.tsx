@@ -257,21 +257,41 @@ export function MediaFull({
   const video = isVideoMedia(display, directMime);
   const audio = isAudioMedia(display, directMime);
   const [loaded, setLoaded] = useState(false);
+  const [broken, setBroken] = useState(false);
+
+  useEffect(() => {
+    setLoaded(false);
+    setBroken(false);
+  }, [display]);
 
   // Same cached-media race as MediaThumb: mark complete elements at ref time.
   const markImgComplete = (node: HTMLImageElement | null) => {
-    if (node?.complete) setLoaded(true);
+    if (node?.complete && node.naturalWidth > 0) setLoaded(true);
   };
   const markVideoReady = (node: HTMLVideoElement | null) => {
     if (node && node.readyState >= 2) setLoaded(true);
   };
 
-  if (!display) {
+  if (!display || broken) {
     return (
       <div
-        className={`flex aspect-square items-center justify-center rounded-xl bg-raised text-sm text-faint ${className ?? ""}`}
+        role="status"
+        className={`flex aspect-square flex-col items-center justify-center gap-3 rounded-xl bg-raised text-sm text-faint ${className ?? ""}`}
       >
-        no media
+        {broken ? "Media unavailable" : "no media"}
+        {broken ? (
+          <button
+            type="button"
+            aria-label="Retry media"
+            onClick={() => {
+              setLoaded(false);
+              setBroken(false);
+            }}
+            className="rounded-lg border border-edge px-3 py-1.5 text-xs text-muted transition-colors hover:bg-foreground/[0.05] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/50"
+          >
+            Retry
+          </button>
+        ) : null}
       </div>
     );
   }
@@ -295,6 +315,7 @@ export function MediaFull({
           controls
           preload="metadata"
           aria-label={source.alt}
+          onError={() => setBroken(true)}
           className="w-full"
         />
       ) : video ? (
@@ -313,6 +334,7 @@ export function MediaFull({
               : undefined
           }
           onLoadedData={() => setLoaded(true)}
+          onError={() => setBroken(true)}
           className={`h-auto w-full ${ratio ? "absolute inset-0 h-full object-contain" : ""} ${loaded ? "opacity-100" : "opacity-0"} transition-opacity duration-300`}
         />
       ) : (
@@ -324,7 +346,7 @@ export function MediaFull({
           alt={source.alt}
           decoding="async"
           onLoad={() => setLoaded(true)}
-          onError={() => setLoaded(true)}
+          onError={() => setBroken(true)}
           className={`h-auto w-full ${ratio ? "absolute inset-0 h-full object-contain" : ""} ${loaded ? "opacity-100" : "opacity-0"} transition-opacity duration-300`}
         />
       )}

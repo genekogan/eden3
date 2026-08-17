@@ -12,6 +12,7 @@ import type {
   OperatorUsageBreakdown,
   OperatorUsageSummary,
 } from "@/lib/types";
+import { OperatorRequestGate } from "./operator-request-gate";
 import { EmptyState } from "@/components/empty-state";
 import { Skeleton, SkeletonRows } from "@/components/skeleton";
 import { formatMannaExact } from "@/lib/format";
@@ -437,9 +438,11 @@ export function OperatorClient() {
   const [error, setError] = useState<unknown>(null);
   const [days, setDays] = useState(7);
   const alive = useRef(true);
+  const requestGate = useRef(new OperatorRequestGate());
 
   const load = useCallback(
     async (soft = false) => {
+      const request = requestGate.current.begin(days);
       if (!soft) setPhase("loading");
       try {
         const [data, healthData, runtimeData] = await Promise.all([
@@ -447,14 +450,14 @@ export function OperatorClient() {
           api.operator.health().catch(() => null),
           api.operator.modelRuntimes().catch(() => null),
         ]);
-        if (!alive.current) return;
+        if (!alive.current || !requestGate.current.isCurrent(request)) return;
         setSummary(data);
         setHealth(healthData);
         setModelRuntimes(runtimeData?.models ?? null);
         setPhase("ready");
         setError(null);
       } catch (err) {
-        if (!alive.current) return;
+        if (!alive.current || !requestGate.current.isCurrent(request)) return;
         setError(err);
         setPhase("error");
       }
@@ -467,6 +470,7 @@ export function OperatorClient() {
     void load();
     return () => {
       alive.current = false;
+      requestGate.current.retire();
     };
   }, [load]);
 

@@ -17,6 +17,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -28,6 +29,10 @@ import {
 import { loadClerk, selectAuthMode } from "@/lib/clerk";
 import type { AgentDto, DevUser } from "@/lib/types";
 import { clearLastAgent, getLastAgent, setLastAgent } from "@/lib/last-agent";
+import {
+  AgentCacheAuthority,
+  authIdentityChanged,
+} from "./agent-cache-authority";
 
 /** /agents/<username>/… — excluding the static /agents/new + /agents/builder. */
 const NON_AGENT_SEGMENTS = new Set(["new", "builder"]);
@@ -78,9 +83,6 @@ const MyAgentsContext = createContext<MyAgentsState>({
   refresh: () => {},
 });
 
-/** Session-lived profile cache — agent switches feel instant. */
-const agentCache = new Map<string, AgentDto>();
-
 export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const urlUsername = agentUsernameFromPathname(pathname);
@@ -99,6 +101,10 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   }, [urlUsername, pathname]);
 
   const username = urlUsername ?? fallbackUsername;
+  // Cache lifetime is this viewer-aware provider, never the JS module. The
+  // generation fence rejects responses admitted before an identity handoff.
+  const agentCache = useRef(new Map<string, AgentDto>()).current;
+  const cacheAuthority = useRef(new AgentCacheAuthority());
 
   const [agent, setAgent] = useState<AgentDto | null>(
     username ? (agentCache.get(username) ?? null) : null,
@@ -112,6 +118,52 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   const [viewer, setViewer] = useState<DevUser | null>(null);
   const [viewerResolved, setViewerResolved] = useState(false);
   const [viewerPhase, setViewerPhase] = useState<ViewerPhase>("loading");
+  const clerkIdentityRef = useRef<string | null | undefined>(undefined);
+  const resolvedViewerIdentityRef = useRef<string | null | undefined>(undefined);
+
+  const invalidateViewerCustody = useCallback(() => {
+    cacheAuthority.current.invalidate(agentCache);
+    setAgent(null);
+    setPhase((current) => (current === "idle" ? "idle" : "loading"));
+    setMyAgents(null);
+    setMyAgentsPhase("loading");
+    setViewer(null);
+    setViewerResolved(false);
+    setViewerPhase("loading");
+    setAgentNonce((nonce) => nonce + 1);
+    setMyAgentsNonce((nonce) => nonce + 1);
+  }, [agentCache]);
+
+  // Clerk's listener is the earliest authoritative A -> B / sign-out seam.
+  // Clear every private cache before the replacement viewer is fetched; the
+  // surrounding sign-in gate alone cannot unmount this long-lived provider.
+  useEffect(() => {
+    if (selectAuthMode() !== "clerk") return;
+    let cancelled = false;
+    let unsubscribe: (() => void) | undefined;
+    void loadClerk().then((clerk) => {
+      if (cancelled) return;
+      const apply = () => {
+        const identity = clerk.isSignedIn ? (clerk.user?.id ?? null) : null;
+        const previous = clerkIdentityRef.current;
+        clerkIdentityRef.current = identity;
+        // Clerk subjects and Eden account UUIDs are distinct namespaces. The
+        // first Clerk observation fences any /auth/me request admitted before
+        // the listener attached; later subject changes fence subsequent work.
+        if (previous === undefined || authIdentityChanged(previous, identity)) {
+          invalidateViewerCustody();
+        }
+      };
+      apply();
+      unsubscribe = clerk.addListener?.(apply);
+    }).catch(() => {
+      if (!cancelled && clerkIdentityRef.current !== undefined) invalidateViewerCustody();
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe?.();
+    };
+  }, [invalidateViewerCustody]);
 
   // Clerk copies Google/OAuth profile photos into user.imageUrl. Import that
   // first-party identity image once per shell boot; the API preserves any
@@ -138,13 +190,13 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   // global surfaces such as command search do not retain the signed-out view.
   useEffect(() => {
     return onDevUserChange((user) => {
+      invalidateViewerCustody();
+      resolvedViewerIdentityRef.current = user?.id ?? null;
       setViewer(user);
       setViewerResolved(true);
       setViewerPhase(user ? "ready" : "signed_out");
-      setMyAgentsPhase("loading");
-      setMyAgentsNonce((nonce) => nonce + 1);
     });
-  }, []);
+  }, [invalidateViewerCustody]);
 
   // Agent creation/import/profile/avatar mutations happen in several screens.
   // One app-wide invalidation keeps this long-lived shell inventory coherent
@@ -159,20 +211,32 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   // ---- viewer (dev-impersonated or Clerk-backed) --------------------------
   useEffect(() => {
     let cancelled = false;
+    const authority = cacheAuthority.current.token();
     void api.dev
       .me()
       .then((user) => {
-        if (!cancelled) {
+        if (!cancelled && cacheAuthority.current.admits(authority)) {
+          const identity = user?.id ?? null;
+          const previous = resolvedViewerIdentityRef.current;
+          resolvedViewerIdentityRef.current = identity;
+          if (authIdentityChanged(previous, identity)) {
+            cacheAuthority.current.invalidate(agentCache);
+            setAgent(null);
+            setPhase((current) => (current === "idle" ? "idle" : "loading"));
+            setMyAgents(null);
+            setMyAgentsPhase("loading");
+            setAgentNonce((nonce) => nonce + 1);
+          }
           setViewer(user);
           setViewerResolved(true);
           setViewerPhase(user ? "ready" : "signed_out");
         }
       })
       .catch(() => {
-        if (!cancelled) {
-          // A transport/API failure is not evidence of sign-out. Preserve the
-          // last known identity for private browser custody, while server
-          // authorization remains authoritative for every request.
+        if (!cancelled && cacheAuthority.current.admits(authority)) {
+          // A transport/API failure is not evidence of sign-out, but it also
+          // cannot authorize browser-resident private rows. Derived context
+          // values fail closed until a fresh viewer check succeeds.
           setViewerPhase("error");
         }
       });
@@ -189,6 +253,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
       return;
     }
     let cancelled = false;
+    const authority = cacheAuthority.current.token();
     const cached = agentCache.get(username);
     if (cached) {
       setAgent(cached);
@@ -202,27 +267,37 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     void (async () => {
       try {
         const profile = await api.agents.get(username);
-        if (cancelled) return;
+        if (cancelled || !cacheAuthority.current.admits(authority)) return;
         agentCache.set(username, profile.agent);
         setAgent(profile.agent);
         setPhase("ready");
         setLastAgent(profile.agent.username);
       } catch (err) {
-        if (cancelled) return;
+        if (cancelled || !cacheAuthority.current.admits(authority)) return;
         const status =
           err && typeof err === "object" && "status" in err
             ? Number((err as { status: unknown }).status)
             : null;
-        if (status === 404 && !urlUsername) {
+        if (status === 401 || status === 403) {
+          agentCache.delete(username);
+          setAgent(null);
+          setPhase("error");
+          return;
+        }
+        if (status === 404) {
+          agentCache.delete(username);
+          setAgent(null);
+          if (urlUsername) {
+            setPhase("missing");
+            return;
+          }
           // The remembered agent is gone (deleted/renamed) — forget it so it
           // stops resurrecting on every page, and fall back to no selection.
           clearLastAgent();
           setFallbackUsername(null);
           return;
         }
-        if (!agentCache.has(username)) {
-          setPhase(status === 404 ? "missing" : "error");
-        }
+        if (!agentCache.has(username)) setPhase("error");
       }
     })();
     return () => {
@@ -233,20 +308,26 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   // ---- my agents (once per session, refreshable) --------------------------
   useEffect(() => {
     if (!viewerResolved) return;
+    if (viewerPhase !== "ready") {
+      setMyAgents(viewerPhase === "signed_out" ? [] : null);
+      setMyAgentsPhase(viewerPhase === "error" ? "error" : viewerPhase === "signed_out" ? "ready" : "loading");
+      return;
+    }
     if (viewer === null) {
       setMyAgents([]);
       setMyAgentsPhase("ready");
       return;
     }
     let cancelled = false;
+    const authority = cacheAuthority.current.token();
     void (async () => {
       try {
         const page = await api.agents.list({ scope: "mine" });
-        if (cancelled) return;
+        if (cancelled || !cacheAuthority.current.admits(authority)) return;
         setMyAgents(page.items);
         setMyAgentsPhase("ready");
       } catch {
-        if (cancelled) return;
+        if (cancelled || !cacheAuthority.current.admits(authority)) return;
         setMyAgents(null);
         setMyAgentsPhase("error");
       }
@@ -254,7 +335,7 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [myAgentsNonce, viewer, viewerResolved]);
+  }, [myAgentsNonce, viewer, viewerResolved, viewerPhase]);
 
   const refreshAgent = useCallback(() => {
     if (username) agentCache.delete(username);
@@ -265,18 +346,28 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
     setMyAgentsNonce((n) => n + 1);
   }, []);
 
+  const privateAuthorityReady = viewerPhase === "ready";
+  const visibleViewer = privateAuthorityReady ? viewer : null;
+  const visibleAgent = privateAuthorityReady ? agent : null;
+  const visibleAgentPhase = privateAuthorityReady
+    ? phase
+    : viewerPhase === "error" ? "error" : username ? "loading" : "idle";
+  const visibleMyAgents = privateAuthorityReady ? myAgents : null;
+  const visibleMyAgentsPhase = privateAuthorityReady
+    ? myAgentsPhase
+    : viewerPhase === "error" ? "error" : "loading";
   const canManage =
-    viewer !== null &&
-    agent !== null &&
-    ((agent.ownerId !== null && agent.ownerId === viewer.id) || Boolean(viewer.isAdmin));
+    visibleViewer !== null &&
+    visibleAgent !== null &&
+    ((visibleAgent.ownerId !== null && visibleAgent.ownerId === visibleViewer.id) || Boolean(visibleViewer.isAdmin));
 
   const selected = useMemo<SelectedAgentState>(
-    () => ({ username, agent, phase, viewer, viewerPhase, canManage, refresh: refreshAgent }),
-    [username, agent, phase, viewer, viewerPhase, canManage, refreshAgent],
+    () => ({ username, agent: visibleAgent, phase: visibleAgentPhase, viewer: visibleViewer, viewerPhase, canManage, refresh: refreshAgent }),
+    [username, visibleAgent, visibleAgentPhase, visibleViewer, viewerPhase, canManage, refreshAgent],
   );
   const mine = useMemo<MyAgentsState>(
-    () => ({ agents: myAgents, phase: myAgentsPhase, refresh: refreshMyAgents }),
-    [myAgents, myAgentsPhase, refreshMyAgents],
+    () => ({ agents: visibleMyAgents, phase: visibleMyAgentsPhase, refresh: refreshMyAgents }),
+    [visibleMyAgents, visibleMyAgentsPhase, refreshMyAgents],
   );
 
   return (

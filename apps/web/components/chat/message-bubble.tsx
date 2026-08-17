@@ -34,6 +34,7 @@ import type {
   MediaPendingItem,
   UserEchoItem,
 } from "./conversation-state";
+import { hasComposerRetryPayload } from "./composer";
 
 // ---------------------------------------------------------------------------
 // Shared bits
@@ -165,22 +166,7 @@ function AttachmentList({ attachments }: { attachments: MessageAttachment[] }) {
           const media = image || video || audio;
           return (
             <figure key={`${attachment.url}:${index}`} className="max-w-md">
-              {image ? (
-                <button
-                  type="button"
-                  aria-label="View attachment larger"
-                  onClick={() => setExpanded(attachment)}
-                  className="block w-full cursor-zoom-in rounded-xl text-left outline-none ring-accent/50 focus-visible:ring-2"
-                >
-                  <MediaFull
-                    url={attachment.url}
-                    mime={attachment.mime ?? null}
-                    alt="attachment"
-                    width={attachment.width ?? null}
-                    height={attachment.height ?? null}
-                  />
-                </button>
-              ) : media ? (
+              {media ? (
                 <MediaFull
                   url={attachment.url}
                   mime={attachment.mime ?? null}
@@ -684,10 +670,12 @@ export function InlineError({
   item,
   onRetry,
   onDismiss,
+  retryDisabled = false,
 }: {
   item: ErrorItem;
   onRetry?: (content: string) => void;
   onDismiss: () => void;
+  retryDisabled?: boolean;
 }) {
   return (
     <div className="flex justify-center">
@@ -701,11 +689,12 @@ export function InlineError({
           ) : null}
         </span>
         <span className="flex items-center gap-2">
-          {item.retryContent && onRetry ? (
+          {hasComposerRetryPayload(item.retryContent, item.retryAttachments) && onRetry ? (
             <button
               type="button"
               onClick={() => onRetry(item.retryContent ?? "")}
-              className="rounded-md border border-danger/30 px-2 py-1 transition-colors hover:border-danger-soft/60 hover:text-danger-soft"
+              disabled={retryDisabled}
+              className="rounded-md border border-danger/30 px-2 py-1 transition-colors hover:border-danger-soft/60 hover:text-danger-soft disabled:cursor-not-allowed disabled:opacity-45"
             >
               Retry
             </button>

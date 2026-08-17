@@ -12,6 +12,7 @@ import type {
   MediaItem,
 } from "../components/chat/conversation-state";
 import type { MessageDto, SessionEvent } from "../lib/types";
+import type { ComposerAttachment } from "../components/chat/composer";
 
 const SESSION_ID = "6c1f5b7e-3d2a-4e8b-9f10-2a3b4c5d6e7f";
 const TURN_ID = "0f9e8d7c-6b5a-4433-a221-100f0e0d0c0b";
@@ -47,8 +48,9 @@ function streamEvent(
   clientId: string,
   event: SessionEvent,
   retryContent: string | null = "retry me",
+  retryAttachments: ComposerAttachment[] = [],
 ): ConversationAction {
-  return { type: "stream/event", clientId, event, retryContent, at: AT };
+  return { type: "stream/event", clientId, event, retryContent, retryAttachments, at: AT };
 }
 
 function streamItems(state: ConversationState): AssistantStreamItem[] {
@@ -128,6 +130,10 @@ describe("send -> stream lifecycle", () => {
   });
 
   it("marks the bubble stopped on abort and failed on error", () => {
+    const retryAttachments: ComposerAttachment[] = [{
+      objectId: "object-review-1",
+      attachment: { url: "/objects/object-review-1", mime: "image/png" },
+    }];
     const base = run([
       { type: "send", clientId: "c1", content: "hi", at: AT },
       streamEvent("c1", { type: "token", turnId: TURN_ID, delta: "par" }),
@@ -143,7 +149,7 @@ describe("send -> stream lifecycle", () => {
           turnId: TURN_ID,
           code: "gateway_error",
           message: "boom",
-        }),
+        }, "retry me", retryAttachments),
       ],
       base,
     );
@@ -151,6 +157,9 @@ describe("send -> stream lifecycle", () => {
     const error = failed.local.find((i) => i.kind === "error");
     expect(error && error.kind === "error" && error.retryContent).toBe(
       "retry me",
+    );
+    expect(error && error.kind === "error" && error.retryAttachments).toEqual(
+      retryAttachments,
     );
   });
 

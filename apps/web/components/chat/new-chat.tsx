@@ -27,13 +27,14 @@ import {
 } from "./chat-api";
 import { startNewSessionTurn } from "./turn-pump";
 import type { TurnPump } from "./turn-pump";
-import { Composer, ComposerNotice, retryComposerDraftAfterTurnAcceptance } from "./composer";
+import { Composer, ComposerNotice, hasComposerRetryPayload, retryComposerDraftAfterTurnAcceptance } from "./composer";
 import type { ComposerAttachment } from "./composer";
 import { Markdown } from "./markdown";
 
 interface SendNotice {
   message: string;
   retryContent: string | null;
+  retryAttachments: ComposerAttachment[];
   manna: boolean;
 }
 
@@ -137,6 +138,7 @@ function NewSessionComposer({
         setNotice({
           message: describeSendError(error),
           retryContent: content,
+          retryAttachments: attachments,
           manna: isInsufficientManna(error),
         });
         return false;
@@ -193,14 +195,14 @@ function NewSessionComposer({
   const noticeNode = notice ? (
     <ComposerNotice tone="warn">
       <span className="min-w-0">{notice.message}</span>
-      {notice.retryContent ? (
+      {hasComposerRetryPayload(notice.retryContent, notice.retryAttachments) ? (
         <button
           type="button"
           onClick={() => {
             const content = notice.retryContent ?? "";
             setNotice(null);
             void retryComposerDraftAfterTurnAcceptance(
-              send(content), viewer?.id, `new:${username}`,
+              send(content, notice.retryAttachments), viewer?.id, `new:${username}`,
             );
           }}
           className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"

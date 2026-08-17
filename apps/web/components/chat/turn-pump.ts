@@ -45,6 +45,8 @@ export interface TurnPump {
   /** The user message that started the turn (echo + retry payload). */
   readonly content: string;
   readonly attachments: MessageAttachment[];
+  /** Exact uploaded objects that may be safely re-submitted after refusal. */
+  readonly retryAttachments: ComposerAttachment[];
   /** Agent context for avatar/title before the session record loads. */
   readonly agent: AgentDto | null;
   /** Session the turn belongs to; null until turn.started/header on a new session. */
@@ -72,6 +74,7 @@ class Pump implements TurnPump {
   readonly clientId = crypto.randomUUID();
   readonly content: string;
   readonly attachments: MessageAttachment[];
+  readonly retryAttachments: ComposerAttachment[];
   readonly agent: AgentDto | null;
   sessionId: string | null;
   done = false;
@@ -85,9 +88,10 @@ class Pump implements TurnPump {
   private acceptReject!: (error: Error) => void;
   private acceptanceSettled = false;
 
-  constructor(content: string, attachments: MessageAttachment[], agent: AgentDto | null, sessionId: string | null) {
+  constructor(content: string, attachments: ComposerAttachment[], agent: AgentDto | null, sessionId: string | null) {
     this.content = content;
-    this.attachments = attachments;
+    this.retryAttachments = attachments;
+    this.attachments = attachments.map((item) => item.attachment);
     this.agent = agent;
     this.sessionId = sessionId;
     this.accepted = new Promise<void>((resolve, reject) => {
@@ -210,7 +214,7 @@ async function consume(
  * The pump is registered immediately; attach to render it.
  */
 export function startSessionTurn(sessionId: string, content: string, attachments: ComposerAttachment[] = []): TurnPump {
-  const pump = new Pump(content, attachments.map((item) => item.attachment), null, sessionId);
+  const pump = new Pump(content, attachments, null, sessionId);
   register(pump);
   const events = api.sessions.send(sessionId, content, attachments.map(({ objectId }) => ({ objectId })), {
     signal: pump.controller.signal,
@@ -238,7 +242,7 @@ export function startNewSessionTurn(body: {
   agent: AgentDto | null;
 }): NewSessionTurn {
   const attachments = body.attachments ?? [];
-  const pump = new Pump(body.content, attachments.map((item) => item.attachment), body.agent, null);
+  const pump = new Pump(body.content, attachments, body.agent, null);
 
   const ready = new Promise<string>((resolve, reject) => {
     void (async () => {

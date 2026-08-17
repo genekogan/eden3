@@ -15,7 +15,7 @@ export default async function AgentChatsLayout({
 }) {
   const { username } = await params;
   return (
-    <div className="flex h-dvh min-w-0">
+    <div className="flex h-[calc(100dvh-3.5rem-var(--eden-safe-top)-var(--eden-safe-bottom))] min-w-0 sm:h-[calc(100dvh-var(--eden-safe-top)-var(--eden-safe-bottom))]">
       <AgentChatsRail username={decodeURIComponent(username)} />
       <div className="h-full min-w-0 flex-1">{children}</div>
     </div>

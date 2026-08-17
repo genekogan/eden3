@@ -6,6 +6,7 @@
 export interface ClerkJs {
   isSignedIn: boolean;
   user?: {
+    id: string;
     imageUrl: string;
   } | null;
   session?: {

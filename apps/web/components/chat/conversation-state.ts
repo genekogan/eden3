@@ -21,6 +21,7 @@
  */
 
 import type { MessageAttachment, MessageDto, SessionEvent } from "@/lib/types";
+import type { ComposerAttachment } from "./composer";
 
 // ---------------------------------------------------------------------------
 // Local (unpersisted) transcript items
@@ -76,6 +77,7 @@ export interface ErrorItem {
   message: string;
   /** When set, "Retry" re-sends this user content. */
   retryContent: string | null;
+  retryAttachments: ComposerAttachment[];
   at: string;
 }
 
@@ -138,6 +140,7 @@ export type ConversationAction =
       clientId: string;
       event: SessionEvent;
       retryContent: string | null;
+      retryAttachments: ComposerAttachment[];
       at: string;
     }
   | { type: "stream/aborted"; clientId: string }
@@ -154,6 +157,7 @@ export type ConversationAction =
       code: string;
       message: string;
       retryContent: string | null;
+      retryAttachments: ComposerAttachment[];
       at: string;
     }
   | {
@@ -498,6 +502,7 @@ function applyMediaFailed(
       code: event.code,
       message: event.message,
       retryContent: null,
+      retryAttachments: [],
       at,
     },
   );
@@ -634,6 +639,7 @@ export function conversationReducer(
             code: event.code,
             message: event.message,
             retryContent: action.retryContent,
+            retryAttachments: action.retryAttachments,
             at: action.at,
           });
         }
@@ -678,6 +684,7 @@ export function conversationReducer(
         code: action.code,
         message: action.message,
         retryContent: action.retryContent,
+        retryAttachments: action.retryAttachments,
         at: action.at,
       });
     }
@@ -772,6 +779,7 @@ export function conversationReducer(
             code: event.code,
             message: event.message,
             retryContent: null,
+            retryAttachments: [],
             at: action.at,
           });
         }

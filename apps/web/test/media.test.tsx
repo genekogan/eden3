@@ -1,4 +1,5 @@
 import React from "react";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { MediaFull, isAudioMedia, isVideoMedia } from "../components/media";
@@ -30,6 +31,22 @@ describe("media rendering", () => {
         <MediaFull url="/media/a/audio.bin" mime="audio/mpeg" alt="audio" />,
       ),
     ).toContain("<audio");
+  });
+
+  it("routes image, video, and audio decode failures to one accessible fallback", () => {
+    const source = readFileSync(new URL("../components/media.tsx", import.meta.url), "utf8");
+    const full = source.slice(source.indexOf("export function MediaFull"));
+    expect(full.match(/onError=\{\(\) => setBroken\(true\)\}/g)).toHaveLength(3);
+    expect(full).toContain('role="status"');
+    expect(full).toContain('broken ? "Media unavailable" : "no media"');
+    expect(full).toContain('aria-label="Retry media"');
+    expect(full).not.toContain("border-border");
+    expect(full).not.toContain("text-body");
+    expect(full).not.toContain("bg-overlay");
+    expect(full).not.toContain("ring-focus");
+    expect(full).toContain("setBroken(false)");
+    expect(full).toContain("setLoaded(false)");
+    expect(full).not.toContain('onError={() => setLoaded(true)}');
   });
 
   it("reserves the persisted attachment dimensions before the image loads", () => {
@@ -71,7 +88,7 @@ describe("media rendering", () => {
     );
     expect(html).toContain('src="/media/dog.png"');
     expect(html).toContain("aspect-ratio:1024 / 768");
-    expect(html).toContain('aria-label="View attachment larger"');
+    expect(html).not.toContain('aria-label="View attachment larger"');
     expect(html).toContain("View larger");
     expect(html).toContain('download="eden3-00000000-0000-4000-8000-000000000004.png"');
     expect(html).not.toContain('/creations/00000000-0000-4000-8000-000000000004');

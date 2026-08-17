@@ -23,6 +23,10 @@ function expectGuardedEditor(source: string, expectedRegistrations = 1) {
 }
 
 describe("agent settings unsaved-change protection", () => {
+  it("gives the private memory correction editor an accessible name", () => {
+    expect(profile).toContain('aria-label="MEMORY.md owner correction"');
+  });
+
   it("wraps every settings page in the navigation guard", () => {
     expect(layout).toContain("<SettingsUnsavedChangesProvider>");
     expect(layout).toContain("</SettingsUnsavedChangesProvider>");

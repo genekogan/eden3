@@ -33,6 +33,12 @@ import {
   useMyAgents,
   useSelectedAgent,
 } from "./selected-agent-context";
+import {
+  paletteOwnedAgents,
+  privateSearchAuthority,
+  privateSearchAuthorityMatches,
+  type PrivateSearchAuthority,
+} from "./agent-cache-authority";
 
 const NEXT_THEME: Record<ThemePreference, ThemePreference> = {
   system: "light",
@@ -45,17 +51,32 @@ export const COMMAND_PALETTE_OPEN_EVENT = "eden:command-palette-open";
 export function CommandPalette() {
   const router = useRouter();
   const pathname = usePathname();
-  const { username, viewer, canManage } = useSelectedAgent();
-  const { agents } = useMyAgents();
+  const { username, viewer, viewerPhase, canManage } = useSelectedAgent();
+  const { agents, phase: agentsPhase } = useMyAgents();
   const { preference: themePreference, setPreference: setThemePreference } = useTheme();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const [tools, setTools] = useState<StudioTool[]>([]);
-  const [contentResults, setContentResults] = useState<OwnedSearchResultDto[]>([]);
+  const [contentResults, setContentResults] = useState<{
+    authority: PrivateSearchAuthority;
+    items: OwnedSearchResultDto[];
+  } | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
+  const searchGeneration = useRef(0);
+  const searchViewerId = useRef<string | null | undefined>(undefined);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  const currentSearchViewerId = viewerPhase === "ready" ? (viewer?.id ?? null) : null;
+  if (searchViewerId.current !== currentSearchViewerId) {
+    searchViewerId.current = currentSearchViewerId;
+    searchGeneration.current += 1;
+  }
+  const currentSearchAuthority = privateSearchAuthority(
+    viewer?.id,
+    viewerPhase,
+    searchGeneration.current,
+  );
 
   // ⌘K / Ctrl-K toggles; the sidebar search button opens the same surface.
   useEffect(() => {
@@ -93,24 +114,29 @@ export function CommandPalette() {
 
   useEffect(() => {
     const trimmed = query.trim();
-    if (!open || viewer === null || trimmed.length === 0) {
-      setContentResults([]);
+    const admitted = privateSearchAuthority(viewer?.id, viewerPhase, searchGeneration.current);
+    if (!open || !admitted || trimmed.length === 0) {
+      setContentResults(null);
       setSearchLoading(false);
       return;
     }
 
     const controller = new AbortController();
-    setContentResults([]);
+    setContentResults(null);
     setSearchLoading(true);
     const timer = window.setTimeout(() => {
       void api.search
         .owned(trimmed, { signal: controller.signal })
         .then((response) => {
-          if (!controller.signal.aborted) setContentResults(response.items);
+          if (!controller.signal.aborted && privateSearchAuthorityMatches(
+            admitted, searchViewerId.current, viewerPhase, searchGeneration.current,
+          )) setContentResults({ authority: admitted, items: response.items });
         })
         .catch(() => {
           // Static ontology results remain usable when search is unavailable.
-          if (!controller.signal.aborted) setContentResults([]);
+          if (!controller.signal.aborted && privateSearchAuthorityMatches(
+            admitted, searchViewerId.current, viewerPhase, searchGeneration.current,
+          )) setContentResults({ authority: admitted, items: [] });
         })
         .finally(() => {
           if (!controller.signal.aborted) setSearchLoading(false);
@@ -120,7 +146,7 @@ export function CommandPalette() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [open, query, viewer]);
+  }, [open, query, viewer, viewerPhase]);
 
   const commands = useMemo<PaletteCommand[]>(() => {
     const registry = createOntologyRegistry({
@@ -146,15 +172,22 @@ export function CommandPalette() {
     );
     return buildPaletteCommands({
       ontology,
-      agents: agents ?? [],
+      agents: paletteOwnedAgents(agents, agentsPhase, viewerPhase),
       selectedUsername: username,
       selectedSubPath: agentSubPathFromPathname(pathname),
     });
-  }, [pathname, username, agents, tools, viewer, canManage]);
+  }, [pathname, username, agents, agentsPhase, tools, viewer, viewerPhase, canManage]);
 
   const results = useMemo(() => {
-    return mergePaletteResults(commands, contentResults, query);
-  }, [query, commands, contentResults]);
+    const visibleContent = contentResults && currentSearchAuthority &&
+      privateSearchAuthorityMatches(
+        contentResults.authority,
+        currentSearchAuthority.viewerId,
+        viewerPhase,
+        currentSearchAuthority.generation,
+      ) ? contentResults.items : [];
+    return mergePaletteResults(commands, visibleContent, query);
+  }, [query, commands, contentResults, currentSearchAuthority, viewerPhase]);
 
   const clamped = clampPaletteIndex(activeIndex, results.length);
 

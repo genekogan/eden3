@@ -40,6 +40,13 @@ export interface ComposerAttachment {
   attachment: MessageAttachment;
 }
 
+export function hasComposerRetryPayload(
+  content: string | null,
+  attachments: ComposerAttachment[],
+): boolean {
+  return content !== null || attachments.length > 0;
+}
+
 interface StagedAttachment {
   id: string;
   file: File;
@@ -80,6 +87,23 @@ export function retryComposerDraftAfterTurnAcceptance(
   return clearComposerDraftAfterTurnAcceptance(acceptance, () => {
     if (ownerId) return clearDictationComposerDraft(ownerId, contextKey, options, expectedEpoch);
   });
+}
+
+export async function retryInlineErrorAfterTurnAcceptance(
+  acceptance: boolean | Promise<boolean>,
+  ownerId: string | null | undefined,
+  contextKey: string,
+  dismiss: () => void,
+  options?: { indexedDB?: IDBFactory; purgeFenceStore?: DictationPurgeFenceStore },
+): Promise<boolean> {
+  const accepted = await retryComposerDraftAfterTurnAcceptance(
+    acceptance,
+    ownerId,
+    contextKey,
+    options,
+  );
+  if (accepted) dismiss();
+  return accepted;
 }
 
 export function composerDraftIdentity(ownerId: string, contextKey: string): string {

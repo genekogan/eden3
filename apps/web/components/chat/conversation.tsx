@@ -51,7 +51,7 @@ import {
   initialConversationState,
 } from "./conversation-state";
 import type { LocalItem } from "./conversation-state";
-import { Composer, ComposerNotice, retryComposerDraftAfterTurnAcceptance } from "./composer";
+import { Composer, ComposerNotice, hasComposerRetryPayload, retryComposerDraftAfterTurnAcceptance, retryInlineErrorAfterTurnAcceptance } from "./composer";
 import type { ComposerAttachment } from "./composer";
 import { SessionShareDialog } from "./session-share-dialog";
 import {
@@ -68,6 +68,7 @@ type LoadPhase = "loading" | "ready" | "missing" | "error";
 interface SendNotice {
   message: string;
   retryContent: string | null;
+  retryAttachments: ComposerAttachment[];
   manna: boolean;
 }
 
@@ -204,6 +205,7 @@ export function SessionConversation({
       setNotice({
         message: describeSendError(error),
         retryContent: null,
+        retryAttachments: [],
         manna: error instanceof ApiError && error.status === 402,
       });
     }
@@ -290,6 +292,7 @@ export function SessionConversation({
               clientId: pump.clientId,
               event,
               retryContent: pump.content,
+              retryAttachments: pump.retryAttachments,
               at: nowIso(),
             });
             break;
@@ -299,6 +302,7 @@ export function SessionConversation({
             setNotice({
               message: entry.message,
               retryContent: pump.content,
+              retryAttachments: pump.retryAttachments,
               manna: entry.manna,
             });
             break;
@@ -309,6 +313,7 @@ export function SessionConversation({
               code: entry.code,
               message: entry.message,
               retryContent: pump.content,
+              retryAttachments: pump.retryAttachments,
               at: nowIso(),
             });
             break;
@@ -363,10 +368,12 @@ export function SessionConversation({
   }, []);
 
   const retryFromError = useCallback(
-    (item: { clientId: string }, content: string) => {
-      dispatch({ type: "error/dismiss", clientId: item.clientId });
-      void retryComposerDraftAfterTurnAcceptance(
-        send(content), viewer?.id, `session:${session?.id ?? routeId}`,
+    (item: { clientId: string; retryAttachments: ComposerAttachment[] }, content: string) => {
+      void retryInlineErrorAfterTurnAcceptance(
+        send(content, item.retryAttachments),
+        viewer?.id,
+        `session:${session?.id ?? routeId}`,
+        () => dispatch({ type: "error/dismiss", clientId: item.clientId }),
       );
     },
     [routeId, send, session, viewer],
@@ -550,14 +557,14 @@ export function SessionConversation({
   const noticeNode: ReactNode = notice ? (
     <ComposerNotice tone="warn">
       <span className="min-w-0">{notice.message}</span>
-      {notice.retryContent ? (
+      {hasComposerRetryPayload(notice.retryContent, notice.retryAttachments) ? (
         <button
           type="button"
           onClick={() => {
             const content = notice.retryContent ?? "";
             setNotice(null);
             void retryComposerDraftAfterTurnAcceptance(
-              send(content), viewer?.id, `session:${session?.id ?? routeId}`,
+              send(content, notice.retryAttachments), viewer?.id, `session:${session?.id ?? routeId}`,
             );
           }}
           className="rounded-md border border-warning/30 px-2 py-0.5 transition-colors hover:border-warning-soft/60 hover:text-warning-soft"
@@ -819,6 +826,7 @@ export function SessionConversation({
                     key={item.clientId}
                     item={item}
                     onRetry={(content) => retryFromError(item, content)}
+                    retryDisabled={streaming}
                     onDismiss={() =>
                       dispatch({
                         type: "error/dismiss",
