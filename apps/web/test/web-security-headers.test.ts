@@ -35,7 +35,7 @@ describe("cockpit browser security headers", () => {
       "Content-Security-Policy":
         "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
       "Permissions-Policy":
-        "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
       "Referrer-Policy": "strict-origin-when-cross-origin",
       "X-Content-Type-Options": "nosniff",
       "X-Frame-Options": "DENY",
