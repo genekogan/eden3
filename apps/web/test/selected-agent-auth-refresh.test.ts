@@ -148,6 +148,12 @@ describe("selected-agent authentication refresh", () => {
     expect(source).toMatch(
       /status === 401 \|\| status === 403[\s\S]*agentCache\.delete\(username\);[\s\S]*setAgent\(null\);[\s\S]*setPhase\("error"\);/,
     );
+    const ordinaryRefresh = source.slice(
+      source.indexOf("const refreshAgent = useCallback"),
+      source.indexOf("const refreshMyAgents = useCallback"),
+    );
+    expect(ordinaryRefresh).toContain("setAgentNonce((n) => n + 1);");
+    expect(ordinaryRefresh).not.toContain("agentCache.delete(username)");
 
     const palette = await readFile(
       new URL("../components/shell/command-palette.tsx", import.meta.url),

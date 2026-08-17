@@ -338,9 +338,8 @@ export function SelectedAgentProvider({ children }: { children: ReactNode }) {
   }, [myAgentsNonce, viewer, viewerResolved, viewerPhase]);
 
   const refreshAgent = useCallback(() => {
-    if (username) agentCache.delete(username);
     setAgentNonce((n) => n + 1);
-  }, [username]);
+  }, []);
   const refreshMyAgents = useCallback(() => {
     setMyAgentsPhase("loading");
     setMyAgentsNonce((n) => n + 1);
