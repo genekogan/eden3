@@ -7,7 +7,7 @@ import {
   sessionEventsUrl,
   streamSseBody,
 } from "../lib/sse";
-import { api, ApiError, toPaginated } from "../lib/api";
+import { api, ApiError, subscribeNotifications, toPaginated } from "../lib/api";
 import { formatManna, formatRelativeTime } from "../lib/format";
 import { decodeBlurhash } from "../lib/blurhash";
 
@@ -175,6 +175,129 @@ describe("lib/api toPaginated", () => {
       items: [],
       nextCursor: null,
     });
+  });
+});
+
+describe("lib/api notification stream multiplexing", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  class FakeEventSource {
+    static instances: FakeEventSource[] = [];
+    readonly url: string;
+    onopen: ((event: Event) => void) | null = null;
+    onmessage: ((event: MessageEvent<string>) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+    readonly close = vi.fn();
+
+    constructor(url: string | URL) {
+      this.url = String(url);
+      FakeEventSource.instances.push(this);
+    }
+  }
+
+  function installEventSource() {
+    FakeEventSource.instances = [];
+    vi.stubGlobal("EventSource", FakeEventSource);
+  }
+
+  it("shares only within one account and URL until that key's last unsubscribe", () => {
+    installEventSource();
+    const first = vi.fn();
+    const second = vi.fn();
+    const unsubscribeFirst = subscribeNotifications(first, { accountKey: "account-a" });
+    const unsubscribeSecond = subscribeNotifications(second, { accountKey: "account-a" });
+    expect(FakeEventSource.instances).toHaveLength(1);
+
+    const unsubscribeOtherAccount = subscribeNotifications(vi.fn(), { accountKey: "account-b" });
+    const unsubscribeOtherUrl = subscribeNotifications(vi.fn(), {
+      accountKey: "account-a",
+      url: "/api/notifications/other",
+    });
+    expect(FakeEventSource.instances).toHaveLength(3);
+
+    const source = FakeEventSource.instances[0]!;
+    source.onopen?.({} as Event);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+
+    unsubscribeFirst();
+    expect(source.close).not.toHaveBeenCalled();
+    source.onopen?.({} as Event);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(2);
+
+    unsubscribeSecond();
+    expect(source.close).toHaveBeenCalledTimes(1);
+    unsubscribeSecond();
+    expect(source.close).toHaveBeenCalledTimes(1);
+    const unsubscribeThird = subscribeNotifications(vi.fn(), { accountKey: "account-a" });
+    expect(FakeEventSource.instances).toHaveLength(4);
+    unsubscribeThird();
+    unsubscribeOtherAccount();
+    unsubscribeOtherUrl();
+  });
+
+  it("fans out open, decoded message, and error events without stale or throwing subscribers", () => {
+    installEventSource();
+    const reported = vi.fn();
+    vi.stubGlobal("reportError", reported);
+    const thrown = new Error("subscriber failed");
+    const thrower = vi.fn(() => { throw thrown; });
+    const follower = vi.fn();
+    const errors = vi.fn();
+    const unsubscribeThrower = subscribeNotifications(thrower, { accountKey: "account-a" });
+    const unsubscribeFollower = subscribeNotifications(follower, {
+      accountKey: "account-a",
+      onConnectionError: errors,
+    });
+    const source = FakeEventSource.instances[0]!;
+
+    source.onmessage?.({ data: '{"type":"notification.changed"}' } as MessageEvent<string>);
+    expect(thrower).toHaveBeenCalledTimes(1);
+    expect(follower).toHaveBeenCalledTimes(1);
+    expect(reported).toHaveBeenCalledWith(thrown);
+    source.onmessage?.({
+      data: '{"type":"notification.created","notificationId":"00000000-0000-4000-8000-000000000003","kind":"agent_build_ready"}',
+    } as MessageEvent<string>);
+    expect(thrower).toHaveBeenCalledTimes(2);
+    expect(follower).toHaveBeenCalledTimes(2);
+    expect(reported).toHaveBeenCalledTimes(2);
+    source.onmessage?.({
+      data: '{"type":"manna.updated","accountId":"00000000-0000-4000-8000-000000000001","balance":42}',
+    } as MessageEvent<string>);
+    source.onmessage?.({ data: 'not-json' } as MessageEvent<string>);
+    expect(thrower).toHaveBeenCalledTimes(2);
+    expect(follower).toHaveBeenCalledTimes(2);
+    source.onerror?.({ type: "error" } as Event);
+    expect(errors).toHaveBeenCalledTimes(1);
+
+    unsubscribeThrower();
+    unsubscribeFollower();
+
+    let unsubscribeRemoved = () => {};
+    const removed = vi.fn();
+    const remover = vi.fn(() => unsubscribeRemoved());
+    const unsubscribeRemover = subscribeNotifications(remover, { accountKey: "account-b" });
+    unsubscribeRemoved = subscribeNotifications(removed, { accountKey: "account-b" });
+    FakeEventSource.instances[1]!.onopen?.({ type: "open" } as Event);
+    expect(remover).toHaveBeenCalledTimes(1);
+    expect(removed).not.toHaveBeenCalled();
+    unsubscribeRemover();
+    unsubscribeRemoved();
+  });
+
+  it("is inert without EventSource and rejects an empty account authority", () => {
+    vi.stubGlobal("EventSource", undefined);
+    const callback = vi.fn();
+    const unsubscribe = subscribeNotifications(callback, { accountKey: "account-a" });
+    unsubscribe();
+    expect(callback).not.toHaveBeenCalled();
+    expect(() => subscribeNotifications(callback, { accountKey: " " })).toThrow(
+      "notification account key is required",
+    );
   });
 });
 

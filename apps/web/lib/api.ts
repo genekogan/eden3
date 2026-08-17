@@ -472,24 +472,86 @@ export function subscribeSession(
 }
 
 /** Account-scoped notification SSE. Initial/history authority stays in GET. */
+interface NotificationStreamSubscriber {
+  onCreated: () => void;
+  onConnectionError?: (event: Event) => void;
+}
+
+interface SharedNotificationStream {
+  source: EventSource;
+  subscribers: Set<NotificationStreamSubscriber>;
+}
+
+// Responsive shell variants can coexist in the DOM, but they represent one
+// account and must not each consume a browser HTTP/1.1 connection. Multiplex
+// their callbacks onto one EventSource per URL; two chat windows then retain
+// capacity for navigation alongside their per-session streams.
+const sharedNotificationStreams = new Map<string, SharedNotificationStream>();
+
+function fanoutNotificationSubscribers(
+  shared: SharedNotificationStream,
+  callback: (subscriber: NotificationStreamSubscriber) => void,
+): void {
+  let firstError: unknown;
+  for (const subscriber of [...shared.subscribers]) {
+    if (!shared.subscribers.has(subscriber)) continue;
+    try {
+      callback(subscriber);
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError !== undefined) {
+    if (typeof globalThis.reportError === "function") globalThis.reportError(firstError);
+    else queueMicrotask(() => { throw firstError; });
+  }
+}
+
 export function subscribeNotifications(
   onCreated: () => void,
-  options: { url?: string; onConnectionError?: (event: Event) => void } = {},
+  options: { accountKey: string; url?: string; onConnectionError?: (event: Event) => void },
 ): () => void {
+  if (options.accountKey.trim() === "") throw new TypeError("notification account key is required");
   if (typeof EventSource === "undefined") return () => {};
-  const source = new EventSource(options.url ?? "/api/notifications/events");
-  // Re-read durable authority after every initial connect/reconnect. This
-  // closes the process-death window between DB commit and best-effort publish
-  // without introducing polling.
-  source.onopen = () => onCreated();
-  source.onmessage = (message: MessageEvent<string>) => {
-    const event = decodeSessionEventData(message.data);
-    if (event?.type === "notification.created" || event?.type === "notification.changed") {
-      onCreated();
+  const url = options.url ?? "/api/notifications/events";
+  const streamKey = JSON.stringify([options.accountKey, url]);
+  let shared = sharedNotificationStreams.get(streamKey);
+  if (!shared) {
+    const source = new EventSource(url);
+    shared = { source, subscribers: new Set() };
+    sharedNotificationStreams.set(streamKey, shared);
+    source.onopen = () => {
+      // Re-read durable authority after every initial connect/reconnect. This
+      // closes the process-death window between DB commit and best-effort
+      // publish without introducing polling.
+      fanoutNotificationSubscribers(shared!, (subscriber) => subscriber.onCreated());
+    };
+    source.onmessage = (message: MessageEvent<string>) => {
+      const event = decodeSessionEventData(message.data);
+      if (event?.type === "notification.created" || event?.type === "notification.changed") {
+        fanoutNotificationSubscribers(shared!, (subscriber) => subscriber.onCreated());
+      }
+    };
+    source.onerror = (event) => {
+      fanoutNotificationSubscribers(shared!, (subscriber) => subscriber.onConnectionError?.(event));
+    };
+  }
+
+  const subscriber: NotificationStreamSubscriber = {
+    onCreated,
+    ...(options.onConnectionError ? { onConnectionError: options.onConnectionError } : {}),
+  };
+  shared.subscribers.add(subscriber);
+  let subscribed = true;
+  return () => {
+    if (!subscribed) return;
+    subscribed = false;
+    shared!.subscribers.delete(subscriber);
+    if (shared!.subscribers.size === 0 && sharedNotificationStreams.get(streamKey) === shared) {
+      sharedNotificationStreams.delete(streamKey);
+      shared!.source.close();
     }
   };
-  if (options.onConnectionError) source.onerror = options.onConnectionError;
-  return () => source.close();
 }
 
 // ---------------------------------------------------------------------------
@@ -654,8 +716,8 @@ export const api = {
     dismiss(id: string): Promise<void> {
       return apiFetch<void>(`/notifications/${enc(id)}`, { method: "DELETE" });
     },
-    subscribe(onCreated: () => void): () => void {
-      return subscribeNotifications(onCreated);
+    subscribe(onCreated: () => void, accountKey: string): () => void {
+      return subscribeNotifications(onCreated, { accountKey });
     },
   },
 

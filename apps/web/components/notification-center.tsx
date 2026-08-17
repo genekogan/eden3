@@ -76,7 +76,10 @@ export function NotificationCenter({
       return;
     }
     void refresh(accountGeneration);
-    const unsubscribe = api.notifications.subscribe(() => void refresh(accountGeneration));
+    const unsubscribe = api.notifications.subscribe(
+      () => void refresh(accountGeneration),
+      accountKey,
+    );
     return () => {
       loadFence.current.invalidateAccount(accountGeneration);
       unsubscribe();
