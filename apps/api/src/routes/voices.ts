@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { serviceAuthenticatedCallback } from '../auth-plugin';
 import { ApiError, sendError } from '../errors';
 import { isValidChannelRuntimeAuthorization } from '../services/channel-runtime-auth';
+import { hashSessionShareToken } from '../services/session-shares';
 import { VoiceKernel, VoiceKernelError, type VoiceOutputBytes } from '../services/voice-kernel';
 import { applyPrivateCapabilityHeaders } from '../services/share-cache-policy';
 
@@ -54,6 +55,9 @@ const cloneParams = z.object({ id: z.string().uuid() });
 const messageParams = z.object({ sessionId: z.string().uuid(), messageId: z.string().uuid() });
 const turnParams = z.object({ turnId: z.string().uuid() });
 const executionParams = z.object({ executionId: z.string().uuid() });
+const sharedExecutionParams = executionParams.extend({
+  token: z.string().regex(/^[A-Za-z0-9_-]{32,200}$/),
+});
 const runtimeAudioParams = z.object({
   turnId: z.string().uuid(),
   executionId: z.string().uuid(),
@@ -190,6 +194,17 @@ export const voiceRoutes: FastifyPluginAsync<VoiceRoutesOptions> = async (app, o
     const output = await boundary(() => kernel.ownerVoiceOutput(request.account!.accountId, executionId));
     return sendVoiceBytes(request, reply, output, true);
   };
+  const sharedAudio = async (request: FastifyRequest, reply: FastifyReply) => {
+    applyPrivateCapabilityHeaders(reply);
+    const { token, executionId } = sharedExecutionParams.parse(request.params);
+    const output = await boundary(() => kernel.sharedVoiceOutput(
+      hashSessionShareToken(token),
+      executionId,
+    ));
+    return sendVoiceBytes(request, reply, output, true);
+  };
+  app.get('/media/share/voice/:token/:executionId', { exposeHeadRoute: false }, sharedAudio);
+  app.head('/media/share/voice/:token/:executionId', sharedAudio);
   app.get('/media/voice/:executionId', { exposeHeadRoute: false, preHandler: app.requireAuth }, ownerAudio);
   app.head('/media/voice/:executionId', { preHandler: app.requireAuth }, ownerAudio);
 

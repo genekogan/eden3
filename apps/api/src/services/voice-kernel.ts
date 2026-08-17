@@ -1401,6 +1401,63 @@ export class VoiceKernel {
     return await this.readVerifiedVoiceOutput(row);
   }
 
+  /** Revocable unlisted-share capability for one exact captured/live chat attachment. */
+  async sharedVoiceOutput(tokenHash: string, executionId: string): Promise<VoiceOutputBytes> {
+    if (!/^[0-9a-f]{64}$/.test(tokenHash)) {
+      throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');
+    }
+    const result = await this.dbc.execute(sql`
+      select v.* from voice_executions v
+      join sessions s on s.id=v.session_id and s.deleted=false and s.visible is distinct from false
+      join accounts session_owner on session_owner.id=s.owner_id and session_owner.deleted=false
+      where v.id=${executionId} and v.status='completed' and v.purpose='chat'
+        and not exists (
+          select 1 from account_erasure_jobs e where e.state<>'succeeded' and (
+            e.account_id=v.owner_account_id or exists (
+              select 1 from agents a where a.account_id=v.agent_account_id and a.owner_id=e.account_id
+            )
+          )
+        )
+        and exists (
+          select 1 from session_share_links sl
+          join accounts creator on creator.id=sl.created_by and creator.deleted=false
+          where sl.session_id=s.id and sl.token_hash=${tokenHash} and sl.revoked_at is null
+            and (
+              (
+                sl.mode='snapshot' and exists (
+                  select 1
+                  from jsonb_array_elements(
+                    case when jsonb_typeof(sl.snapshot_payload->'messages')='array'
+                      then sl.snapshot_payload->'messages' else '[]'::jsonb end
+                  ) shared_message
+                  cross join lateral jsonb_array_elements(
+                    case when jsonb_typeof(shared_message->'attachments')='array'
+                      then shared_message->'attachments' else '[]'::jsonb end
+                  ) shared_attachment
+                  where shared_message->>'id'=v.message_id::text
+                    and shared_message->>'role'='assistant'
+                    and shared_attachment->>'url'=v.output_url
+                )
+              )
+              or (
+                sl.mode='live' and exists (
+                  select 1 from messages m
+                  cross join lateral jsonb_array_elements(
+                    case when jsonb_typeof(m.attachments)='array' then m.attachments else '[]'::jsonb end
+                  ) item
+                  where m.id=v.message_id and m.session_id=v.session_id
+                    and m.role='assistant' and m.sender_id=v.agent_account_id
+                    and item->>'voiceExecutionId'=v.id::text and item->>'url'=v.output_url
+                )
+              )
+            )
+        )
+    `);
+    const row = rows<ExecutionRow>(result)[0];
+    if (!row) throw new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found');
+    return await this.readVerifiedVoiceOutput(row);
+  }
+
   /** Docker-private capability resolution; the route verifies the HMAC first. */
   async channelVoiceOutput(turnId: string, executionId: string, operationId: string): Promise<VoiceOutputBytes> {
     const result = await this.dbc.execute(sql`

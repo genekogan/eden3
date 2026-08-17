@@ -70,6 +70,7 @@ export function hashSessionShareToken(token: string): string {
 }
 
 const PRIVATE_OBJECT_PATH = /^\/media\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
+const PRIVATE_VOICE_PATH = /^\/media\/voice\/([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i;
 
 /**
  * Turn private lifecycle-object references into revocable, share-scoped media
@@ -87,9 +88,13 @@ function scopePrivateMediaUrls(
       messages: share.snapshot.messages.map((message) => ({
         ...message,
         attachments: message.attachments.map((attachment) => {
-          const match = PRIVATE_OBJECT_PATH.exec(attachment.url);
-          return match
-            ? { ...attachment, url: `/media/share/${scopedToken}/${match[1]}` }
+          const objectMatch = PRIVATE_OBJECT_PATH.exec(attachment.url);
+          if (objectMatch) {
+            return { ...attachment, url: `/media/share/${scopedToken}/${objectMatch[1]}` };
+          }
+          const voiceMatch = PRIVATE_VOICE_PATH.exec(attachment.url);
+          return voiceMatch
+            ? { ...attachment, url: `/media/share/voice/${scopedToken}/${voiceMatch[1]}` }
             : attachment;
         }),
       })),

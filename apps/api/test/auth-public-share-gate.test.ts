@@ -27,6 +27,8 @@ describe('closed-alpha public share gate seam', () => {
     app.post('/shares/:token', async () => ({ mutated: true }));
     app.get('/media/share/:token/:objectId', { exposeHeadRoute: false }, async () => ({ media: true }));
     app.head('/media/share/:token/:objectId', async (_request, reply) => reply.send());
+    app.get('/media/share/voice/:token/:executionId', { exposeHeadRoute: false }, async () => ({ voice: true }));
+    app.head('/media/share/voice/:token/:executionId', async (_request, reply) => reply.send());
     app.get('/media/voice/:executionId', { preHandler: app.requireAuth }, async () => ({ media: true }));
     return app;
   }
@@ -41,6 +43,19 @@ describe('closed-alpha public share gate seam', () => {
       });
       expect(response.statusCode).toBe(200);
       if (method === 'GET') expect(response.json()).toEqual({ public: true });
+    },
+  );
+
+  it.each(['GET', 'HEAD'] as const)(
+    'allows anonymous %s of an exact share-scoped voice capability',
+    async (method) => {
+      const app = await setup();
+      const response = await app.inject({
+        method,
+        url: `/media/share/voice/${'x'.repeat(32)}/00000000-0000-4000-8000-000000000001`,
+      });
+      expect(response.statusCode).toBe(200);
+      if (method === 'GET') expect(response.json()).toEqual({ voice: true });
     },
   );
 
@@ -65,6 +80,8 @@ describe('closed-alpha public share gate seam', () => {
     ['GET', `/shares/${'x'.repeat(32)}/extra`],
     ['POST', `/media/share/${'x'.repeat(32)}/00000000-0000-4000-8000-000000000001`],
     ['GET', `/media/share/${'x'.repeat(32)}/not-a-uuid`],
+    ['POST', `/media/share/voice/${'x'.repeat(32)}/00000000-0000-4000-8000-000000000001`],
+    ['GET', `/media/share/voice/${'x'.repeat(32)}/not-a-uuid`],
     ['GET', '/media/voice/00000000-0000-4000-8000-000000000001'],
   ] as const)('keeps %s %s behind the gate', async (method, url) => {
     const app = await setup();

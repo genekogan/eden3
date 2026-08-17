@@ -1,9 +1,11 @@
+import { readFile } from 'node:fs/promises';
 import Fastify from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { EventsBus } from '../src/events-bus';
 import { voiceRoutes } from '../src/routes/voices';
-import type { VoiceKernel } from '../src/services/voice-kernel';
+import { hashSessionShareToken } from '../src/services/session-shares';
+import { VoiceKernelError, type VoiceKernel } from '../src/services/voice-kernel';
 
 const OWNER = '11111111-1111-4111-8111-111111111111';
 const CLIP_A = '22222222-2222-4222-8222-222222222222';
@@ -90,6 +92,7 @@ async function harness() {
     revokeClone: vi.fn(async () => clone),
     deleteClone: vi.fn(async () => clone),
     ownerVoiceOutput: vi.fn(async () => ({ bytes: Buffer.from('0123456789'), mime: 'audio/mpeg', sizeBytes: 10, sha256: 'c'.repeat(64) })),
+    sharedVoiceOutput: vi.fn(async () => ({ bytes: Buffer.from('0123456789'), mime: 'audio/mpeg', sizeBytes: 10, sha256: 'c'.repeat(64) })),
     channelVoiceOutput: vi.fn(async () => ({ bytes: Buffer.from('voice'), mime: 'audio/ogg', sizeBytes: 5, sha256: 'd'.repeat(64) })),
     channelVoiceNote: vi.fn(async () => ({
       ...execution,
@@ -112,6 +115,25 @@ afterEach(async () => {
 });
 
 describe('voice HTTP contract', () => {
+  it('binds shared voice bytes to one active snapshot or live attachment capability', async () => {
+    const source = await readFile(new URL('../src/services/voice-kernel.ts', import.meta.url), 'utf8');
+    const method = source.slice(
+      source.indexOf('async sharedVoiceOutput('),
+      source.indexOf('/** Docker-private capability resolution', source.indexOf('async sharedVoiceOutput(')),
+    );
+    for (const authority of [
+      "sl.session_id=s.id and sl.token_hash=${tokenHash} and sl.revoked_at is null",
+      "creator.id=sl.created_by and creator.deleted=false",
+      "sl.mode='snapshot'",
+      "sl.snapshot_payload->'messages'",
+      "shared_message->>'id'=v.message_id::text",
+      "shared_attachment->>'url'=v.output_url",
+      "sl.mode='live'",
+      "item->>'voiceExecutionId'=v.id::text and item->>'url'=v.output_url",
+      "e.account_id=v.owner_account_id",
+    ]) expect(method).toContain(authority);
+  });
+
   it('keeps the private catalog and nested assignment contract aligned with the web client', async () => {
     const { app, kernel } = await harness();
     expect((await app.inject({ method: 'GET', url: '/voices/catalog' })).statusCode).toBe(401);
@@ -237,6 +259,32 @@ describe('voice HTTP contract', () => {
     expect(head.statusCode).toBe(200);
     expect(head.headers['content-length']).toBe('10');
     expect(head.body).toBe('');
+  });
+
+  it('serves a voice attachment only through its exact revocable share token', async () => {
+    const { app, kernel, execution } = await harness();
+    const token = 'x'.repeat(43);
+    const url = `/media/share/voice/${token}/${execution.id}`;
+    const response = await app.inject({ method: 'GET', url, headers: { range: 'bytes=2-5' } });
+    expect(response.statusCode).toBe(206);
+    expect(response.body).toBe('2345');
+    expect(response.headers).toMatchObject({
+      'cache-control': 'private, no-store',
+      'cross-origin-resource-policy': 'same-origin',
+      'content-range': 'bytes 2-5/10',
+    });
+    expect(kernel.sharedVoiceOutput).toHaveBeenCalledWith(hashSessionShareToken(token), execution.id);
+
+    kernel.sharedVoiceOutput.mockRejectedValueOnce(
+      new VoiceKernelError(404, 'voice_output_not_found', 'Voice output not found'),
+    );
+    const revokedToken = 'r'.repeat(43);
+    const denied = await app.inject({
+      method: 'GET',
+      url: `/media/share/voice/${revokedToken}/${execution.id}`,
+    });
+    expect(denied.statusCode).toBe(404);
+    expect(denied.body).not.toContain(revokedToken);
   });
 
   it('mints one private channel capability and rejects tampering before byte lookup', async () => {

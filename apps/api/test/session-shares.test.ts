@@ -26,6 +26,7 @@ const MESSAGE_ONE = '00000000-0000-4000-8000-000000000011';
 const MESSAGE_TWO = '00000000-0000-4000-8000-000000000012';
 const MESSAGE_THREE = '00000000-0000-4000-8000-000000000013';
 const PRIVATE_OBJECT_ID = '00000000-0000-4000-8000-000000000021';
+const VOICE_EXECUTION_ID = '00000000-0000-4000-8000-000000000022';
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -53,6 +54,12 @@ class MemoryShareRepository implements SessionShareRepository {
           {
             url: `/media/${PRIVATE_OBJECT_ID}`,
             mime: 'image/png',
+            width: null,
+            height: null,
+          },
+          {
+            url: `/media/voice/${VOICE_EXECUTION_ID}`,
+            mime: 'audio/mpeg',
             width: null,
             height: null,
           },
@@ -186,6 +193,7 @@ describe('session share service', () => {
       attachments: [
         { url: 'https://cdn.example.test/reference.png' },
         { url: `/media/share/${snapshot.token}/${PRIVATE_OBJECT_ID}` },
+        { url: `/media/share/voice/${snapshot.token}/${VOICE_EXECUTION_ID}` },
       ],
     });
     expect((await service.resolvePublic(live.token))?.snapshot.messages.at(-1)?.content).toBe(

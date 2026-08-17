@@ -212,6 +212,7 @@ const UUID_MEDIA_ROUTE =
   '/media/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
 const SHARE_MEDIA_ROUTE =
   '/media/share/:token/:objectId(^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$)';
+const SHARE_VOICE_ROUTE = '/media/share/voice/:token/:executionId';
 const VOICE_RUNTIME_MEDIA_ROUTE =
   '/media/runtime/voice/:turnId/:executionId/:operationId/:expires/:signature.ogg';
 
@@ -234,6 +235,7 @@ export const ROUTE_AUTH_INVENTORY: readonly RouteAuthManifestEntry[] = [
     [
       ['/shares/:token', ['GET', 'HEAD']],
       [SHARE_MEDIA_ROUTE, ['GET', 'HEAD']],
+      [SHARE_VOICE_ROUTE, ['GET', 'HEAD']],
     ],
   ),
   ...entries(
