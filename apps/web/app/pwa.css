@@ -15,19 +15,19 @@
   padding-inline: var(--eden-safe-left) var(--eden-safe-right);
 }
 
-.pwa-safe-area-shell > header {
+.pwa-safe-area-shell > [data-mobile-navigation-root] > header {
   inset-inline: var(--eden-safe-left) var(--eden-safe-right);
   top: var(--eden-safe-top);
 }
 
-.pwa-safe-area-shell > #mobile-navigation-sheet {
+.pwa-safe-area-shell > [data-mobile-navigation-root] > #mobile-navigation-sheet {
   inset-inline: var(--eden-safe-left) var(--eden-safe-right);
   top: calc(3.5rem + var(--eden-safe-top));
 }
 
 /* Primary phone navigation remains comfortably tappable without inflating the
  * compact desktop rail. 2.75rem is the platform-standard 44px minimum. */
-.pwa-safe-area-shell > #mobile-navigation-sheet :is(a, button, select) {
+.pwa-safe-area-shell > [data-mobile-navigation-root] > #mobile-navigation-sheet :is(a, button, select) {
   min-height: 2.75rem;
 }
 

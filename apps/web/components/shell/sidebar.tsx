@@ -15,7 +15,7 @@
 import Link from "next/link";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import type { StudioTool } from "@/lib/types";
 import { getLastAgent } from "@/lib/last-agent";
@@ -86,6 +86,9 @@ const AGENT_NAV = [
   { sub: "log", label: "Log", icon: ICONS.log },
   { sub: "settings", label: "Settings", icon: ICONS.settings },
 ] as const;
+
+const MOBILE_DIALOG_FOCUSABLE =
+  'a[href], button:not([disabled]), select:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 const CATEGORY_ICON: Record<StudioCategory, string> = {
   image: ICONS.image,
@@ -316,6 +319,7 @@ export function Sidebar() {
   const { username } = useSelectedAgent();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [desktopCollapsed, setDesktopCollapsed] = useState(false);
+  const mobileNavigationButtonRef = useRef<HTMLButtonElement>(null);
   const domain = domainFromPathname(pathname);
 
   useEffect(() => {
@@ -358,8 +362,43 @@ export function Sidebar() {
 
   return (
     <>
-      {/* Phones get the full viewport: navigation lives in a top bar + sheet. */}
-      <header className="fixed inset-x-0 top-0 z-50 flex h-14 items-center justify-between border-b border-edge bg-surface/95 px-3 backdrop-blur sm:hidden">
+      {/* Phones get one modal region containing both the top bar and sheet. */}
+      <div
+        data-mobile-navigation-root
+        role={mobileOpen ? "dialog" : undefined}
+        aria-modal={mobileOpen ? true : undefined}
+        aria-label={mobileOpen ? "Navigation" : undefined}
+        className={mobileOpen ? "fixed inset-0 z-40 sm:hidden" : "contents sm:hidden"}
+        onKeyDown={(event) => {
+          if (!mobileOpen) return;
+          if (event.key === "Tab") {
+            const focusable = Array.from(
+              event.currentTarget.querySelectorAll<HTMLElement>(MOBILE_DIALOG_FOCUSABLE),
+            ).filter((element) => element.getClientRects().length > 0 && element.getAttribute("aria-hidden") !== "true");
+            const first = focusable[0];
+            const last = focusable[focusable.length - 1];
+            if (!first || !last) {
+              event.preventDefault();
+              mobileNavigationButtonRef.current?.focus();
+              return;
+            }
+            const active = document.activeElement;
+            if (event.shiftKey && (active === first || !event.currentTarget.contains(active))) {
+              event.preventDefault();
+              last.focus();
+            } else if (!event.shiftKey && (active === last || !event.currentTarget.contains(active))) {
+              event.preventDefault();
+              first.focus();
+            }
+          }
+          if (event.key === "Escape") {
+            event.preventDefault();
+            setMobileOpen(false);
+            window.requestAnimationFrame(() => mobileNavigationButtonRef.current?.focus());
+          }
+        }}
+      >
+        <header className="fixed inset-x-0 top-0 z-50 flex h-14 items-center justify-between border-b border-edge bg-surface/95 px-3 backdrop-blur sm:hidden">
         <Link
           href="/"
           aria-label="Eden home"
@@ -376,6 +415,7 @@ export function Sidebar() {
             <NavIcon d={ICONS.chats} />
           </Link>
           <button
+            ref={mobileNavigationButtonRef}
             type="button"
             aria-label={mobileOpen ? "Close navigation" : "Open navigation"}
             aria-expanded={mobileOpen}
@@ -402,30 +442,28 @@ export function Sidebar() {
             </span>
           </button>
         </div>
-      </header>
+        </header>
 
-      {mobileOpen ? (
-        <div
-          id="mobile-navigation-sheet"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Navigation"
-          className="fixed inset-x-0 bottom-0 top-14 z-40 overflow-y-auto bg-background/98 px-3 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-4 backdrop-blur sm:hidden"
-        >
-          <DomainToggle domain={domain} agentsHref={agentsHref} labels="always" />
-          {domain === "agents" ? (
-            <div className="mt-3">
-              <AgentSelector />
-              <AgentNav labels="always" onNavigate={() => setMobileOpen(false)} />
+        {mobileOpen ? (
+          <div
+            id="mobile-navigation-sheet"
+            className="fixed inset-x-0 bottom-0 top-14 z-40 overflow-y-auto bg-background/98 px-3 pb-[calc(1rem+env(safe-area-inset-bottom))] pt-4 backdrop-blur sm:hidden"
+          >
+            <DomainToggle domain={domain} agentsHref={agentsHref} labels="always" />
+            {domain === "agents" ? (
+              <div className="mt-3">
+                <AgentSelector />
+                <AgentNav labels="always" onNavigate={() => setMobileOpen(false)} />
+              </div>
+            ) : (
+              <StudioNav labels="always" onNavigate={() => setMobileOpen(false)} />
+            )}
+            <div className="mt-4 rounded-xl border border-edge bg-surface">
+              <UserArea />
             </div>
-          ) : (
-            <StudioNav labels="always" onNavigate={() => setMobileOpen(false)} />
-          )}
-          <div className="mt-4 rounded-xl border border-edge bg-surface">
-            <UserArea />
           </div>
-        </div>
-      ) : null}
+        ) : null}
+      </div>
 
       {/* Tablet/desktop rail; labels return at lg+. */}
       <aside

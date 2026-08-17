@@ -103,6 +103,17 @@ describe("PWA manifest", () => {
     expect(sidebar.match(/size-11/g)?.length).toBeGreaterThanOrEqual(2);
     expect(pwaCss).toContain("#mobile-navigation-sheet :is(a, button, select)");
     expect(pwaCss).toContain("min-height: 2.75rem");
+    expect(sidebar).toContain('role={mobileOpen ? "dialog" : undefined}');
+    expect(sidebar).toContain('aria-modal={mobileOpen ? true : undefined}');
+    expect(sidebar).toContain('if (event.key === "Escape")');
+    expect(sidebar).toContain('if (event.key === "Tab")');
+    expect(sidebar).toContain('querySelectorAll<HTMLElement>(MOBILE_DIALOG_FOCUSABLE)');
+    expect(sidebar).toContain('mobileNavigationButtonRef.current?.focus()');
+    expect(sidebar).toContain('data-mobile-navigation-root');
+    expect(sidebar).not.toMatch(/id="mobile-navigation-sheet"\s+role="dialog"/);
+    expect(pwaCss).toContain('.pwa-safe-area-shell > [data-mobile-navigation-root] > header');
+    expect(pwaCss).toContain('.pwa-safe-area-shell > [data-mobile-navigation-root] > #mobile-navigation-sheet');
+    expect(pwaCss).not.toContain('.pwa-safe-area-shell > #mobile-navigation-sheet');
   });
 });
 
