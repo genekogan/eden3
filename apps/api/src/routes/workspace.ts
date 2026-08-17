@@ -20,6 +20,8 @@ import {
   sha256Hex,
   workspaceDownloadMime,
   writeWorkspaceFile,
+  type WorkspaceFileContent,
+  type WorkspaceWriteResult,
 } from '../services/workspace-files';
 import {
   AGENT_RUNTIME_SYNC_LOCK_SEED,
@@ -183,7 +185,21 @@ export async function appendWorkspaceArchiveFiles(
   await archive.finalize();
 }
 
-export const workspaceRoutes: FastifyPluginAsync = async (app) => {
+export interface WorkspaceRoutesOptions {
+  /** Narrow DB-backed SOUL projection for provider-free review; production remains file-backed. */
+  soulStore?: {
+    read(params: { root: string; persona: string | null; revision: number }): Promise<WorkspaceFileContent>;
+    write(params: {
+      root: string;
+      persona: string | null;
+      revision: number;
+      content: string;
+      baseSha256: string;
+    }): Promise<WorkspaceWriteResult>;
+  };
+}
+
+export const workspaceRoutes: FastifyPluginAsync<WorkspaceRoutesOptions> = async (app, opts) => {
   // ---- GET /agents/:username/workspace — recursive tree --------------------
   app.get('/:username/workspace', { preHandler: app.requireAuth }, async (req) => {
     const { username } = usernameParamsSchema.parse(req.params);
@@ -197,14 +213,18 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
     const { username } = usernameParamsSchema.parse(req.params);
     const { path: filePath } = filePathQuerySchema.parse(req.query);
     const { account, root } = await resolveManagedWorkspace(req, username);
-    const file = await readWorkspaceFile(root, filePath);
+    const canonicalPath = resolveWorkspacePath(root, filePath).rel;
+    const row = canonicalPath === SOUL_WORKSPACE_FILE ? await readDoctrineRevision(account.id) : null;
+    const file = row && opts.soulStore
+      ? await opts.soulStore.read({ root, persona: row.persona, revision: row.runtime_sync_version })
+      : await readWorkspaceFile(root, canonicalPath);
     if (file.kind !== 'text' || file.path !== SOUL_WORKSPACE_FILE) return { file };
 
     // The revision is DB-authoritative and the hash is file-authoritative. A
     // runtime/file write that crosses this read may conservatively surface a
     // conflict; it can never be mislabeled as synced unless the exact bytes
     // equal the persisted persona.
-    return { file: doctrineFileMetadata(file, await readDoctrineRevision(account.id)) };
+    return { file: doctrineFileMetadata(file, row ?? await readDoctrineRevision(account.id)) };
   });
 
   // ---- GET /agents/:username/workspace/download — raw bytes ----------------
@@ -353,7 +373,9 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
         if (!current) throw new ApiError(404, 'agent_not_found', 'Agent no longer exists');
 
         if (current.runtime_sync_version !== body.baseRevision) {
-          const file = await readWorkspaceFile(root, canonicalPath);
+          const file = opts.soulStore
+            ? await opts.soulStore.read({ root, persona: current.persona, revision: current.runtime_sync_version })
+            : await readWorkspaceFile(root, canonicalPath);
           return {
             ok: false as const,
             currentSha256: file.kind === 'text' ? file.sha256 : null,
@@ -362,12 +384,20 @@ export const workspaceRoutes: FastifyPluginAsync = async (app) => {
           };
         }
 
-        const result = await writeWorkspaceFile({
-          root,
-          path: canonicalPath,
-          content: body.content,
-          baseSha256: body.baseSha256,
-        });
+        const result = opts.soulStore
+          ? await opts.soulStore.write({
+              root,
+              persona: current.persona,
+              revision: current.runtime_sync_version,
+              content: body.content,
+              baseSha256: body.baseSha256,
+            })
+          : await writeWorkspaceFile({
+              root,
+              path: canonicalPath,
+              content: body.content,
+              baseSha256: body.baseSha256,
+            });
         if (!result.ok) {
           return {
             ...result,

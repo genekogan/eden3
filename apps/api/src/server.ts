@@ -99,6 +99,7 @@ import { studioRoutes } from './routes/studio';
 import { triggersRoutes } from './routes/triggers';
 import { usageRoutes } from './routes/usage';
 import { workspaceRoutes } from './routes/workspace';
+import type { WorkspaceRoutesOptions } from './routes/workspace';
 import { uploadsRoutes } from './routes/uploads';
 import { transcriptionsRoutes } from './routes/transcriptions';
 import { voiceRoutes, type VoiceRoutesOptions } from './routes/voices';
@@ -204,6 +205,8 @@ export interface BuildServerOptions {
   };
   shares?: { repository: SessionShareRepository };
   notifications?: NotificationsRoutesOptions;
+  /** Narrow DB-backed SOUL projection for isolated provider-free review. */
+  workspace?: WorkspaceRoutesOptions;
   accountErasure?: AccountErasureRuntimeBundle;
   /** Deterministic DB-free startup seams; production always uses the defaults. */
   bootstrap?: {
@@ -913,7 +916,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   // Concepts share the /agents path root (/agents/:username/concepts/*).
   await app.register(conceptsRoutes, { prefix: '/agents' });
   // Owner-only workspace file browser (tree/read/download/export/save).
-  await app.register(workspaceRoutes, { prefix: '/agents' });
+  await app.register(workspaceRoutes, { prefix: '/agents', ...(opts.workspace ?? {}) });
   await app.register(skillsRoutes);
   await app.register(creationsRoutes, { prefix: '/creations' });
   await app.register(feedRoutes, { prefix: '/feed' });

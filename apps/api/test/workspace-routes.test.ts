@@ -43,11 +43,13 @@ const agentBare = `${marker}_bare`; // public, NOT provisioned
 const agentVoid = `${marker}_void`; // provisioned but workspace dir never created
 const agentBig = `${marker}_big`; // workspace with >2000 entries
 const agentRace = `${marker}_race`; // canonical workspace for projector/save race
+const agentProjection = `${marker}_projection`; // DB-backed review SOUL projection
 
 let parentDir = ''; // holds the workspaces + an outside file (escape target)
 let wsFiles = '';
 let wsNeighbor = '';
 let wsRace = '';
+let wsProjection = '';
 
 const NOTES_CONTENT = '# Notes\nhello world\n';
 const notesSha = createHash('sha256').update(NOTES_CONTENT).digest('hex');
@@ -104,6 +106,7 @@ beforeAll(async () => {
   wsNeighbor = path.join(parentDir, 'workspace-neighbor-agent');
   const wsBig = path.join(parentDir, 'workspace-big-agent');
   wsRace = path.join(parentDir, `workspace-${agentRace}`);
+  wsProjection = path.join(parentDir, `workspace-${agentProjection}`);
 
   // Populated workspace: visible files, hidden/internal names, binaries,
   // and symlinks that try to escape the jail.
@@ -142,6 +145,7 @@ beforeAll(async () => {
   await writeFile(path.join(wsFiles, 'MEMORY.md'), '');
   await writeFile(path.join(wsFiles, 'HEARTBEAT.md'), '');
   await mkdir(wsRace, { recursive: true });
+  await mkdir(wsProjection, { recursive: true });
   for (const file of [
     'SOUL.md',
     'IDENTITY.md',
@@ -152,6 +156,7 @@ beforeAll(async () => {
     'HEARTBEAT.md',
   ]) {
     await writeFile(path.join(wsRace, file), await readFile(path.join(wsFiles, file)));
+    await writeFile(path.join(wsProjection, file), await readFile(path.join(wsFiles, file)));
   }
   await writeFile(path.join(wsFiles, 'art', 'plan.md'), 'make art\n');
   await writeFile(path.join(wsFiles, 'memory', 'users', 'alice.md'), '# alice\n');
@@ -224,6 +229,15 @@ beforeAll(async () => {
     public: true,
     openclawId: agentRace,
     workspacePath: wsRace,
+    provisionStatus: 'ready',
+  });
+  await insertAgentAccount(agentProjection, {
+    ownerId,
+    name: 'Projection Agent',
+    persona: 'You are the Files Agent.',
+    public: true,
+    openclawId: agentProjection,
+    workspacePath: wsProjection,
     provisionStatus: 'ready',
   });
 
@@ -664,6 +678,92 @@ describe('PUT /agents/:username/workspace/file', () => {
       payload: { path: 'notes.md', content: 'x', baseSha256: 'not-a-sha' },
     });
     expect(res.statusCode).toBe(400);
+  });
+
+  it('composes the DB-backed review SOUL store without mutating workspace files', async () => {
+    const readCalls: Array<{ root: string; persona: string | null; revision: number }> = [];
+    const writeCalls: Array<{
+      root: string; persona: string | null; revision: number; content: string; baseSha256: string;
+    }> = [];
+    const project = (content: string, revision: number) => ({
+      path: 'SOUL.md' as const,
+      kind: 'text' as const,
+      content,
+      sizeBytes: Buffer.byteLength(content),
+      mtime: new Date(revision).toISOString(),
+      sha256: createHash('sha256').update(content).digest('hex'),
+    });
+    const projectedApp = await buildServer({
+      gateway: null,
+      provisioning: {
+        provisioner: makeFakeProvisioner(),
+        cronSync: makeFakeCronSync(),
+        skillSync: makeFakeSkillSync(),
+        toolSync: makeFakeToolSync(),
+      },
+      workspace: { soulStore: {
+        async read(params) {
+          readCalls.push({ ...params });
+          return project(params.persona ?? '', params.revision);
+        },
+        async write(params) {
+          writeCalls.push({ ...params });
+          const current = project(params.persona ?? '', params.revision);
+          if (params.baseSha256 !== current.sha256) {
+            return { ok: false as const, currentSha256: current.sha256, currentMtime: current.mtime };
+          }
+          const next = project(params.content, params.revision + 1);
+          return { ok: true as const, file: {
+            path: next.path, kind: next.kind, sizeBytes: next.sizeBytes,
+            mtime: next.mtime, sha256: next.sha256,
+          } };
+        },
+      } },
+    });
+    try {
+      await projectedApp.ready();
+      const physicalBefore = await readFile(path.join(wsProjection, 'SOUL.md'), 'utf8');
+      const loaded = (
+        (
+          await projectedApp.inject({ method: 'GET', url: fileUrl(agentProjection, 'SOUL.md'), headers: asOwner })
+        ).json() as TextFileBody
+      ).file;
+      expect(readCalls).toEqual([{ root: wsProjection, persona: 'You are the Files Agent.', revision: 0 }]);
+      expect(loaded).toMatchObject({
+        content: 'You are the Files Agent.',
+        doctrineRevision: 0,
+        doctrineSyncState: 'synced',
+        sha256: createHash('sha256').update('You are the Files Agent.').digest('hex'),
+      });
+
+      const revised = 'You are the Projection Agent, with explicit synthetic review boundaries.';
+      const saved = await projectedApp.inject({
+        method: 'PUT',
+        url: `${treeUrl(agentProjection)}/file`,
+        headers: asOwner,
+        payload: {
+          path: 'SOUL.md', content: revised,
+          baseSha256: loaded.sha256, baseRevision: loaded.doctrineRevision,
+        },
+      });
+      expect(saved.statusCode).toBe(200);
+      expect(writeCalls).toEqual([{
+        root: wsProjection,
+        persona: 'You are the Files Agent.',
+        revision: 0,
+        content: revised,
+        baseSha256: loaded.sha256,
+      }]);
+      expect(await readFile(path.join(wsProjection, 'SOUL.md'), 'utf8')).toBe(physicalBefore);
+      const [row] = await pg<{ persona: string | null; runtime_sync_version: number }[]>`
+        select g.persona, g.runtime_sync_version
+        from agents g join accounts a on a.id = g.account_id
+        where a.username = ${agentProjection}
+      `;
+      expect(row).toEqual({ persona: revised, runtime_sync_version: 1 });
+    } finally {
+      await projectedApp.close();
+    }
   });
 
   it('mirrors a SOUL.md save back into agents.persona (single source of truth)', async () => {
