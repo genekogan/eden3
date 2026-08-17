@@ -43,6 +43,13 @@ describe('closed runtime attestation inputs', () => {
       integrationHead: valid.EDEN3_E2E_INTEGRATION_HEAD,
       nonce: valid.EDEN3_E2E_RUNTIME_NONCE,
     });
+    expect(runtimeAttestationFromEnvironment({
+      ...valid,
+      DATABASE_URL: 'postgres://eden3_review_runtime:private@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdef',
+    })).toEqual({
+      integrationHead: valid.EDEN3_E2E_INTEGRATION_HEAD,
+      nonce: valid.EDEN3_E2E_RUNTIME_NONCE,
+    });
   });
 
   it('rejects partial, malformed, production, and canonical DB inputs', () => {
@@ -76,6 +83,16 @@ describe('closed runtime attestation inputs', () => {
       'postgres://eden3@127.0.0.1:5432/eden3_voice_e2e_0123456789abcdef',
       'postgres://eden3@127.0.0.1:5433/eden3_voice_e2e_0123456789abcdeg',
       'postgres://eden3@127.0.0.1:5433/eden3_voice_e2e_0123456789abcdef?sslmode=disable',
+      'postgres://eden3_review_runtime:private@127.0.0.1:5432/eden3_runtime_e2e_review_0123456789abcdef',
+      'postgres://eden3_review_runtime:private@127.0.0.1:5433/eden3_runtime_e2e_review_0123456789abcdef',
+      'postgres://eden3_review_runtime@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdef',
+      'postgres://eden3_review_admin:private@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdef',
+      'postgres://eden3_review_runtime:private@localhost:54730/eden3_runtime_e2e_review_0123456789abcdef',
+      'postgres://eden3_review_runtime:private@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdeg',
+      'postgres://eden3_review_runtime:private@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdef?sslmode=disable',
+      'postgres://eden3_review_runtime:private@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdef?',
+      'postgres://eden3_review_runtime:private@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdef#',
+      'postgres://eden3_review_runtime:private@127.0.0.1:54730/eden3_runtime_e2e_review_0123456789abcdef#fragment',
     ]) {
       expect(() => runtimeAttestationFromEnvironment({
         ...valid,

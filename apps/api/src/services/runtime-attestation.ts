@@ -17,6 +17,18 @@ function isClosedLoadHarnessDatabase(raw: string, databaseName: string | null): 
   return Number.isSafeInteger(port) && port >= 1024 && port <= 65_535 && port !== 5432 && port !== 5433;
 }
 
+function isClosedReviewDatabase(raw: string, databaseName: string | null): boolean {
+  if (databaseName === null || !/^eden3_runtime_e2e_review_[a-f0-9]{16}$/.test(databaseName) ||
+      raw.includes('?') || raw.includes('#')) return false;
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { return false; }
+  const port = Number(parsed.port);
+  return (parsed.protocol === 'postgres:' || parsed.protocol === 'postgresql:') &&
+    parsed.hostname === '127.0.0.1' && Number.isSafeInteger(port) && port >= 1024 && port <= 65_535 &&
+    port !== 5432 && port !== 5433 && parsed.username === 'eden3_review_runtime' && parsed.password !== '' &&
+    parsed.pathname === `/${databaseName}` && parsed.search === '' && parsed.hash === '';
+}
+
 /** Closed-harness attestation; never enabled by one input or a canonical DB. */
 export function runtimeAttestationFromEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
@@ -36,9 +48,10 @@ export function runtimeAttestationFromEnvironment(
     hasLiteralPostgresEndpoint(databaseUrl, '[::1]', 5433);
   const isClosedHarnessDatabase = databaseName !== null && (
     (/^eden3_channel_client_[a-z0-9_]{8,48}$/.test(databaseName) && isLiteralIpv4) ||
-    (/^eden3_runtime_e2e_[a-z0-9][a-z0-9_]{7,80}$/.test(databaseName) && isGate3Loopback) ||
+    (/^eden3_runtime_e2e_(?!review_)[a-z0-9][a-z0-9_]{7,80}$/.test(databaseName) && isGate3Loopback) ||
     (/^eden3_voice_e2e_[a-f0-9]{16}$/.test(databaseName) && isLiteralIpv4) ||
-    isClosedLoadHarnessDatabase(databaseUrl, databaseName)
+    isClosedLoadHarnessDatabase(databaseUrl, databaseName) ||
+    isClosedReviewDatabase(databaseUrl, databaseName)
   );
   if (
     environment.NODE_ENV === 'production' ||
