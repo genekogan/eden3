@@ -13,6 +13,10 @@ class EdenPcmRecorderProcessor extends AudioWorkletProcessor {
     // requests during a long dictation. The backend can replay the bytes to
     // its provider adapter in smaller realtime frames.
     this.outputChunkSamples = 16000;
+    // The transcription API accepts only complete 10 ms PCM frames. Regular
+    // one-second emissions are already aligned; the final flush usually is
+    // not, so pad only that tail with silence instead of dropping speech.
+    this.frameSamples = 160;
     this.port.onmessage = (event) => {
       if (event.data === "flush") {
         this.emit(true);
@@ -29,6 +33,12 @@ class EdenPcmRecorderProcessor extends AudioWorkletProcessor {
 
   emit(force) {
     if (this.output.length === 0 || (!force && this.output.length < this.outputChunkSamples)) return;
+    if (force) {
+      const remainder = this.output.length % this.frameSamples;
+      if (remainder !== 0) {
+        this.output.push(...new Array(this.frameSamples - remainder).fill(0));
+      }
+    }
     const samples = new Int16Array(this.output);
     this.output = [];
     this.port.postMessage({ type: "chunk", samples: samples.buffer }, [samples.buffer]);

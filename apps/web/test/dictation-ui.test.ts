@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { IDBFactory } from "fake-indexeddb";
 
@@ -37,6 +38,34 @@ const workletSource = readFileSync(
   new URL("../public/audio/pcm-recorder-worklet.js", import.meta.url),
   "utf8",
 );
+
+function loadRecorderProcessor(): new () => {
+  output: number[];
+  frameSamples: number;
+  port: { postMessage: (message: unknown) => void };
+  emit(force: boolean): void;
+} {
+  let processor: unknown;
+  class AudioWorkletProcessor {
+    port = {
+      onmessage: null,
+      postMessage: () => undefined,
+    };
+  }
+  runInNewContext(workletSource, {
+    AudioWorkletProcessor,
+    Int16Array,
+    ArrayBuffer,
+    sampleRate: 48_000,
+    registerProcessor: (_name: string, value: unknown) => { processor = value; },
+  });
+  return processor as new () => {
+    output: number[];
+    frameSamples: number;
+    port: { postMessage: (message: unknown) => void };
+    emit(force: boolean): void;
+  };
+}
 
 async function composerRows(indexedDB: IDBFactory): Promise<Array<Record<string, unknown>>> {
   return new Promise((resolve, reject) => {
@@ -81,6 +110,28 @@ describe("dictation UI helpers", () => {
   it("batches 16 kHz PCM into one-second durable upload chunks", () => {
     expect(PCM_UPLOAD_CHUNK_SAMPLES).toBe(16_000);
     expect(workletSource).toContain("this.outputChunkSamples = 16000");
+  });
+
+  it("pads only the final PCM tail to a complete 10 ms frame", () => {
+    const RecorderProcessor = loadRecorderProcessor();
+    const recorder = new RecorderProcessor();
+    const emitted: ArrayBuffer[] = [];
+    recorder.port.postMessage = (message) => {
+      const value = message as { type?: string; samples?: ArrayBuffer };
+      if (value.type === "chunk" && value.samples) emitted.push(value.samples);
+    };
+
+    recorder.output = new Array(16_000).fill(7);
+    recorder.emit(false);
+    expect(emitted[0]?.byteLength).toBe(32_000);
+
+    recorder.output = new Array(161).fill(9);
+    recorder.emit(true);
+    expect(recorder.frameSamples).toBe(160);
+    expect(emitted[1]?.byteLength).toBe(640);
+    const finalSamples = new Int16Array(emitted[1]!);
+    expect([...finalSamples.slice(0, 161)]).toEqual(new Array(161).fill(9));
+    expect([...finalSamples.slice(161)]).toEqual(new Array(159).fill(0));
   });
 
   it("waits through a full ten-minute realtime replay without hammering status", () => {
