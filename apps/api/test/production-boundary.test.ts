@@ -8,7 +8,7 @@ const closedCohort = {
   AUTH_PROVIDER: 'clerk' as const,
   CLERK_JWT_KEY: 'configured-clerk-instance-public-key',
   EDEN3_DEV_ROUTES: false,
-  ACCESS_ALLOWLIST: ['gene'],
+  ACCESS_ALLOWLIST: ['alex'],
 };
 
 describe('production service boundary', () => {

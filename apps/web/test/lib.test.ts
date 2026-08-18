@@ -555,7 +555,7 @@ describe("lib/api browser transport", () => {
         JSON.stringify({
           user: {
             id: "acct-1",
-            username: "gene",
+            username: "alex",
             type: "user",
             userImage: null,
             isAdmin: true,
@@ -570,7 +570,7 @@ describe("lib/api browser transport", () => {
     await expect(api.auth.me()).resolves.toEqual({
       user: {
         id: "acct-1",
-        username: "gene",
+        username: "alex",
         type: "user",
         userImage: null,
         isAdmin: true,

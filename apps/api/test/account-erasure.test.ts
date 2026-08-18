@@ -98,20 +98,20 @@ function sink(): AccountErasureLedgerSink {
 function request(overrides: Partial<Parameters<typeof requestAccountErasure>[0]> = {}) {
   return {
     actorAccountId: ACTOR_ID,
-    actorUsername: 'Gene',
+    actorUsername: 'Alex',
     actorIsAdmin: false,
-    confirmUsername: 'gene',
+    confirmUsername: 'alex',
     ...overrides,
   };
 }
 
 describe('account erasure admission and ledger ordering', () => {
   it('accepts only an explicit current-username confirmation and no target selector', () => {
-    expect(accountErasureRequestSchema.parse({ confirmUsername: 'gene' })).toEqual({
-      confirmUsername: 'gene',
+    expect(accountErasureRequestSchema.parse({ confirmUsername: 'alex' })).toEqual({
+      confirmUsername: 'alex',
     });
     expect(() =>
-      accountErasureRequestSchema.parse({ confirmUsername: 'gene', accountId: JOB_ID }),
+      accountErasureRequestSchema.parse({ confirmUsername: 'alex', accountId: JOB_ID }),
     ).toThrow();
     expect(() => accountErasureRequestSchema.parse({})).toThrow();
   });
@@ -175,7 +175,7 @@ describe('account erasure admission and ledger ordering', () => {
     ]);
     expect(repository.acceptIntent).toHaveBeenCalledWith({
       accountId: ACTOR_ID,
-      confirmUsername: 'gene',
+      confirmUsername: 'alex',
     });
     expect(ledger.writeAndConfirm).toHaveBeenCalledWith({
       schemaVersion: ACCOUNT_ERASURE_LEDGER_SCHEMA_VERSION,
@@ -408,7 +408,7 @@ describe('account erasure admission and ledger ordering', () => {
     const ledger = sink();
     const recovery = manifestSink();
     await expect(
-      requestAccountErasure(request({ confirmUsername: 'not-gene' }), repository, ledger, recovery),
+      requestAccountErasure(request({ confirmUsername: 'not-alex' }), repository, ledger, recovery),
     ).rejects.toMatchObject({
       statusCode: 400,
       code: 'confirmation_mismatch',

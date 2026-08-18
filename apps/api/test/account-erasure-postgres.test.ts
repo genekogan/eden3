@@ -242,7 +242,7 @@ describe('PostgresAccountErasureStore transaction boundary', () => {
       .rejects.toMatchObject({ code: 'erasure_stripe_identity_conflict' });
   });
   it('calls account_erasure_begin_operation as statement one before every admission row lock', async () => {
-    const { client, statements } = fakeClient({ username: 'gene', type: 'user', deleted: false });
+    const { client, statements } = fakeClient({ username: 'alex', type: 'user', deleted: false });
     const databaseBoundary = await boundary(client);
     statements.length = 0;
     const store = new PostgresAccountErasureStore({
@@ -250,7 +250,7 @@ describe('PostgresAccountErasureStore transaction boundary', () => {
       reconciler: { reconcile: async () => undefined },
     });
 
-    await expect(store.acceptIntent({ accountId: ACCOUNT_ID, confirmUsername: 'Gene' }))
+    await expect(store.acceptIntent({ accountId: ACCOUNT_ID, confirmUsername: 'Alex' }))
       .resolves.toMatchObject({ accountId: ACCOUNT_ID, state: 'intent_pending' });
     expect(statements[0]).toBe('select account_erasure_begin_operation()');
     expect(statements.findIndex((statement) => statement.includes('for update'))).toBeGreaterThan(0);
@@ -260,12 +260,12 @@ describe('PostgresAccountErasureStore transaction boundary', () => {
   });
 
   it('converges a duplicate request on the one active intent', async () => {
-    const { client } = fakeClient({ username: 'gene', type: 'user', deleted: false }, true);
+    const { client } = fakeClient({ username: 'alex', type: 'user', deleted: false }, true);
     const store = new PostgresAccountErasureStore({
       databaseBoundary: await boundary(client),
       reconciler: { reconcile: async () => undefined },
     });
-    await expect(store.acceptIntent({ accountId: ACCOUNT_ID, confirmUsername: 'gene' }))
+    await expect(store.acceptIntent({ accountId: ACCOUNT_ID, confirmUsername: 'alex' }))
       .resolves.toEqual({
         jobId: JOB_ID,
         accountId: ACCOUNT_ID,
@@ -276,8 +276,8 @@ describe('PostgresAccountErasureStore transaction boundary', () => {
 
   it.each([
     [{ username: 'eve', type: 'user', deleted: false }, 'protected_account'],
-    [{ username: 'gene', type: 'agent', deleted: false }, 'account_not_found'],
-    [{ username: 'gene', type: 'user', deleted: true }, 'account_not_found'],
+    [{ username: 'alex', type: 'agent', deleted: false }, 'account_not_found'],
+    [{ username: 'alex', type: 'user', deleted: true }, 'account_not_found'],
   ] as const)('refuses protected/non-user/deleted principals under lock', async (account, code) => {
     const { client, statements } = fakeClient(account);
     const store = new PostgresAccountErasureStore({
@@ -306,7 +306,7 @@ describe('PostgresAccountErasureStore transaction boundary', () => {
   });
 
   it('refuses construction without an attested dedicated operator boundary', () => {
-    const { client } = fakeClient({ username: 'gene', type: 'user', deleted: false });
+    const { client } = fakeClient({ username: 'alex', type: 'user', deleted: false });
     expect(() => new PostgresAccountErasureStore({ client } as never)).toThrow(
       'requires an attested dedicated PostgreSQL operator boundary',
     );

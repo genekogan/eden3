@@ -55,7 +55,7 @@ describe("authenticated help surface", () => {
 
     const zero = renderToStaticMarkup(
       <HelpSearch
-        agentAuthority={{ loadedUsername: "gene", phase: "ready", canManage: true }}
+        agentAuthority={{ loadedUsername: "alex", phase: "ready", canManage: true }}
         initialQuery="no-such-help-topic"
       />,
     );
@@ -146,7 +146,7 @@ describe("authenticated help surface", () => {
   it("renders semantic local search, safe actions, and contextual links", () => {
     const html = renderToStaticMarkup(
       <HelpSearch
-        agentAuthority={{ loadedUsername: "gene", phase: "ready", canManage: true }}
+        agentAuthority={{ loadedUsername: "alex", phase: "ready", canManage: true }}
       />,
     );
     expect(html).toContain('role="search"');
@@ -207,7 +207,6 @@ describe("authenticated help surface", () => {
     const sources = [
       readFileSync(resolve(REPO_ROOT, "apps/web/lib/help-content.ts"), "utf8"),
       readFileSync(resolve(REPO_ROOT, "apps/web/components/help/help-search.tsx"), "utf8"),
-      readFileSync(resolve(REPO_ROOT, "docs/help/FIRST-HOUR.md"), "utf8"),
     ].join("\n");
 
     expect(sources).not.toMatch(/fetch\(|api\.|console\.|localStorage|sessionStorage/);

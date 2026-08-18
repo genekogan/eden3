@@ -12,8 +12,8 @@ import { PCM_UPLOAD_CHUNK_SAMPLES } from "../lib/pcm-recorder";
 import {
   DICTATION_DRAFT_TTL_MS,
   DICTATION_DB_NAME,
-  DICTATION_COMPOSER_DRAFTS_KEY,
-  DICTATION_CUSTODY_EPOCH_KEY,
+  DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE,
+  DICTATION_CUSTODY_EPOCH_STORAGE_COORDINATE,
   DICTATION_SIGN_OUT_PURGE_DEADLINE_MS,
   beginDictationPurgeFence,
   commitDictationTranscriptToComposer,
@@ -148,10 +148,10 @@ describe("dictation UI helpers", () => {
       setItem: (key, value) => { values.set(key, value); },
       removeItem: (key) => { values.delete(key); },
     };
-    values.set(DICTATION_COMPOSER_DRAFTS_KEY, "legacy private transcript");
-    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(true);
+    values.set(DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE, "legacy private transcript");
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE)).toBe(true);
     expect(await purgeDictationDraftsBeforeSignOut(async () => undefined, 500, fenceStore)).toBe("purged");
-    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(false);
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE)).toBe(false);
     // Success intentionally remains fenced through the auth transition.
     const successfulEpoch = currentDictationPurgeFence(fenceStore)!;
     expect(successfulEpoch).toBeTruthy();
@@ -276,14 +276,14 @@ describe("dictation UI helpers", () => {
       ],
     });
     const values = new Map<string, string>([
-      [DICTATION_COMPOSER_DRAFTS_KEY, legacy], [DICTATION_CUSTODY_EPOCH_KEY, "legacy-epoch"],
+      [DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE, legacy], [DICTATION_CUSTODY_EPOCH_STORAGE_COORDINATE, "legacy-epoch"],
     ]);
     let failLegacyRemoval = true;
     const purgeFenceStore: DictationPurgeFenceStore = {
       getItem: (key) => values.get(key) ?? null,
       setItem: (key, value) => { values.set(key, value); },
       removeItem: (key) => {
-        if (key === DICTATION_COMPOSER_DRAFTS_KEY && failLegacyRemoval) throw new Error("interrupted after commit");
+        if (key === DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE && failLegacyRemoval) throw new Error("interrupted after commit");
         values.delete(key);
       },
     };
@@ -291,12 +291,12 @@ describe("dictation UI helpers", () => {
     const options = { indexedDB, purgeFenceStore };
     await expect(loadDictationComposerDraft("account-1", "session:legacy", options))
       .rejects.toThrow("interrupted after commit");
-    expect(values.get(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(legacy);
+    expect(values.get(DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE)).toBe(legacy);
 
     failLegacyRemoval = false;
     await expect(loadDictationComposerDraft("account-1", "session:legacy", options))
       .resolves.toBe("typed legacy transcript");
-    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(false);
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE)).toBe(false);
     await expect(composerRows(indexedDB)).resolves.toMatchObject([{
       ownerId: "account-1", custodyEpoch: "legacy-epoch", contextKey: "session:legacy",
     }]);
@@ -316,7 +316,7 @@ describe("dictation UI helpers", () => {
       }],
     });
     const values = new Map<string, string>([
-      [DICTATION_COMPOSER_DRAFTS_KEY, legacy], [DICTATION_CUSTODY_EPOCH_KEY, "legacy-epoch"],
+      [DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE, legacy], [DICTATION_CUSTODY_EPOCH_STORAGE_COORDINATE, "legacy-epoch"],
     ]);
     const purgeFenceStore: DictationPurgeFenceStore = {
       getItem: (key) => values.get(key) ?? null,
@@ -327,12 +327,12 @@ describe("dictation UI helpers", () => {
     await expect(loadDictationComposerDraft("account-1", "session:legacy", {
       indexedDB: brokenFactory, purgeFenceStore,
     })).rejects.toThrow("indexeddb unavailable");
-    expect(values.get(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(legacy);
+    expect(values.get(DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE)).toBe(legacy);
   });
 
   it("purges an unreadable legacy envelope without admitting any record", async () => {
     const values = new Map<string, string>([
-      [DICTATION_COMPOSER_DRAFTS_KEY, "{not-json"], [DICTATION_CUSTODY_EPOCH_KEY, "legacy-epoch"],
+      [DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE, "{not-json"], [DICTATION_CUSTODY_EPOCH_STORAGE_COORDINATE, "legacy-epoch"],
     ]);
     const purgeFenceStore: DictationPurgeFenceStore = {
       getItem: (key) => values.get(key) ?? null,
@@ -343,7 +343,7 @@ describe("dictation UI helpers", () => {
     await expect(loadDictationComposerDraft("account-1", "session:legacy", {
       indexedDB, purgeFenceStore,
     })).resolves.toBeNull();
-    expect(values.has(DICTATION_COMPOSER_DRAFTS_KEY)).toBe(false);
+    expect(values.has(DICTATION_COMPOSER_DRAFTS_STORAGE_COORDINATE)).toBe(false);
     await expect(composerRows(indexedDB)).resolves.toEqual([]);
   });
 

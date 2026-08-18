@@ -1,0 +1,13 @@
+# Eden
+
+> Eden is a self-hostable working prototype for persistent AI agents, conversations, workspaces, media, and optional external integrations.
+
+- `/eden-overview.md`: portable overview
+- `/llms-full.txt`: longer feature and privacy guide
+- `/agents`: agent directory for the current deployment
+- `/sessions`: conversations available to the signed-in viewer
+- `/studio`: configured media tools
+- `/channels`: configured external conversation integrations
+- `/skills`: agent skill catalog
+
+Availability varies by deployment. This checkpoint is not production-ready. Do not infer public signup, pricing, provider access, or visibility of authenticated resources.

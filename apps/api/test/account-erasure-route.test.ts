@@ -89,36 +89,36 @@ async function appFor(
 
 describe('DELETE /account', () => {
   it('derives the only deletion target from the authenticated self', async () => {
-    const { app, erasure } = await appFor({ accountId: ACCOUNT_ID, username: 'Gene', isAdmin: false });
+    const { app, erasure } = await appFor({ accountId: ACCOUNT_ID, username: 'Alex', isAdmin: false });
     const response = await app.inject({
       method: 'DELETE',
       url: '/account',
-      payload: { confirmUsername: 'gene' },
+      payload: { confirmUsername: 'alex' },
     });
 
     expect(response.statusCode).toBe(202);
     expect(response.json()).toEqual({ jobId: JOB_ID, status: 'pending' });
     expect(erasure.store.acceptIntent).toHaveBeenCalledWith({
       accountId: ACCOUNT_ID,
-      confirmUsername: 'gene',
+      confirmUsername: 'alex',
     });
     await app.close();
   });
 
   it('rejects anonymous/admin requests and caller-selected target fields', async () => {
     const anonymous = await appFor(null);
-    expect((await anonymous.app.inject({ method: 'DELETE', url: '/account', payload: { confirmUsername: 'gene' } })).statusCode).toBe(401);
+    expect((await anonymous.app.inject({ method: 'DELETE', url: '/account', payload: { confirmUsername: 'alex' } })).statusCode).toBe(401);
     await anonymous.app.close();
 
-    const admin = await appFor({ accountId: ACCOUNT_ID, username: 'Gene', isAdmin: true });
-    expect((await admin.app.inject({ method: 'DELETE', url: '/account', payload: { confirmUsername: 'gene' } })).statusCode).toBe(403);
+    const admin = await appFor({ accountId: ACCOUNT_ID, username: 'Alex', isAdmin: true });
+    expect((await admin.app.inject({ method: 'DELETE', url: '/account', payload: { confirmUsername: 'alex' } })).statusCode).toBe(403);
     await admin.app.close();
 
-    const selected = await appFor({ accountId: ACCOUNT_ID, username: 'Gene', isAdmin: false });
+    const selected = await appFor({ accountId: ACCOUNT_ID, username: 'Alex', isAdmin: false });
     expect((await selected.app.inject({
       method: 'DELETE',
       url: '/account',
-      payload: { confirmUsername: 'gene', accountId: '33333333-3333-4333-8333-333333333333' },
+      payload: { confirmUsername: 'alex', accountId: '33333333-3333-4333-8333-333333333333' },
     })).statusCode).toBe(400);
     expect(selected.erasure.store.acceptIntent).not.toHaveBeenCalled();
     await selected.app.close();

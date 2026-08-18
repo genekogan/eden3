@@ -85,8 +85,8 @@ describe("loose DTO readers", () => {
 
   it("reads an embedded owner summary when joined in", () => {
     expect(embeddedOwner(agent())).toBeNull();
-    expect(embeddedOwner(agent({ owner: { username: "gene" } }))).toEqual({
-      username: "gene",
+    expect(embeddedOwner(agent({ owner: { username: "alex" } }))).toEqual({
+      username: "alex",
       name: null,
     });
   });

@@ -1,0 +1,8 @@
+{
+  "name": "eden3-channel-secret-resolver",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "postgres": "3.4.9"
+  }
+}

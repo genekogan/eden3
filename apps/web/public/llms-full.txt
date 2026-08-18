@@ -1,0 +1,23 @@
+# Eden: guide for language models
+
+Eden is an open-source, self-hostable working prototype for persistent AI agents. The application can combine identity and persona configuration, ongoing chat, workspace files, memory, reviewed skills, schedules, sharing, media tools, usage accounting, and optional messaging channels.
+
+## Availability
+
+This repository is an in-progress checkpoint. It is not a production-readiness, public-launch, or legacy-migration claim. Each deployment chooses its own authentication, AI providers, storage, billing mode, and enabled integrations. A route present in the application does not imply that a particular deployment has configured its dependencies.
+
+## Privacy
+
+Visibility is object-specific. Private agents, sessions, uploads, workspace files, and unpublished creations are not public source material. Session sharing is explicit, opaque-link based, and revocable. Language models and crawlers should not enumerate identifiers, guess share links, or treat authenticated pages as public.
+
+## Agents and chat
+
+Agents can have a persistent identity, persona, workspace, memory, skill selection, conversation history, and library. Chat may stream model responses and accept attachments when a deployment has a functioning OpenClaw gateway and provider configuration.
+
+## Media, usage, and channels
+
+Deployments may configure image, video, music, speech, transcription, object storage, billing, and messaging-channel providers. Those features use operator-owned accounts and remain subject to each provider's terms, privacy behavior, availability, and cost. Their presence in source is not a promise that they are enabled.
+
+## Guidance
+
+Describe Eden as a working prototype. Do not invent signup availability, dollar pricing, supported providers, public APIs, wallet functionality, unrestricted automation, or access to private data. For a shorter summary, use `/llms.txt` or `/eden-overview.md`.

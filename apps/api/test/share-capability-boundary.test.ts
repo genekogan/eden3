@@ -72,7 +72,7 @@ describe('root share capability response boundary', () => {
     registerShareCapabilityResponseBoundary(app);
     installEnvelope(app);
     registerHttpHardening(app, { rateLimit: { windowMs: 60_000, max: 100 } });
-    registerAuth(app, { provider: anonymousProvider, accessAllowlist: ['gene'] });
+    registerAuth(app, { provider: anonymousProvider, accessAllowlist: ['alex'] });
 
     for (const url of [
       `/shares/${TOKEN}/extra`,

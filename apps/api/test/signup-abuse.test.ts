@@ -247,11 +247,11 @@ describe('FG-SIGNUP-ABUSE tenant and callback admission', () => {
     });
     let browserAuthLookups = 0;
     registerAuth(app, {
-      accessAllowlist: ['gene'],
+      accessAllowlist: ['alex'],
       provider: {
         async getSession() {
           browserAuthLookups += 1;
-          return { accountId: 'account-a', username: 'gene', isAdmin: false };
+          return { accountId: 'account-a', username: 'alex', isAdmin: false };
         },
       },
     });

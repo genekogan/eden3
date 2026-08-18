@@ -24,7 +24,7 @@ const SECRET_REF = {
 
 function managedBotUpdate() {
   return {
-    user: { id: 9007199254740001, is_bot: false, first_name: 'Gene', username: 'GeneK' },
+    user: { id: 9007199254740001, is_bot: false, first_name: 'Alex', username: 'ExampleUser' },
     bot: {
       id: 9007199254740002,
       is_bot: true,
@@ -39,10 +39,10 @@ describe('Telegram managed-bot deep links', () => {
     expect(
       createTelegramManagedBotDeepLink({
         managerBotUsername: '@EdenManagerBot',
-        suggestedBotUsername: '@GeneHelper',
-        suggestedBotName: 'Gene & Eden',
+        suggestedBotUsername: '@ExampleHelper',
+        suggestedBotName: 'Example & Eden',
       }),
-    ).toBe('https://t.me/newbot/EdenManagerBot/GeneHelperbot?name=Gene+%26+Eden');
+    ).toBe('https://t.me/newbot/EdenManagerBot/ExampleHelperbot?name=Example+%26+Eden');
   });
 
   it.each([
@@ -128,7 +128,7 @@ describe('FetchTelegramManagedBotApiClient', () => {
 describe('Telegram managed-bot metadata and custody', () => {
   it('validates and normalizes only non-secret metadata', () => {
     expect(normalizeTelegramManagedBotUpdate(managedBotUpdate())).toEqual({
-      owner: { id: '9007199254740001', username: 'GeneK', displayName: 'Gene' },
+      owner: { id: '9007199254740001', username: 'ExampleUser', displayName: 'Alex' },
       bot: {
         id: '9007199254740002',
         username: 'Eden_Helper_Bot',
@@ -163,7 +163,7 @@ describe('Telegram managed-bot metadata and custody', () => {
       ownerAccountId: '223e4567-e89b-42d3-a456-426614174000',
       expectedTelegramOwnerId: '9007199254740001',
       agentId: '323e4567-e89b-42d3-a456-426614174000',
-      label: 'Gene helper',
+      label: 'Example helper',
       update: managedBotUpdate(),
     });
 

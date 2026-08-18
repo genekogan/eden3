@@ -15,7 +15,7 @@ import {
 } from '../components/chat/composer';
 import {
   clearDictationComposerDraft,
-  DICTATION_CUSTODY_EPOCH_KEY,
+  DICTATION_CUSTODY_EPOCH_STORAGE_COORDINATE,
   loadDictationComposerDraft,
   persistDictationComposerDraft,
   type DictationPurgeFenceStore,
@@ -139,7 +139,7 @@ describe('chat composer attachments', () => {
   });
 
   it('cannot let an old accepted send clear a relogged-in epoch', async () => {
-    const values = new Map<string, string>([[DICTATION_CUSTODY_EPOCH_KEY, 'epoch-a']]);
+    const values = new Map<string, string>([[DICTATION_CUSTODY_EPOCH_STORAGE_COORDINATE, 'epoch-a']]);
     const storage: DictationPurgeFenceStore = {
       getItem: (key) => values.get(key) ?? null,
       setItem: (key, value) => { values.set(key, value); },
@@ -152,7 +152,7 @@ describe('chat composer attachments', () => {
     const clearing = retryComposerDraftAfterTurnAcceptance(
       acceptance, 'owner', 'session:one', options,
     );
-    storage.setItem(DICTATION_CUSTODY_EPOCH_KEY, 'epoch-b');
+    storage.setItem(DICTATION_CUSTODY_EPOCH_STORAGE_COORDINATE, 'epoch-b');
     await persistDictationComposerDraft('owner', 'session:one', 'new epoch', options);
     accept(true);
     await expect(clearing).resolves.toBe(true);

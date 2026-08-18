@@ -66,7 +66,7 @@ async function buildAdmissionHarness(): Promise<FastifyInstance> {
   const app = Fastify();
   registerAuth(app, {
     provider: { async getSession() { return null; } },
-    accessAllowlist: ['gene'],
+    accessAllowlist: ['alex'],
   });
 
   const requireRuntime = async (request: FastifyRequest, reply: FastifyReply) => {
@@ -112,7 +112,7 @@ async function buildAdmissionHarness(): Promise<FastifyInstance> {
 
 describe('closed-cohort admission for channel service callbacks', () => {
   it.each([
-    [['gene'], false],
+    [['alex'], false],
     [[], true],
   ] as const)(
     'derives account creation=%s from allowlist %j through the production provider factory',
@@ -138,7 +138,7 @@ describe('closed-cohort admission for channel service callbacks', () => {
   it('does not let a nonallowlisted admin bypass cohort admission', async () => {
     const app = Fastify();
     registerAuth(app, {
-      accessAllowlist: ['gene'],
+      accessAllowlist: ['alex'],
       provider: {
         async getSession() {
           return {
@@ -165,7 +165,7 @@ describe('closed-cohort admission for channel service callbacks', () => {
     async (position) => {
       const app = Fastify();
       registerAuth(app, {
-        accessAllowlist: ['gene'],
+        accessAllowlist: ['alex'],
         provider: { async getSession() { return null; } },
       });
       let sideEffects = 0;
@@ -197,7 +197,7 @@ describe('closed-cohort admission for channel service callbacks', () => {
   it('rejects a bad bearer in the root hook before request-body parsing', async () => {
     const app = Fastify();
     registerAuth(app, {
-      accessAllowlist: ['gene'],
+      accessAllowlist: ['alex'],
       provider: { async getSession() { return null; } },
     });
     let parsed = 0;
@@ -227,7 +227,7 @@ describe('closed-cohort admission for channel service callbacks', () => {
   it('refuses a wildcard service callback declaration', async () => {
     const app = Fastify();
     registerAuth(app, {
-      accessAllowlist: ['gene'],
+      accessAllowlist: ['alex'],
       provider: { async getSession() { return null; } },
     });
     const guard = async (_request: FastifyRequest, _reply: FastifyReply) => undefined;

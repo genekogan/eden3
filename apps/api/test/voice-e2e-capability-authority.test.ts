@@ -23,7 +23,7 @@ describe('isolated voice capability authority', () => {
   function appWithAuthority(): FastifyInstance {
     const app = Fastify({ logger: false });
     apps.push(app);
-    registerAuth(app, { provider: anonymousProvider, accessAllowlist: ['gene'] });
+    registerAuth(app, { provider: anonymousProvider, accessAllowlist: ['alex'] });
     registerVoiceE2eCapabilityAuthority(app, { runtimeCapabilityKey, authorityNonce });
     return app;
   }

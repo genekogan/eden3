@@ -296,7 +296,7 @@ export interface ProvisionAgentParams {
   openclawId: string;
   /** Display name ({{NAME}}). */
   name: string;
-  /** eden.art handle ({{USERNAME}}). */
+  /** Instance-local account handle ({{USERNAME}}). */
   username: string;
   /** One-line role description ({{DESCRIPTION}}). */
   description: string;

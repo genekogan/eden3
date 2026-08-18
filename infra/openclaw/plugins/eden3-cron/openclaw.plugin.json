@@ -1,0 +1,20 @@
+{
+  "id": "eden3-cron",
+  "activation": { "onStartup": true },
+  "name": "Eden Metered Cron",
+  "description": "Lets an Eden agent manage its own scheduled prompts through Eden's metered scheduler.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "contracts": {
+    "tools": ["eden_cron"]
+  },
+  "toolMetadata": {
+    "eden_cron": {
+      "optional": true
+    }
+  }
+}

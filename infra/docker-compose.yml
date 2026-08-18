@@ -1,0 +1,35 @@
+name: eden3
+
+# Evaluation-only infrastructure. This file intentionally exposes PostgreSQL
+# on loopback and does not represent a production deployment architecture.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env.local}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.local}
+      POSTGRES_DB: ${EDEN3_DATABASE_NAME:?set EDEN3_DATABASE_NAME in .env.local}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+
+  # Build the pinned OpenClaw integration image without starting it. Running a
+  # gateway requires operator-owned configuration and provider credentials;
+  # see docs/OPENCLAW.md.
+  openclaw-image:
+    profiles: ["openclaw-build"]
+    build:
+      context: ./openclaw
+    image: eden3-openclaw:2026.7.1
+
+volumes:
+  postgres_data:

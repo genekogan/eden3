@@ -63,8 +63,8 @@ describe("stripMediaSentinelLines", () => {
   it("removes raw gateway media paths from mixed text bodies", () => {
     // Observed live (staging chiba): text + trailing MEDIA: container path.
     const body =
-      "Here's gene enjoying a sandwich!\n\nMEDIA:/home/node/.openclaw/media/tool-image-generation/image-1---6dc9a993.jpg";
-    expect(stripMediaSentinelLines(body)).toBe("Here's gene enjoying a sandwich!");
+      "Here's alex enjoying a sandwich!\n\nMEDIA:/home/node/.openclaw/media/tool-image-generation/image-1---6dc9a993.jpg";
+    expect(stripMediaSentinelLines(body)).toBe("Here's alex enjoying a sandwich!");
   });
 
   it("handles Attachment: spike shape, multiple lines, and media-only bodies", () => {

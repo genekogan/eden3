@@ -35,16 +35,14 @@ const authProviderSchema = z
 export const DEFAULT_CLERK_NEW_USER_SEED_MANNA = 100;
 
 export const envSchema = z.object({
-  /** Postgres (docker, localhost:5433). */
-  DATABASE_URL: z.string().min(1).default('postgres://eden3:eden3@localhost:5433/eden3'),
+  /** Disposable local Postgres; deployments must inject an explicit URL. */
+  DATABASE_URL: z.string().min(1).default('postgresql://127.0.0.1:5432/eden3_local'),
   /**
    * Logical Postgres database selected for the API and both trusted Compose
    * sidecars. When omitted it is derived from DATABASE_URL; when supplied it
    * must match, so staging cannot silently split API and sidecar state.
    */
   EDEN3_DATABASE_NAME: z.string().regex(/^[A-Za-z0-9_-]+$/).optional(),
-  /** Local fork of prod Mongo (docker, localhost:27018). */
-  MONGO_URL: z.string().min(1).default('mongodb://127.0.0.1:27018/eden-prod'),
   /** OpenClaw gateway (single-tenant trusted backend). */
   OPENCLAW_BASE_URL: z.string().min(1).default('http://127.0.0.1:18789'),
   /** Gateway bearer token — no sane default; undefined until configured. */

@@ -100,7 +100,7 @@ describe('disposable population load fixture', () => {
     })).rejects.toThrow(/unexpected database/);
 
     const drifted = new FakeRepository(databaseName);
-    drifted.accounts.push({ id: crypto.randomUUID(), username: 'gene', type: 'user' });
+    drifted.accounts.push({ id: crypto.randomUUID(), username: 'alex', type: 'user' });
     await expect(seedLoadScratchUsers({ repository: drifted, databaseName }))
       .rejects.toThrow(/unexpected account inventory/);
   });

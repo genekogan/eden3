@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
@@ -97,16 +95,13 @@ describe("pre-live legal routes", () => {
     );
   });
 
-  it("keeps the test-enforcement clause non-operative and aligned with the long-form Terms", () => {
-    const root = resolve(process.cwd(), "../..");
-    const longFormTerms = readFileSync(resolve(root, "docs/legal/TERMS-DRAFT.md"), "utf8");
+  it("keeps the test-enforcement clause non-operative", () => {
     const webTerms = legalDocument("terms").sections
       .flatMap((section) => section.paragraphs ?? [])
       .join("\n");
 
-    expect(longFormTerms).toContain("enforce an approved policy");
     expect(webTerms).toContain("enforce an approved policy");
-    expect(`${longFormTerms}\n${webTerms}`).not.toMatch(
+    expect(webTerms).not.toMatch(
       /enforce these drafts|these terms (?:are|become) effective|by using .*agree to (?:these|the) terms/i,
     );
   });
@@ -127,27 +122,5 @@ describe("pre-live legal routes", () => {
       /DMCA safe harbor protected/i,
     ];
     for (const denied of denylist) expect(routeText).not.toMatch(denied);
-  });
-
-  it("ships matching draft documents and a counsel decision register", () => {
-    const root = resolve(process.cwd(), "../..");
-    const paths = [
-      "docs/legal/TERMS-DRAFT.md",
-      "docs/legal/PRIVACY-DRAFT.md",
-      "docs/legal/CONTENT-DMCA-DRAFT.md",
-      "docs/legal/COOKIES-DRAFT.md",
-      "docs/legal/SOURCES.md",
-      "docs/LEGAL-QUESTIONS.md",
-    ];
-    const files = paths.map((path) => readFileSync(resolve(root, path), "utf8"));
-
-    for (const content of files.slice(0, 4)) {
-      expect(content).toMatch(/PRE-LIVE.*NOT EFFECTIVE/i);
-      expect(content).toMatch(/Requires .*legal-counsel approval/i);
-    }
-    expect(files.at(-1)).toMatch(/Adult and sensitive content/);
-    expect(files.at(-1)).toMatch(/Providers, subprocessors, and international transfers/);
-    expect(files.at(-1)).toMatch(/DMCA and other rights reports/);
-    expect(files.join("\n")).not.toMatch(/(?:sk_live|sk_test|xox[baprs]-|ghp_)[A-Za-z0-9_-]+/);
   });
 });

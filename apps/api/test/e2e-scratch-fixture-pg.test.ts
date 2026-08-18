@@ -51,7 +51,7 @@ describe('isolated E2E scratch fixture (disposable Postgres)', () => {
       repository: e2eScratchPostgresRepository,
       databaseName,
       fetchUsers: async () => {
-        const response = await app.inject({ method: 'GET', url: '/dev/users?q=gene' });
+        const response = await app.inject({ method: 'GET', url: '/dev/users?q=alex' });
         expect(response.statusCode).toBe(200);
         return response.json();
       },
@@ -63,7 +63,7 @@ describe('isolated E2E scratch fixture (disposable Postgres)', () => {
       preflightE2EScratchUser({
         repository: e2eScratchPostgresRepository,
         databaseName,
-        fetchUsers: async () => (await app.inject({ method: 'GET', url: '/dev/users?q=gene' })).json(),
+        fetchUsers: async () => (await app.inject({ method: 'GET', url: '/dev/users?q=alex' })).json(),
       }),
     ).rejects.toThrow(/platform Eve baseline/);
     await pg`update accounts set clerk_user_id = null where id = ${fixtureId}`;
@@ -97,7 +97,7 @@ describe('isolated E2E scratch fixture (disposable Postgres)', () => {
           repository: e2eScratchPostgresRepository,
           databaseName,
           fetchUsers: async () =>
-            (await app.inject({ method: 'GET', url: '/dev/users?q=gene' })).json(),
+            (await app.inject({ method: 'GET', url: '/dev/users?q=alex' })).json(),
         }),
       ).rejects.toThrow(/platform Eve baseline/);
     const mutations: {

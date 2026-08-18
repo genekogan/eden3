@@ -10,7 +10,7 @@ describe("settings page", () => {
         data={{
           user: {
             id: "acct-123",
-            username: "gene",
+            username: "alex",
             type: "user",
             userImage: null,
             isAdmin: true,
@@ -28,7 +28,7 @@ describe("settings page", () => {
       />,
     );
 
-    expect(html).toContain("@gene");
+    expect(html).toContain("@alex");
     expect(html).toContain("Add photo");
     expect(html).toContain("sign-in photo is imported automatically");
     expect(html).toContain("acct-123");

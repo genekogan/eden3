@@ -6,7 +6,7 @@
 -- Catalog-guarded on purpose:
 --   * exists + correct + valid  -> return via catalog reads only. No CREATE INDEX
 --     is issued, so no lock of any mode is taken on manna_transactions — safe
---     against a live-serving database (the prod box; local canonical eden3 after
+--     against a live-serving database (or a local database after
 --     its concurrent pre-create). Plain CREATE INDEX IF NOT EXISTS would still
 --     take the SHARE lock before resolving the name, and never verifies the
 --     existing definition.

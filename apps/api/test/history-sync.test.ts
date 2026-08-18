@@ -129,7 +129,7 @@ describe('planHistorySync', () => {
   });
 
   it('dedupes the primed first user message via the PRIMER_HEADER suffix rule', () => {
-    const primed = `${PRIMER_HEADER}\n[gene]: old line\n(Older Eden conversation resumed…)\n\nwhat is my favorite fruit?`;
+    const primed = `${PRIMER_HEADER}\n[alex]: old line\n(Older Eden conversation resumed…)\n\nwhat is my favorite fruit?`;
     const rows: ExistingMessageLike[] = [
       { id: 'row-primed', externalId: null, role: 'user', content: 'what is my favorite fruit?' },
     ];

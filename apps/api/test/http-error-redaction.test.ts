@@ -399,6 +399,8 @@ describe('HTTP 5xx disclosure boundary', () => {
     vi.stubEnv('MEDIA_DIR', mediaDir);
     vi.stubEnv('CHANNEL_TOKEN_ENCRYPTION_KEY', '11'.repeat(32));
     vi.stubEnv('OPENCLAW_GATEWAY_TOKEN', '');
+    vi.stubEnv('AUTH_PROVIDER', 'dev');
+    vi.stubEnv('EDEN3_DEV_ROUTES', '1');
     const lines: string[] = [];
     const app = await buildServer({
       logger: {

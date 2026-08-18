@@ -1,0 +1,20 @@
+# The runtime image needs only these reviewed build inputs. In particular,
+# never send ignored local env files, runtime state, transcripts, or npm
+# archives to the Docker builder as context.
+**
+!Dockerfile
+!docker-entrypoint.sh
+!docker-cli-wrapper.sh
+!eden-channel-secret-resolver.mjs
+!patch-message-sent-run-id.mjs
+!patch-channel-inbound-trust.mjs
+!patch-discord-reconnect-retention.mjs
+!discord-reconnect-drain.mjs
+!patch-session-admission-consistency.mjs
+!patch-sqlite-symlink-storage.mjs
+!session-admission-policy.mjs
+!patch-channel-secret-requester.mjs
+!channel-secret-requester-origin.mjs
+!patch-channel-secret-error-redaction.mjs
+!plugins/
+!plugins/**

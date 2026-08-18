@@ -1,0 +1,8 @@
+{
+  "name": "eden3-agent-cron-bridge",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "postgres": "3.4.9"
+  }
+}

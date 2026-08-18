@@ -18,7 +18,7 @@ describe('closed-alpha public share gate seam', () => {
   async function setup() {
     const app = Fastify();
     apps.push(app);
-    registerAuth(app, { provider: anonymousProvider, accessAllowlist: ['gene'] });
+    registerAuth(app, { provider: anonymousProvider, accessAllowlist: ['alex'] });
     app.get('/shares/:token', { exposeHeadRoute: false }, async () => ({ public: true }));
     app.head('/shares/:token', async (_request, reply) => reply.send());
     app.get('/sessions/:sessionId/shares', async () => ({ managed: true }));

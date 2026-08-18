@@ -6,7 +6,7 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 export interface E2EScratchUser {
   id: string;
   type: 'user';
-  username: 'gene';
+  username: 'alex';
   externalId: null;
   clerkUserId: null;
   userImage: null;
@@ -122,7 +122,7 @@ export function e2eScratchUser(databaseName: string): E2EScratchUser {
   return {
     id: `${versioned.slice(0, 8)}-${versioned.slice(8, 12)}-${versioned.slice(12, 16)}-${versioned.slice(16, 20)}-${versioned.slice(20)}`,
     type: 'user',
-    username: 'gene',
+    username: 'alex',
     externalId: null,
     clerkUserId: null,
     userImage: null,
@@ -184,7 +184,7 @@ export function assertE2EScratchRuntimeInventory(
     geneRows.length !== (geneRequired ? 1 : 0) ||
     eveRows.length !== 1
   ) {
-    throw new Error('scratch database must contain only the exact Gene and platform Eve baseline');
+    throw new Error('scratch database must contain only the exact Alex and platform Eve baseline');
   }
 }
 
@@ -204,7 +204,7 @@ function assertExactDevUsers(payload: unknown, fixture: E2EScratchUser): void {
   if (
     candidate.id !== fixture.id ||
     candidate.type !== 'user' ||
-    candidate.username !== 'gene' ||
+    candidate.username !== 'alex' ||
     candidate.externalId !== null ||
     candidate.userImage !== null
   ) {

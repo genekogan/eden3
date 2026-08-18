@@ -188,7 +188,7 @@ async function preflight(databaseName: string, rawApiUrl: string) {
     repository: e2eScratchPostgresRepository,
     databaseName,
     fetchUsers: async () => {
-      const response = await fetch(new URL('/dev/users?q=gene', apiUrl), {
+      const response = await fetch(new URL('/dev/users?q=alex', apiUrl), {
         signal: AbortSignal.timeout(10_000),
       });
       if (!response.ok) throw new Error('isolated E2E API user preflight failed');

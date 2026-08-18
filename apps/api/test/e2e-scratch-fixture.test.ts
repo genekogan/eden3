@@ -153,7 +153,7 @@ describe('isolated E2E scratch user fixture', () => {
       'http://user@127.0.0.1:4381/',
       'http://:pass@127.0.0.1:4381/',
       'http://127.0.0.1:4381/dev/users',
-      'http://127.0.0.1:4381/?q=gene',
+      'http://127.0.0.1:4381/?q=alex',
       'http://127.0.0.1:4381/#fragment',
       'http://127.0.0.1:4301/',
     ]) {
@@ -166,7 +166,7 @@ describe('isolated E2E scratch user fixture', () => {
     expect(fixture).toEqual({
       id: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/),
       type: 'user',
-      username: 'gene',
+      username: 'alex',
       externalId: null,
       clerkUserId: null,
       userImage: null,
@@ -176,7 +176,7 @@ describe('isolated E2E scratch user fixture', () => {
     expect(e2eScratchUser(`${databaseName}_other`).id).not.toBe(fixture.id);
   });
 
-  it('accepts only exact Gene plus one canonical platform Eve after API startup', () => {
+  it('accepts only exact Alex plus one canonical platform Eve after API startup', () => {
     const fixture = e2eScratchUser(databaseName);
     expect(() => assertE2EScratchRuntimeInventory([platformEve, fixture], fixture)).not.toThrow();
     expect(() =>
@@ -233,7 +233,7 @@ describe('isolated E2E scratch user fixture', () => {
               id: fixture.id,
               externalId: null,
               type: 'user',
-              username: 'gene',
+              username: 'alex',
               userImage: null,
             },
           ],
@@ -314,7 +314,7 @@ describe('isolated E2E scratch user fixture', () => {
             id: seeded.fixture.id,
             externalId: null,
             type: 'user',
-            username: 'gene',
+            username: 'alex',
             userImage: null,
           },
         ],
@@ -350,12 +350,12 @@ describe('isolated E2E scratch user fixture', () => {
               id: fixture.id,
               externalId: null,
               type: 'user',
-              username: 'gene',
+              username: 'alex',
               userImage: null,
             },
           ],
         }),
       }),
-    ).rejects.toThrow(/exact Gene and platform Eve baseline/);
+    ).rejects.toThrow(/exact Alex and platform Eve baseline/);
   });
 });

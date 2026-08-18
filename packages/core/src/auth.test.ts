@@ -24,8 +24,8 @@ describe('parseCookieHeader', () => {
   });
 
   it('decodes percent-encoding and strips quotes', () => {
-    expect(parseCookieHeader('name=gene%20kogan; q="quoted"')).toEqual({
-      name: 'gene kogan',
+    expect(parseCookieHeader('name=alex%20example; q="quoted"')).toEqual({
+      name: 'alex example',
       q: 'quoted',
     });
   });
@@ -44,8 +44,8 @@ describe('parseCookieHeader', () => {
 
 describe('dev session cookies', () => {
   it('buildDevSessionCookie encodes the value and sets attributes', () => {
-    const cookie = buildDevSessionCookie('gene kogan');
-    expect(cookie).toContain(`${DEV_USER_COOKIE}=gene%20kogan`);
+    const cookie = buildDevSessionCookie('alex example');
+    expect(cookie).toContain(`${DEV_USER_COOKIE}=alex%20example`);
     expect(cookie).toContain('Path=/');
     expect(cookie).toContain('HttpOnly');
     expect(cookie).toContain('SameSite=Lax');
@@ -53,9 +53,9 @@ describe('dev session cookies', () => {
   });
 
   it('round-trips through parseCookieHeader', () => {
-    const setCookie = buildDevSessionCookie('gene kogan');
+    const setCookie = buildDevSessionCookie('alex example');
     const pair = setCookie.split(';')[0]!;
-    expect(parseCookieHeader(pair)[DEV_USER_COOKIE]).toBe('gene kogan');
+    expect(parseCookieHeader(pair)[DEV_USER_COOKIE]).toBe('alex example');
   });
 
   it('clearDevSessionCookie expires the cookie', () => {
@@ -68,7 +68,7 @@ describe('DevAuthProvider', () => {
   const records: Record<string, DevAccountRecord> = {
     '0d4ff44a-2e6c-4b19-a021-63f2fe1c5a11': {
       id: '0d4ff44a-2e6c-4b19-a021-63f2fe1c5a11',
-      username: 'gene',
+      username: 'alex',
       deleted: false,
     },
     verdelis: {
@@ -80,7 +80,7 @@ describe('DevAuthProvider', () => {
   };
   const seenRefs: string[] = [];
   const provider = new DevAuthProvider({
-    adminUsernames: ['GENE'],
+    adminUsernames: ['ALEX'],
     lookupAccount: async (ref) => {
       seenRefs.push(ref);
       return records[ref] ?? null;
@@ -100,7 +100,7 @@ describe('DevAuthProvider', () => {
     const session = await provider.getSession(reqWithCookie('0d4ff44a-2e6c-4b19-a021-63f2fe1c5a11'));
     expect(session).toEqual({
       accountId: '0d4ff44a-2e6c-4b19-a021-63f2fe1c5a11',
-      username: 'gene',
+      username: 'alex',
       isAdmin: true,
     });
   });
