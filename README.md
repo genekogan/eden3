@@ -30,10 +30,11 @@ pnpm db:migrate
 pnpm dev
 ```
 
-The web app defaults to `http://127.0.0.1:4300` and the API to `http://127.0.0.1:4301`. The minimal local profile uses development authentication and a local PostgreSQL database. Real AI responses require an OpenClaw gateway configured with your own provider credentials.
+The web app defaults to `http://127.0.0.1:4300` and the API to `http://127.0.0.1:4301`. The minimal local profile uses development authentication and a local PostgreSQL database. Real AI responses require an OpenClaw gateway configured with your own provider API credentials or the supported Claude Code subscription runtime.
 
 ## Documentation
 
+- [Developer handoff](docs/DEVELOPER-HANDOFF.md) — the short “replicate this checkpoint” note to send first
 - [Architecture](docs/ARCHITECTURE.md)
 - [Local setup](docs/SETUP.md)
 - [Configuration](docs/CONFIGURATION.md)
